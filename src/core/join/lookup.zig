@@ -745,12 +745,14 @@ const expr_ast = @import("../expr/ast.zig");
 const expr_eval = @import("../expr/eval.zig");
 const output_values = @import("../scan/output_values.zig");
 const AggValue = output_values.AggValue;
+const ResultProgram = @import("../result_program.zig").ResultProgram;
 
 /// GROUP BY keys that the build key determines (the FK, build columns): every group is one build slot, so the
 /// aggregates fold into per-slot accumulators, with no group table. Row groups fold in their order whatever the
-/// worker that read them (a reorder buffer), so float sums are the same at every `-j`.
+/// worker that read them (a reorder buffer), so float sums are the same at every `-j`. A NULL argument is skipped, as
+/// SQL skips it: a slot whose rows held only NULLs answers NULL for that call.
 pub const GroupJoin = struct {
-    pub const Func = enum { sum, count, min, max };
+    pub const Func = enum { sum, count, min, max, avg };
     pub const Lane = enum { f64, i64 };
     pub const Call = struct { func: Func, arg: ?expr_ast.Expr, lane: Lane };
     pub const Output = union(enum) { key: usize, agg: usize };
@@ -760,12 +762,15 @@ pub const GroupJoin = struct {
     calls: []const Call,
     outputs: []const Output,
     order: expr_ast.ResultOrder,
-    /// Per slot: whether any row reached it; rows folded, when a `count` is asked; each call's accumulator (sum, min
-    /// or max) in its lane.
+    /// Per slot: whether any row reached it, and how many did when a `count(*)` is asked.
     seen: []u64,
     count: []u32,
+    /// Per call and slot: its accumulator in its lane (the sum, for avg); whether a non-NULL argument reached it
+    /// (sum, min, max: a bit per slot); and how many did (count of a column, avg).
     f: [][]f64,
     i: [][]i64,
+    has: [][]u64,
+    n: [][]u32,
     /// One entry per probe row group: its partial, until every earlier row group has folded.
     pending: []std.atomic.Value(?*Partial),
     next: std.atomic.Value(usize) = .init(0),
@@ -774,17 +779,29 @@ pub const GroupJoin = struct {
     n_slots: usize,
     overflow: std.atomic.Value(bool) = .init(false),
 
-    /// One row group's contributions, as runs of rows with one slot, in row order.
+    fn valued(c: Call) bool {
+        return c.arg != null and c.func != .count;
+    }
+
+    fn counted(c: Call) bool {
+        return c.arg != null and (c.func == .count or c.func == .avg);
+    }
+
+    /// One row group's contributions, as runs of rows with one slot, in row order. `nn[call]`: the run's rows whose
+    /// argument was not NULL, when any was (else every row's was not: `counts`).
     const Partial = struct {
         slots: []u32,
         counts: []u32,
         f: [][]f64,
         i: [][]i64,
+        nn: [][]u32,
         fn free(p: *Partial, gpa: std.mem.Allocator) void {
             for (p.f) |x| gpa.free(x);
             for (p.i) |x| gpa.free(x);
+            for (p.nn) |x| gpa.free(x);
             gpa.free(p.f);
             gpa.free(p.i);
+            gpa.free(p.nn);
             gpa.free(p.slots);
             gpa.free(p.counts);
             gpa.destroy(p);
@@ -794,30 +811,39 @@ pub const GroupJoin = struct {
     /// Takes `keys`, `calls` and `outputs` (`gpa`'s) once it succeeds; a refusal (the ledger's, under a budget) frees
     /// everything it allocated and leaves them the caller's.
     pub fn init(gpa: std.mem.Allocator, j: *const Join, keys: []const usize, calls: []const Call, outputs: []const Output, row_groups: usize) !*GroupJoin {
+        const n_calls = calls.len;
         const g = try gpa.create(GroupJoin);
         errdefer gpa.destroy(g);
         const seen = try gpa.alloc(u64, j.n / 64 + 1);
         errdefer gpa.free(seen);
         const count: []u32 = for (calls) |c| {
-            if (c.func == .count) break try gpa.alloc(u32, j.n);
+            if (c.func == .count and c.arg == null) break try gpa.alloc(u32, j.n);
         } else &.{};
         errdefer gpa.free(count);
-        const f = try gpa.alloc([]f64, calls.len);
+        const f = try gpa.alloc([]f64, n_calls);
         errdefer gpa.free(f);
         @memset(f, &.{});
         errdefer for (f) |x| gpa.free(x);
-        const i = try gpa.alloc([]i64, calls.len);
+        const i = try gpa.alloc([]i64, n_calls);
         errdefer gpa.free(i);
         @memset(i, &.{});
         errdefer for (i) |x| gpa.free(x);
+        const has = try gpa.alloc([]u64, n_calls);
+        errdefer gpa.free(has);
+        @memset(has, &.{});
+        errdefer for (has) |x| gpa.free(x);
+        const n = try gpa.alloc([]u32, n_calls);
+        errdefer gpa.free(n);
+        @memset(n, &.{});
+        errdefer for (n) |x| gpa.free(x);
         const pending = try gpa.alloc(std.atomic.Value(?*Partial), row_groups);
         errdefer gpa.free(pending);
-        for (calls, f, i) |c, *fl, *il| {
-            if (c.lane == .f64 and c.func != .count) fl.* = try gpa.alloc(f64, j.n);
-            if (c.lane == .i64 and c.func != .count) il.* = try gpa.alloc(i64, j.n);
+        for (calls, f, i, has, n) |c, *fl, *il, *h, *nl| {
+            if (valued(c) and c.lane == .f64) fl.* = try gpa.alloc(f64, j.n);
+            if (valued(c) and c.lane == .i64) il.* = try gpa.alloc(i64, j.n);
+            if (valued(c) and c.func != .avg) h.* = try gpa.alloc(u64, j.n / 64 + 1);
+            if (counted(c)) nl.* = try gpa.alloc(u32, j.n);
         }
-        @memset(seen, 0);
-        @memset(count, 0);
         for (pending) |*p| p.* = .init(null);
         g.* = .{
             .keys = keys,
@@ -828,11 +854,21 @@ pub const GroupJoin = struct {
             .count = count,
             .f = f,
             .i = i,
+            .has = has,
+            .n = n,
             .pending = pending,
             .gpa = gpa,
             .n_slots = j.n,
         };
+        g.zero();
         return g;
+    }
+
+    fn zero(g: *GroupJoin) void {
+        @memset(g.seen, 0);
+        @memset(g.count, 0);
+        for (g.has) |h| @memset(h, 0);
+        for (g.n) |n| @memset(n, 0);
     }
 
     /// Forget every fold: a refused scan replays from its first row group (`scan.runMultiAggregate`).
@@ -840,20 +876,27 @@ pub const GroupJoin = struct {
         for (g.pending) |*p| if (p.swap(null, .acquire)) |partial| partial.free(g.gpa);
         g.next.store(0, .monotonic);
         g.overflow.store(false, .monotonic);
-        @memset(g.seen, 0);
-        @memset(g.count, 0);
+        g.zero();
     }
 
     fn reached(g: *const GroupJoin, s: u32) bool {
-        return g.seen[s >> 6] & (@as(u64, 1) << @intCast(s & 63)) != 0;
+        return bitAt(g.seen, s);
+    }
+
+    fn bitAt(bits: []const u64, s: u32) bool {
+        return bits[s >> 6] & (@as(u64, 1) << @intCast(s & 63)) != 0;
     }
 
     pub fn deinit(g: *GroupJoin) void {
         const gpa = g.gpa;
         for (g.f) |x| gpa.free(x);
         for (g.i) |x| gpa.free(x);
+        for (g.has) |x| gpa.free(x);
+        for (g.n) |x| gpa.free(x);
         gpa.free(g.f);
         gpa.free(g.i);
+        gpa.free(g.has);
+        gpa.free(g.n);
         gpa.free(g.seen);
         gpa.free(g.count);
         gpa.free(g.pending);
@@ -866,31 +909,62 @@ pub const GroupJoin = struct {
     /// Bytes per slot this group-join holds: what the build is charged on top of its keys and payloads.
     pub fn bytesFor(slots: usize, calls: []const Call) usize {
         var per: usize = 0;
-        var counted = false;
+        var bits: usize = 1;
         for (calls) |c| {
-            if (c.func == .count) counted = true else per += 8;
+            if (c.func == .count and c.arg == null) per += 4;
+            if (valued(c)) per += 8;
+            if (valued(c) and c.func != .avg) bits += 1;
+            if (counted(c)) per += 4;
         }
-        return slots * (per + @as(usize, if (counted) 4 else 0)) + slots / 8;
+        // One `count(*)` array serves every count(*).
+        var star = false;
+        for (calls) |c| if (c.func == .count and c.arg == null) {
+            if (star) per -= 4;
+            star = true;
+        };
+        return slots * per + slots / 8 * bits;
     }
 
-    fn argColumn(a: std.mem.Allocator, batch: *const filter_eval.Batch, lookup: []const ?usize, e: expr_ast.Expr, lane: Lane) !union(enum) { f: []const f64, i: []const i64 } {
-        var col = try expr_eval.evalExpr(a, batch, lookup, e);
+    /// One argument's values in its lane, with its NULLs.
+    const Arg = struct {
+        f: []const f64 = &.{},
+        i: []const i64 = &.{},
+        def: ?[]const u32 = null,
+        max_def: u32 = 0,
+
+        fn isNull(a: Arg, r: usize) bool {
+            const d = a.def orelse return false;
+            return d[r] < a.max_def;
+        }
+    };
+
+    /// `c`'s argument over `batch`; for a count, its NULLs alone.
+    fn argColumn(a: std.mem.Allocator, batch: *const filter_eval.Batch, lookup: []const ?usize, call: Call) !Arg {
+        const lane = call.lane;
+        var col = try expr_eval.evalExpr(a, batch, lookup, call.arg.?);
+        if (call.func == .count) {
+            const info = col.nullInfo();
+            const nulls = switch (col) {
+                inline else => |x| x.has_nulls,
+            };
+            return .{ .def = if (nulls) info.def_levels else null, .max_def = info.max_def };
+        }
         // A column decoded as codes alone reads as values here.
         if (col.codes() != null) col = try @import("../expr/agg_coded.zig").materialize(a, col);
         switch (col) {
             inline .f64, .i64, .i32 => |c, tag| {
-                if (c.has_nulls) return error.GroupJoinNullArgument;
                 // A coded column's values are materialized for value consumers (a build column always is).
                 if (c.values.len < batch.num_rows) return error.GroupJoinCodedArgument;
+                const def = if (c.has_nulls) c.def_levels else null;
                 if (lane == .f64) {
                     if (tag != .f64) return error.GroupJoinArgumentType;
-                    return .{ .f = c.values };
+                    return .{ .f = c.values, .def = def, .max_def = c.max_def };
                 }
                 if (tag == .f64) return error.GroupJoinArgumentType;
-                if (tag == .i64) return .{ .i = c.values };
+                if (tag == .i64) return .{ .i = c.values, .def = def, .max_def = c.max_def };
                 const wide = try a.alloc(i64, c.values.len);
                 for (c.values, wide) |v, *w| w.* = v;
-                return .{ .i = wide };
+                return .{ .i = wide, .def = def, .max_def = c.max_def };
             },
             else => return error.GroupJoinArgumentType,
         }
@@ -915,25 +989,21 @@ pub const GroupJoin = struct {
         g: *GroupJoin,
         slots: std.ArrayList(u32) = .empty,
         counts: std.ArrayList(u32) = .empty,
-        /// Per call, its run accumulators, in the call's lane.
+        /// Per call: its run accumulators, in the call's lane; and its non-NULL rows per run, once a NULL showed.
         f: []std.ArrayList(f64) = &.{},
         i: []std.ArrayList(i64) = &.{},
+        nn: []std.ArrayList(u32) = &.{},
 
         /// Rows `sel` keeps of `batch`, with their slots in `at` (indexed as `sel`).
         pub fn add(fold: *Fold, a: std.mem.Allocator, at: []const u32, batch: *const filter_eval.Batch, lookup: []const ?usize, sel: *const selection.SelectionVector) !void {
             const g = fold.g;
             const gpa = g.gpa;
             try fold.lanes();
-            const args_f = try a.alloc([]const f64, g.calls.len);
-            const args_i = try a.alloc([]const i64, g.calls.len);
-            for (g.calls, args_f, args_i) |c, *af, *ai| {
-                af.* = &.{};
-                ai.* = &.{};
-                const e = c.arg orelse continue;
-                switch (try argColumn(a, batch, lookup, e, c.lane)) {
-                    .f => |v| af.* = v,
-                    .i => |v| ai.* = v,
-                }
+            const args = try a.alloc(Arg, g.calls.len);
+            for (g.calls, args) |c, *arg| {
+                arg.* = .{};
+                if (c.arg == null) continue;
+                arg.* = try argColumn(a, batch, lookup, c);
             }
             // Runs of one slot, in row order: on a key-sorted probe a slot's rows are one run. Counted first, so
             // each list grows once a batch.
@@ -946,10 +1016,15 @@ pub const GroupJoin = struct {
             }
             try fold.slots.ensureUnusedCapacity(gpa, runs);
             try fold.counts.ensureUnusedCapacity(gpa, runs);
-            for (g.calls, fold.f, fold.i) |c, *f, *i| switch (c.lane) {
-                .f64 => if (c.func != .count) try f.ensureUnusedCapacity(gpa, runs),
-                .i64 => if (c.func != .count) try i.ensureUnusedCapacity(gpa, runs),
-            };
+            for (g.calls, fold.f, fold.i, args, fold.nn) |c, *f, *i, arg, *nn| {
+                if (valued(c)) switch (c.lane) {
+                    .f64 => try f.ensureUnusedCapacity(gpa, runs),
+                    .i64 => try i.ensureUnusedCapacity(gpa, runs),
+                };
+                // The first NULL of this call in the row group: every run before it had no NULL.
+                if (arg.def != null and nn.items.len == 0 and fold.counts.items.len != 0) try nn.appendSlice(gpa, fold.counts.items);
+                if (arg.def != null or nn.items.len != 0) try nn.ensureUnusedCapacity(gpa, runs + 1);
+            }
             it = sel.iterator();
             while (it.next()) |r| {
                 const s = at[r];
@@ -959,43 +1034,63 @@ pub const GroupJoin = struct {
                     fold.slots.appendAssumeCapacity(s);
                     fold.counts.appendAssumeCapacity(0);
                 }
-                fold.counts.items[fold.counts.items.len - 1] += 1;
-                for (g.calls, 0..) |c, ci| switch (c.lane) {
-                    .f64 => if (c.func != .count) {
-                        const v = args_f[ci][r];
-                        if (fresh) fold.f[ci].appendAssumeCapacity(v) else {
-                            const dst = &fold.f[ci].items[fold.f[ci].items.len - 1];
-                            dst.* = switch (c.func) {
-                                .sum => dst.* + v,
+                const run = fold.counts.items.len - 1;
+                // The rows of this run before this one.
+                const before_row = fold.counts.items[run];
+                fold.counts.items[run] += 1;
+                for (g.calls, fold.f, fold.i, fold.nn, args) |c, *f, *i, *nn, arg| {
+                    if (c.arg == null) continue;
+                    const null_row = arg.isNull(r);
+                    if (null_row and nn.items.len == 0) {
+                        // Every row so far had a value; this run has `before_row` of them.
+                        try nn.appendSlice(gpa, fold.counts.items);
+                        nn.items[run] = before_row;
+                    } else if (nn.items.len != 0 and nn.items.len < fold.counts.items.len) nn.appendAssumeCapacity(0);
+                    // Whether this run already holds a value of this call.
+                    const started = if (nn.items.len != 0) nn.items[run] != 0 else before_row != 0;
+                    if (fresh and valued(c)) switch (c.lane) {
+                        .f64 => f.appendAssumeCapacity(0),
+                        .i64 => i.appendAssumeCapacity(0),
+                    };
+                    if (null_row) continue;
+                    if (nn.items.len != 0) nn.items[run] += 1;
+                    if (!valued(c)) continue;
+                    switch (c.lane) {
+                        .f64 => {
+                            const v = arg.f[r];
+                            const dst = &f.items[run];
+                            dst.* = if (!started) v else switch (c.func) {
+                                .sum, .avg => dst.* + v,
                                 .min => @min(dst.*, v),
                                 .max => @max(dst.*, v),
                                 .count => unreachable,
                             };
-                        }
-                    },
-                    .i64 => if (c.func != .count) {
-                        const v = if (c.arg != null) args_i[ci][r] else 1;
-                        if (fresh) fold.i[ci].appendAssumeCapacity(v) else {
-                            const dst = &fold.i[ci].items[fold.i[ci].items.len - 1];
-                            dst.* = switch (c.func) {
-                                .sum => std.math.add(i64, dst.*, v) catch return error.GroupJoinOverflow,
+                        },
+                        .i64 => {
+                            const v = arg.i[r];
+                            const dst = &i.items[run];
+                            dst.* = if (!started) v else switch (c.func) {
+                                .sum, .avg => std.math.add(i64, dst.*, v) catch return error.GroupJoinOverflow,
                                 .min => @min(dst.*, v),
                                 .max => @max(dst.*, v),
                                 .count => unreachable,
                             };
-                        }
-                    },
-                };
+                        },
+                    }
+                }
             }
         }
 
         fn lanes(fold: *Fold) !void {
             const n = fold.g.calls.len;
             if (fold.f.len == n) return;
-            fold.f = try fold.g.gpa.alloc(std.ArrayList(f64), n);
+            const gpa = fold.g.gpa;
+            fold.f = try gpa.alloc(std.ArrayList(f64), n);
             @memset(fold.f, .empty);
-            fold.i = try fold.g.gpa.alloc(std.ArrayList(i64), n);
+            fold.i = try gpa.alloc(std.ArrayList(i64), n);
             @memset(fold.i, .empty);
+            fold.nn = try gpa.alloc(std.ArrayList(u32), n);
+            @memset(fold.nn, .empty);
         }
 
         /// Hand the row group's partial to the ordered merge.
@@ -1005,15 +1100,19 @@ pub const GroupJoin = struct {
             try fold.lanes();
             // Empty first: on a refusal the partial frees what has moved into it, and the caller's `deinit` the rest.
             const p = try gpa.create(Partial);
-            p.* = .{ .slots = &.{}, .counts = &.{}, .f = &.{}, .i = &.{} };
+            p.* = .{ .slots = &.{}, .counts = &.{}, .f = &.{}, .i = &.{}, .nn = &.{} };
             errdefer p.free(gpa);
-            p.f = try gpa.alloc([]f64, g.calls.len);
+            const n = g.calls.len;
+            p.f = try gpa.alloc([]f64, n);
             @memset(p.f, &.{});
-            p.i = try gpa.alloc([]i64, g.calls.len);
+            p.i = try gpa.alloc([]i64, n);
             @memset(p.i, &.{});
-            for (fold.f, fold.i, p.f, p.i) |*lf, *li, *df, *di| {
+            p.nn = try gpa.alloc([]u32, n);
+            @memset(p.nn, &.{});
+            for (fold.f, fold.i, fold.nn, p.f, p.i, p.nn) |*lf, *li, *ln, *df, *di, *dn| {
                 df.* = try lf.toOwnedSlice(gpa);
                 di.* = try li.toOwnedSlice(gpa);
+                dn.* = try ln.toOwnedSlice(gpa);
             }
             p.slots = try fold.slots.toOwnedSlice(gpa);
             p.counts = try fold.counts.toOwnedSlice(gpa);
@@ -1026,46 +1125,59 @@ pub const GroupJoin = struct {
             const gpa = fold.g.gpa;
             for (fold.f) |*x| x.deinit(gpa);
             for (fold.i) |*x| x.deinit(gpa);
+            for (fold.nn) |*x| x.deinit(gpa);
             gpa.free(fold.f);
             gpa.free(fold.i);
+            gpa.free(fold.nn);
             fold.f = &.{};
             fold.i = &.{};
+            fold.nn = &.{};
             fold.slots.deinit(gpa);
             fold.counts.deinit(gpa);
         }
     };
 
     fn apply(g: *GroupJoin, p: *const Partial) void {
-        for (p.slots, p.counts, 0..) |s, n, at| {
+        for (p.slots, p.counts, 0..) |s, run_rows, at| {
+            const word = s >> 6;
             const bit = @as(u64, 1) << @intCast(s & 63);
-            const first = g.seen[s >> 6] & bit == 0;
-            g.seen[s >> 6] |= bit;
-            if (g.count.len != 0) g.count[s] += n;
-            for (g.calls, 0..) |c, ci| switch (c.lane) {
-                .f64 => if (c.func != .count) {
-                    const dst = &g.f[ci][s];
-                    const v = p.f[ci][at];
-                    dst.* = if (first) v else switch (c.func) {
-                        .sum => dst.* + v,
-                        .min => @min(dst.*, v),
-                        .max => @max(dst.*, v),
-                        .count => unreachable,
-                    };
-                },
-                .i64 => if (c.func != .count) {
-                    const dst = &g.i[ci][s];
-                    const v = p.i[ci][at];
-                    dst.* = if (first) v else switch (c.func) {
-                        .sum => std.math.add(i64, dst.*, v) catch blk: {
-                            g.overflow.store(true, .monotonic);
-                            break :blk dst.*;
-                        },
-                        .min => @min(dst.*, v),
-                        .max => @max(dst.*, v),
-                        .count => unreachable,
-                    };
-                },
-            };
+            g.seen[word] |= bit;
+            if (g.count.len != 0) g.count[s] += run_rows;
+            for (g.calls, 0..) |c, ci| {
+                if (c.arg == null) continue;
+                const values = if (p.nn[ci].len != 0) p.nn[ci][at] else run_rows;
+                if (values == 0) continue;
+                // Whether the slot already holds a value of this call.
+                const first = if (g.has[ci].len != 0) g.has[ci][word] & bit == 0 else g.n[ci][s] == 0;
+                if (g.has[ci].len != 0) g.has[ci][word] |= bit;
+                if (g.n[ci].len != 0) g.n[ci][s] += values;
+                if (!valued(c)) continue;
+                switch (c.lane) {
+                    .f64 => {
+                        const dst = &g.f[ci][s];
+                        const v = p.f[ci][at];
+                        dst.* = if (first) v else switch (c.func) {
+                            .sum, .avg => dst.* + v,
+                            .min => @min(dst.*, v),
+                            .max => @max(dst.*, v),
+                            .count => unreachable,
+                        };
+                    },
+                    .i64 => {
+                        const dst = &g.i[ci][s];
+                        const v = p.i[ci][at];
+                        dst.* = if (first) v else switch (c.func) {
+                            .sum, .avg => std.math.add(i64, dst.*, v) catch blk: {
+                                g.overflow.store(true, .monotonic);
+                                break :blk dst.*;
+                            },
+                            .min => @min(dst.*, v),
+                            .max => @max(dst.*, v),
+                            .count => unreachable,
+                        };
+                    },
+                }
+            }
         }
     }
 
@@ -1115,7 +1227,8 @@ pub const GroupJoin = struct {
         }
     }
 
-    fn value(g: *const GroupJoin, j: *const Join, out: Output, s: u32, gpa: std.mem.Allocator) !AggValue {
+    /// Output `out` of slot `s`; a string is copied onto `gpa`, or borrowed from the build's dictionary without one.
+    fn value(g: *const GroupJoin, j: *const Join, out: Output, s: u32, gpa: ?std.mem.Allocator) !AggValue {
         switch (out) {
             .key => |k| {
                 const leaf = g.keys[k];
@@ -1125,26 +1238,38 @@ pub const GroupJoin = struct {
                     .i32 => |d| .{ .i = d[code] },
                     .i64 => |d| .{ .i = d[code] },
                     .f64 => |d| .{ .f = d[code] },
-                    .string => |d| .{ .s = try gpa.dupe(u8, d[code]) },
+                    .string => |d| .{ .s = if (gpa) |a| try a.dupe(u8, d[code]) else d[code] },
                 };
             },
             .agg => |ci| {
                 const c = g.calls[ci];
-                if (c.func == .count) return .{ .i = g.count[s] };
-                return switch (c.lane) {
-                    .f64 => .{ .f = g.f[ci][s] },
-                    .i64 => .{ .i = g.i[ci][s] },
-                };
+                switch (c.func) {
+                    .count => return .{ .i = if (c.arg == null) g.count[s] else g.n[ci][s] },
+                    .avg => {
+                        const n = g.n[ci][s];
+                        if (n == 0) return .null_val;
+                        const sum: f64 = switch (c.lane) {
+                            .f64 => g.f[ci][s],
+                            .i64 => @floatFromInt(g.i[ci][s]),
+                        };
+                        return .{ .f = sum / @as(f64, @floatFromInt(n)) };
+                    },
+                    .sum, .min, .max => {
+                        if (!bitAt(g.has[ci], s)) return .null_val;
+                        return switch (c.lane) {
+                            .f64 => .{ .f = g.f[ci][s] },
+                            .i64 => .{ .i = g.i[ci][s] },
+                        };
+                    },
+                }
             },
         }
     }
 
     fn before(g: *const GroupJoin, j: *const Join, x: u32, y: u32) bool {
         for (g.order.keys) |key| {
-            const a = g.value(j, g.outputs[key.column], x, std.heap.page_allocator) catch return x < y;
-            const b = g.value(j, g.outputs[key.column], y, std.heap.page_allocator) catch return x < y;
-            defer if (a == .s) std.heap.page_allocator.free(a.s);
-            defer if (b == .s) std.heap.page_allocator.free(b.s);
+            const a = g.value(j, g.outputs[key.column], x, null) catch return x < y;
+            const b = g.value(j, g.outputs[key.column], y, null) catch return x < y;
             switch (output_values.orderValues(a, b, key.descending)) {
                 .lt => return true,
                 .gt => return false,
@@ -1154,7 +1279,24 @@ pub const GroupJoin = struct {
         return x < y;
     }
 
-    /// The answer's rows, one per slot any row reached: in slot order, or, under ORDER BY ... LIMIT, the first
+    /// Whether slot `s` is a row of the answer: a row reached it, and HAVING (which the result program applies again)
+    /// makes it TRUE.
+    fn kept(g: *const GroupJoin, j: *const Join, s: u32) bool {
+        if (!g.reached(s)) return false;
+        const h = g.order.having orelse return true;
+        const Slot = struct {
+            g: *const GroupJoin,
+            j: *const Join,
+            s: u32,
+            pub fn at(self: @This(), c: usize) AggValue {
+                // Borrowed: nothing here allocates.
+                return self.g.value(self.j, self.g.outputs[c], self.s, null) catch unreachable;
+            }
+        };
+        return ResultProgram.truth(h.*, Slot{ .g = g, .j = j, .s = s }) == true;
+    }
+
+    /// The answer's rows, one per slot `kept` keeps: in slot order, or, under ORDER BY ... LIMIT, the first
     /// `offset + limit` by the order (ties by slot), which the result program then cuts as it would the full answer.
     pub fn rows(g: *GroupJoin, j: *const Join, gpa: std.mem.Allocator) ![]const []const AggValue {
         g.drain(true);
@@ -1166,14 +1308,14 @@ pub const GroupJoin = struct {
             // A sorted buffer of the best `k`: on this shape `k` is small, and each insert shifts at most `k`.
             for (0..g.n_slots) |si| {
                 const s: u32 = @intCast(si);
-                if (!g.reached(s)) continue;
+                if (!g.kept(j, s)) continue;
                 if (chosen.items.len == k and !g.before(j, s, chosen.items[k - 1])) continue;
                 var pos = chosen.items.len;
                 while (pos > 0 and g.before(j, s, chosen.items[pos - 1])) pos -= 1;
                 if (chosen.items.len == k) _ = chosen.pop();
                 try chosen.insert(gpa, pos, s);
             }
-        } else for (0..g.n_slots) |si| if (g.reached(@intCast(si))) try chosen.append(gpa, @intCast(si));
+        } else for (0..g.n_slots) |si| if (g.kept(j, @intCast(si))) try chosen.append(gpa, @intCast(si));
         const out = try gpa.alloc([]const AggValue, chosen.items.len);
         for (chosen.items, out) |s, *row| {
             const vals = try gpa.alloc(AggValue, g.outputs.len);

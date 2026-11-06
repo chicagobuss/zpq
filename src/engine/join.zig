@@ -140,7 +140,7 @@ pub const Prepared = struct {
         for (self.semis) |s| a.filter = try withLookup(arena, a.filter, try leafOf(meta, s, diag));
         a.filter = try withLookup(arena, a.filter, try leafOf(meta, self.main, diag));
         const j = self.main.join;
-        if (j.group == null and j.kind == .inner and self.order.having == null and self.order.hidden.len == 0) {
+        if (j.group == null and j.kind == .inner) {
             const admitted = groupJoin(self.charge.allocator(), j, a.*, meta) catch |err| {
                 Diag.setInput(diag, j.build_name, null);
                 Diag.setColumn(diag, j.key_name);
@@ -249,10 +249,10 @@ fn groupJoin(gpa: std.mem.Allocator, j: *lookup.Join, q: plans.Aggregate, meta: 
     for (q.calls) |c| {
         if (c.where != null or c.state or c.offset != 0 or c.as_date) return null;
         switch (c.func) {
-            .sum, .count, .min, .max => {},
+            .sum, .count, .min, .max => if (c.result != .f64 and c.result != .i64) return null,
+            .avg => if (c.result != .avg_f64) return null,
             else => return null,
         }
-        if (c.result != .f64 and c.result != .i64) return null;
     }
     for (outputs) |o| if (o.derived != null) return null;
     const G = lookup.GroupJoin;
@@ -268,10 +268,12 @@ fn groupJoin(gpa: std.mem.Allocator, j: *lookup.Join, q: plans.Aggregate, meta: 
             .count => .count,
             .min => .min,
             .max => .max,
+            .avg => .avg,
             else => unreachable,
         },
         .arg = c.arg,
-        .lane = if (c.result == .f64) .f64 else .i64,
+        // An avg sums in its argument's lane.
+        .lane = if (c.result == .f64 or (c.func == .avg and c.arg.?.typeOf() == .f64)) .f64 else .i64,
     };
     const outs = try gpa.alloc(G.Output, outputs.len);
     errdefer gpa.free(outs);

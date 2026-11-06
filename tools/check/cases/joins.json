@@ -17,6 +17,14 @@
    "copy": "COPY (SELECT k * 100003 AS spk, (k % 3)::BIGINT AS sgrp FROM range(0, 997, 2) t(k)) TO '{path}' (FORMAT PARQUET)"
   },
   {
+   "name": "nullfact",
+   "copy": "COPY (SELECT i % 50 AS fk, (CASE WHEN i % 7 = 0 THEN NULL ELSE i * 1.5 END)::DOUBLE AS x, (CASE WHEN i % 5 = 0 THEN NULL ELSE i END)::BIGINT AS y, (CASE WHEN i % 50 < 3 THEN NULL ELSE i % 13 END)::BIGINT AS z FROM range(0, 10000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)"
+  },
+  {
+   "name": "nulldim",
+   "copy": "COPY (SELECT k AS pk, (k % 4)::BIGINT AS g FROM range(0, 50) t(k)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
    "script": "tools/check/prepare_join_gate.py",
    "files": [
     "join-gate",
@@ -460,6 +468,284 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT grp, sum(dec) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk GROUP BY grp ORDER BY grp"
+   }
+  },
+  {
+   "id": "join:groupjoin:null-arguments",
+   "fixture": "nullfact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, sum(x) AS s, count(x) AS c, min(y) AS lo, max(y) AS hi, avg(x) AS ax, avg(y) AS ay, sum(z) AS sz, count(*) AS n FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk ORDER BY fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, sum(x) AS s, count(x) AS c, min(y) AS lo, max(y) AS hi, avg(x) AS ax, avg(y) AS ay, sum(z) AS sz, count(*) AS n FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk ORDER BY fk"
+   }
+  },
+  {
+   "id": "join:groupjoin:null-arguments:written",
+   "fixture": "nullfact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, sum(x) AS s, count(x) AS c, min(y) AS lo, max(y) AS hi, avg(x) AS ax, avg(y) AS ay, sum(z) AS sz, count(*) AS n FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk ORDER BY fk",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "written_as",
+    "sql": "SELECT fk, sum(x) AS s, count(x) AS c, min(y) AS lo, max(y) AS hi, avg(x) AS ax, avg(y) AS ay, sum(z) AS sz, count(*) AS n FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk ORDER BY fk"
+   }
+  },
+  {
+   "id": "join:groupjoin:avg-topk",
+   "fixture": "nullfact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, avg(x) AS ax, avg(y) AS ay FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk ORDER BY ay DESC, fk LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, avg(x) AS ax, avg(y) AS ay FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk ORDER BY ay DESC, fk LIMIT 4"
+   }
+  },
+  {
+   "id": "join:groupjoin:having",
+   "fixture": "nullfact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, sum(x) AS s, count(*) AS n FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk HAVING sum(x) > 1280000 ORDER BY fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, sum(x) AS s, count(*) AS n FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk HAVING sum(x) > 1280000 ORDER BY fk"
+   }
+  },
+  {
+   "id": "join:groupjoin:having-hidden",
+   "fixture": "nullfact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, count(*) AS n FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk HAVING sum(x) > 1285000 AND avg(y) < 5100 ORDER BY sum(y) DESC, fk LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, count(*) AS n FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk HAVING sum(x) > 1285000 AND avg(y) < 5100 ORDER BY sum(y) DESC, fk LIMIT 5"
+   }
+  },
+  {
+   "id": "join:groupjoin:having-hidden:written",
+   "fixture": "nullfact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, count(*) AS n FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk HAVING sum(x) > 1285000 AND avg(y) < 5100 ORDER BY sum(y) DESC, fk LIMIT 5",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "written_as",
+    "sql": "SELECT fk, count(*) AS n FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk HAVING sum(x) > 1285000 AND avg(y) < 5100 ORDER BY sum(y) DESC, fk LIMIT 5"
+   }
+  },
+  {
+   "id": "join:groupjoin:having-null",
+   "fixture": "nullfact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, sum(z) AS sz FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk HAVING sum(z) IS NULL OR sum(z) < 1150 ORDER BY fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, sum(z) AS sz FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk HAVING sum(z) IS NULL OR sum(z) < 1150 ORDER BY fk"
+   }
+  },
+  {
+   "id": "join:explain:group-join-having",
+   "fixture": "nullfact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, avg(x) AS ax FROM '{fixture:nullfact}', '{fixture:nulldim}' WHERE fk = pk GROUP BY fk HAVING count(x) > 170 ORDER BY ax DESC LIMIT 3",
+    "--explain"
+   ],
+   "oracle": {
+    "compare": "plan",
+    "holds": {
+     "join": {
+      "group_join": {
+       "slots": 50
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "review:r9:gated-group-join",
+   "fixture": "join-gate",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, sum(amt) AS s, count(*) AS n FROM '{fixture:join-gate}', '{fixture:join-gate-dim}' WHERE fk = pk AND sd >= '1994-01-01' GROUP BY fk ORDER BY fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, sum(amt) AS s, count(*) AS n FROM '{fixture:join-gate-clean}', '{fixture:join-gate-dim}' WHERE fk = pk AND sd >= '1994-01-01' GROUP BY fk ORDER BY fk"
    }
   },
   {

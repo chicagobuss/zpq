@@ -136,8 +136,8 @@ pub const ResultProgram = struct {
         out.group_rows = kept;
     }
 
-    /// Three-valued truth of `h` for one result row: null is UNKNOWN.
-    fn truth(h: expr_ast.Having, row: anytype) ?bool {
+    /// Three-valued truth of `h` for one result row (`row.at(column)` its value): null is UNKNOWN.
+    pub fn truth(h: expr_ast.Having, row: anytype) ?bool {
         switch (h) {
             .all => |terms| {
                 var unknown = false;

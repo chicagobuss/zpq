@@ -1592,3 +1592,44 @@ test "every write path records a row group's uncompressed bytes as its total_byt
         }
     }
 }
+
+test "a join whose group-join the budget refuses frees what it allocated, request after request" {
+    // Review R5 (zpq-060/REVIEW-joins.md): the refusal came partway through the group-join's arrays and kept the rest.
+    const fact = "ci/fixtures/parquet/full_match.parquet"; // 1600 rows, `ts` unique
+    std.Io.Dir.cwd().access(std.testing.io, fact, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const sql_parser = @import("../core/expr/sql_parser.zig");
+    const engine_join = @import("join.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().copyFile(fact, tmp.dir, "dim.parquet", std.testing.io, .{});
+    var path_buf: [96]u8 = undefined;
+    const dim = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/dim.parquet", .{tmp.sub_path});
+    // 100 sums over 1600 slots: the build fits half a megabyte, the group-join's slots do not.
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(gpa);
+    try sql.appendSlice(gpa, "SELECT f.ts");
+    for (0..100) |i| try sql.print(gpa, ", sum(f.b * {d}) AS s{d}", .{ i + 1, i });
+    try sql.print(gpa, " FROM '{s}' f JOIN '{s}' d ON f.ts = d.ts GROUP BY f.ts", .{ fact, dim });
+    for (0..8) |_| {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var schemas: engine_join.LocalSchemas = .{ .arena = arena };
+        defer schemas.deinit();
+        const pq = (try sql_parser.parseSqlJoinPlan(arena, sql.items, .{ .ctx = &schemas, .footer = engine_join.LocalSchemas.footer })).?;
+        try std.testing.expectError(error.JoinBuildExceedsBudget, runQuery(.{ .gpa = gpa, .env = .empty, .io = std.testing.io }, .{
+            .inputs = &.{fact},
+            .plan_source = @import("syntax_plan.zig").source(pq.syntax.?),
+            .aggregate = pq.aggregate_str,
+            .filter = pq.filter_str,
+            .group_by = pq.group_by_str,
+            .select = pq.select_str,
+            .select_cols = pq.select_cols,
+            .result_order = pq.result_order,
+            .parallelism = 1,
+            .max_memory = 512 * 1024,
+            .max_memory_explicit = 512 * 1024,
+        }));
+    }
+}

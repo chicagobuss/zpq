@@ -786,30 +786,47 @@ pub const GroupJoin = struct {
         }
     };
 
+    /// Takes `keys`, `calls` and `outputs` (`gpa`'s) once it succeeds; a refusal (the ledger's, under a budget) frees
+    /// everything it allocated and leaves them the caller's.
     pub fn init(gpa: std.mem.Allocator, j: *const Join, keys: []const usize, calls: []const Call, outputs: []const Output, row_groups: usize) !*GroupJoin {
         const g = try gpa.create(GroupJoin);
+        errdefer gpa.destroy(g);
+        const seen = try gpa.alloc(u64, j.n / 64 + 1);
+        errdefer gpa.free(seen);
+        const count: []u32 = for (calls) |c| {
+            if (c.func == .count) break try gpa.alloc(u32, j.n);
+        } else &.{};
+        errdefer gpa.free(count);
+        const f = try gpa.alloc([]f64, calls.len);
+        errdefer gpa.free(f);
+        @memset(f, &.{});
+        errdefer for (f) |x| gpa.free(x);
+        const i = try gpa.alloc([]i64, calls.len);
+        errdefer gpa.free(i);
+        @memset(i, &.{});
+        errdefer for (i) |x| gpa.free(x);
+        const pending = try gpa.alloc(std.atomic.Value(?*Partial), row_groups);
+        errdefer gpa.free(pending);
+        for (calls, f, i) |c, *fl, *il| {
+            if (c.lane == .f64 and c.func != .count) fl.* = try gpa.alloc(f64, j.n);
+            if (c.lane == .i64 and c.func != .count) il.* = try gpa.alloc(i64, j.n);
+        }
+        @memset(seen, 0);
+        @memset(count, 0);
+        for (pending) |*p| p.* = .init(null);
         g.* = .{
             .keys = keys,
             .calls = calls,
             .outputs = outputs,
             .order = .{},
-            .seen = try gpa.alloc(u64, j.n / 64 + 1),
-            .count = for (calls) |c| {
-                if (c.func == .count) break try gpa.alloc(u32, j.n);
-            } else &.{},
-            .f = try gpa.alloc([]f64, calls.len),
-            .i = try gpa.alloc([]i64, calls.len),
-            .pending = try gpa.alloc(std.atomic.Value(?*Partial), row_groups),
+            .seen = seen,
+            .count = count,
+            .f = f,
+            .i = i,
+            .pending = pending,
             .gpa = gpa,
             .n_slots = j.n,
         };
-        @memset(g.seen, 0);
-        @memset(g.count, 0);
-        for (calls, g.f, g.i) |c, *f, *i| {
-            f.* = if (c.lane == .f64 and c.func != .count) try gpa.alloc(f64, j.n) else &.{};
-            i.* = if (c.lane == .i64 and c.func != .count) try gpa.alloc(i64, j.n) else &.{};
-        }
-        for (g.pending) |*p| p.* = .init(null);
         return g;
     }
 
@@ -898,16 +915,19 @@ pub const GroupJoin = struct {
             prev = slots[r];
         }
         const gpa = g.gpa;
+        // Empty first, so a refusal anywhere below frees exactly what was allocated (`Partial.free`).
         const p = try gpa.create(Partial);
-        p.* = .{
-            .slots = try gpa.alloc(u32, runs),
-            .counts = try gpa.alloc(u32, runs),
-            .f = try gpa.alloc([]f64, g.calls.len),
-            .i = try gpa.alloc([]i64, g.calls.len),
-        };
+        p.* = .{ .slots = &.{}, .counts = &.{}, .f = &.{}, .i = &.{} };
+        errdefer p.free(gpa);
+        p.slots = try gpa.alloc(u32, runs);
+        p.counts = try gpa.alloc(u32, runs);
+        p.f = try gpa.alloc([]f64, g.calls.len);
+        @memset(p.f, &.{});
+        p.i = try gpa.alloc([]i64, g.calls.len);
+        @memset(p.i, &.{});
         for (g.calls, p.f, p.i) |c, *f, *i| {
-            f.* = if (c.lane == .f64 and c.func != .count) try gpa.alloc(f64, runs) else &.{};
-            i.* = if (c.lane == .i64 and c.func != .count) try gpa.alloc(i64, runs) else &.{};
+            if (c.lane == .f64 and c.func != .count) f.* = try gpa.alloc(f64, runs);
+            if (c.lane == .i64 and c.func != .count) i.* = try gpa.alloc(i64, runs);
         }
         var at: usize = 0;
         prev = EMPTY;

@@ -200,9 +200,12 @@ fn groupJoin(gpa: std.mem.Allocator, j: *lookup.Join, q: plans.Aggregate, meta: 
     }
     for (outputs) |o| if (o.derived != null) return null;
     const G = lookup.GroupJoin;
+    // Each array is the group-join's once `init` succeeds, and freed here when anything refuses before.
     const leaves = try gpa.alloc(usize, keys.len);
+    errdefer gpa.free(leaves);
     for (keys, leaves) |k, *leaf| leaf.* = k.col_ref.col_idx;
     const calls = try gpa.alloc(G.Call, q.calls.len);
+    errdefer gpa.free(calls);
     for (q.calls, calls) |c, *out| out.* = .{
         .func = switch (c.func) {
             .sum => .sum,
@@ -215,6 +218,7 @@ fn groupJoin(gpa: std.mem.Allocator, j: *lookup.Join, q: plans.Aggregate, meta: 
         .lane = if (c.result == .f64) .f64 else .i64,
     };
     const outs = try gpa.alloc(G.Output, outputs.len);
+    errdefer gpa.free(outs);
     for (outputs, outs) |o, *out| out.* = switch (o.source) {
         .key => |k| .{ .key = k },
         .agg => |a| .{ .agg = a },

@@ -259,6 +259,78 @@
    }
   },
   {
+   "id": "join:sql:typed-date",
+   "fixture": "join-gate-clean",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:join-gate-clean}', '{fixture:join-gate-dim}' WHERE fk = pk AND sd >= DATE '1994-01-01' AND sd < DATE '1994-01-01' + INTERVAL '1' YEAR"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:join-gate-clean}', '{fixture:join-gate-dim}' WHERE fk = pk AND sd >= DATE '1994-01-01' AND sd < DATE '1994-01-01' + INTERVAL '1' YEAR"
+   }
+  },
+  {
+   "id": "join:sql:ilike-group-by-all",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT kind, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND kind ILIKE 'KIND1%' GROUP BY ALL ORDER BY kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT kind, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND kind ILIKE 'KIND1%' GROUP BY ALL ORDER BY kind"
+   }
+  },
+  {
+   "id": "join:sql:in-ilike-date",
+   "fixture": "join-gate-clean",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:join-gate-clean}' WHERE fk IN (SELECT pk FROM '{fixture:join-gate-dim}' WHERE grp < 3) AND sd >= DATE '1994-01-01'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:join-gate-clean}' WHERE fk IN (SELECT pk FROM '{fixture:join-gate-dim}' WHERE grp < 3) AND sd >= DATE '1994-01-01'"
+   }
+  },
+  {
    "id": "join:semi:in",
    "fixture": "fact",
    "cli": [

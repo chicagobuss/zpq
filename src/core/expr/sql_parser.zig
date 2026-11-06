@@ -633,21 +633,25 @@ pub const Schemas = struct {
 /// (`syntax.Query.join`). Null when `sql` is no join. `allocator` must be an arena: the probe's and every build's
 /// syntax outlive the call. The footers decide only which table owns a column and which side probes.
 pub fn parseSqlJoinPlan(allocator: std.mem.Allocator, sql: []const u8, schemas: Schemas) !?ParsedQuery {
-    const z = try allocator.dupeSentinel(u8, sql, 0);
+    // The binder reads the query as the single-table parser does, once folded; its pieces parse with the same markers.
+    var report: literals.Report = .{};
+    const folded = try fold(allocator, sql, &report);
+    const markers = report.markers;
+    const z = try allocator.dupeSentinel(u8, folded, 0);
     const paths = (try sql_join.tables(allocator, z)) orelse return null;
-    const first = try resolveJoin(allocator, z, paths, schemas);
+    const first = try resolveJoin(allocator, z, paths, schemas, markers);
     // A probe query that still holds `IN (SELECT ...)` semi-joins the probe itself.
     var probe_sql = first.probe_sql;
     var semis: std.ArrayList(syntax.Semi) = .empty;
     while (true) {
         const pz = try allocator.dupeSentinel(u8, probe_sql, 0);
         const inner = (try sql_join.tables(allocator, pz)) orelse break;
-        const r = try resolveJoin(allocator, pz, inner, schemas);
+        const r = try resolveJoin(allocator, pz, inner, schemas, markers);
         // A reduced query holds one IN, the one the reduction wrote: no other subquery passes its table count.
         try semis.append(allocator, .{ .fk = r.fk, .build = r.build, .unique = first.reduced == .probe });
         probe_sql = r.probe_sql;
     }
-    var pq = try parseSqlPlan(allocator, probe_sql);
+    var pq = try parseFolded(true, allocator, probe_sql, markers);
     const q = try allocator.create(syntax.Query);
     q.* = pq.syntax.?.*;
     q.join = .{ .kind = first.kind, .fk = first.fk, .build = first.build, .semis = semis.items };
@@ -666,7 +670,7 @@ const Owners = struct {
     }
 };
 
-fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u8, schemas: Schemas) !Resolved {
+fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u8, schemas: Schemas, markers: literals.Markers) !Resolved {
     const metas = try a.alloc(*const schema.FileMetaData, paths.len);
     const rows = try a.alloc(u64, paths.len);
     for (paths, metas, rows) |path, *m, *r| {
@@ -680,10 +684,10 @@ fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u
         const text = try std.fmt.allocPrintSentinel(a, "SELECT count(*) FROM '{s}' WHERE {s}", .{ p.build_path, w }, 0);
         if (try sql_join.tables(a, text)) |inner| {
             // The build's own filter is a SEMI join: a third table the binder reduced onto it.
-            const nested = try resolveJoin(a, text, inner, schemas);
+            const nested = try resolveJoin(a, text, inner, schemas, markers);
             build.semis = try a.dupe(syntax.Semi, &.{.{ .fk = nested.fk, .build = nested.build, .unique = p.reduced == .build }});
-            build.filter = (try parseSqlPlan(a, nested.probe_sql)).syntax.?.filter;
-        } else build.filter = (try parseSqlPlan(a, text)).syntax.?.filter;
+            build.filter = (try parseFolded(true, a, nested.probe_sql, markers)).syntax.?.filter;
+        } else build.filter = (try parseFolded(true, a, text, markers)).syntax.?.filter;
     }
     return .{ .kind = if (p.kind == .semi) .semi else .inner, .fk = p.fk, .build = build, .probe_sql = p.probe_sql, .reduced = p.reduced };
 }
@@ -693,16 +697,26 @@ pub fn parseSqlPlan(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery 
 }
 
 fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {
+    var literal_report: literals.Report = .{};
+    const folded_sql = try fold(allocator, sql, &literal_report);
+    defer allocator.free(folded_sql);
+    return parseFolded(structured, allocator, folded_sql, literal_report.markers);
+}
+
+/// `sql` with its typed literals and sugar folded (`sql_literals.rewrite`); `report.markers` say how to read it back.
+fn fold(allocator: std.mem.Allocator, sql: []const u8, report: *literals.Report) ![]u8 {
+    return literals.rewrite(allocator, sql, report) catch |err| {
+        if (report.len > 0) diagnosticPrint("sql: {s}\n", .{report.text()});
+        return err;
+    };
+}
+
+/// A query `fold` rewrote, read with the markers it chose: a join's probe and build queries are its pieces.
+fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_sql: []const u8, markers: literals.Markers) !ParsedQuery {
     const lp_arena = c.arena_create(64 * 1024) orelse return error.OutOfMemory;
     defer c.arena_destroy(lp_arena);
 
     var error_msg: [*c]const u8 = null;
-    var literal_report: literals.Report = .{};
-    const folded_sql = literals.rewrite(allocator, sql, &literal_report) catch |err| {
-        if (literal_report.len > 0) diagnosticPrint("sql: {s}\n", .{literal_report.text()});
-        return err;
-    };
-    defer allocator.free(folded_sql);
     const sql_c = try extractAsDatePart(allocator, folded_sql);
     defer allocator.free(sql_c);
 
@@ -727,7 +741,7 @@ fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []cons
         return error.UnsupportedStatement;
     }
     try distinctAsGroupBy(root, lp_arena);
-    try groupByAll(root, lp_arena, literal_report.markers.groupAll());
+    try groupByAll(root, lp_arena, markers.groupAll());
     // Reject clauses we'd otherwise silently drop → wrong answers.
     try rejectUnsupportedClauses(root.*.u.select);
     boolLiterals(root);
@@ -775,7 +789,7 @@ fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []cons
     var lower: Lower = .{
         .arena = if (syntax_owner) |owner| owner.allocator() else undefined,
         .lp_arena = lp_arena,
-        .ilike_escape = literal_report.markers.ilikeEscape(),
+        .ilike_escape = markers.ilikeEscape(),
     };
     const lowering = if (structured) &lower else null;
     const shape = try classifyQuery(allocator, root, lp_arena);

@@ -199,23 +199,15 @@ pub fn plan(a: std.mem.Allocator, bytes: []const u8, opts: Options, failure: *Fa
 
 fn nextField(s: *csv_scan.Scanner, bytes: []const u8, failure: *Failure, column: usize) !?csv_scan.Field {
     return s.next() catch {
-        failure.* = scanFailure(s, bytes, column);
+        failure.* = scanFailure(s, column);
         failure.line = 1 + csv_scan.countNewlines(bytes[0..@intCast(failure.offset)]);
         return error.CsvMalformed;
     };
 }
 
-/// The scanner stopped inside quotes at the end of the file. When the field it stopped in does not start with a
-/// quote, the quote that opened the run is a stray one inside an unquoted field: that is the refusal to report.
-fn scanFailure(s: *const csv_scan.Scanner, bytes: []const u8, column: usize) Failure {
-    const at = s.failure.offset;
-    const stray = at < bytes.len and bytes[at] != s.quote;
-    return .{
-        .kind = .malformed,
-        .malformed = if (stray) .quote_in_unquoted_field else s.failure.kind,
-        .offset = at,
-        .column = column,
-    };
+/// The scanner's refusal (it names a stray quote as one), in the column being read.
+fn scanFailure(s: *const csv_scan.Scanner, column: usize) Failure {
+    return .{ .kind = .malformed, .malformed = s.failure.kind, .offset = s.failure.offset, .column = column };
 }
 
 fn decode(
@@ -388,7 +380,7 @@ pub const Source = struct {
         var col: usize = 0;
         var record_start = span.lo;
         while (true) {
-            const next = scanner.next() catch return s.fail(i, scanFailure(&scanner, bytes, col), span.lines, lo_b);
+            const next = scanner.next() catch return s.fail(i, scanFailure(&scanner, col), span.lines, lo_b);
             const f = next orelse break;
             if (f.last and col == 0 and f.start == f.end and ncols > 1) {
                 // A blank line holds no record.

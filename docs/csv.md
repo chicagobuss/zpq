@@ -15,7 +15,8 @@ Filters, expressions, renames, ORDER BY, LIMIT and aggregates are refused: they 
 ## Which inputs are CSV
 
 A file whose first and last four bytes are `PAR1` is Parquet, whatever its name. Any other local file is CSV when it
-is named `.csv`, `.tsv` or `.txt` (any case), or when `--input-format csv` is given; otherwise zpq refuses it. One CSV
+is named `.csv`, `.tsv` or `.txt` (any case), or when `--input-format csv` is given; anything else is read as Parquet
+and refused as Parquet when it is not. One CSV
 input per query; S3 CSV input is not supported yet.
 
 ## Dialect

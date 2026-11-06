@@ -402,11 +402,13 @@ test "csv query: inputs are told apart by content, then by name, and a CSV is wr
     try writeFile(csv, "a,b\n1,x\n2,ab\"c\n");
     try writeFile(bin, "a,b\n1,x\n");
     try testing.expectEqual(csv_write.InputFormat.csv, try csv_write.inputFormat(csv, .auto));
-    try testing.expectError(error.UnknownInputFormat, csv_write.inputFormat(bin, .auto));
+    // Neither Parquet nor named as CSV: the Parquet reader's to refuse, as it refuses any file that is not Parquet.
+    try testing.expectEqual(csv_write.InputFormat.parquet, try csv_write.inputFormat(bin, .auto));
     try testing.expectEqual(csv_write.InputFormat.csv, try csv_write.inputFormat(bin, .csv));
     try testing.expectEqual(csv_write.InputFormat.parquet, try csv_write.inputFormat("s3://b/k.csv", .auto));
 
     const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    try testing.expectError(error.NotParquet, runQuery(ctx, .{ .inputs = &.{bin}, .aggregate = "count(*)" }));
     // A refusal names its place: line, byte and the column by its header name.
     var diag: Diag = .{};
     try testing.expectError(error.CsvMalformed, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .diag = &diag }));

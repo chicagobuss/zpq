@@ -545,14 +545,6 @@ fn csvError(err: anyerror, diag: *const Diag) bool {
     const path = diag.input orelse "the input";
     switch (err) {
         error.CsvMalformed, error.CsvFieldCount, error.CsvTypeChanged, error.CsvPinnedType => {},
-        error.UnknownInputFormat => {
-            diagnosticPrint(
-                "zpq query: {s} is not Parquet (no PAR1 at both ends); a CSV file is read\n" ++
-                    "  when it is named .csv, .tsv or .txt, or with --input-format csv\n",
-                .{path},
-            );
-            return true;
-        },
         error.CsvQueryNotSupported => {
             diagnosticPrint(
                 "zpq query: a CSV input is written to Parquet: zpq query data.csv -o data.parquet,\n" ++

@@ -1110,7 +1110,8 @@ fn writeOnce(
 pub const InputFormat = engine_types.InputFormat;
 
 /// What `path` is: Parquet when `PAR1` both starts and ends it, else CSV when it is named `.csv`, `.tsv` or `.txt`
-/// (any case) or `forced` says so; anything else is refused. An S3 path is Parquet unless forced to CSV.
+/// (any case) or `forced` says so. Anything else is Parquet, so the Parquet reader refuses it as it always has
+/// (`NotParquet`, with its cause). An S3 path is Parquet unless forced to CSV.
 pub fn inputFormat(path: []const u8, forced: InputFormat) !InputFormat {
     if (forced != .auto) return forced;
     if (std.mem.startsWith(u8, path, "s3://")) return .parquet;
@@ -1119,7 +1120,7 @@ pub fn inputFormat(path: []const u8, forced: InputFormat) !InputFormat {
     if (std.ascii.eqlIgnoreCase(ext, ".parquet")) return .parquet;
     if (try hasParquetMagic(path)) return .parquet;
     for ([_][]const u8{ ".csv", ".tsv", ".txt" }) |e| if (std.ascii.eqlIgnoreCase(ext, e)) return .csv;
-    return error.UnknownInputFormat;
+    return .parquet;
 }
 
 /// `PAR1` at both ends. A file that cannot be opened is left to the Parquet path to report as it does.

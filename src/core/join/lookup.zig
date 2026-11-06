@@ -22,7 +22,18 @@ const selection = @import("../filter/selection.zig");
 const column_mod = @import("../parquet/column.zig");
 const metadata = @import("../parquet/metadata.zig");
 
-pub const Kind = enum { inner, semi };
+/// INNER and LEFT builds are N:1 (a key twice refuses); SEMI and ANTI take duplicates. INNER and SEMI keep a probe
+/// row with a match, ANTI one without (`NOT IN`), and LEFT every row, a miss reading its build columns as NULL.
+pub const Kind = enum {
+    inner,
+    semi,
+    anti,
+    left,
+
+    pub fn unique(k: Kind) bool {
+        return k == .inner or k == .left;
+    }
+};
 
 /// A build column's distinct values, in the order its codes number them (first appearance in (row group, row)).
 pub const Dict = union(enum) {
@@ -166,6 +177,8 @@ pub const Join = struct {
     fk_leaf: usize = 0,
     /// Set when the query's GROUP BY is one the build key determines (`GroupJoin`).
     group: ?*GroupJoin = null,
+    /// A build row the build's filter kept had a NULL key (`Part.null_key`): an ANTI join then keeps no row.
+    null_key: bool = false,
 
     pub fn slot(j: *const Join, k: i64) ?u32 {
         return switch (j.keys) {
@@ -194,7 +207,8 @@ pub fn extend(j: *Join, a: std.mem.Allocator, meta: *schema.FileMetaData) !void 
     meta.schema = try meta.schema.clone(a);
     for (j.payloads) |p| {
         var e = p.element;
-        e.repetition_type = .REQUIRED;
+        // A LEFT join's miss reads NULL.
+        e.repetition_type = if (j.kind == .left) .OPTIONAL else .REQUIRED;
         e.name = p.name;
         try meta.schema.append(a, e);
     }
@@ -287,29 +301,53 @@ pub fn slotsFor(j: *const Join, fk: filter_eval.Batch.Column, sel: *const select
 
 /// Keep the selected rows whose foreign key has a build match (INNER and SEMI alike: the build is N:1). With
 /// `capture` (one entry per row of `sel`), the selected rows' slots stay there for the columns published later.
+/// Keep the selected rows the join keeps (`Kind`): INNER and SEMI those whose FK has a build match; ANTI those whose
+/// FK is not NULL and has none, and no row when a build key was NULL (SQL's `NOT IN`); LEFT every row. With `capture`
+/// (one entry per row of `sel`), the selected rows' slots stay there for the columns published later.
 pub fn narrow(j: *const Join, fk: filter_eval.Batch.Column, sel: *selection.SelectionVector, a: std.mem.Allocator, capture: ?[]u32) filter_eval.Error!void {
+    if (j.kind == .anti) {
+        // `x NOT IN (...)` is UNKNOWN against a NULL in the list, and TRUE for every x, NULL too, against no row.
+        if (j.null_key) @memset(sel.mask, 0);
+        if (j.null_key or j.n == 0) return;
+    }
     const at = capture orelse try a.alloc(u32, sel.len);
     defer if (capture == null) a.free(at);
     try slotsOfColumn(j, fk, sel, at, a);
+    if (j.kind == .left) return;
+    const info = fk.nullInfo();
     for (sel.mask, 0..) |*w, wi| {
         var bits = w.*;
         while (bits != 0) : (bits &= bits - 1) {
             const r = wi * 64 + @ctz(bits);
-            if (at[r] == EMPTY) w.* &= ~(@as(u64, 1) << @intCast(r & 63));
+            const drop = switch (j.kind) {
+                .inner, .semi => at[r] == EMPTY,
+                .anti => at[r] != EMPTY or if (info.def_levels) |dl| dl[r] < info.max_def else false,
+                .left => unreachable,
+            };
+            if (drop) w.* &= ~(@as(u64, 1) << @intCast(r & 63));
         }
     }
 }
 
-/// Payload `p` as a coded column over the rows `sel` keeps, from their slots (every one has a match: the lookup
-/// conjunct ran first). Rows outside `sel` take code 0; no consumer reads them. With `values`, values are
-/// materialized beside the codes for the consumers that read values.
+/// Payload `p` as a coded column over the rows `sel` keeps, from their slots (every one has a match, the lookup
+/// conjunct having run first, except under LEFT, where a miss is NULL). Rows outside `sel` take code 0; no consumer
+/// reads them. With `values`, values are materialized beside the codes for the consumers that read values.
 pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.SelectionVector, a: std.mem.Allocator, values: bool) !filter_eval.Batch.Column {
     const payload = j.payloads[p];
     const codes = try a.alloc(u32, sel.len);
     @memset(codes, 0);
+    var def: ?[]u32 = null;
     var it = sel.iterator();
     while (it.next()) |r| {
-        if (at[r] == EMPTY) return error.LookupWithoutMatch;
+        if (at[r] == EMPTY) {
+            if (j.kind != .left) return error.LookupWithoutMatch;
+            if (def == null) {
+                def = try a.alloc(u32, sel.len);
+                @memset(def.?, 1);
+            }
+            def.?[r] = 0;
+            continue;
+        }
         codes[r] = payload.codes.get(at[r]);
     }
     return switch (payload.dict) {
@@ -322,7 +360,14 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
                     v.* = dict[code];
                 }
             }
-            break :blk @unionInit(filter_eval.Batch.Column, @tagName(tag), .{ .values = vals, .codes = codes, .dict = dict });
+            break :blk @unionInit(filter_eval.Batch.Column, @tagName(tag), .{
+                .values = vals,
+                .codes = codes,
+                .dict = dict,
+                .def_levels = def,
+                .max_def = if (j.kind == .left) 1 else 0,
+                .has_nulls = def != null,
+            });
         },
     };
 }
@@ -345,6 +390,8 @@ pub const Spec = struct {
 /// One build row group's survivors: their keys, and per payload a local dictionary and each survivor's local code.
 const Part = struct {
     keys: []i64 = &.{},
+    /// A row the build's filter kept had a NULL key: `NOT IN` is then UNKNOWN for every probe row.
+    null_key: bool = false,
     local: []Local = &.{},
     lo: i64 = std.math.maxInt(i64),
     hi: i64 = std.math.minInt(i64),
@@ -506,7 +553,10 @@ fn buildPart(c: *Ctx, rg_index: usize) !void {
             else => return error.JoinKeyType,
         };
         // A NULL build key matches no probe row, NULL ones included.
-        const key = k orelse continue;
+        const key = k orelse {
+            part.null_key = true;
+            continue;
+        };
         try keep.append(sa, @intCast(r));
         try keys.append(sa, key);
         part.lo = @min(part.lo, key);
@@ -687,13 +737,15 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     var n: usize = 0;
     var lo: i64 = std.math.maxInt(i64);
     var hi: i64 = std.math.minInt(i64);
+    var null_key = false;
     for (parts) |p| {
         n += p.keys.len;
         lo = @min(lo, p.lo);
         hi = @max(hi, p.hi);
+        null_key = null_key or p.null_key;
     }
     const j = try a.create(Join);
-    j.* = .{ .kind = spec.kind, .build_name = spec.build_name, .key_name = spec.key_name, .n = n, .keys = undefined, .payloads = &.{}, .bytes = 0, .domain = domain };
+    j.* = .{ .kind = spec.kind, .build_name = spec.build_name, .key_name = spec.key_name, .n = n, .keys = undefined, .payloads = &.{}, .bytes = 0, .domain = domain, .null_key = null_key };
     // Bytes per structure, from the survivors' own domain: a bit per possible key plus a rank per 64, against two
     // slots per key of an 8-byte key and a 4-byte slot.
     const span: u128 = if (n == 0) 0 else @as(u128, @intCast(@as(i128, hi) - lo)) + 1;
@@ -711,7 +763,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
         var dup = std.atomic.Value(bool).init(false);
         try parallel(parts.len, spec.threads, SetBits{ .parts = parts, .d = &d, .dup = &dup }, SetBits.run);
         // A SEMI join keeps a probe row with any match: a key twice is still one key.
-        if (dup.load(.monotonic) and spec.kind == .inner) return error.DuplicateBuildKey;
+        if (dup.load(.monotonic) and spec.kind.unique()) return error.DuplicateBuildKey;
         var r: u32 = 0;
         for (d.bits, d.rank) |w, *rk| {
             rk.* = r;
@@ -730,7 +782,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
                 if (h.keys[i] == k) break true;
             } else false;
             if (dup) {
-                if (spec.kind == .inner) return error.DuplicateBuildKey;
+                if (spec.kind.unique()) return error.DuplicateBuildKey;
                 continue;
             }
             h.keys[i] = k;
@@ -743,7 +795,13 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     const codes = try a.alloc(Codes, spec.payload.len);
     for (spec.payload, payloads, codes, 0..) |leaf, *out, *cs, p| {
         const element = @import("../parquet/metadata.zig").leafSchemaElement(meta, leaf).?;
-        const dict: Dict = if (parts.len == 0) .{ .i64 = &.{} } else switch (parts[0].local[p].dict) {
+        // With no row group the dictionary's type comes from the column's: a LEFT miss still reads it, as NULL.
+        const dict: Dict = if (parts.len == 0) switch (element.type orelse .INT64) {
+            .INT32 => .{ .i32 = &.{} },
+            .DOUBLE => .{ .f64 = &.{} },
+            .BYTE_ARRAY => .{ .string = &.{} },
+            else => .{ .i64 = &.{} },
+        } else switch (parts[0].local[p].dict) {
             .i32 => try unify(i32, a, parts, p),
             .i64 => try unify(i64, a, parts, p),
             .f64 => try unify(f64, a, parts, p),
@@ -1383,9 +1441,13 @@ test "the group-join's cut keeps a NULL group first under NULLS FIRST (review R1
     var bits = [_]u64{7};
     var rank = [_]u32{0};
     const j: Join = .{
-        .kind = .inner, .build_name = "dim", .key_name = "pk", .n = 3,
+        .kind = .inner,
+        .build_name = "dim",
+        .key_name = "pk",
+        .n = 3,
         .keys = .{ .dense = .{ .lo = 0, .bits = &bits, .rank = &rank } },
-        .payloads = &.{}, .bytes = 0,
+        .payloads = &.{},
+        .bytes = 0,
     };
     const keys = try a.alloc(usize, 1);
     keys[0] = 0;

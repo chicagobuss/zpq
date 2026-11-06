@@ -1,17 +1,18 @@
 //! The join binder: an N:1 star of equi-joins written as `FROM a, b, ... WHERE a.k = b.k ...` or `FROM a JOIN b ON
-//! a.k = b.k ...` (INNER), or as `WHERE a.k IN (SELECT b.k FROM b WHERE ...)` (SEMI), becomes one single-table query
-//! over the probe (the largest table) and a build spec per other table, each joined to the probe by one key. A table
-//! only its own conjuncts read reduces to an IN first (`reduce`), onto the table it joins. The probe query reads build
-//! columns by name; the frontend binds them as virtual leaves (`join/lookup.zig`).
+//! a.k = b.k ...` (INNER) or `FROM a LEFT JOIN b ON a.k = b.k ...` (LEFT), or as `WHERE a.k [NOT] IN (SELECT b.k FROM b
+//! WHERE ...)` (SEMI, ANTI), becomes one single-table query over the probe (the largest table a LEFT JOIN keeps) and a
+//! build spec per other table, each joined to the probe by one key. A table only its own conjuncts read reduces to an
+//! IN first (`reduce`), onto the table it joins. The probe query reads build columns by name; the frontend binds them as
+//! virtual leaves (`join/lookup.zig`), a LEFT JOIN's NULL on a miss.
 //!
 //! Every WHERE/ON conjunct must read one side only, apart from the one key equality: build-side conjuncts become the
-//! build's filter, the rest stay in the probe query. Anything else (residuals across sides, OR across sides, a second
-//! equality, outer joins) refuses rather than guess.
+//! build's filter, the rest stay in the probe query. A LEFT JOIN's table is read by its own ON alone (`NullSide`).
+//! Anything else (residuals across sides, OR across sides, a second equality, RIGHT and FULL joins) refuses rather
+//! than guess.
 const std = @import("std");
 const c = @import("liteparser_c");
 
-pub const Kind = enum { inner, semi };
-
+pub const Kind = enum { inner, semi, anti, left };
 
 pub const Error = error{
     SqlParseError,
@@ -21,6 +22,8 @@ pub const Error = error{
     JoinKeyNotFound,
     JoinResidualNotSupported,
     AmbiguousJoinColumn,
+    LeftJoinOn,
+    LeftJoinWhere,
     OutOfMemory,
 };
 
@@ -52,6 +55,8 @@ pub const Dim = struct {
     key: []const u8,
     where: ?[]const u8,
     columns: []const []const u8,
+    /// A LEFT JOIN's: every probe row stays, a miss reading the dimension's columns as NULL.
+    left: bool = false,
 };
 
 /// What the caller knows of the tables (from their footers): whether a column name is theirs, and their rows.
@@ -106,7 +111,7 @@ pub fn tables(a: std.mem.Allocator, sql: [:0]const u8) Error!?[]const []const u8
     var list: std.ArrayList(*c.LpNode) = .empty;
     defer list.deinit(a);
     if (from.*.kind == c.LP_JOIN_CLAUSE) {
-        try flattenFrom(from, &list, null, a);
+        try flattenFrom(from, &list, null, null, a);
     } else {
         _ = fromTable(from) orelse return null;
         const in = semiConjunct(p.root.u.select.where) orelse return null;
@@ -122,15 +127,32 @@ pub fn tables(a: std.mem.Allocator, sql: [:0]const u8) Error!?[]const []const u8
     return out;
 }
 
-/// The FROM tables of a join tree in order, its ON conditions into `on`. Comma and INNER joins only: NATURAL, USING
-/// and outer joins change which rows exist.
-fn flattenFrom(n: *c.LpNode, out: *std.ArrayList(*c.LpNode), on: ?*std.ArrayList(*c.LpNode), a: std.mem.Allocator) Error!void {
+/// A LEFT JOIN's null-supplying table, by its place in the FROM list, and its ON conjuncts: they decide which of its
+/// rows match a probe row, never which probe rows exist, so they stay apart from the WHERE.
+const NullSide = struct { table: usize, on: std.ArrayList(*c.LpNode) = .empty };
+
+/// The FROM tables of a join tree in order, the INNER ON conditions into `on` and each LEFT JOIN's into `nulls`.
+/// Comma, INNER and LEFT joins, a LEFT JOIN's right side one table: NATURAL and USING name no key, and RIGHT and FULL
+/// joins keep the rows of a side this binder does not probe.
+fn flattenFrom(n: *c.LpNode, out: *std.ArrayList(*c.LpNode), on: ?*std.ArrayList(*c.LpNode), nulls: ?*std.ArrayList(NullSide), a: std.mem.Allocator) Error!void {
     if (n.kind == c.LP_JOIN_CLAUSE) {
         const j = n.u.join;
-        if (j.join_type & ~@as(c_int, c.LP_JOIN_INNER | c.LP_JOIN_CROSS) != 0 or j.using_columns.count != 0)
-            return error.UnsupportedJoin;
-        try flattenFrom(j.left orelse return error.UnsupportedJoin, out, on, a);
-        try flattenFrom(j.right orelse return error.UnsupportedJoin, out, on, a);
+        const left = j.join_type & c.LP_JOIN_LEFT != 0;
+        const allowed: c_int = if (left) c.LP_JOIN_LEFT | c.LP_JOIN_OUTER else c.LP_JOIN_INNER | c.LP_JOIN_CROSS;
+        if (j.join_type & ~allowed != 0 or j.using_columns.count != 0) return error.UnsupportedJoin;
+        try flattenFrom(j.left orelse return error.UnsupportedJoin, out, on, nulls, a);
+        if (left) {
+            const right = j.right orelse return error.UnsupportedJoin;
+            _ = fromTable(right) orelse return error.UnsupportedJoin;
+            try out.append(a, right);
+            if (nulls) |list| {
+                var side: NullSide = .{ .table = out.items.len - 1 };
+                try flatten(j.on_expr, &side.on, a);
+                try list.append(a, side);
+            }
+            return;
+        }
+        try flattenFrom(j.right orelse return error.UnsupportedJoin, out, on, nulls, a);
         if (on) |list| try flatten(j.on_expr, list, a);
         return;
     }
@@ -138,7 +160,7 @@ fn flattenFrom(n: *c.LpNode, out: *std.ArrayList(*c.LpNode), on: ?*std.ArrayList
     try out.append(a, n);
 }
 
-const Conj = struct { node: *c.LpNode };
+const Conj = struct { node: *c.LpNode, anti: bool };
 
 fn flatten(n: ?*c.LpNode, list: *std.ArrayList(*c.LpNode), a: std.mem.Allocator) !void {
     const node = n orelse return;
@@ -150,7 +172,7 @@ fn flatten(n: ?*c.LpNode, list: *std.ArrayList(*c.LpNode), a: std.mem.Allocator)
     try list.append(a, node);
 }
 
-/// The first top-level `col IN (SELECT ...)` conjunct of `where`.
+/// The first top-level `col IN (SELECT ...)` or `col NOT IN (SELECT ...)` conjunct of `where`.
 fn semiConjunct(where: ?*c.LpNode) ?Conj {
     var stack: [64]*c.LpNode = undefined;
     var len: usize = 0;
@@ -172,8 +194,8 @@ fn semiConjunct(where: ?*c.LpNode) ?Conj {
             }
             continue;
         }
-        if (n.kind == c.LP_EXPR_IN and n.u.in.select != null and n.u.in.is_not == 0 and n.u.in.expr != null and
-            n.u.in.expr.*.kind == c.LP_EXPR_COLUMN_REF) return .{ .node = n };
+        if (n.kind == c.LP_EXPR_IN and n.u.in.select != null and n.u.in.expr != null and
+            n.u.in.expr.*.kind == c.LP_EXPR_COLUMN_REF) return .{ .node = n, .anti = n.u.in.is_not != 0 };
     }
     return null;
 }
@@ -367,7 +389,8 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
     if (from.*.kind != c.LP_JOIN_CLAUSE) return planSemi(a, p, sel, from, t);
     var conjuncts: std.ArrayList(*c.LpNode) = .empty;
     var list: std.ArrayList(*c.LpNode) = .empty;
-    try flattenFrom(from, &list, &conjuncts, a);
+    var nulls: std.ArrayList(NullSide) = .empty;
+    try flattenFrom(from, &list, &conjuncts, &nulls, a);
     try flatten(sel.where, &conjuncts, a);
     if (list.items.len != t.paths.len or list.items.len > 64) return error.UnsupportedJoin;
     const aliases = try a.alloc(?[]const u8, list.items.len);
@@ -376,8 +399,16 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
     var live: std.ArrayList(usize) = .empty;
     for (0..list.items.len) |i| try live.append(a, i);
     var reduced = false;
-    // The probe is chosen once, over every table: the reductions that follow take tables out around it.
-    const center = live.items[largest(t, live.items)];
+    // A LEFT JOIN's null-supplying table is read by its ON alone: a WHERE or INNER ON condition on it would need its
+    // NULL rows, and one joining it to a third table would stack a join on the join. Having no conjunct, it never reduces.
+    var null_set: u64 = 0;
+    for (nulls.items) |ns| null_set |= @as(u64, 1) << @intCast(ns.table);
+    if (null_set != 0) {
+        const all: Sides = .{ .t = t, .tables = live.items, .aliases = aliases };
+        for (conjuncts.items) |node| if ((try all.reads(node, a)) & null_set != 0) return error.LeftJoinWhere;
+    }
+    // The probe is chosen once, over every table a LEFT JOIN keeps: the reductions that follow take tables out around it.
+    const center = live.items[largest(t, live.items, null_set)];
     while (live.items.len > 2) {
         const sides: Sides = .{ .t = t, .tables = live.items, .aliases = aliases };
         const keep = std.mem.indexOfScalar(usize, live.items, center).?;
@@ -412,6 +443,27 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         const side = try sides.only(node, a) orelse probe;
         try wheres[side].append(a, node);
     }
+    // Each LEFT JOIN's ON: its one key equality with the probe, and conditions on its own table (its build's filter).
+    const left = try a.alloc(bool, n);
+    @memset(left, false);
+    for (nulls.items) |ns| {
+        const d = std.mem.indexOfScalar(usize, live.items, ns.table).?;
+        left[d] = true;
+        const bit = @as(u64, 1) << @intCast(d);
+        for (ns.on.items) |node| {
+            if (try keyEquality(sides, node)) |eq| if ((eq.l == probe and eq.x == d) or (eq.x == probe and eq.l == d)) {
+                if (keys[d] == null) {
+                    const fk_ref = if (eq.l == probe) eq.l_ref else eq.x_ref;
+                    const key_ref = if (eq.l == probe) eq.x_ref else eq.l_ref;
+                    fks[d] = try a.dupe(u8, span(fk_ref.*.u.column_ref.column));
+                    keys[d] = try a.dupe(u8, span(key_ref.*.u.column_ref.column));
+                    continue;
+                }
+            };
+            if ((try sides.reads(node, a)) & ~bit != 0) return error.LeftJoinOn;
+            try wheres[d].append(a, node);
+        }
+    }
     for (0..n) |i| if (i != probe and keys[i] == null) return error.JoinKeyNotFound;
     // The probe query: its own FROM, its own conjuncts, unqualified names; each dimension's key reads as its FK.
     const columns = try a.alloc(std.ArrayList([]const u8), n);
@@ -422,7 +474,8 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         const d = side orelse continue;
         if (d == probe) continue;
         const name = span(ref.*.u.column_ref.column);
-        if (std.mem.eql(u8, name, keys[d].?)) {
+        // A LEFT JOIN's key is NULL on a miss, where the FK is not: it reads as a build column.
+        if (!left[d] and std.mem.eql(u8, name, keys[d].?)) {
             ref.*.u.column_ref.column = (try a.dupeSentinel(u8, fks[d].?, 0)).ptr;
             continue;
         }
@@ -452,9 +505,10 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         .key = keys[d].?,
         .where = try whereSql(a, p, wheres[d].items),
         .columns = columns[d].items,
+        .left = left[d],
     });
     return .{
-        .kind = .inner,
+        .kind = if (left[main]) .left else .inner,
         .probe_path = t.paths[live.items[probe]],
         .build_path = t.paths[live.items[main]],
         .fk = fks[main].?,
@@ -467,13 +521,15 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
     };
 }
 
-/// The probe, as a position in `live`: the largest table by footer rows (a star's fact), the first of equals.
-fn largest(t: Tables, live: []const usize) usize {
-    var at: usize = 0;
-    for (live, 0..) |ti, i| if (t.rows[ti] > t.rows[live[at]]) {
-        at = i;
-    };
-    return at;
+/// The probe, as a position in `live`: the largest table by footer rows (a star's fact), the first of equals, of the
+/// tables outside `skip` (original indices: LEFT JOINs' null-supplying ones). The FROM's first table is never skipped.
+fn largest(t: Tables, live: []const usize, skip: u64) usize {
+    var at: ?usize = null;
+    for (live, 0..) |ti, i| {
+        if (skip & (@as(u64, 1) << @intCast(ti)) != 0) continue;
+        if (at == null or t.rows[ti] > t.rows[live[at.?]]) at = i;
+    }
+    return at.?;
 }
 
 /// A build's own conjuncts as one SQL expression with unqualified names, or null.
@@ -489,11 +545,6 @@ fn planSemi(a: std.mem.Allocator, p: Parsed, sel: anytype, from: *c.LpNode, t: T
     const t0 = fromTable(from) orelse return error.UnsupportedJoin;
     var conjuncts: std.ArrayList(*c.LpNode) = .empty;
     try flatten(sel.where, &conjuncts, a);
-    const all = [_]usize{ 0, 1 };
-    const aliases = try a.alloc(?[]const u8, t.paths.len);
-    @memset(aliases, null);
-    aliases[0] = t0.alias;
-    const sides: Sides = .{ .t = t, .tables = &all, .aliases = aliases };
     var probe_conj: std.ArrayList(*c.LpNode) = .empty;
     var build_conj: std.ArrayList(*c.LpNode) = .empty;
     var fk: []const u8 = "";
@@ -526,23 +577,22 @@ fn planSemi(a: std.mem.Allocator, p: Parsed, sel: anytype, from: *c.LpNode, t: T
             try flatten(sub.where, &build_conj, a);
             continue;
         }
-        const side = try sides.only(n, a);
-        if (side != null and side.? == 1) try build_conj.append(a, n) else try probe_conj.append(a, n);
+        try probe_conj.append(a, n);
     }
     if (fk.len == 0) return error.JoinKeyNotFound;
     from.*.u.from_table.alias = null;
     sel.where = try andOf(a, probe_conj.items);
-    for (try columnRefs(p.root, a)) |ref| {
-        const side = try sides.of(ref);
+    // The subquery's table is not in scope outside it: every other name is the probe's, or a build column an earlier
+    // join published under its own name (which the subquery's table may share), and a qualifier names the probe.
+    var outer = try columnRefs(p.root, a);
+    if (sel.where) |w| outer = try std.mem.concat(a, *c.LpNode, &.{ outer, try columnRefs(w, a) });
+    for (outer) |ref| {
+        if (ref.*.u.column_ref.table) |q| if (t0.alias == null or !std.mem.eql(u8, span(q), t0.alias.?))
+            return error.UnsupportedJoin;
         ref.*.u.column_ref.table = null;
-        // A SEMI join's build columns are not in its result.
-        if (side != null and side.? == 1) return error.UnsupportedJoin;
     }
-    if (sel.where) |w| for (try columnRefs(w, a)) |ref| {
-        ref.*.u.column_ref.table = null;
-    };
     return .{
-        .kind = .semi,
+        .kind = if (semi.anti) .anti else .semi,
         .probe_path = t.paths[0],
         .build_path = t.paths[1],
         .fk = fk,

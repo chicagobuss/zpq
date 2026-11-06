@@ -65,6 +65,8 @@ pub const Explained = struct {
     charged: usize,
 
     pub const Lookup = struct {
+        /// Written beside a SEMI join's or a dimension's lookup; the main one's is `Explained.kind`.
+        kind: lookup.Kind,
         fk: []const u8,
         input: []const u8,
         key: []const u8,
@@ -81,6 +83,7 @@ pub const Explained = struct {
             const semis = try a.alloc(Lookup, l.semis.len);
             for (l.semis, semis) |s, *out| out.* = try of(a, s);
             return .{
+                .kind = j.kind,
                 .fk = try a.dupe(u8, l.fk),
                 .input = try a.dupe(u8, j.build_name),
                 .key = try a.dupe(u8, j.key_name),
@@ -245,6 +248,8 @@ fn withLookup(arena: std.mem.Allocator, f: ?filter_ast.Filter, leaf: filter_ast.
 /// A group-join when the FK is a GROUP BY key and every other key is a build column (each group is one build slot)
 /// and every aggregate is one the slots fold; else null, and the query groups as any other.
 fn groupJoin(gpa: std.mem.Allocator, j: *lookup.Join, q: plans.Aggregate, meta: *const schema.FileMetaData) !?*lookup.GroupJoin {
+    // An ANTI join's rows have no slot, and a LEFT join's misses none: their groups are the probe's own.
+    if (j.kind == .anti or j.kind == .left) return null;
     const keys = q.keys orelse return null;
     const outputs = q.outputs orelse return null;
     // Build columns alone (GROUP BY a dimension attribute) gather many slots into one group.
@@ -294,9 +299,9 @@ fn groupJoin(gpa: std.mem.Allocator, j: *lookup.Join, q: plans.Aggregate, meta: 
     return try G.init(gpa, j, leaves, calls, outs, meta.row_groups.items.len);
 }
 
-/// A reduced INNER edge keeps the INNER join's unique keys; a SEMI join the query wrote takes duplicates.
+/// A reduced INNER edge keeps the INNER join's unique keys; a SEMI or ANTI join the query wrote takes duplicates.
 fn semiKind(s: syntax.Semi) lookup.Kind {
-    return if (s.unique) .inner else .semi;
+    return if (s.anti) .anti else if (s.unique) .inner else .semi;
 }
 
 /// Read one build side (its own SEMI joins first) into the lookup conjunct on `fk`, charged to the ledger as it is
@@ -365,7 +370,10 @@ pub fn prepare(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: types.Que
     p.store = .init(p.charge.allocator());
     // No group-join exists before the probe binds.
     errdefer p.releaseBuilds();
-    const main = try build(p, arena, sj.fk, sj.build, if (sj.kind == .semi) .semi else .inner, threads, args.diag);
+    const kind: lookup.Kind = switch (sj.kind) {
+        inline else => |k| @field(lookup.Kind, @tagName(k)),
+    };
+    const main = try build(p, arena, sj.fk, sj.build, kind, threads, args.diag);
     main.join.main = true;
     main.join.publishes = true;
     const semis = try arena.alloc(Leaf, sj.semis.len);
@@ -373,7 +381,7 @@ pub fn prepare(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: types.Que
     // A star's dimensions publish after the main build, each with its own slots.
     const dims = try arena.alloc(Leaf, sj.dims.len);
     for (sj.dims, dims, 1..) |d, *out, slot| {
-        out.* = try build(p, arena, d.fk, d.build, .inner, threads, args.diag);
+        out.* = try build(p, arena, d.fk, d.build, if (d.left) .left else .inner, threads, args.diag);
         out.join.publishes = true;
         out.join.slot_index = slot;
     }

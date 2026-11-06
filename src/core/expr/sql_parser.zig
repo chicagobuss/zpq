@@ -684,9 +684,12 @@ fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u
     for (p.dims, dims) |d, *out| out.* = .{
         .fk = d.fk,
         .build = try resolveBuild(a, d.path, d.key, d.columns, d.where, schemas, markers, unique),
+        .left = d.left,
     };
     return .{
-        .kind = if (p.kind == .semi) .semi else .inner,
+        .kind = switch (p.kind) {
+            inline else => |k| @field(syntax.JoinKind, @tagName(k)),
+        },
         .fk = p.fk,
         .build = try resolveBuild(a, p.build_path, p.build_key, p.build_columns, p.build_where, schemas, markers, unique),
         .dims = dims,
@@ -706,7 +709,8 @@ fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, columns
     return build;
 }
 
-/// Every `IN (SELECT ...)` of `sql`, as SEMI joins of its table, and the query left once they are out.
+/// Every `IN (SELECT ...)` and `NOT IN (SELECT ...)` of `sql`, as SEMI and ANTI joins of its table, and the query left
+/// once they are out.
 fn peelSemis(a: std.mem.Allocator, sql: []const u8, schemas: Schemas, markers: literals.Markers, unique: bool) !struct { semis: []const syntax.Semi, rest: []const u8 } {
     var rest = sql;
     var semis: std.ArrayList(syntax.Semi) = .empty;
@@ -714,7 +718,8 @@ fn peelSemis(a: std.mem.Allocator, sql: []const u8, schemas: Schemas, markers: l
         const z = try a.dupeSentinel(u8, rest, 0);
         const inner = (try sql_join.tables(a, z)) orelse break;
         const r = try resolveJoin(a, z, inner, schemas, markers, unique);
-        try semis.append(a, .{ .fk = r.fk, .build = r.build, .unique = unique });
+        const anti = r.kind == .anti;
+        try semis.append(a, .{ .fk = r.fk, .build = r.build, .unique = unique and !anti, .anti = anti });
         rest = r.probe_sql;
     }
     return .{ .semis = semis.items, .rest = rest };

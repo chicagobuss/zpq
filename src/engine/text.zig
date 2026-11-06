@@ -960,14 +960,14 @@ fn writeExplainJoin(writer: anytype, p: engine_join.Explained) !void {
     try writer.writeAll(",\"semis\":[");
     for (p.semis, 0..) |s, i| {
         if (i > 0) try writer.writeByte(',');
-        try writer.writeByte('{');
+        try writer.print("{{\"kind\":\"{s}\",", .{@tagName(s.kind)});
         try writeExplainLookup(writer, s);
         try writer.writeByte('}');
     }
     try writer.writeAll("],\"dims\":[");
     for (p.dims, 0..) |d, i| {
         if (i > 0) try writer.writeByte(',');
-        try writer.writeByte('{');
+        try writer.print("{{\"kind\":\"{s}\",", .{@tagName(d.kind)});
         try writeExplainLookup(writer, d);
         try writer.writeByte('}');
     }
@@ -996,7 +996,7 @@ fn writeExplainLookup(writer: anytype, l: engine_join.Explained.Lookup) !void {
     try writer.writeAll("],\"semis\":[");
     for (l.semis, 0..) |s, i| {
         if (i > 0) try writer.writeByte(',');
-        try writer.writeByte('{');
+        try writer.print("{{\"kind\":\"{s}\",", .{@tagName(s.kind)});
         try writeExplainLookup(writer, s);
         try writer.writeByte('}');
     }

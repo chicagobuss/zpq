@@ -186,12 +186,20 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             .{diag.input orelse "S3"},
         ),
         error.UnsupportedJoin => diagnosticPrint(
-            "zpq query: a join is a star of N:1 tables, each joined to the largest by one key (comma or INNER JOIN ... ON), or IN (SELECT ...)\n",
+            "zpq query: a join is a star of N:1 tables, each joined to the largest by one key (comma, INNER or LEFT JOIN ... ON), or [NOT] IN (SELECT ...)\n",
             .{},
         ),
         error.JoinKeyNotFound => diagnosticPrint("zpq query: a join needs one key equality between its tables\n", .{}),
         error.JoinResidualNotSupported => diagnosticPrint(
             "zpq query: a join condition reads both tables beyond its one key equality\n",
+            .{},
+        ),
+        error.LeftJoinOn => diagnosticPrint(
+            "zpq query: a LEFT JOIN's ON is one key equality with the largest table the joins keep, and conditions on its own table\n",
+            .{},
+        ),
+        error.LeftJoinWhere => diagnosticPrint(
+            "zpq query: a condition outside a LEFT JOIN's ON reads its table; this release reads it only in SELECT, GROUP BY and ORDER BY\n",
             .{},
         ),
         error.AmbiguousJoinColumn => diagnosticPrint("zpq query: a column name is in both tables of the join; qualify it\n", .{}),

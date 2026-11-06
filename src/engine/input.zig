@@ -1155,7 +1155,10 @@ fn mappedReadAhead(arena: std.mem.Allocator, args: QueryArgs, opened: OpenedInpu
         seen = dev;
         block = @min(block, deviceReadAhead(arena, dev));
     }
-    return .{ .window = window, .block = block };
+    // Residency and advice through each file's descriptor, where the mapping kept one (`scan_read_ahead.Config.fds`).
+    const fds = arena.alloc(i32, opened.mmaps.len) catch return .{ .window = window, .block = block };
+    for (opened.mmaps, fds) |m, *fd| fd.* = if (m) |mapped| mapped.fd orelse -1 else -1;
+    return .{ .window = window, .block = block, .fds = fds };
 }
 
 /// The kernel's own read-ahead default (`VM_READAHEAD_PAGES`), for a file whose device sysfs does not describe (tmpfs,

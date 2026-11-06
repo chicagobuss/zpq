@@ -4,19 +4,31 @@
 //! input the local-I/O choice leaves mapped) otherwise reads each chunk when a worker decodes it: one synchronous
 //! fault and its read-around at a time per worker, so a cold scan runs at a queue depth of about its worker count
 //! and decoders wait on the disk. Here a worker that claims a work item advises the chunks the next items of the
-//! same pass will decode (`MADV_WILLNEED`), so their pages arrive while it decodes.
+//! same pass will decode (`POSIX_FADV_WILLNEED` through the file's descriptor), so their pages arrive while it
+//! decodes.
 //!
 //! Bounded on every side, from run-time facts only:
 //! - what: the chunks of the columns this pass decodes for each item, nothing between them but the pages a chunk's
 //!   first and last bytes share with its neighbours (advice is page-granular, and a fault there reads the same page);
-//! - how far: a few items per worker ahead of the latest claim, and a hard cap on the bytes advised and not yet
+//! - how far: a few items per worker ahead of the latest claim, paced by the claims (each moves the cursor by about
+//!   one item), and a hard cap on the bytes advised and not yet
 //!   claimed: the caller's window (`Config`), or what the query's ledger has free when it is less, whichever is
 //!   smaller each time it advances. The cap holds within an item too: a cursor advises an item block by block and
 //!   stops at the cap mid-chunk, the rest left to the next claim or to demand faults. A cap below one page advises
 //!   nothing. Advice never waits for room: it is optional, and a fault reads what it declined;
 //! - how: in blocks of the device's read-ahead (`Config.block`): one advice call reads no more than that;
 //! - who: one caller at a time (the others go on decoding): several advising callers contend on the page cache;
-//! - when: only for pages not already resident (`mincore`), so a hot scan issues no reads and makes no advice.
+//! - when: only once workers run, from their claims, and only for pages not already resident (`cachestat`): a hot
+//!   scan issues no reads and makes no advice, and pages a worker's fault already has in flight count as resident.
+//!   Nothing is advised before the workers start: the first claims fault their own items in together, as many reads
+//!   in flight as there are workers, and a serial walk over the first items ahead of them only delayed every
+//!   worker's start (by about 10 ms at 32 workers) for little: where the workers already keep the device busy, the
+//!   delay is the whole cost.
+//!
+//! Residency and advice go through each file's descriptor (`Config.fds`): `cachestat` and `fadvise`, where the
+//! mapping's `mincore` and `madvise` also take the address space's lock, which the workers' region maps write. On
+//! granite that was 4-6% of a 3 GB cold scan (ClickBench Q21) and even elsewhere; per call, the two cost about the
+//! same. A mapping kept without a descriptor uses the mapping's calls.
 //!
 //! What a claim releases: the bytes advised for every item up to it, which a worker is decoding or has decoded.
 //! Advice changes when pages arrive, never what is decoded: answers and refusals are those of the mapping.
@@ -37,12 +49,15 @@ pub const Config = struct {
     /// Advise resident pages too (`ZPQ_IO_ADVISE=always`): coverage for the advice path on inputs a test leaves
     /// resident. Never chosen by the engine.
     force: bool = false,
+    /// Each input's open descriptor, indexed like the scan's inputs, or -1: residency and advice through it, else
+    /// through the mapping (`mincore`, `madvise`).
+    fds: []const i32 = &.{},
 };
 
 /// Tests: the most bytes any pass held advised ahead of its claims, page-rounded.
 pub var test_peak_ahead: std.atomic.Value(u64) = .init(0);
 
-/// Items advised ahead of the latest claim, per worker: the one each worker decodes next, and one more in flight.
+/// How far ahead of the latest claim advice reaches, in items per worker.
 const ahead_per_worker = 2;
 
 pub const ReadAhead = struct {
@@ -61,6 +76,10 @@ pub const ReadAhead = struct {
     busy: std.atomic.Value(bool) = .init(false),
     /// One past the latest claimed item: claims arrive while another caller advises, and are released at its next turn.
     claimed_hi: std.atomic.Value(usize) = .init(0),
+    /// `claimed_hi` as the last advance saw it: each advance moves the cursor by at most the items claimed since, and
+    /// one, so advice keeps pace with the claims instead of falling on one worker in a burst.
+    paced: usize = 0,
+    workers: usize,
     /// The cursor: the next bytes to advise are chunk `col` of item `item`, from `offset` into it.
     item: usize = 0,
     col: usize = 0,
@@ -95,6 +114,7 @@ pub const ReadAhead = struct {
             .plan = plan,
             .sources = sources,
             .lookahead = @max(1, workers) * ahead_per_worker,
+            .workers = @max(1, workers),
             .ledger = ledger,
             .item_bytes = item_bytes,
         };
@@ -121,18 +141,18 @@ pub const ReadAhead = struct {
         return init(c, work, metas, plan, sources, workers, ledger, try arena.alloc(u64, work.len));
     }
 
-    /// A pass over the work list begins, decoding `columns` for every item (null: each item's own): advise its first
-    /// items now, so the workers about to claim them at once do not each fault theirs in. Before its workers start.
-    pub fn start(self: *ReadAhead, columns: ?agg_plan.Columns) void {
+    /// A pass over the work list begins, before its workers start: nothing of it is advised yet, and nothing is
+    /// advised here (the first claims do).
+    pub fn start(self: *ReadAhead) void {
         self.item = 0;
         self.col = 0;
         self.offset = 0;
         self.released = 0;
         self.ahead = 0;
+        self.paced = 0;
         self.last = null;
         self.claimed_hi.store(0, .monotonic);
         @memset(self.item_bytes, 0);
-        self.advance(columns);
     }
 
     /// Item `idx` was claimed. `columns`: what this pass decodes for every item (a sketch's count pass reads only its
@@ -155,9 +175,11 @@ pub const ReadAhead = struct {
         defer self.busy.store(false, .release);
         const hi = @min(self.claimed_hi.load(.monotonic), self.work.len);
         while (self.released < hi) : (self.released += 1) self.ahead -|= self.item_bytes[self.released];
-        // Never advise what a worker already claimed: its own decode faults whatever is missing.
-        if (self.item < self.released) {
-            self.item = self.released;
+        const claims = hi -| self.paced;
+        self.paced = hi;
+        // Never advise what a worker already claimed.
+        if (self.item < hi) {
+            self.item = hi;
             self.col = 0;
             self.offset = 0;
         }
@@ -166,18 +188,20 @@ pub const ReadAhead = struct {
         // A block no larger than the cap, so the cap can be met exactly; below one page there is nothing to advise.
         const step = std.mem.alignBackward(u64, @min(@as(u64, @max(self.config.block, page)), limit), page);
         if (step == 0) return;
-        const stop = @min(self.work.len, self.released +| self.lookahead);
+        const stop = @min(@min(self.work.len, self.released +| self.lookahead), self.item +| claims +| 1);
         while (self.item < stop) {
             const range = self.nextRange(columns) orelse continue;
             // Page-rounded: the pages a block touches are what advice reads and what the cap counts.
             const lo = std.mem.alignBackward(usize, @intFromPtr(range.ptr), page);
             const end = std.mem.alignForward(usize, @intFromPtr(range.ptr) + range.len, page);
             const len: usize = @intCast(@min(step, end - lo));
-            if (!self.config.force and allResident(lo, len, page)) {
+            const fd: i32 = if (self.work[self.item].file < self.config.fds.len) self.config.fds[self.work[self.item].file] else -1;
+            const file_off = lo - @intFromPtr(self.sources[self.work[self.item].file].ptr);
+            if (!self.config.force and cached(fd, file_off, lo, len, page)) {
                 _ = self.resident.fetchAdd(len, .monotonic);
             } else {
                 if (self.ahead + len > limit) break;
-                _ = std.os.linux.madvise(@ptrFromInt(lo), len, std.os.linux.MADV.WILLNEED);
+                willNeed(fd, file_off, lo, len);
                 self.ahead += len;
                 self.item_bytes[self.item] += len;
                 _ = self.advised.fetchAdd(len, .monotonic);
@@ -234,6 +258,27 @@ pub const ReadAhead = struct {
     }
 };
 
+/// Whether every page of the `len` bytes at file offset `off` (mapped at page-aligned `addr`) is in the page cache:
+/// `cachestat` through `fd`, else `mincore` on the mapping (no descriptor, or a kernel before 6.5).
+fn cached(fd: i32, off: usize, addr: usize, len: usize, page: usize) bool {
+    if (fd >= 0) {
+        const linux = std.os.linux;
+        const range: linux.cache_stat_range = .{ .off = off, .len = len };
+        var cs: linux.cache_stat = undefined;
+        if (linux.errno(linux.cachestat(fd, &range, &cs, 0)) == .SUCCESS) return cs.cache * page >= len;
+    }
+    return allResident(addr, len, page);
+}
+
+/// Advise the `len` bytes at file offset `off` (mapped at `addr`): `fadvise` through `fd`, else `madvise`. Advisory
+/// only: a refusal keeps the ordinary fault path.
+fn willNeed(fd: i32, off: usize, addr: usize, len: usize) void {
+    const linux = std.os.linux;
+    if (fd >= 0 and linux.errno(linux.fadvise(fd, @intCast(off), @intCast(len), linux.POSIX_FADV.WILLNEED)) == .SUCCESS)
+        return;
+    _ = linux.madvise(@ptrFromInt(addr), len, linux.MADV.WILLNEED);
+}
+
 /// Whether every page of the `len` bytes at `addr` (page-aligned) is in the page cache. A failed `mincore` says no.
 fn allResident(addr: usize, len: usize, page: usize) bool {
     var vec: [256]u8 = undefined;
@@ -249,37 +294,44 @@ fn allResident(addr: usize, len: usize, page: usize) bool {
     return true;
 }
 
-/// Tests: one row group of one chunk, `len` bytes at `offset` of `bytes`, read by every item.
-const OneChunk = struct {
-    chunks: [1]schema.ColumnChunk,
-    groups: [1]schema.RowGroup,
+/// Tests: `n` row groups of one chunk each, `len` bytes at `offset + i * stride` of the source, read by every item.
+const Chunks = struct {
+    chunks: []schema.ColumnChunk,
+    groups: []schema.RowGroup,
     metas: [1]schema.FileMetaData,
     mask: [1]bool = .{true},
     plan: agg_plan.Plan,
-    work: [1]WorkItem,
-    item_bytes: [1]u64 = .{0},
+    work: []WorkItem,
+    item_bytes: []u64,
 
-    fn init(self: *OneChunk, offset: usize, len: usize) void {
+    fn init(self: *Chunks, a: std.mem.Allocator, n: usize, offset: usize, stride: usize, len: usize) !void {
         self.mask = .{true};
-        self.chunks = .{.{
-            .file_path = null,
-            .file_offset = 0,
-            .meta_data = .{
-                .type = .INT64,
-                .encodings = .empty,
-                .path_in_schema = .empty,
-                .codec = .UNCOMPRESSED,
-                .num_values = 1,
-                .total_uncompressed_size = @intCast(len),
-                .total_compressed_size = @intCast(len),
-                .data_page_offset = @intCast(offset),
-                .index_page_offset = null,
-                .dictionary_page_offset = null,
-            },
-        }};
-        self.groups = .{.{ .columns = .fromOwnedSlice(&self.chunks), .total_byte_size = @intCast(len), .num_rows = 1 }};
-        self.metas = .{.{ .version = 2, .schema = .empty, .num_rows = 1, .created_by = null, .row_groups = .fromOwnedSlice(&self.groups) }};
+        self.chunks = try a.alloc(schema.ColumnChunk, n);
+        self.groups = try a.alloc(schema.RowGroup, n);
+        self.work = try a.alloc(WorkItem, n);
+        self.item_bytes = try a.alloc(u64, n);
         const columns: agg_plan.Columns = .{ .read = &self.mask, .consumed = &self.mask, .preserve = &self.mask };
+        for (self.chunks, self.groups, self.work, 0..) |*c, *g, *w, i| {
+            c.* = .{
+                .file_path = null,
+                .file_offset = 0,
+                .meta_data = .{
+                    .type = .INT64,
+                    .encodings = .empty,
+                    .path_in_schema = .empty,
+                    .codec = .UNCOMPRESSED,
+                    .num_values = 1,
+                    .total_uncompressed_size = @intCast(len),
+                    .total_compressed_size = @intCast(len),
+                    .data_page_offset = @intCast(offset + i * stride),
+                    .index_page_offset = null,
+                    .dictionary_page_offset = null,
+                },
+            };
+            g.* = .{ .columns = .fromOwnedSlice(c[0..1]), .total_byte_size = @intCast(len), .num_rows = 1 };
+            w.* = .{ .file = 0, .rg = i, .agg_start = 0, .agg_len = 0, .columns = columns, .accumulators = &.{} };
+        }
+        self.metas = .{.{ .version = 2, .schema = .empty, .num_rows = @intCast(n), .created_by = null, .row_groups = .fromOwnedSlice(self.groups) }};
         self.plan = .{
             .query = .{ .filter = null, .calls = &.{}, .group_keys = null },
             .stats = .ignore,
@@ -287,80 +339,158 @@ const OneChunk = struct {
             .columns = columns,
             .cols_stat_pruned = 0,
         };
-        self.work = .{.{ .file = 0, .rg = 0, .agg_start = 0, .agg_len = 0, .columns = columns, .accumulators = &.{} }};
     }
 
-    fn readAhead(self: *OneChunk, sources: []const []const u8, window: u64, workers: usize, ledger: ?*core_memory.SharedBudget) ReadAhead {
+    fn readAhead(self: *Chunks, sources: []const []const u8, window: u64, workers: usize, ledger: ?*core_memory.SharedBudget) ReadAhead {
         const page = std.heap.pageSize();
-        return .init(.{ .window = window, .block = page, .force = true }, &self.work, &self.metas, &self.plan, sources, workers, ledger, &self.item_bytes);
+        return .init(.{ .window = window, .block = page, .force = true }, self.work, &self.metas, &self.plan, sources, workers, ledger, self.item_bytes);
     }
 };
 
-test "the cap holds within an oversized first item: advice stops mid-chunk, before any claim" {
+test "a pass's start advises nothing, and each claim advises about one item past it" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
-    const bytes = try std.heap.page_allocator.alloc(u8, 64 * page);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const bytes = try std.heap.page_allocator.alloc(u8, 16 * page);
     defer std.heap.page_allocator.free(bytes);
     @memset(bytes, 1);
     const sources = [_][]const u8{bytes};
-    var one: OneChunk = undefined;
-    one.init(0, bytes.len);
+    var set: Chunks = undefined;
+    try set.init(arena_state.allocator(), 16, 0, page, page);
+    const workers = 4;
+    var ra = set.readAhead(&sources, 1 << 30, workers, null);
+    ra.start();
+    try std.testing.expectEqual(@as(u64, 0), ra.advised.load(.monotonic));
+    // Item 0 claimed: never item 0 itself, and the next item (and one for the claim) advised.
+    ra.claimed(0, null);
+    try std.testing.expectEqual(@as(u64, 0), set.item_bytes[0]);
+    try std.testing.expectEqual(@as(u64, 2 * page), ra.advised.load(.monotonic));
+    try std.testing.expect(set.item_bytes[1] == page and set.item_bytes[2] == page);
+    // Paced: each later claim advises about one more item, never the whole lookahead at once.
+    for (1..16) |idx| {
+        const before = ra.advised.load(.monotonic);
+        ra.claimed(idx, null);
+        try std.testing.expect(ra.advised.load(.monotonic) - before <= 2 * page);
+        try std.testing.expect(ra.item <= idx + 1 + ra.lookahead);
+    }
+}
+
+test "the cap holds within an oversized item: advice stops mid-chunk" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const page = std.heap.pageSize();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
     for ([_]usize{ 1, 4, 16 }) |workers| for ([_]u64{ page, 3 * page + page / 2 }) |window| {
-        var ra = one.readAhead(&sources, window, workers, null);
-        ra.start(null);
+        const n = 2 * workers + 2;
+        const bytes = try std.heap.page_allocator.alloc(u8, n * 64 * page);
+        defer std.heap.page_allocator.free(bytes);
+        @memset(bytes, 1);
+        const sources = [_][]const u8{bytes};
+        var set: Chunks = undefined;
+        try set.init(arena_state.allocator(), n, 0, 64 * page, 64 * page);
+        var ra = set.readAhead(&sources, window, workers, null);
+        ra.start();
+        ra.claimed(0, null);
         // Whole pages only, never past the window: one page, or three of the three and a half.
         try std.testing.expectEqual(window / page * page, ra.advised.load(.monotonic));
         try std.testing.expect(ra.ahead <= window);
-        // Claimed, the item is a worker's: nothing more is advised for it, and its advice no longer counts.
-        ra.claimed(0, null);
-        try std.testing.expectEqual(window / page * page, ra.advised.load(.monotonic));
-        try std.testing.expectEqual(@as(u64, 0), ra.ahead);
+        // A later claim of the advised item gives its advice back; the cap holds again for what follows.
+        ra.claimed(1, null);
+        try std.testing.expect(ra.ahead <= window);
     };
 }
 
 test "a chunk's boundary page counts whole: one byte inside a page advises and counts that page" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
-    const bytes = try std.heap.page_allocator.alloc(u8, 2 * page);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const bytes = try std.heap.page_allocator.alloc(u8, 8 * page);
     defer std.heap.page_allocator.free(bytes);
     @memset(bytes, 1);
     const sources = [_][]const u8{bytes};
-    var one: OneChunk = undefined;
-    one.init(page + 17, 1);
-    var ra = one.readAhead(&sources, 1 << 30, 4, null);
-    ra.start(null);
-    // The accepted contract: advice is page-granular, so the page the byte sits on is advised and counted.
-    try std.testing.expectEqual(@as(u64, page), ra.advised.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, page), ra.ahead);
+    var set: Chunks = undefined;
+    // Four one-byte chunks, each 17 bytes into its own page.
+    try set.init(arena_state.allocator(), 4, page + 17, 2 * page, 1);
+    var ra = set.readAhead(&sources, 1 << 30, 1, null);
+    ra.start();
+    ra.claimed(0, null);
+    // The accepted contract: advice is page-granular, so the page each advised byte (items 1 and 2's) sits on is
+    // advised and counted whole.
+    try std.testing.expectEqual(@as(u64, 2 * page), ra.advised.load(.monotonic));
+    try std.testing.expect(set.item_bytes[1] == page and set.item_bytes[2] == page);
+    try std.testing.expectEqual(@as(u64, 2 * page), ra.ahead);
     // A window below one page advises nothing.
-    var narrow = one.readAhead(&sources, page - 1, 4, null);
-    narrow.start(null);
+    var narrow = set.readAhead(&sources, page - 1, 1, null);
+    narrow.start();
+    narrow.claimed(0, null);
     try std.testing.expectEqual(@as(u64, 0), narrow.advised.load(.monotonic));
+}
+
+test "through a file's descriptor: resident pages are left alone, and the rest advised" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const local_fs = @import("../../local_fs.zig");
+    const page = std.heap.pageSize();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/chunks.bin", .{tmp.sub_path});
+    const fd = try local_fs.createFile(path);
+    const body = try a.alloc(u8, 8 * page);
+    @memset(body, 1);
+    try local_fs.writeAll(fd, body);
+    local_fs.close(fd);
+    const m = try local_fs.mapFile(path);
+    defer m.unmap();
+    const held = m.fd orelse return error.SkipZigTest;
+    const sources = [_][]const u8{m.bytes};
+    const fds = [_]i32{held};
+    var set: Chunks = undefined;
+    try set.init(a, 8, 0, page, page);
+    // Just written, so resident: `cachestat` says so and nothing is advised.
+    var ra: ReadAhead = .init(.{ .window = 1 << 30, .block = page, .fds = &fds }, set.work, &set.metas, &set.plan, &sources, 1, null, set.item_bytes);
+    ra.start();
+    ra.claimed(0, null);
+    try std.testing.expectEqual(@as(u64, 0), ra.advised.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2 * page), ra.resident.load(.monotonic));
+    // Forced: the same pages advised through the descriptor, and counted as for the mapping.
+    var forced: ReadAhead = .init(.{ .window = 1 << 30, .block = page, .force = true, .fds = &fds }, set.work, &set.metas, &set.plan, &sources, 1, null, set.item_bytes);
+    forced.start();
+    forced.claimed(0, null);
+    try std.testing.expectEqual(@as(u64, 2 * page), forced.advised.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), forced.resident.load(.monotonic));
 }
 
 test "the cap never passes what the query's ledger has free" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
-    const bytes = try std.heap.page_allocator.alloc(u8, 64 * page);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const bytes = try std.heap.page_allocator.alloc(u8, 4 * 64 * page);
     defer std.heap.page_allocator.free(bytes);
     @memset(bytes, 1);
     const sources = [_][]const u8{bytes};
-    var one: OneChunk = undefined;
-    one.init(0, bytes.len);
+    var set: Chunks = undefined;
+    try set.init(arena_state.allocator(), 4, 0, 64 * page, 64 * page);
     var ledger: core_memory.SharedBudget = .{ .limit = 1 << 30 };
     // Nearly exhausted: two pages free of a window far wider.
     ledger.used.store(ledger.limit - 2 * page, .monotonic);
-    var ra = one.readAhead(&sources, 1 << 30, 4, &ledger);
-    ra.start(null);
+    var ra = set.readAhead(&sources, 1 << 30, 1, &ledger);
+    ra.start();
+    ra.claimed(0, null);
     try std.testing.expectEqual(@as(u64, 2 * page), ra.advised.load(.monotonic));
     // Exhausted: no advice at all, and nothing waits for room.
     ledger.used.store(ledger.limit, .monotonic);
-    var none = one.readAhead(&sources, 1 << 30, 4, &ledger);
-    none.start(null);
+    var none = set.readAhead(&sources, 1 << 30, 1, &ledger);
+    none.start();
+    none.claimed(0, null);
     try std.testing.expectEqual(@as(u64, 0), none.advised.load(.monotonic));
 }
 
-test "a pass advises its first items before any claim, then keeps a lookahead of items within the window" {
+test "a pass keeps a lookahead of items within the window" {
     const testing = std.testing;
     const metadata = @import("../parquet/metadata.zig");
     const expr_parser = @import("../expr/parser.zig");
@@ -387,8 +517,7 @@ test "a pass advises its first items before any claim, then keeps a lookahead of
     for ([_]u64{ 1 << 30, page + page / 2 }) |window| {
         var ra: ReadAhead = .init(.{ .window = window, .block = page, .force = true }, work, &metas, &plan, &sources, workers, null, try a.alloc(u64, n));
         test_peak_ahead.store(0, .monotonic);
-        ra.start(null);
-        if (window > bytes.len) try testing.expectEqual(@min(n, workers * ahead_per_worker), ra.item);
+        ra.start();
         for (0..n) |idx| {
             ra.claimed(idx, null);
             try testing.expect(ra.item <= idx + 1 + ra.lookahead);

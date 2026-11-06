@@ -801,6 +801,12 @@ pub fn run(
             continue;
         };
         @memcpy(types, p.types);
+        // A DECIMAL's precision is the data's, as its footer has it (`writeOnce`), not the sample's.
+        for (types, 0..) |*t, c| if (t.kind == .decimal) {
+            var max: u128 = 0;
+            for (0..source.count) |i| max = @max(max, source.max_abs[i * p.names.len + c]);
+            t.int_digits = @intCast(csv_types.decimalPrecision(t.*, max) - t.scale);
+        };
         report.types = types;
         return result;
     }

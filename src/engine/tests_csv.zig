@@ -592,3 +592,29 @@ test "csv query: a late value restarts into the caller's own output file, and re
     }));
     try testing.expectEqualStrings("amt", diag.column.get());
 }
+
+test "csv write: the report's DECIMAL precision is the data's, as the footer writes it, not the sample's" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    const in = try tmpPath(&b1, &tmp, "prec.csv");
+    const out = try tmpPath(&b2, &tmp, "prec.parquet");
+    // The sample sees 1.50; a later -10000.25 needs two more integer digits, which only the footer's precision shows.
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(a, "id,v\n");
+    for (0..4000) |i| try text.print(a, "{d},1.50\n", .{i});
+    try text.appendSlice(a, "4000,-10000.25\n");
+    try writeFile(in, text.items);
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    var report: csv_write.Report = .{};
+    _ = try csv_write.run(ctx, .{ .inputs = &.{in} }, in, out, .{ .sample_bytes = 256 }, &report, a);
+    try testing.expectEqual(@as(usize, 0), report.restarts);
+    const meta = try metadata.open(a, try metadata.readFileSlice(out, a));
+    try testing.expectEqual(@as(?i32, 7), meta.schema.items[2].precision);
+    try testing.expectEqual(@as(u32, 7), report.types[1].precision());
+    try testing.expectEqual(@as(u8, 2), report.types[1].scale);
+}

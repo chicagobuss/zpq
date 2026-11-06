@@ -482,6 +482,8 @@ fn executeAggregateOver(
         .order = args.result_order,
         .visible = r.visible_cols,
         .select = if (post) args.select_cols.? else &.{},
+        .calls = r.state.agg_calls,
+        .sources = r.state.agg_sources,
     };
     try program.finish(ctx.gpa, &r.output, &r.state.group_col_types);
     const text_kinds = try answerTextKinds(ctx.gpa, r.output, r.state, args.output == null, args.diag);

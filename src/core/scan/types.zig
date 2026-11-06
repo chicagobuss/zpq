@@ -329,6 +329,19 @@ pub const GroupColType = struct {
             .source = source,
         };
     }
+
+    /// The SQL integer type an aggregate call's `i64` column has: COUNT is BIGINT, SUM HUGEINT, MIN and MAX of a bare
+    /// column that column's own type (`source`). Null for any other: the min or max of an expression has a type zpq
+    /// does not resolve. Kept apart from `GroupColType` so every scan strategy reports one type for a column.
+    pub fn intType(call: expr_agg.AggCall, source: ?schema.SchemaElement) ?expr_ast.IntType {
+        if (call.result != .i64) return null;
+        return switch (call.func) {
+            .count, .count_distinct => .i64,
+            .sum => .i128,
+            .min, .max => if (source) |elem| expr_ast.IntType.ofElement(elem) else null,
+            else => null,
+        };
+    }
 };
 
 pub const WorkItem = @import("contracts.zig").WorkItem;

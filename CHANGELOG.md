@@ -6,7 +6,9 @@
   `sum(a) + sum(b)` and their kin now run as a SELECT item, in `HAVING` (`sum(a) > avg(a) * 1000`, also a result
   against another result) and in `ORDER BY` (`ORDER BY sum(a) / count(*) DESC`), with or without GROUP BY. Each is computed
   once per group from the group's aggregates, typed as DuckDB types it (exact `+ - *` over integers and DECIMALs, `/` in
-  DOUBLE, `round` half away from zero) and matches DuckDB. A scan strategy that cuts groups early stands aside for such
+  DOUBLE, `round` half away from zero) and matches DuckDB. Integer results are checked in the SQL type DuckDB gives
+  the operation (`count(*) + 9223372036854775807` and `max(int32_col) + 2147483647` overflow, as there), an AVG is
+  computed from the exact sum and count, and `round` keeps an infinity or NaN. A scan strategy that cuts groups early stands aside for such
   a query. `%`, `||`, other functions and CASE inside the expression are refused by name.
 - **SELECT sugar in SQL.** `SELECT DISTINCT a, b` (one group per distinct row, NULLs together), `GROUP BY ALL`, `ORDER BY ... NULLS FIRST
   | LAST` (on aggregate results and on plain rows with a `LIMIT`; a row group whose statistics cannot bound its NULLs is

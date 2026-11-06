@@ -257,6 +257,12 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
                 "--max-memory or rewrite the file with smaller row groups\n",
             .{},
         ),
+        error.IntegerOverflowRound => diagnosticPrint("zpq query: integer overflow in round\n", .{}),
+        error.PostAggTypeUnknown => diagnosticPrint(
+            "zpq query: arithmetic on the min or max of an expression or of a FLOAT column is not supported: its\n" ++
+                "SQL type is not one zpq resolves. Use a column of another type, or sum() the expression\n",
+            .{},
+        ),
         error.DecimalScaleTooLarge => diagnosticPrint(
             "zpq query: a DECIMAL product would have more than 38 digits after the\n" ++
                 "point; cast an operand to DOUBLE (divide by 1.0) to compute it inexactly\n",

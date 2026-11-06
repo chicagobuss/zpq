@@ -53,8 +53,14 @@ A SELECT item, a HAVING comparison or an ORDER BY term may be an expression over
 `round(avg(x), 2)`, `HAVING sum(a) > avg(a) * 1000`, `ORDER BY sum(a) / count(*) DESC`). Each is evaluated once per
 group after aggregation, never per input row, and typed as DuckDB types it: `+ - *` stay exact over integers and
 DECIMALs (a DECIMAL result of at most 38 digits, else an error), `/` is DOUBLE (a zero divisor gives an infinity or
-NaN), anything with a DOUBLE is DOUBLE, NULL propagates, `round` goes half away from zero, and an AVG reads as DOUBLE
-(from its rounded DECIMAL mean for a DECIMAL column, so the last digits can differ from DuckDB's). The rest (`%`,
+NaN), anything with a DOUBLE is DOUBLE, NULL propagates, `round` goes half away from zero (a non-finite input stays
+as it is), and an AVG reads as DOUBLE from its exact sum and count (never from the rounded DECIMAL mean zpq answers a
+bare AVG of a DECIMAL column with). Integer results are checked in the SQL type DuckDB gives the operation, not in 128
+bits: COUNT is BIGINT, SUM HUGEINT, MIN and MAX their column's own type, a literal takes the other operand's type when
+its value fits it, and a result outside the type is an overflow error (`count(*) + 9223372036854775807`,
+`max(int32_col) + 2147483647`, `max(tinyint_col) + max(tinyint_col)`); a product of two DECIMALs that each fit 18 digits
+keeps 18, with an overflow error past 10^18, as DuckDB's does. Arithmetic on the MIN or MAX of an expression or of a
+FLOAT column is refused (`PostAggTypeUnknown`): its SQL type is not one zpq resolves. The rest (`%`,
 `||`, other functions, CASE, a string in the expression) is refused by name (`PostAggNotSupported`), and a column beside
 an aggregate in one is refused (`ColumnMustBeGrouped`) as it always was. A HAVING term is evaluated only for the groups
 it keeps, and a SELECT item before the ranking reads it. `SELECT DISTINCT a, b`

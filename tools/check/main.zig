@@ -130,6 +130,9 @@ const Refuse = struct {
     exit: ?u8 = null,
     /// DuckDB must refuse too, with a Binder Error, when asked this SQL (`{path}` and `{fixture:NAME}` apply).
     binder_sql: ?[]const u8 = null,
+    /// With `binder_sql`, the start of DuckDB's refusal in place of "Binder Error:" (an overflow is an "Out of Range
+    /// Error:", a failed conversion a "Conversion Error:").
+    duck_error: ?[]const u8 = null,
 };
 
 const Case = struct {
@@ -830,7 +833,7 @@ fn checkCase(
         if (r.binder_sql) |sql| {
             const ans = try run.oracle.ask(arena, sql);
             const said = ans.refused orelse return try arena.dupe(u8, "duck answered, zpq refused");
-            if (!std.mem.startsWith(u8, said, "Binder Error:")) return try std.fmt.allocPrint(
+            if (!std.mem.startsWith(u8, said, r.duck_error orelse "Binder Error:")) return try std.fmt.allocPrint(
                 arena,
                 "duck refused otherwise: {s}",
                 .{said},

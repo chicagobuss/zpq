@@ -500,6 +500,108 @@ pub const OrderKey = struct {
     nulls_first: bool = false,
 };
 
+/// A SQL integer type by DuckDB's names, the width an integer operation is checked in: DuckDB raises an overflow
+/// error when a result leaves its type's range, not the range of the machine integer zpq computes it in.
+pub const IntType = enum {
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    u8,
+    u16,
+    u32,
+    u64,
+
+    pub fn minValue(self: IntType) i128 {
+        return switch (self) {
+            .i8 => std.math.minInt(i8),
+            .i16 => std.math.minInt(i16),
+            .i32 => std.math.minInt(i32),
+            .i64 => std.math.minInt(i64),
+            .i128 => std.math.minInt(i128),
+            .u8, .u16, .u32, .u64 => 0,
+        };
+    }
+
+    pub fn maxValue(self: IntType) i128 {
+        return switch (self) {
+            .i8 => std.math.maxInt(i8),
+            .i16 => std.math.maxInt(i16),
+            .i32 => std.math.maxInt(i32),
+            .i64 => std.math.maxInt(i64),
+            .i128 => std.math.maxInt(i128),
+            .u8 => std.math.maxInt(u8),
+            .u16 => std.math.maxInt(u16),
+            .u32 => std.math.maxInt(u32),
+            .u64 => std.math.maxInt(u64),
+        };
+    }
+
+    pub fn holds(self: IntType, v: i128) bool {
+        return v >= self.minValue() and v <= self.maxValue();
+    }
+
+    /// The type DuckDB gives an integer literal on its own: INTEGER, BIGINT or HUGEINT, the first that holds it.
+    pub fn ofValue(v: i128) IntType {
+        if (IntType.i32.holds(v)) return .i32;
+        if (IntType.i64.holds(v)) return .i64;
+        return .i128;
+    }
+
+    /// The DECIMAL precision DuckDB widens this type to when it meets a DECIMAL.
+    pub fn digits(self: IntType) u8 {
+        return switch (self) {
+            .i8, .u8 => 3,
+            .i16, .u16 => 5,
+            .i32, .u32 => 10,
+            .i64 => 19,
+            .u64 => 20,
+            .i128 => 38,
+        };
+    }
+
+    /// The integer type of a column's schema element (INT32 and INT64 physical types, with their annotations), null for
+    /// anything else.
+    pub fn ofElement(elem: schema.SchemaElement) ?IntType {
+        const physical = elem.type orelse return null;
+        if (physical != .INT32 and physical != .INT64) return null;
+        const lt = elem.effectiveLogicalType() orelse return if (physical == .INT32) .i32 else .i64;
+        const it = switch (lt) {
+            .INTEGER => |i| i,
+            else => return null,
+        };
+        return switch (it.bitWidth) {
+            8 => if (it.isSigned) .i8 else .u8,
+            16 => if (it.isSigned) .i16 else .u16,
+            32 => if (it.isSigned) .i32 else .u32,
+            64 => if (it.isSigned) .i64 else .u64,
+            else => null,
+        };
+    }
+
+    /// The type of an operation between two integer-typed values, as DuckDB resolves it (checked against DuckDB 2.0.0
+    /// for every pair; `+`, `-` and `*` agree). Not symmetric in spirit: TINYINT with UTINYINT is BIGINT, not SMALLINT.
+    pub fn combine(a: IntType, b: IntType) IntType {
+        const t = comptime blk: {
+            const E = IntType;
+            break :blk [9][9]E{
+                // i8, i16, i32, i64, i128, u8, u16, u32, u64
+                .{ .i8, .i16, .i32, .i64, .i128, .i64, .i64, .i64, .i128 }, // i8
+                .{ .i16, .i16, .i32, .i64, .i128, .i16, .i64, .i64, .i128 }, // i16
+                .{ .i32, .i32, .i32, .i64, .i128, .i32, .i32, .i64, .i128 }, // i32
+                .{ .i64, .i64, .i64, .i64, .i128, .i64, .i64, .i64, .i128 }, // i64
+                .{ .i128, .i128, .i128, .i128, .i128, .i128, .i128, .i128, .i128 }, // i128
+                .{ .i64, .i16, .i32, .i64, .i128, .u8, .u16, .u32, .u64 }, // u8
+                .{ .i64, .i64, .i32, .i64, .i128, .u16, .u16, .u32, .u64 }, // u16
+                .{ .i64, .i64, .i64, .i64, .i128, .u32, .u32, .u32, .u64 }, // u32
+                .{ .i128, .i128, .i128, .i128, .i128, .u64, .u64, .u64, .u64 }, // u64
+            };
+        };
+        return t[@intFromEnum(a)][@intFromEnum(b)];
+    }
+};
+
 /// An expression over the result columns of one group, evaluated once per group after aggregation, never per input
 /// row: arithmetic and `round` over aggregates and literals. Typed as DuckDB types it (`result_program.PostType`).
 pub const PostExpr = union(enum) {
@@ -667,6 +769,33 @@ pub const SelectColumn = struct {
 // ============================================================
 
 const testing = std.testing;
+
+test "IntType: DuckDB's operation types, ranges and literal types" {
+    const T = IntType;
+    // Symmetric, and a type with itself is itself.
+    for (std.enums.values(T)) |a| {
+        try testing.expectEqual(a, T.combine(a, a));
+        for (std.enums.values(T)) |b| try testing.expectEqual(T.combine(a, b), T.combine(b, a));
+    }
+    // Spot values from DuckDB 2.0.0: TINYINT with UTINYINT is BIGINT, SMALLINT with UTINYINT stays SMALLINT, an
+    // unsigned type meets a signed one at the next signed type up, and UBIGINT with any signed type is HUGEINT.
+    try testing.expectEqual(T.i64, T.combine(.i8, .u8));
+    try testing.expectEqual(T.i16, T.combine(.i16, .u8));
+    try testing.expectEqual(T.i64, T.combine(.i32, .u32));
+    try testing.expectEqual(T.i128, T.combine(.u64, .i8));
+    try testing.expectEqual(T.u64, T.combine(.u32, .u64));
+    try testing.expectEqual(T.i8, T.combine(.i8, .i8));
+    // Ranges.
+    try testing.expect(T.i32.holds(-2147483648) and !T.i32.holds(2147483648));
+    try testing.expect(T.u64.holds(std.math.maxInt(u64)) and !T.u64.holds(-1) and !T.u64.holds(std.math.maxInt(u64) + 1));
+    try testing.expect(T.i128.holds(std.math.minInt(i128)));
+    // A literal on its own is the first of INTEGER, BIGINT and HUGEINT that holds it.
+    try testing.expectEqual(T.i32, T.ofValue(-2147483648));
+    try testing.expectEqual(T.i64, T.ofValue(2147483648));
+    try testing.expectEqual(T.i64, T.ofValue(-2147483649));
+    try testing.expectEqual(T.i128, T.ofValue(9223372036854775808));
+    try testing.expectEqual(@as(u8, 20), T.u64.digits());
+}
 
 test "Type.promote" {
     try testing.expectEqual(Type.i64, Type.promote(.i64, .i64).?);

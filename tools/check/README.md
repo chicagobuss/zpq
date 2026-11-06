@@ -55,7 +55,8 @@ when the file loads, as is a file with no cases):
   at another width compares exactly) and the multiset of rows.
 - `refuse`: `{"error": KIND, "diag": SUBSTRING, "exit": N, "no_output": true, "binder_sql": SQL}`, the declared
   refusal of this exact query (a CLI refusal's kind is its JSON `code`, its `(Name)`, else `exit N`);
-  with `binder_sql`, DuckDB must refuse that SQL with a Binder Error too. A file-level `refuse` map declares
+  with `binder_sql`, DuckDB must refuse that SQL with a Binder Error too (or with the error `duck_error` names, such
+  as "Out of Range Error:" for an overflow). A file-level `refuse` map declares
   refusals by case id for cells a matrix generates.
 - `same`: byte parity only, with the reason no independent oracle applies.
 - `safe`: refusal kinds that are acceptable answers, still identical at every point.

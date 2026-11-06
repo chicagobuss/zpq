@@ -1325,8 +1325,12 @@ const PostBuilder = struct {
         const f = node.u.function;
         const name = std.mem.span(f.name orelse return postUnsupported(self.lp_arena, node, "the call"));
         if (isAggregateCall(node)) {
-            const at = try hiddenAgg(self.allocator, self.lp_arena, node, self.hidden, self.lower);
-            return .{ .col = .{ .column = self.n_select + at, .mean = std.ascii.eqlIgnoreCase(name, "avg") } };
+            // An AVG in an expression is DOUBLE, computed from the exact sum and count: the call is read as
+            // `avg_state`, whose pair has both, not as `avg`, which answers a DECIMAL column with a rounded DECIMAL mean.
+            const mean = std.ascii.eqlIgnoreCase(name, "avg");
+            const call_node = if (mean) try avgStateCopy(self.lp_arena, node) else node;
+            const at = try hiddenAgg(self.allocator, self.lp_arena, call_node, self.hidden, self.lower);
+            return .{ .col = .{ .column = self.n_select + at, .mean = mean } };
         }
         if (f.over != null or f.distinct != 0 or f.filter != null or f.order_by.count != 0 or
             !std.ascii.eqlIgnoreCase(name, "round") or f.args.count < 1 or f.args.count > 2)
@@ -1353,6 +1357,16 @@ const PostBuilder = struct {
         return if (v > 1000) null else v;
     }
 };
+
+const avg_state_name = "avg_state\x00".*;
+
+/// `avg(...)` as `avg_state(...)`: a copy of the call node, so the user's own is untouched.
+fn avgStateCopy(lp_arena: *c.arena_t, node: *c.LpNode) error{OutOfMemory}!*c.LpNode {
+    const copy: *c.LpNode = c.lp_node_alloc(lp_arena, c.LP_EXPR_FUNCTION) orelse return error.OutOfMemory;
+    copy.* = node.*;
+    copy.u.function.name = @constCast(&avg_state_name);
+    return copy;
+}
 
 /// Add the aggregate call `node` to `hidden` (once: the same call written alike is reused); its index there.
 fn hiddenAgg(
@@ -2179,7 +2193,8 @@ test "sql_parser reads a derived ORDER BY or HAVING term and an AVG as a mean" {
     try std.testing.expectEqualStrings("sum(a)", q.result_order.hidden[0].expr);
     try std.testing.expectEqualStrings("count(*)", q.result_order.hidden[1].expr);
     try std.testing.expectEqual(ast.SelectColumn.Role.derived, q.result_order.hidden[2].role);
-    try std.testing.expectEqualStrings("avg(a)", q.result_order.hidden[3].expr);
+    // An AVG in an expression is read as `avg_state`, for its exact sum and count.
+    try std.testing.expectEqualStrings("avg_state(a)", q.result_order.hidden[3].expr);
     try std.testing.expectEqual(ast.SelectColumn.Role.derived, q.result_order.hidden[4].role);
     try std.testing.expect(q.result_order.hidden[3].role == .agg);
     // Result columns: k, s, then the hidden ones from 2.

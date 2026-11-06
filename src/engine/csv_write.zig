@@ -1,0 +1,910 @@
+//! A CSV file written as Parquet: the CSV source of the write window.
+//!
+//! The file is cut into fixed byte chunks. Each chunk's producer counts its quote bytes; the XOR of the earlier
+//! chunks' parities is the exact quote state at its first byte (`core/csv/scan.zig`), so it finds its first record,
+//! parses its records straight into typed output columns (a `write_window.Piece`, never a row table; strings stay
+//! slices of the input), and hands the piece to the write window. The window's assembler cuts output row groups by
+//! the writer's row and byte targets, encodes them on the shared executor and places them in order, exactly as it
+//! does re-encoded Parquet: where chunks start and end never shows in the output, and the bytes are the same at
+//! every `-j`.
+//!
+//! Types (`core/csv/types.zig`) come from a sample of the first records and are a promise checked on every value:
+//! a value its column's type does not hold stops the write (`error.CsvTypeChanged`), the whole file is classified in
+//! parallel, the types widen to what every value fits, and the write starts again. A pinned type (`Options.types`)
+//! or `--csv-strict` refuses instead. DECIMAL precision is not part of that promise: the schema is written in the
+//! footer, so it is set there from the largest value. Malformed input is refused at its line, byte and column; no
+//! value is ever rounded, truncated, coerced or dropped.
+
+const std = @import("std");
+const csv_scan = @import("../core/csv/scan.zig");
+const csv_types = @import("../core/csv/types.zig");
+const schema = @import("../core/schema.zig");
+const consumer = @import("../core/consumer.zig");
+const core_memory = @import("../core/memory.zig");
+const huge_pages = @import("../core/huge_pages.zig");
+const system = @import("../core/system.zig");
+const thrift = @import("../core/thrift.zig");
+const page_index = @import("../core/writer/page_index.zig");
+const streaming = @import("../core/writer/streaming.zig");
+const fastpath = @import("../core/writer/fastpath.zig");
+const Diag = @import("../core/diag.zig").Diag;
+const local_fs = @import("../local_fs.zig");
+const profile = @import("../profile.zig");
+const nowMonoNs = @import("../clock.zig").monoNs;
+const window_mod = @import("write_window.zig");
+const write_mod = @import("write.zig");
+const compression = @import("../core/parquet/compression.zig");
+const engine_types = @import("types.zig");
+const Context = engine_types.Context;
+const QueryArgs = engine_types.QueryArgs;
+const WriteResult = engine_types.WriteResult;
+const Type = csv_types.Type;
+
+/// What a CSV source is told; every field has a default that sniffs or detects it.
+pub const Options = struct {
+    /// The field delimiter; null: the sniffed one (`, \t ; |`).
+    delimiter: ?u8 = null,
+    /// Whether the first record names the columns; null: detected (`types.firstRecordIsHeader`).
+    header: ?bool = null,
+    /// Unquoted field texts read as NULL besides the empty one (`--csv-null`).
+    nulls: []const []const u8 = &.{},
+    /// Columns whose type is given, not inferred; a value that does not fit is refused (`--csv-types`).
+    types: []const Pinned = &.{},
+    /// Refuse a value that does not fit its sampled type instead of widening and starting again.
+    strict: bool = false,
+    /// How much of the file the types are sampled from.
+    sample_bytes: usize = 4 << 20,
+    /// Forced-path control: the chunk size (chunks never change the output's bytes).
+    chunk_bytes: ?usize = null,
+
+    pub const Pinned = struct { column: []const u8, type: Type };
+};
+
+/// Why a CSV write stopped, for the diagnostic: where in the file (`line` counts newlines from 1, quoted ones too, as
+/// an editor does) and in which column.
+pub const Failure = struct {
+    kind: Kind = .malformed,
+    malformed: csv_scan.Malformed = .unterminated_quote,
+    /// File offset of the field (or record) at fault.
+    offset: u64 = 0,
+    line: u64 = 0,
+    /// The column (0-based), when a field is at fault.
+    column: ?usize = null,
+    expected_fields: usize = 0,
+    got_fields: usize = 0,
+    /// A value that did not fit its column's type, and the type.
+    value: [64]u8 = undefined,
+    value_len: usize = 0,
+    type: Type = .{},
+
+    pub const Kind = enum { malformed, field_count, type_changed, pinned_type, utf16, empty };
+
+    pub fn valueText(f: *const Failure) []const u8 {
+        return f.value[0..f.value_len];
+    }
+};
+
+/// What a CSV write reports beside its result: why it stopped, if it did, and how it got its types.
+pub const Report = struct {
+    failure: Failure = .{},
+    /// Writes started again after a value changed its column's type.
+    restarts: usize = 0,
+    /// Per column, whether a restart widened it (allocated by the write, on the caller's allocator).
+    widened: []bool = &.{},
+    chunks: usize = 0,
+    /// The types written (on the caller's allocator), for the summary.
+    types: []Type = &.{},
+    names: []const []const u8 = &.{},
+};
+
+pub const Error = error{ CsvMalformed, CsvFieldCount, CsvTypeChanged, CsvPinnedType, CsvUtf16, CsvEmpty };
+
+/// The parse of a file before its chunks run: dialect, header, column names and sampled types.
+pub const Plan = struct {
+    bytes: []const u8,
+    data_start: usize,
+    /// Newlines before `data_start` (the BOM and header), for line numbers.
+    head_lines: u64,
+    dialect: csv_scan.Dialect,
+    header: bool,
+    names: []const []const u8,
+    types: []Type,
+    /// Columns whose type was given (`Options.types`): refused, never widened.
+    pinned: []const bool,
+    mean_record: usize,
+    nulls: []const []const u8,
+};
+
+pub fn plan(a: std.mem.Allocator, bytes: []const u8, opts: Options, failure: *Failure) !Plan {
+    const bom = csv_scan.bomLen(bytes) catch {
+        failure.* = .{ .kind = .utf16 };
+        return error.CsvUtf16;
+    };
+    if (bytes.len == bom) {
+        failure.* = .{ .kind = .empty };
+        return error.CsvEmpty;
+    }
+    const sample_end = @min(bytes.len, bom + opts.sample_bytes);
+    const quote: u8 = '"';
+    const dialect: csv_scan.Dialect = .{
+        .delimiter = opts.delimiter orelse csv_scan.sniffDelimiter(bytes[0..sample_end], bom, quote),
+        .quote = quote,
+    };
+    // The first record, then the sample's records after it.
+    var s = csv_scan.Scanner.init(bytes[0..sample_end], bom, sample_end == bytes.len, dialect);
+    var scratch: std.ArrayList(u8) = .empty;
+    var first: std.ArrayList([]const u8) = .empty;
+    var first_quoted: std.ArrayList(bool) = .empty;
+    while (try nextField(&s, bytes, failure, first.items.len)) |f| {
+        const t = try decode(a, bytes, f, dialect, &scratch, failure, 0, first.items.len);
+        try first.append(a, try a.dupe(u8, t.bytes));
+        try first_quoted.append(a, t.quoted);
+        if (f.last) break;
+    }
+    const ncols = first.items.len;
+    const after_first = s.position();
+    var sampled = try a.alloc(Type, ncols);
+    @memset(sampled, .{});
+    var col: usize = 0;
+    var records: usize = 0;
+    var record_start = after_first;
+    var last_end = after_first;
+    while (try nextField(&s, bytes, failure, col)) |f| {
+        if (f.last and col == 0 and f.start == f.end and ncols > 1) {
+            record_start = s.position();
+            continue; // a blank line
+        }
+        if (col >= ncols) return fieldCount(failure, bytes, record_start, ncols, col + 1);
+        const t = try decode(a, bytes, f, dialect, &scratch, failure, 0, col);
+        if (!isNull(t, opts.nulls)) sampled[col] = sampled[col].join(classifyText(t.bytes, false));
+        col += 1;
+        if (f.last) {
+            if (col != ncols) return fieldCount(failure, bytes, record_start, ncols, col);
+            col = 0;
+            records += 1;
+            last_end = s.position();
+            record_start = last_end;
+        }
+    }
+    const header = opts.header orelse csv_types.firstRecordIsHeader(first.items, sampled);
+    if (!header) for (first.items, first_quoted.items, sampled) |text, quoted, *t| {
+        if (!isNull(.{ .bytes = text, .quoted = quoted }, opts.nulls))
+            t.* = t.join(csv_types.classify(text, std.unicode.utf8ValidateSlice(text)));
+    };
+    const names = try csv_types.columnNames(a, if (header) first.items else null, ncols);
+    const pinned = try a.alloc(bool, ncols);
+    @memset(pinned, false);
+    for (opts.types) |p| {
+        const i = for (names, 0..) |n, i| {
+            if (std.mem.eql(u8, n, p.column)) break i;
+        } else return error.UnknownColumn;
+        sampled[i] = p.type;
+        pinned[i] = true;
+    }
+    const data_start = if (header) after_first else bom;
+    const counted = last_end - after_first;
+    return .{
+        .bytes = bytes,
+        .data_start = data_start,
+        .head_lines = csv_scan.countNewlines(bytes[0..data_start]),
+        .dialect = dialect,
+        .header = header,
+        .names = names,
+        .types = sampled,
+        .pinned = pinned,
+        .mean_record = if (records == 0) 64 else @max(1, counted / records),
+        .nulls = opts.nulls,
+    };
+}
+
+fn nextField(s: *csv_scan.Scanner, bytes: []const u8, failure: *Failure, column: usize) !?csv_scan.Field {
+    return s.next() catch {
+        failure.* = scanFailure(s, bytes, column);
+        failure.line = 1 + csv_scan.countNewlines(bytes[0..@intCast(failure.offset)]);
+        return error.CsvMalformed;
+    };
+}
+
+/// The scanner stopped inside quotes at the end of the file. When the field it stopped in does not start with a
+/// quote, the quote that opened the run is a stray one inside an unquoted field: that is the refusal to report.
+fn scanFailure(s: *const csv_scan.Scanner, bytes: []const u8, column: usize) Failure {
+    const at = s.failure.offset;
+    const stray = at < bytes.len and bytes[at] != s.quote;
+    return .{
+        .kind = .malformed,
+        .malformed = if (stray) .quote_in_unquoted_field else s.failure.kind,
+        .offset = at,
+        .column = column,
+    };
+}
+
+fn decode(
+    a: std.mem.Allocator,
+    bytes: []const u8,
+    f: csv_scan.Field,
+    d: csv_scan.Dialect,
+    scratch: *std.ArrayList(u8),
+    failure: *Failure,
+    base_lines: u64,
+    column: usize,
+) !csv_scan.Text {
+    const raw = bytes[f.start..f.end];
+    return csv_scan.decodeField(raw, d.quote, scratch, a) catch |e| switch (e) {
+        error.MalformedCsv => {
+            failure.* = .{
+                .kind = .malformed,
+                .malformed = csv_scan.fieldMalformation(raw, d.quote),
+                .offset = f.start,
+                .column = column,
+            };
+            failure.line = base_lines + 1 + csv_scan.countNewlines(bytes[0..f.start]);
+            return error.CsvMalformed;
+        },
+        else => |oom| return oom,
+    };
+}
+
+fn fieldCount(failure: *Failure, bytes: []const u8, record: usize, want: usize, got: usize) Error {
+    failure.* = .{ .kind = .field_count, .offset = record, .expected_fields = want, .got_fields = got };
+    failure.line = 1 + csv_scan.countNewlines(bytes[0..record]);
+    return error.CsvFieldCount;
+}
+
+/// A non-NULL value's type alone; `ascii`: its chunk has no byte past 0x7f, so it is UTF-8 unchecked.
+fn classifyText(s: []const u8, ascii: bool) Type {
+    return csv_types.classify(s, ascii or std.unicode.utf8ValidateSlice(s));
+}
+
+fn isNull(t: csv_scan.Text, nulls: []const []const u8) bool {
+    if (t.quoted) return false;
+    if (t.bytes.len == 0) return true;
+    for (nulls) |n| if (std.mem.eql(u8, n, t.bytes)) return true;
+    return false;
+}
+
+// ---------------------------------------------------------------- the chunks
+
+/// The window's piece source over a planned file: chunk `i` is bytes `[data_start + i * chunk, ...)`.
+pub const Source = struct {
+    plan: *const Plan,
+    elems: []const schema.SchemaElement,
+    paths: []const []const []const u8,
+    chunk: usize,
+    count: usize,
+    /// Per chunk: its quote parity and newline count, published by its producer before it parses.
+    stats: []csv_scan.ChunkStats,
+    ready: []std.Io.Event,
+    /// Per chunk and DECIMAL column: the largest unscaled magnitude it held.
+    max_abs: []u128,
+    /// Per chunk: why it stopped, if it did.
+    failures: []Failure,
+    failed: []bool,
+    rows: std.atomic.Value(u64) = .init(0),
+    /// Classify instead of convert: each chunk's join of its values' types, for a restart.
+    classify: bool = false,
+    seen: []Type = &.{},
+
+    pub fn init(a: std.mem.Allocator, p: *const Plan, chunk: usize) !Source {
+        const data = p.bytes.len - p.data_start;
+        const count = @max(1, std.math.divCeil(usize, data, chunk) catch 1);
+        const ncols = p.names.len;
+        const elems = try a.alloc(schema.SchemaElement, ncols);
+        const paths = try a.alloc([]const []const u8, ncols);
+        for (elems, paths, p.names, p.types) |*e, *path, n, t| {
+            e.* = csv_types.schemaElement(n, t);
+            path.* = try a.dupe([]const u8, &.{n});
+        }
+        const s: Source = .{
+            .plan = p,
+            .elems = elems,
+            .paths = paths,
+            .chunk = chunk,
+            .count = count,
+            .stats = try a.alloc(csv_scan.ChunkStats, count),
+            .ready = try a.alloc(std.Io.Event, count),
+            .max_abs = try a.alloc(u128, count * ncols),
+            .failures = try a.alloc(Failure, count),
+            .failed = try a.alloc(bool, count),
+        };
+        @memset(s.ready, .unset);
+        @memset(s.max_abs, 0);
+        @memset(s.failed, false);
+        return s;
+    }
+
+    fn bound(s: *const Source, i: usize) usize {
+        return @min(s.plan.bytes.len, s.plan.data_start + i * s.chunk);
+    }
+
+    /// Chunk `i`'s records: from the first record start at or after its first byte to its successor's.
+    fn records(s: *Source, io: std.Io, i: usize) !struct { lo: usize, hi: usize, lines: u64 } {
+        const p = s.plan;
+        const lo_b = s.bound(i);
+        const hi_b = s.bound(i + 1);
+        s.stats[i] = csv_scan.chunkStats(p.bytes[lo_b..hi_b], p.dialect.quote);
+        s.ready[i].set(io);
+        // Chunks are dispatched in order, so every earlier one is already counting its quotes.
+        var parity: u1 = 0;
+        var lines: u64 = p.head_lines;
+        for (0..i) |k| {
+            s.ready[k].waitUncancelable(io);
+            parity ^= s.stats[k].quote_parity;
+            lines += s.stats[k].newlines;
+        }
+        const q = p.dialect.quote;
+        const lo = if (i == 0) p.data_start else csv_scan.recordStart(p.bytes, lo_b, parity == 1, q) orelse p.bytes.len;
+        const next_parity = parity ^ s.stats[i].quote_parity;
+        const hi = if (i + 1 >= s.count)
+            p.bytes.len
+        else
+            csv_scan.recordStart(p.bytes, hi_b, next_parity == 1, q) orelse p.bytes.len;
+        // Starts found from exact quote states only increase: a decrease is quotes that do not pair.
+        if (hi < lo) return s.fail(i, .{ .malformed = .inconsistent_quotes, .offset = hi_b }, lines, lo_b);
+        return .{ .lo = lo, .hi = hi, .lines = lines };
+    }
+
+    fn fail(s: *Source, i: usize, f: Failure, lines: u64, from: usize) Error {
+        s.failures[i] = f;
+        const at = @max(from, @as(usize, @intCast(f.offset)));
+        s.failures[i].line = lines + 1 + csv_scan.countNewlines(s.plan.bytes[from..at]);
+        s.failed[i] = true;
+        return switch (f.kind) {
+            .malformed => error.CsvMalformed,
+            .field_count => error.CsvFieldCount,
+            .type_changed => error.CsvTypeChanged,
+            .pinned_type => error.CsvPinnedType,
+            .utf16 => error.CsvUtf16,
+            .empty => error.CsvEmpty,
+        };
+    }
+
+    /// The earliest chunk's failure.
+    pub fn firstFailure(s: *const Source) ?*const Failure {
+        for (s.failed, s.failures) |f, *x| if (f) return x;
+        return null;
+    }
+
+    /// Parse chunk `i` into a piece (or, classifying, into `seen`).
+    pub fn produce(s: *Source, io: std.Io, piece: ?*window_mod.Piece, i: usize) !void {
+        const p = s.plan;
+        const span = try s.records(io, i);
+        const ncols = p.names.len;
+        const bytes = p.bytes;
+        const lo_b = s.bound(i);
+        var builder: Builder = undefined;
+        const a: std.mem.Allocator = if (piece) |pc| pc.arena.allocator() else std.heap.page_allocator;
+        const seen: []Type = if (s.classify) s.seen[i * ncols ..][0..ncols] else &.{};
+        if (s.classify) @memset(seen, .{});
+        if (piece) |pc| try builder.init(pc, s, span.hi - span.lo);
+        if (span.lo >= span.hi) {
+            if (piece) |pc| try builder.finish(pc, s, i);
+            return;
+        }
+        const ascii = !hasHighBit(bytes[span.lo..span.hi]);
+        var scanner = csv_scan.Scanner.init(bytes, span.lo, true, p.dialect);
+        const scratch_alloc = std.heap.smp_allocator;
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(scratch_alloc);
+        var col: usize = 0;
+        var record_start = span.lo;
+        while (true) {
+            const next = scanner.next() catch return s.fail(i, scanFailure(&scanner, bytes, col), span.lines, lo_b);
+            const f = next orelse break;
+            if (f.last and col == 0 and f.start == f.end and ncols > 1) {
+                // A blank line holds no record.
+                record_start = scanner.position();
+                if (record_start >= span.hi) break;
+                continue;
+            }
+            if (col >= ncols) return s.fail(i, .{
+                .kind = .field_count,
+                .offset = record_start,
+                .expected_fields = ncols,
+                .got_fields = col + 1 + countRest(&scanner),
+            }, span.lines, lo_b);
+            const raw = bytes[f.start..f.end];
+            const text = csv_scan.decodeField(raw, p.dialect.quote, &scratch, scratch_alloc) catch |e| switch (e) {
+                error.MalformedCsv => return s.fail(i, .{
+                    .kind = .malformed,
+                    .malformed = csv_scan.fieldMalformation(raw, p.dialect.quote),
+                    .offset = f.start,
+                    .column = col,
+                }, span.lines, lo_b),
+                else => |oom| return oom,
+            };
+            if (s.classify) {
+                if (!isNull(text, p.nulls))
+                    seen[col] = seen[col].join(classifyText(text.bytes, ascii));
+            } else if (!(try builder.add(a, col, text, ascii, p.nulls, text.bytes.ptr == scratch.items.ptr))) {
+                const t = p.types[col];
+                var fl: Failure = .{
+                    .kind = if (p.pinned[col]) .pinned_type else .type_changed,
+                    .offset = f.start,
+                    .column = col,
+                    .type = t,
+                };
+                fl.value_len = @min(fl.value.len, text.bytes.len);
+                @memcpy(fl.value[0..fl.value_len], text.bytes[0..fl.value_len]);
+                return s.fail(i, fl, span.lines, lo_b);
+            }
+            col += 1;
+            if (f.last) {
+                if (col != ncols) return s.fail(i, .{
+                    .kind = .field_count,
+                    .offset = record_start,
+                    .expected_fields = ncols,
+                    .got_fields = col,
+                }, span.lines, lo_b);
+                col = 0;
+                if (!s.classify) builder.rows += 1;
+                record_start = scanner.position();
+                if (record_start >= span.hi) {
+                    if (record_start != span.hi) return s.fail(i, .{
+                        .kind = .malformed,
+                        .malformed = .inconsistent_quotes,
+                        .offset = span.hi,
+                    }, span.lines, lo_b);
+                    break;
+                }
+            }
+        }
+        if (piece) |pc| try builder.finish(pc, s, i);
+    }
+
+    /// The window's view of this source.
+    pub fn pieceSource(s: *Source) window_mod.PieceSource {
+        return .{ .ctx = s, .count = s.count, .produce = produceErased, .item_bytes = s.chunk *| 3 };
+    }
+
+    fn produceErased(ctx: *anyopaque, w: *window_mod.WinCtx, i: usize) anyerror!*window_mod.Piece {
+        const s: *Source = @ptrCast(@alignCast(ctx));
+        const piece = try w.takePiece();
+        errdefer piece.unref(w.gpa);
+        try s.produce(w.io, piece, i);
+        return piece;
+    }
+};
+
+/// Fields left in the current record (for a too-long record's count).
+fn countRest(s: *csv_scan.Scanner) usize {
+    var n: usize = 0;
+    while (s.next() catch null) |f| {
+        n += 1;
+        if (f.last) break;
+    }
+    return n;
+}
+
+fn hasHighBit(bytes: []const u8) bool {
+    const V = @Vector(64, u8);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + 64 <= bytes.len) : (i += 64) acc |= @as(V, bytes[i..][0..64].*);
+    var tail: u8 = 0;
+    for (bytes[i..]) |c| tail |= c;
+    return (@reduce(.Or, acc) | tail) & 0x80 != 0;
+}
+
+/// Typed output columns being filled from one chunk's fields.
+const Builder = struct {
+    cols: []consumer.OutputAggregator.ColumnBuf,
+    types: []const Type,
+    max_abs: []u128,
+    rows: usize = 0,
+
+    fn init(b: *Builder, piece: *window_mod.Piece, s: *const Source, span_bytes: usize) !void {
+        const p = s.plan;
+        const pa = piece.arena.allocator();
+        const ncols = p.names.len;
+        const cols = try pa.alloc(consumer.OutputAggregator.ColumnBuf, ncols);
+        const reserve = span_bytes / @max(1, p.mean_record) + span_bytes / @max(1, p.mean_record) / 4 + 16;
+        for (cols, p.types) |*c, t| {
+            c.* = switch (columnLane(t)) {
+                inline else => |lane| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(lane), .{}),
+            };
+            switch (c.*) {
+                inline else => |*buf| try buf.values.ensureTotalCapacity(pa, reserve),
+            }
+        }
+        b.* = .{ .cols = cols, .types = p.types, .max_abs = try pa.alloc(u128, ncols) };
+        @memset(b.max_abs, 0);
+        piece.agg = .{
+            .arena = pa,
+            .cols = cols,
+            .schema_elems = @constCast(s.elems),
+            .paths = @constCast(s.paths),
+            .num_rows = 0,
+            .captured = true,
+        };
+    }
+
+    /// Append one field to column `col`; false when the value is not one of the column's type.
+    /// `escaped`: the text was unescaped into the producer's scratch, which the next field reuses.
+    inline fn add(
+        b: *Builder,
+        a: std.mem.Allocator,
+        col: usize,
+        text: csv_scan.Text,
+        ascii: bool,
+        nulls: []const []const u8,
+        escaped: bool,
+    ) !bool {
+        const t = b.types[col];
+        const buf = &b.cols[col];
+        if (isNull(text, nulls)) {
+            switch (buf.*) {
+                inline else => |*x| {
+                    if (x.max_def == 0) {
+                        x.max_def = 1;
+                        try x.def_levels.ensureTotalCapacity(a, x.values.capacity);
+                        x.def_levels.appendNTimesAssumeCapacity(1, b.rows);
+                    }
+                    try x.def_levels.append(a, 0);
+                    try x.values.append(a, std.mem.zeroes(@TypeOf(x.values.items[0])));
+                },
+            }
+            return true;
+        }
+        const s = text.bytes;
+        switch (buf.*) {
+            .i64 => |*x| {
+                const v: i64 = switch (t.kind) {
+                    .int64 => csv_types.parseInt(s) orelse return false,
+                    .decimal => blk: {
+                        const cap = csv_types.decimalIntCapacity(t);
+                        const d = csv_types.parseDecimal(s, t.scale, cap) orelse return false;
+                        b.max_abs[col] = @max(b.max_abs[col], @abs(d));
+                        break :blk @intCast(d);
+                    },
+                    .timestamp => csv_types.timestampValue(t, s) orelse return false,
+                    else => unreachable,
+                };
+                try x.values.append(a, v);
+                if (x.max_def > 0) try x.def_levels.append(a, 1);
+            },
+            .i128 => |*x| {
+                const d = csv_types.parseDecimal(s, t.scale, csv_types.decimalIntCapacity(t)) orelse return false;
+                b.max_abs[col] = @max(b.max_abs[col], @abs(d));
+                try x.values.append(a, d);
+                if (x.max_def > 0) try x.def_levels.append(a, 1);
+            },
+            .i32 => |*x| {
+                try x.values.append(a, csv_types.parseDate(s) orelse return false);
+                if (x.max_def > 0) try x.def_levels.append(a, 1);
+            },
+            .f64 => |*x| {
+                try x.values.append(a, csv_types.parseFloat(s) orelse return false);
+                if (x.max_def > 0) try x.def_levels.append(a, 1);
+            },
+            .boolean => |*x| {
+                try x.values.append(a, csv_types.parseBool(s) orelse return false);
+                if (x.max_def > 0) try x.def_levels.append(a, 1);
+            },
+            .string => |*x| {
+                if (t.kind == .string and !ascii and !std.unicode.utf8ValidateSlice(s)) return false;
+                if (t.kind == .null_only) return false;
+                // Every other string stays a slice of the input, which outlives the write.
+                const owned = if (escaped) try a.dupe(u8, s) else s;
+                try x.values.append(a, owned);
+                if (x.max_def > 0) try x.def_levels.append(a, 1);
+            },
+            .f32 => unreachable,
+        }
+        return true;
+    }
+
+    fn finish(b: *Builder, piece: *window_mod.Piece, s: *Source, i: usize) !void {
+        const pa = piece.arena.allocator();
+        piece.agg.num_rows = b.rows;
+        piece.bits_prefix = try consumer.plainBitsPrefix(pa, &piece.agg);
+        @memcpy(s.max_abs[i * b.cols.len ..][0..b.cols.len], b.max_abs);
+        _ = s.rows.fetchAdd(b.rows, .monotonic);
+    }
+};
+
+fn columnLane(t: Type) std.meta.Tag(consumer.OutputAggregator.ColumnBuf) {
+    return switch (t.kind) {
+        .int64, .timestamp => .i64,
+        .decimal => if (t.decimalInt64()) .i64 else .i128,
+        .float64 => .f64,
+        .date => .i32,
+        .boolean => .boolean,
+        .string, .binary, .null_only => .string,
+    };
+}
+
+// ---------------------------------------------------------------- the write
+
+/// Chunk size: small enough that a window of chunks per worker stays well inside the budget, large enough that
+/// per-chunk work (a quote count, a record search, a piece) is noise. Never changes the output's bytes.
+fn chunkBytes(opts: Options, args: QueryArgs, workers: usize, file_bytes: usize) usize {
+    if (opts.chunk_bytes) |c| return @max(c, 1);
+    const per_worker = args.max_memory / 16 / @max(1, workers);
+    return std.math.clamp(@min(per_worker, file_bytes / @max(1, workers) + 1), 256 << 10, 4 << 20);
+}
+
+/// Write the CSV file at `path` to `out_path` as Parquet. On a refusal, `failure` says where and why.
+pub fn run(
+    ctx: Context,
+    args: QueryArgs,
+    path: []const u8,
+    out_path: []const u8,
+    opts: Options,
+    report: *Report,
+    report_alloc: std.mem.Allocator,
+) !WriteResult {
+    const failure = &report.failure;
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    if (std.mem.startsWith(u8, path, "s3://")) return error.CsvRemoteInput;
+    const t_open = nowMonoNs();
+    const mapped = local_fs.mapFile(path) catch |e| switch (e) {
+        error.EmptyFile => {
+            failure.* = .{ .kind = .empty };
+            return error.CsvEmpty;
+        },
+        else => return e,
+    };
+    defer mapped.unmap();
+    var p = try plan(arena, mapped.bytes, opts, failure);
+    const workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
+    const chunk = chunkBytes(opts, args, workers, mapped.bytes.len);
+    const widened = try report_alloc.alloc(bool, p.names.len);
+    @memset(widened, false);
+    report.widened = widened;
+    while (true) {
+        var source = try Source.init(arena, &p, chunk);
+        report.chunks = source.count;
+        const result = writeOnce(ctx, args, out_path, &source, t_open) catch |e| {
+            if (source.firstFailure()) |f| failure.* = f.*;
+            if (e != error.CsvTypeChanged or opts.strict or args.output_fd != null) return e;
+            // Widen to what every value holds, then start again.
+            const seen = try classifyFile(ctx, arena, &p, chunk, workers, failure);
+            for (p.types, seen, p.pinned, widened) |*t, s, pinned, *wd| if (!pinned) {
+                const j = t.join(s);
+                wd.* = wd.* or !std.meta.eql(j, t.*);
+                t.* = j;
+            };
+            report.restarts += 1;
+            if (report.restarts > 2) return e; // the join of the whole file holds every value; a third pass is a bug
+            continue;
+        };
+        try mapped.intact(path);
+        report.types = try report_alloc.dupe(Type, p.types);
+        report.names = p.names; // on the write's arena: copied below
+        const names = try report_alloc.alloc([]const u8, p.names.len);
+        for (names, p.names) |*d, n| d.* = try report_alloc.dupe(u8, n);
+        report.names = names;
+        return result;
+    }
+}
+
+/// Every chunk's types, joined: the quote parities first (each chunk alone), then every chunk's records.
+fn classifyFile(
+    ctx: Context,
+    arena: std.mem.Allocator,
+    p: *const Plan,
+    chunk: usize,
+    workers: usize,
+    failure: *Failure,
+) ![]Type {
+    var source = try Source.init(arena, p, chunk);
+    source.classify = true;
+    source.seen = try arena.alloc(Type, source.count * p.names.len);
+    var threaded: std.Io.Threaded = .init(ctx.gpa, .{ .async_limit = .limited(@max(1, workers)) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Task = struct {
+        fn stats(s: *Source, t_io: std.Io, i: usize) void {
+            const lo = s.bound(i);
+            s.stats[i] = csv_scan.chunkStats(s.plan.bytes[lo..s.bound(i + 1)], s.plan.dialect.quote);
+            s.ready[i].set(t_io);
+        }
+        fn classify(s: *Source, t_io: std.Io, i: usize) void {
+            s.produce(t_io, null, i) catch {};
+        }
+    };
+    {
+        var group: std.Io.Group = .init;
+        for (0..source.count) |i| group.async(io, Task.stats, .{ &source, io, i });
+        group.await(io) catch {};
+    }
+    {
+        var group: std.Io.Group = .init;
+        for (0..source.count) |i| group.async(io, Task.classify, .{ &source, io, i });
+        group.await(io) catch {};
+    }
+    if (source.firstFailure()) |f| {
+        failure.* = f.*;
+        return switch (f.kind) {
+            .field_count => error.CsvFieldCount,
+            else => error.CsvMalformed,
+        };
+    }
+    const ncols = p.names.len;
+    const out = try arena.alloc(Type, ncols);
+    @memset(out, .{});
+    for (0..source.count) |i| for (out, source.seen[i * ncols ..][0..ncols]) |*o, s| {
+        o.* = o.join(s);
+    };
+    return out;
+}
+
+fn resolveBlooms(
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    names: []const []const u8,
+    elems: []const schema.SchemaElement,
+) ![]const ?f64 {
+    if (args.bloom_filters.len == 0) return &.{};
+    const out = try arena.alloc(?f64, names.len);
+    @memset(out, null);
+    for (args.bloom_filters) |spec| {
+        const i = for (names, 0..) |n, i| {
+            if (std.mem.eql(u8, n, spec.column)) break i;
+        } else {
+            Diag.setColumn(args.diag, spec.column);
+            return error.UnknownColumn;
+        };
+        if (elems[i].type == .BOOLEAN or elems[i].type == .FIXED_LEN_BYTE_ARRAY) {
+            Diag.setColumn(args.diag, spec.column);
+            return error.BloomFilterUnsupportedColumn;
+        }
+        out[i] = spec.fpp;
+    }
+    return out;
+}
+
+fn writeOnce(ctx: Context, args: QueryArgs, out_path: []const u8, source: *Source, t_open: i64) !WriteResult {
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var t: engine_types.Timings = .{};
+    t.read_ns = @intCast(nowMonoNs() - t_open);
+    const p = source.plan;
+    const blooms = try resolveBlooms(arena, args, p.names, source.elems);
+
+    var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+    defer if (args.profiler) |pr| pr.noteLedger(ledger.peak.load(.monotonic), args.max_memory);
+    const priority = args.compress_priority;
+    var zstd_counts: compression.ZstdModeCounts = .{};
+    const zstd: compression.ZstdPlan = .{ .lambda = priority.lambda(), .counts = &zstd_counts };
+
+    var out: write_mod.Output = .{ .path = out_path };
+    defer out.deinit();
+    try out.open(ctx, arena, args, .{});
+    t.output_started_ns = nowMonoNs();
+    var offset: u64 = 0;
+    try out.sink.write("PAR1");
+    offset += 4;
+
+    var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+    var page_indexes: page_index.Deferred = .{};
+    const sizing = window_mod.writeWindowFor(ctx, args, source.chunk *| 3, source.count);
+    const slots = try arena.alloc(window_mod.Slot, source.count);
+    for (slots) |*s| s.* = .{ .meta_arena = std.heap.ArenaAllocator.init(ctx.gpa) };
+    defer for (slots) |*s| s.meta_arena.deinit();
+    var memory: core_memory.Charged = .{ .child = ctx.gpa, .budget = &ledger };
+    var slicing: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &ledger };
+    var lean_ledger: core_memory.SharedBudget = .{ .limit = core_memory.lean_decode };
+    var lean: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = &lean_ledger };
+    const regions = try arena.alloc(window_mod.WorkRegions, @max(sizing.workers, 1) + sizing.budget + 1);
+    for (regions) |*r| {
+        r.* = .init(ctx.gpa);
+        r.rows.budget = &ledger;
+        r.work.budget = &ledger;
+        r.rows.allowance = huge_pages.huge_page_size;
+    }
+    defer for (regions) |*r| r.deinit();
+    var window_sem: std.Io.Semaphore = .{ .permits = sizing.units };
+    var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
+    var w = window_mod.WinCtx{
+        .worker_io = ctx.worker_io,
+        .rg_target = args.row_group.under(args.max_memory_explicit),
+        .out_elems = source.elems,
+        .out_paths = source.paths,
+        .page_indexes = &page_indexes,
+        .memory = &memory,
+        .slicing = &slicing,
+        .lean = &lean,
+        .win_unit = sizing.unit,
+        .win_units = sizing.units,
+        .gpa = ctx.gpa,
+        .jobs = &.{},
+        .filter = null,
+        .fetch_arr = &.{},
+        .output_specs = &.{},
+        .kept_set = null,
+        .codec = args.codec orelse .SNAPPY,
+        .zstd = zstd,
+        .parquet_version = args.parquet_version,
+        .decode_options = .{},
+        .bloom_outputs = blooms,
+        .dictionary_bloom = args.bloom_filters_enabled,
+        .slots = slots,
+        .regions = regions,
+        .window = &window_sem,
+        .completions = &completions_sem,
+        .sink = out.sink,
+        .out_offset = offset,
+        .new_row_groups = &new_row_groups,
+        .arena = arena,
+        .profiler = args.profiler,
+        .diag = args.diag,
+        .source = source.pieceSource(),
+    };
+    w.cpu_budget = sizing.budget;
+    w.piece_pool = .{ .gpa = ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = &ledger };
+    defer w.piece_pool.deinit();
+    w.piece_pages.child = w.outAlloc();
+    const t_scan = nowMonoNs();
+    try window_mod.runWindowedReencode(&w, sizing.workers, ctx.env);
+    t.decode_wall_ns = @intCast(nowMonoNs() - t_scan);
+    t.core.sink_ns += w.sink_ns;
+    t.core.encode_ns += w.core.encode_ns;
+    offset = w.out_offset;
+
+    // Page indexes and Bloom filters after the row groups, then the footer: DECIMAL precision from the data, every
+    // bound in TYPE_DEFINED_ORDER.
+    const t_footer = nowMonoNs();
+    var so: streaming.SinkOut = .{ .sink = out.sink, .offset = @intCast(offset) };
+    try page_indexes.write(arena, &so, new_row_groups.items);
+    try fastpath.placeFilters(&so, new_row_groups.items);
+    const ncols = p.names.len;
+    var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    try items.append(arena, .{
+        .name = "schema",
+        .type = null,
+        .repetition_type = null,
+        .type_length = null,
+        .num_children = @intCast(ncols),
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    });
+    for (source.elems, p.types, 0..) |e, ty, c| {
+        var elem = e;
+        if (ty.kind == .decimal) {
+            var max: u128 = 0;
+            for (0..source.count) |i| max = @max(max, source.max_abs[i * ncols + c]);
+            const prec: i32 = csv_types.decimalPrecision(ty, max);
+            elem.precision = prec;
+            elem.logical_type = .{ .DECIMAL = .{ .scale = ty.scale, .precision = prec } };
+        }
+        try items.append(arena, elem);
+    }
+    const meta: schema.FileMetaData = .{
+        .version = args.parquet_version.footer(),
+        .schema = items,
+        .num_rows = @intCast(w.rows_kept),
+        .created_by = schema.ZPQ_CREATED_BY,
+        .row_groups = new_row_groups,
+        .column_orders = try schema.FileMetaData.outputColumnOrders(arena, ncols, null, &.{}),
+    };
+    var tw: thrift.Writer = .init(arena);
+    try meta.write(&tw);
+    try so.write(tw.bytes());
+    var len: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len, std.math.cast(u32, tw.bytes().len) orelse return error.TooLarge, .little);
+    try so.write(&len);
+    try so.write("PAR1");
+    t.footer_ns = @intCast(nowMonoNs() - t_footer);
+    if (try out.finish()) |mp| {
+        t.mp_complete_ns = mp.complete_ns;
+        t.mp_await_ns = mp.await_ns;
+    }
+    const rows: i64 = @intCast(source.rows.load(.monotonic));
+    return .{
+        .codec = args.codec orelse .SNAPPY,
+        .files_in = 1,
+        .rows_in = rows,
+        .rows_scanned = rows,
+        .rows_matched = w.rows_kept,
+        .bytes_in = p.bytes.len,
+        .bytes_out = so.offset,
+        .row_groups_in = 0,
+        .row_groups_kept = w.rgs_kept,
+        .timings = t,
+    };
+}

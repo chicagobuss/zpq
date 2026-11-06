@@ -310,64 +310,12 @@ fn runWriteOver(
     const zstd: compression.ZstdPlan = .{ .lambda = priority.lambda(), .counts = &zstd_counts };
 
     // 4. Open output sink: local fd or s3 multipart.
-    var fd_sink: FdSink = .{ .fd = 0, .share = shares };
-    var mp_sink: ?multipart_sink.MultipartSink = null;
-    var sink: streaming.Sink = undefined;
-    var sink_owns_fd = false;
-    defer if (sink_owns_fd) local_fs.close(fd_sink.fd);
-    var out_owned_pool: ?*s3.Pool(POOL_SIZE) = null;
-    defer if (out_owned_pool) |p| p.deinit();
-    defer if (mp_sink) |*ms| {
-        if (!ms.isClosed()) ms.abort();
-        ms.deinit();
-    };
-
-    // A failed write must not leave a truncated local file that looks like output.
-    var remove_on_error = false;
-    errdefer if (remove_on_error) local_fs.removeFile(out_path);
-    if (out_is_s3) {
-        const out_url = s3.Url.parse(out_path) catch return error.BadOutputUrl;
-        const creds = try credentialsFromEnv(ctx.env);
-        const out_criteria = try s3.poolCriteria(arena, creds, out_url.bucket);
-        const out_pool: *OutputLane = if (ctx.pool_registry) |reg|
-            try reg.ensure_output(reg.ctx, ctx.gpa, creds, out_url.bucket)
-        else blk: {
-            const p = try arena.create(s3.Pool(POOL_SIZE));
-            try p.init(ctx.gpa);
-            out_owned_pool = p;
-            const lane = try arena.create(OutputLane);
-            lane.init(p);
-            break :blk lane;
-        };
-        mp_sink = multipart_sink.MultipartSink.init(
-            ctx.io,
-            ctx.gpa,
-            arena,
-            creds,
-            out_url,
-            out_pool,
-            out_criteria,
-            .{
-                .profiler = args.profiler,
-                .diag = args.diag,
-                // Parts uploading at once come out of the query's budget too: an eighth of it, at least two parts.
-                .max_bytes_in_flight = @max(
-                    2 * multipart_sink.TARGET_PART_SIZE,
-                    @min(multipart_sink.DEFAULT_MAX_BYTES_IN_FLIGHT, args.max_memory / 8),
-                ),
-            },
-        );
-        sink = .{
-            .ctx = @ptrCast(&mp_sink.?),
-            .write_fn = multipart_sink.sinkWriteFn,
-        };
-    } else {
-        fd_sink.fd = args.output_fd orelse made_fd.?;
-        made_fd = null;
-        remove_on_error = args.output_fd == null;
-        sink_owns_fd = args.output_fd == null;
-        sink = fd_sink.sink();
-    }
+    var out: Output = .{ .path = out_path };
+    defer out.deinit();
+    // The sink takes over the descriptor made above, and with it removing the file on failure.
+    try out.open(ctx, arena, args, .{ .fd = made_fd, .share = shares });
+    made_fd = null;
+    const sink = out.sink;
 
     // 5. Stream output. PAR1 magic, then per-file × per-RG
     //    encodeRG/copyRG, then footer.
@@ -483,16 +431,9 @@ fn runWriteOver(
 
     // Publish only after the sink has reported completion, and only what was read of inputs that stayed whole.
     try opened.intact();
-    if (mp_sink) |*ms| {
-        try ms.close();
-        const mp_stats = ms.snapshotStats();
+    if (try out.finish()) |mp_stats| {
         t.mp_complete_ns = mp_stats.complete_ns;
         t.mp_await_ns = mp_stats.await_ns;
-    }
-
-    if (sink_owns_fd) {
-        sink_owns_fd = false;
-        try local_fs.closeChecked(fd_sink.fd);
     }
 
     return .{
@@ -1092,6 +1033,94 @@ fn inputLocal(arena: std.mem.Allocator, opened: input.OpenedInputs) ![]const boo
     for (local, opened.mmaps) |*l, m| l.* = m != null;
     return local;
 }
+
+/// A write's destination: a local file, removed again if the write fails before `finish`, or an S3 multipart
+/// upload, aborted then. `open` fills it in place, as `sink` points into it.
+pub const Output = struct {
+    path: []const u8,
+    sink: streaming.Sink = undefined,
+    fd_sink: FdSink = .{ .fd = 0 },
+    mp_sink: ?multipart_sink.MultipartSink = null,
+    owned_pool: ?*s3.Pool(POOL_SIZE) = null,
+    owns_fd: bool = false,
+    /// A failed write must not leave a truncated local file that looks like output.
+    remove_on_error: bool = false,
+    finished: bool = false,
+
+    /// What the caller already decided about a local output: the file it made (`fd`, now the sink's to close or
+    /// remove), and whether it shares blocks with the inputs (`sharesBlocks`), so byte copies may clone ranges.
+    pub const Local = struct { fd: ?local_fs.fd_t = null, share: bool = false };
+
+    pub fn open(o: *Output, ctx: Context, arena: std.mem.Allocator, args: QueryArgs, local: Local) !void {
+        if (std.mem.startsWith(u8, o.path, "s3://")) {
+            const out_url = s3.Url.parse(o.path) catch return error.BadOutputUrl;
+            const creds = try credentialsFromEnv(ctx.env);
+            const out_criteria = try s3.poolCriteria(arena, creds, out_url.bucket);
+            const out_pool: *OutputLane = if (ctx.pool_registry) |reg|
+                try reg.ensure_output(reg.ctx, ctx.gpa, creds, out_url.bucket)
+            else blk: {
+                const p = try arena.create(s3.Pool(POOL_SIZE));
+                try p.init(ctx.gpa);
+                o.owned_pool = p;
+                const lane = try arena.create(OutputLane);
+                lane.init(p);
+                break :blk lane;
+            };
+            o.mp_sink = multipart_sink.MultipartSink.init(
+                ctx.io,
+                ctx.gpa,
+                arena,
+                creds,
+                out_url,
+                out_pool,
+                out_criteria,
+                .{
+                    .profiler = args.profiler,
+                    .diag = args.diag,
+                    // Parts uploading at once come out of the query's budget too: an eighth of it, at least two parts.
+                    .max_bytes_in_flight = @max(
+                        2 * multipart_sink.TARGET_PART_SIZE,
+                        @min(multipart_sink.DEFAULT_MAX_BYTES_IN_FLIGHT, args.max_memory / 8),
+                    ),
+                },
+            );
+            o.sink = .{
+                .ctx = @ptrCast(&o.mp_sink.?),
+                .write_fn = multipart_sink.sinkWriteFn,
+            };
+        } else {
+            o.fd_sink = .{ .fd = args.output_fd orelse local.fd orelse try createFile(o.path), .share = local.share };
+            o.remove_on_error = args.output_fd == null;
+            o.owns_fd = args.output_fd == null;
+            o.sink = o.fd_sink.sink();
+        }
+    }
+
+    /// Complete the upload (its completion's timings) or close the file.
+    pub fn finish(o: *Output) !?multipart_sink.MultipartSink.Stats {
+        var stats: ?multipart_sink.MultipartSink.Stats = null;
+        if (o.mp_sink) |*ms| {
+            try ms.close();
+            stats = ms.snapshotStats();
+        }
+        if (o.owns_fd) {
+            o.owns_fd = false;
+            try local_fs.closeChecked(o.fd_sink.fd);
+        }
+        o.finished = true;
+        return stats;
+    }
+
+    pub fn deinit(o: *Output) void {
+        if (o.mp_sink) |*ms| {
+            if (!ms.isClosed()) ms.abort();
+            ms.deinit();
+        }
+        if (o.owned_pool) |p| p.deinit();
+        if (o.owns_fd) local_fs.close(o.fd_sink.fd);
+        if (!o.finished and o.remove_on_error) local_fs.removeFile(o.path);
+    }
+};
 
 pub const FdSink = struct {
     fd: local_fs.fd_t,

@@ -203,7 +203,7 @@ pub const Piece = struct {
         _ = p.refs.fetchAdd(1, .monotonic);
     }
 
-    fn unref(p: *Piece, gpa: std.mem.Allocator) void {
+    pub fn unref(p: *Piece, gpa: std.mem.Allocator) void {
         if (p.refs.fetchSub(1, .acq_rel) != 1) return;
         if (p.pool) |pool| pool.give(p) else p.destroy(gpa);
     }
@@ -212,6 +212,18 @@ pub const Piece = struct {
         p.arena.deinit();
         gpa.destroy(p);
     }
+};
+
+/// What feeds a write window in place of Parquet row groups (`WinCtx.jobs`): `count` items, each produced into a
+/// piece by `produce` on a producer, in any order, and fed to the assembler in item order. A source's items are never
+/// byte-copied or sliced: an error from `produce` stops the write as a decode error does.
+pub const PieceSource = struct {
+    ctx: *anyopaque,
+    count: usize,
+    /// Fill a piece (`WinCtx.takePiece`) with item `i`'s rows.
+    produce: *const fn (ctx: *anyopaque, w: *WinCtx, i: usize) anyerror!*Piece,
+    /// What one item's piece is expected to hold, for the window's byte budget.
+    item_bytes: u64,
 };
 
 /// Freed pieces with their arenas reset but their memory kept, for the producers' next pieces: a piece's rows are
@@ -1115,6 +1127,8 @@ pub const WinCtx = struct {
     out_paths: []const []const []const u8 = &.{},
     /// Producer turns the writer holds while it slices a row group alone.
     writer_turns: usize = 0,
+    /// Pieces come from here instead of `jobs` (a CSV file's chunks).
+    source: ?PieceSource = null,
     executor: ?*EncodeExecutor = null,
     /// Freed producers' pieces, kept for reuse.
     piece_pool: PiecePool = .{ .gpa = undefined },
@@ -1196,6 +1210,15 @@ pub const WinCtx = struct {
         return w.piece_pages.allocator();
     }
 
+    /// An empty piece for a source to fill, its memory reused from freed pieces where there is some.
+    pub fn takePiece(w: *WinCtx) !*Piece {
+        return w.piece_pool.take();
+    }
+
+    fn items(w: *const WinCtx) usize {
+        return if (w.source) |s| s.count else w.jobs.len;
+    }
+
     fn trimIdle(w: *WinCtx) void {
         if (w.encode_scratch) |scratch| scratch.trimIdle();
         for (w.regions) |*r| {
@@ -1228,6 +1251,7 @@ pub const WinCtx = struct {
 };
 
 fn winProducer(w: *WinCtx, i: usize) void {
+    if (w.source) |src| return sourceProducer(w, src, i);
     const ma = w.slots[i].meta_arena.allocator();
     const prof = profile.threadOf(w.profiler, .encode);
     const span = profile.Span.begin(prof);
@@ -1264,6 +1288,30 @@ fn winProducer(w: *WinCtx, i: usize) void {
         regions.work.trim();
     };
     const held = enc.bytes.len + if (enc.piece) |p| p.arena.queryCapacity() else 0;
+    profile.gauge(prof, .buffered_bytes, @intCast(held));
+    const now = w.inflight.fetchAdd(held, .acq_rel) + held;
+    var p = w.peak_bytes.load(.monotonic);
+    while (now > p) p = w.peak_bytes.cmpxchgWeak(p, now, .monotonic, .monotonic) orelse break;
+    w.slots[i].enc = enc;
+    w.slots[i].done.store(true, .release);
+    w.completions.post(w.io);
+}
+
+/// Item `i` of a piece source, into its slot for the writer.
+fn sourceProducer(w: *WinCtx, src: PieceSource, i: usize) void {
+    const prof = profile.threadOf(w.profiler, .encode);
+    const span = profile.Span.begin(prof);
+    defer span.end(.encode_rg, profile.args(.{ 0, i, false }));
+    // Parsing takes one of the CPU turns encode tasks share; at most half of them parse (`runWindowed`).
+    const executor = w.executor.?;
+    executor.slots.waitUncancelable(w.io);
+    const produced = src.produce(src.ctx, w, i);
+    executor.slots.post(w.io);
+    const enc: EncodedRG = if (produced) |piece|
+        .{ .piece = piece, .surviving = @intCast(piece.agg.num_rows) }
+    else |e|
+        .{ .err = e };
+    const held = if (enc.piece) |p| p.arena.queryCapacity() else 0;
     profile.gauge(prof, .buffered_bytes, @intCast(held));
     const now = w.inflight.fetchAdd(held, .acq_rel) + held;
     var p = w.peak_bytes.load(.monotonic);
@@ -1550,10 +1598,13 @@ fn winWriter(w: *WinCtx) void {
             asm_.feed(p) catch |e| {
                 w.first_err = e;
             };
-            if (w.first_err == null and next + 1 < w.slots.len and w.out_elems.len > w.executor.?.workers and
-                asm_.shouldCompact()) asm_.compactCarry() catch |e| {
-                w.first_err = e;
-            };
+            // A source's pieces are already chunk-sized: copying their carried rows would only redo the copy on
+            // every piece of a wide row group.
+            const compactable = w.source == null and w.out_elems.len > w.executor.?.workers;
+            if (w.first_err == null and compactable and next + 1 < w.slots.len and asm_.shouldCompact())
+                asm_.compactCarry() catch |e| {
+                    w.first_err = e;
+                };
         } else if (enc.deferred) {
             defer w.jobs[next].leave();
             // Under a ledger the slices are decoded alone: the writer takes every producer's turn, so those running
@@ -1635,7 +1686,7 @@ pub fn runWindowedReencode(w: *WinCtx, async_budget: usize, env: ?std.process.En
         w.win_units = 1;
         w.window.* = .{ .permits = 1 };
     }
-    return runWindowed(WinCtx, w, w.jobs.len, @min(async_budget, w.cpu_budget));
+    return runWindowed(WinCtx, w, w.items(), @min(async_budget, w.cpu_budget));
 }
 
 /// Drive the fan-out: `Ctx.writer` on a dedicated thread plus `async_budget` concurrent `Ctx.producer` calls on pool
@@ -1659,7 +1710,12 @@ pub fn runWindowed(comptime Ctx: type, w: *Ctx, n_jobs: usize, async_budget: usi
         threaded = .init(w.gpa, .{ .async_limit = .limited(1 + 2 * (async_budget + encoders)) });
         w.io = threaded.?.io();
     }
-    const producer_count = async_budget;
+    // A piece source's producers parse about as much as its row groups take to encode, and there are many of them, so
+    // at most half the CPU turns parse and the rest stay free for encoding; a Parquet job's producers take any turn.
+    const producer_count = if (Ctx == WinCtx and w.source != null and w.cpu_budget > 1)
+        @max(1, @min(async_budget, w.cpu_budget / 2))
+    else
+        async_budget;
     w.cpu = .{ .permits = producer_count };
     if (@hasField(Ctx, "producers")) w.producers = producer_count;
     var executor: EncodeExecutor = undefined;
@@ -1874,17 +1930,22 @@ const WriteWindow = struct {
 ///     polite (a modest cap, a small fraction of what is available).
 /// A tight byte budget may cut the workers below the CPU budget: idle workers beat exceeding the memory cap.
 pub fn writeWindow(ctx: Context, args: QueryArgs, jobs: []const RGJob) WriteWindow {
-    const async_budget = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
     var sum_bytes: u64 = 0;
     for (jobs) |j| sum_bytes += @intCast(@max(@as(i64, 0), j.rg.total_byte_size));
-    const avg_rg = @max(@as(u64, 1), sum_bytes / @max(@as(u64, 1), jobs.len));
+    return writeWindowFor(ctx, args, sum_bytes / @max(@as(u64, 1), jobs.len), jobs.len);
+}
+
+/// `writeWindow` for `count` items holding `avg_bytes` each in flight.
+pub fn writeWindowFor(ctx: Context, args: QueryArgs, avg_bytes: u64, count: usize) WriteWindow {
+    const async_budget = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
+    const avg_rg = @max(@as(u64, 1), avg_bytes);
     // Never more than a quarter of the query's budget: the S3 fetch window takes another (`s3FetchWindow`), and the
     // rest is for the producers' decode and encode working sets.
     const inflight_budget: u64 = @min(@as(u64, args.max_memory) / 4, if (system.onLambda(ctx.env))
         system.discoverAvailableMemory(ctx.env) / 2
     else
         @min(@as(u64, 256) * 1024 * 1024, system.discoverAvailableMemory(ctx.env) / 8));
-    const window = system.windowCapacity(inflight_budget, avg_rg, jobs.len);
+    const window = system.windowCapacity(inflight_budget, avg_rg, count);
     const unit = @max(@as(u64, 1), inflight_budget / window_units);
     return .{
         .workers = @min(async_budget, window),
@@ -1916,6 +1977,8 @@ fn jobUnits(job: RGJob, unit: u64, units: usize) usize {
 /// `jobUnits` for job `i` of a write fan-out context; one permit for a context that counts row groups instead.
 fn windowPermits(comptime Ctx: type, w: *const Ctx, i: usize) usize {
     if (!@hasField(Ctx, "win_unit")) return 1;
+    if (@hasField(Ctx, "source")) if (w.source) |s|
+        return @intCast(std.math.clamp(std.math.divCeil(u64, s.item_bytes, w.win_unit) catch 1, 1, w.win_units));
     return jobUnits(w.jobs[i], w.win_unit, w.win_units);
 }
 

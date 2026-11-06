@@ -54,8 +54,11 @@ A SELECT item, a HAVING comparison or an ORDER BY term may be an expression over
 group after aggregation, never per input row, and typed as DuckDB types it: `+ - *` stay exact over integers and
 DECIMALs (a DECIMAL result of at most 38 digits, else an error), `/` is DOUBLE (a zero divisor gives an infinity or
 NaN), anything with a DOUBLE is DOUBLE, NULL propagates, `round` goes half away from zero (a non-finite input stays
-as it is), and an AVG reads as DOUBLE from its exact sum and count (never from the rounded DECIMAL mean zpq answers a
-bare AVG of a DECIMAL column with). Integer results are checked in the SQL type DuckDB gives the operation, not in 128
+as it is; a DECIMAL rounds to the same precision, one digit wider for a whole number rounded to tens and up, and a
+result past 38 digits is an overflow error), and an AVG reads as DOUBLE from its exact sum and count (never from the
+rounded DECIMAL mean zpq answers a bare AVG of a DECIMAL column with). That DOUBLE is DuckDB's to the last bit, which
+decides a ROUND at a cent and a HAVING: DuckDB divides the sum by the count times the double 10^scale in `long double`
+inside a GROUP BY or a FILTER, and casts the sum to a double before dividing in a query with neither. Integer results are checked in the SQL type DuckDB gives the operation, not in 128
 bits: COUNT is BIGINT, SUM HUGEINT, MIN and MAX their column's own type, a literal takes the other operand's type when
 its value fits it, and a result outside the type is an overflow error (`count(*) + 9223372036854775807`,
 `max(int32_col) + 2147483647`, `max(tinyint_col) + max(tinyint_col)`); a product of two DECIMALs that each fit 18 digits

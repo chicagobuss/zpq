@@ -231,7 +231,12 @@ pub const ResultProgram = struct {
         const arena = scratch.allocator();
         const types = try arena.alloc(scan.GroupColType, width);
         const ints = try arena.alloc(?expr_ast.IntType, width);
+        const rewritten = try arena.alloc(bool, width);
         const programs = try arena.alloc(?*const Compiled, width);
+        // A GROUP BY shows in the columns as a key, wherever it is listed.
+        const grouped = for (0..width) |j| {
+            if (self.column(j).role == .key) break true;
+        } else false;
         var raw: usize = 0;
         // Without GROUP BY every scanned column is an aggregate (`.named`); with it, the `.agg` ones are, and each takes
         // the next call, as the scan binds them.
@@ -239,6 +244,7 @@ pub const ResultProgram = struct {
         for (0..width) |j| {
             programs[j] = null;
             ints[j] = null;
+            rewritten[j] = false;
             const role = self.column(j).role;
             if (role == .derived) continue;
             types[j] = raw_types[raw];
@@ -247,6 +253,7 @@ pub const ResultProgram = struct {
                 if (next_call < self.calls.len) {
                     const source = if (next_call < self.sources.len) self.sources[next_call] else null;
                     ints[j] = scan.GroupColType.intType(self.calls[next_call], source);
+                    rewritten[j] = !grouped and self.calls[next_call].where == null;
                 }
                 next_call += 1;
             }
@@ -255,7 +262,7 @@ pub const ResultProgram = struct {
         for (0..width) |j| {
             const spec = self.column(j);
             if (spec.role != .derived) continue;
-            const program = try compile(arena, spec.post.?.*, types, ints);
+            const program = try compile(arena, spec.post.?.*, types, .{ .ints = ints, .rewritten = rewritten });
             programs[j] = program;
             types[j] = program.ty.column();
         }
@@ -557,8 +564,8 @@ const Compiled = struct {
 
     const Node = union(enum) {
         col: usize,
-        /// An `avg_state` pair read as the double SQL types an AVG: the exact sum over the count.
-        mean: usize,
+        /// An `avg_state` pair read as the double SQL types an AVG, by the formula DuckDB's plan for that AVG uses.
+        mean: struct { column: usize, rewritten: bool },
         int: i128,
         dec: i128,
         float: f64,
@@ -613,11 +620,20 @@ fn mulDec(a: expr_ast.Dec, b: expr_ast.Dec) error{DecimalScaleTooLarge}!expr_ast
     return .{ .precision = @max(@min(wide.precision, 18), wide.scale), .scale = wide.scale };
 }
 
+/// What `compile` knows of the scan's columns beside their lanes.
+const Facts = struct {
+    /// Each column's SQL integer type, where it has one.
+    ints: []const ?expr_ast.IntType,
+    /// An AVG column DuckDB plans as `CAST(sum AS DOUBLE) / CAST(count AS DOUBLE)`: one of a query with no GROUP BY, and
+    /// of a call with no FILTER. Every other AVG is finalized from its sum and count by the aggregate itself.
+    rewritten: []const bool,
+};
+
 fn compile(
     arena: std.mem.Allocator,
     e: expr_ast.PostExpr,
     types: []const scan.GroupColType,
-    ints: []const ?expr_ast.IntType,
+    facts: Facts,
 ) Error!*const Compiled {
     const out = try arena.create(Compiled);
     out.* = switch (e) {
@@ -629,11 +645,11 @@ fn compile(
                 // An AVG is DOUBLE whatever it averages, from the exact sum and count (`avg_state`), never from the
                 // DECIMAL mean zpq answers a bare AVG of a DECIMAL with.
                 if (t.lane != .avg and t.lane != .avg_dec) return error.TypeMismatch;
-                break :blk .{ .ty = .float, .node = .{ .mean = c.column } };
+                break :blk .{ .ty = .float, .node = .{ .mean = .{ .column = c.column, .rewritten = facts.rewritten[c.column] } } };
             }
             break :blk switch (t.lane) {
                 // A min or max of an expression has no integer type zpq resolves.
-                .i64 => .{ .ty = .{ .int = ints[c.column] orelse return error.PostAggTypeUnknown }, .node = .{ .col = c.column } },
+                .i64 => .{ .ty = .{ .int = facts.ints[c.column] orelse return error.PostAggTypeUnknown }, .node = .{ .col = c.column } },
                 .f64 => .{ .ty = .float, .node = .{ .col = c.column } },
                 .dec => .{ .ty = .{ .dec = t.dec.? }, .node = .{ .col = c.column } },
                 .string, .avg, .avg_dec => return error.TypeMismatch,
@@ -645,7 +661,7 @@ fn compile(
             .float => |f| .{ .ty = .float, .node = .{ .float = f } },
         },
         .neg => |inner| blk: {
-            const v = try compile(arena, inner.*, types, ints);
+            const v = try compile(arena, inner.*, types, facts);
             // `-2147483648` is the literal INTEGER minimum, not the negation of a BIGINT.
             if (v.lit) |n| {
                 const m = std.math.negate(n) catch return error.IntegerOverflowSub;
@@ -654,8 +670,8 @@ fn compile(
             break :blk .{ .ty = v.ty, .node = .{ .neg = v } };
         },
         .binary => |b| blk: {
-            const left = try compile(arena, b.left.*, types, ints);
-            const right = try compile(arena, b.right.*, types, ints);
+            const left = try compile(arena, b.left.*, types, facts);
+            const right = try compile(arena, b.right.*, types, facts);
             const ty: PostType = if (b.op == .div or left.ty == .float or right.ty == .float)
                 .float
             else if (left.ty == .dec or right.ty == .dec)
@@ -668,12 +684,14 @@ fn compile(
             break :blk .{ .ty = ty, .node = .{ .arith = .{ .op = b.op, .left = left, .right = right } } };
         },
         .round => |r| blk: {
-            const v = try compile(arena, r.value.*, types, ints);
+            const v = try compile(arena, r.value.*, types, facts);
             // Fewer digits than the scale: the type keeps its precision at the digits (none below the point for a
-            // negative count); otherwise rounding changes nothing.
+            // negative count); otherwise rounding changes nothing. DuckDB 2.0 gives a whole number rounded to tens, to
+            // hundreds... one more digit (`round(95::DECIMAL(2,0), -1)` is DECIMAL(3,0)), up to 38: only there can the
+            // rounded value leave the type.
             const ty: PostType = switch (v.ty) {
                 .dec => |d| if (r.digits >= d.scale) v.ty else .{ .dec = .{
-                    .precision = d.precision,
+                    .precision = if (d.scale == 0) @min(expr_ast.Dec.max_precision, d.precision + 1) else d.precision,
                     .scale = @intCast(@max(0, r.digits)),
                 } },
                 else => v.ty,
@@ -709,10 +727,10 @@ fn eval(node: *const Compiled, row: []const scan.AggValue) Error!?Raw {
             .dec => |d| .{ .i = d.v },
             else => error.TypeMismatch,
         },
-        .mean => |c| return switch (row[c]) {
+        .mean => |m| return switch (row[m.column]) {
             .null_val => null,
             .avg => |a| if (a.count == 0) null else .{ .f = (a.sum orelse return null) / @as(f64, @floatFromInt(a.count)) },
-            .avg_dec => |a| if (a.count == 0) null else .{ .f = decimalMean(a.sum orelse return null, a.spec.scale, a.count) },
+            .avg_dec => |a| if (a.count == 0) null else .{ .f = decimalMean(a.sum orelse return null, a.spec, a.count, m.rewritten) },
             else => error.TypeMismatch,
         },
         .int, .dec => |v| return .{ .i = v },
@@ -732,13 +750,15 @@ fn eval(node: *const Compiled, row: []const scan.AggValue) Error!?Raw {
                 .float => {
                     const x = asFloat(a.left.ty, l);
                     const y = asFloat(a.right.ty, r);
-                    return .{ .f = switch (a.op) {
-                        .add => x + y,
-                        .sub => x - y,
-                        .mul => x * y,
-                        // IEEE, as DuckDB's `/`: a zero divisor gives an infinity or NaN, never an error.
-                        .div => x / y,
-                    } };
+                    return .{
+                        .f = switch (a.op) {
+                            .add => x + y,
+                            .sub => x - y,
+                            .mul => x * y,
+                            // IEEE, as DuckDB's `/`: a zero divisor gives an infinity or NaN, never an error.
+                            .div => x / y,
+                        },
+                    };
                 },
                 .int => |t| return .{ .i = switch (a.op) {
                     .add => try inType(t, std.math.add(i128, l.i, r.i) catch return error.IntegerOverflowAdd, error.IntegerOverflowAdd),
@@ -771,19 +791,72 @@ fn eval(node: *const Compiled, row: []const scan.AggValue) Error!?Raw {
                 .float => .{ .f = roundDouble(v.f, r.digits) },
                 // An integer rounds to the same type, and DuckDB raises an overflow when the rounded value leaves it.
                 .int => |t| .{ .i = try inType(t, try roundDecimal(v.i, 0, r.digits), error.IntegerOverflowRound) },
-                .dec => |d| .{ .i = try roundDecimal(v.i, d.scale, r.digits) },
+                // The result keeps the argument's precision, which a rounding up to the next power of ten can pass
+                // (`round(99, -1)` of a DECIMAL(2, 0)): DuckDB's "Overflow in ROUND of DECIMAL(w)".
+                .dec => |d| .{ .i = try inPrecision(node.ty.asDec(), try roundDecimal(v.i, d.scale, r.digits)) },
             };
         },
     }
 }
 
-/// The DOUBLE an AVG over a DECIMAL is: the exact sum over `10^scale` over the count, rounded once, as DuckDB computes
-/// it from its own wide sum (never from a mean already rounded to a DECIMAL). 113 bits carry the quotient, so the one
-/// rounding to double is the only one that shows; a sum beyond 128 bits (two values near 10^38) falls back to double.
-fn decimalMean(sum: i192, scale: u8, count: i64) f64 {
-    const n: f128 = if (std.math.cast(i128, sum)) |v| @floatFromInt(v) else wideAsFloat(sum);
+/// `v`, which must be a value of the DECIMAL `spec`: fewer digits than its precision.
+fn inPrecision(spec: expr_ast.Dec, v: i128) error{DecimalOverflow}!i128 {
+    return if (@abs(v) >= @as(u128, @intCast(expr_ast.pow10(spec.precision)))) error.DecimalOverflow else v;
+}
+
+/// The DOUBLE an AVG over a DECIMAL(p, s) is, bit for bit as DuckDB 2.0 computes it from its exact sum and count (a
+/// last-bit difference flips a ROUND at a cent and a HAVING with it). Two plans compute it differently:
+///   - with no GROUP BY and no FILTER, DuckDB plans `CAST(sum AS DOUBLE) / CAST(count AS DOUBLE)`: the sum over 10^s
+///     rounded once to double (the cast is exact to the last bit), then divided by the count in double;
+///   - otherwise the aggregate finalizes it (`avg.cpp`): the sum is converted to a double from its two 64-bit words,
+///     divided by the count times the double 10^s. Up to 4 digits of precision (a SMALLINT inside) that is in double,
+///     above it in x87 `long double`, whose quotient rounds to 64 bits before the double's 53.
+/// A sum past 128 bits is no HUGEINT: DuckDB raises an overflow there, zpq answers with the mean from 113 bits.
+fn decimalMean(sum: i192, spec: expr_ast.Dec, count: i64, rewritten: bool) f64 {
+    const n: u64 = @intCast(count);
+    if (rewritten) return decimalAsDouble(sum, spec.scale) / @as(f64, @floatFromInt(n));
+    const wide = std.math.cast(i128, sum) orelse return decimalMeanWide(sum, spec.scale, count);
+    const scale = hugeintAs(f64, expr_ast.pow10(spec.scale));
+    if (spec.precision <= 4) return @as(f64, @floatFromInt(wide)) / (@as(f64, @floatFromInt(n)) * scale);
+    const divident: f80 = @as(f80, @floatFromInt(n)) * @as(f80, scale);
+    return @floatCast(hugeintAs(f80, wide) / divident);
+}
+
+/// `Hugeint::Cast<T>` of DuckDB: the low and the high word converted apart and added, so the only rounding is the add's
+/// (and the multiplication's, for a `double` high word; a power of ten below 2^53 words is exact in both).
+fn hugeintAs(comptime T: type, v: i128) T {
+    const lower: u64 = @truncate(@as(u128, @bitCast(v)));
+    const upper: i64 = @intCast(v >> 64);
+    const max_word: T = @floatFromInt(std.math.maxInt(u64));
+    if (upper == -1) return -@as(T, @floatFromInt(std.math.maxInt(u64) - lower)) - 1;
+    return @as(T, @floatFromInt(lower)) + @as(T, @floatFromInt(upper)) * (max_word + 1);
+}
+
+/// The double nearest `sum / 10^scale`, ties to even: DuckDB's cast of a DECIMAL to DOUBLE, which is exact to the last
+/// bit. A quotient of at least 55 bits is cut at 53, the rest deciding the rounding with the remainder as a sticky bit.
+fn decimalAsDouble(sum: i192, scale: u8) f64 {
+    if (sum == 0) return 0;
+    const n: u256 = @abs(sum);
+    const d: u256 = @intCast(expr_ast.pow10(scale));
+    const n_bits: i32 = 256 - @clz(n);
+    const d_bits: i32 = 256 - @clz(d);
+    const shift: u8 = @intCast(@max(0, 55 + d_bits - n_bits));
+    const scaled = n << shift;
+    const q = scaled / d;
+    const sticky = scaled % d != 0;
+    const drop: u8 = @intCast(256 - @clz(q) - 53);
+    const dropped = q & ((@as(u256, 1) << drop) - 1);
+    const half = @as(u256, 1) << (drop - 1);
+    var m: u256 = q >> drop;
+    if (dropped > half or (dropped == half and (sticky or m & 1 == 1))) m += 1;
+    const magnitude = std.math.ldexp(@as(f64, @floatFromInt(@as(u64, @intCast(m)))), @as(i32, drop) - @as(i32, shift));
+    return if (sum < 0) -magnitude else magnitude;
+}
+
+/// A mean of a sum beyond 128 bits, which DuckDB cannot make: the sum over 10^scale over the count in 113 bits.
+fn decimalMeanWide(sum: i192, scale: u8, count: i64) f64 {
     const per: f128 = @floatFromInt(expr_ast.pow10(scale));
-    const mean: f128 = n / per / @as(f128, @floatFromInt(count));
+    const mean: f128 = wideAsFloat(sum) / per / @as(f128, @floatFromInt(count));
     return @floatCast(mean);
 }
 
@@ -1283,7 +1356,8 @@ fn evalPostInts(
 ) !scan.AggValue {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const program = try compile(arena.allocator(), e, types, ints);
+    const rewritten: [16]bool = @splat(false);
+    const program = try compile(arena.allocator(), e, types, .{ .ints = ints, .rewritten = rewritten[0..types.len] });
     return postCell(program.ty, try eval(program, row));
 }
 
@@ -1365,7 +1439,7 @@ fn binary(op: expr_ast.PostOp, l: *const expr_ast.PostExpr, r: *const expr_ast.P
 
 test "integer arithmetic is checked in the SQL type DuckDB gives it, not in 128 bits" {
     // count(*) is BIGINT, sum HUGEINT, max(int32 column) INTEGER, max(int64 column) BIGINT.
-    const kinds = [_]?expr_ast.IntType{  .i64, .i128, .i32, .i64, .i8, .u8, .u64, .i16 };
+    const kinds = [_]?expr_ast.IntType{ .i64, .i128, .i32, .i64, .i8, .u8, .u64, .i16 };
     const types: [kinds.len]scan.GroupColType = @splat(.{ .lane = .i64, .nullable = true });
     const row = [_]scan.AggValue{
         .{ .i = 15 },
@@ -1416,7 +1490,7 @@ test "integer arithmetic is checked in the SQL type DuckDB gives it, not in 128 
 }
 
 test "negation and rounding of an integer overflow in its type" {
-    const kinds = [_]?expr_ast.IntType{  .i32, .i8, .u8, .i128 };
+    const kinds = [_]?expr_ast.IntType{ .i32, .i8, .u8, .i128 };
     const types: [kinds.len]scan.GroupColType = @splat(.{ .lane = .i64, .nullable = true });
     // -INT_MIN overflows INTEGER, -(-128) overflows TINYINT, a positive UTINYINT cannot be negated but 0 can.
     try std.testing.expectError(error.IntegerOverflowSub, evalPostInts(.{ .neg = &intCol(0) }, &types, &kinds, &[_]scan.AggValue{ .{ .i = -2147483648 }, .{ .i = 0 }, .{ .i = 0 }, .{ .i = 0 } }));
@@ -1483,6 +1557,84 @@ test "an AVG over a DECIMAL is the exact mean rounded once, never the rounded DE
     const pair = [_]scan.GroupColType{.{ .lane = .avg, .nullable = true }};
     try std.testing.expectEqual(@as(f64, 2.5), (try evalPost(mean, &pair, &.{.{ .avg = .{ .sum = 5, .count = 2 } }})).f);
     try std.testing.expect((try evalPost(mean, &pair, &.{.{ .avg = .{ .sum = null, .count = 0 } }})) == .null_val);
+}
+
+/// `e` over one column with the AVG plan chosen: DuckDB's rewrite (no GROUP BY, no FILTER) or the aggregate's own.
+fn evalPostPlan(e: expr_ast.PostExpr, types: []const scan.GroupColType, row: []const scan.AggValue, rewritten: bool) !scan.AggValue {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const ints: [16]?expr_ast.IntType = @splat(null);
+    const plan: [16]bool = @splat(rewritten);
+    const program = try compile(arena.allocator(), e, types, .{ .ints = ints[0..types.len], .rewritten = plan[0..types.len] });
+    return postCell(program.ty, try eval(program, row));
+}
+
+test "a high-scale DECIMAL AVG is DuckDB's double on each plan: the grouped finalizer's and the ungrouped rewrite's" {
+    // 0.145 as DECIMAL(38, 37), one value among two rows, one NULL. Grouped, DuckDB divides the sum by the double
+    // 10^37 (which is not 10^37) in long double: 0.14500000000000002, and round(., 2) is 0.15. With no GROUP BY it
+    // casts the sum to a double first: 0.145, and 0.14. Both verified against DuckDB 2.0.0.
+    const types = [_]scan.GroupColType{.{ .lane = .avg_dec, .dec = .{ .precision = 38, .scale = 37 }, .nullable = true }};
+    const mean: expr_ast.PostExpr = .{ .col = .{ .column = 0, .mean = true } };
+    const spec: expr_ast.Dec = .{ .precision = 38, .scale = 37 };
+    const row = [_]scan.AggValue{.{ .avg_dec = .{ .sum = 145 * std.math.pow(i192, 10, 34), .count = 1, .mean = null, .spec = spec } }};
+    try std.testing.expectEqual(@as(f64, 0.14500000000000002), (try evalPostPlan(mean, &types, &row, false)).f);
+    try std.testing.expectEqual(@as(f64, 0.145), (try evalPostPlan(mean, &types, &row, true)).f);
+    const rounded: expr_ast.PostExpr = .{ .round = .{ .value = &mean, .digits = 2 } };
+    try std.testing.expectEqual(@as(f64, 0.15), (try evalPostPlan(rounded, &types, &row, false)).f);
+    try std.testing.expectEqual(@as(f64, 0.14), (try evalPostPlan(rounded, &types, &row, true)).f);
+    // Up to 4 digits of precision the finalizer is in double, as DuckDB's SMALLINT states are.
+    const small = [_]scan.AggValue{.{ .avg_dec = .{ .sum = 123 + 456 + 789, .count = 3, .mean = null, .spec = .{ .precision = 4, .scale = 3 } } }};
+    const small_types = [_]scan.GroupColType{.{ .lane = .avg_dec, .dec = .{ .precision = 4, .scale = 3 }, .nullable = true }};
+    try std.testing.expectEqual(@as(f64, 0.456), (try evalPostPlan(mean, &small_types, &small, false)).f);
+    try std.testing.expectEqual(@as(f64, 0.456), (try evalPostPlan(mean, &small_types, &small, true)).f);
+}
+
+test "a DECIMAL becomes the double nearest it, ties to even, however far below a tie it sits" {
+    try std.testing.expectEqual(@as(f64, 1), decimalAsDouble(1, 0));
+    try std.testing.expectEqual(@as(f64, -0.3), decimalAsDouble(-3, 1));
+    try std.testing.expectEqual(@as(f64, 0.145), decimalAsDouble(145 * std.math.pow(i192, 10, 34), 37));
+    // 2^53 + 1 is a tie between 2^53 and 2^53 + 2: the even one. 2^53 + 3 is a tie between two odd multiples of 2.
+    const two53: i192 = 1 << 53;
+    try std.testing.expectEqual(@as(f64, 0x1p53), decimalAsDouble(two53 + 1, 0));
+    try std.testing.expectEqual(@as(f64, 0x1p53 + 4), decimalAsDouble(two53 + 3, 0));
+    // A tie plus a digit 19 places below the point: above the tie, so up. A quotient kept in 113 bits loses that digit.
+    const ten19 = std.math.pow(i192, 10, 19);
+    try std.testing.expectEqual(@as(f64, 0x1p53 + 2), decimalAsDouble((two53 + 1) * ten19 + 1, 19));
+    try std.testing.expectEqual(@as(f64, 0x1p53), decimalAsDouble((two53 + 1) * ten19 - 1, 19));
+    try std.testing.expectEqual(@as(f64, 0x1p53), decimalAsDouble((two53 + 1) * ten19, 19));
+    // Sums past 128 bits still convert.
+    try std.testing.expectEqual(@as(f64, 0x1p150), decimalAsDouble(@as(i192, 1) << 150, 0));
+}
+
+test "ROUND of a DECIMAL fails where the result leaves the precision, and not before" {
+    const wide = [_]scan.GroupColType{.{ .lane = .dec, .dec = .{ .precision = 38, .scale = 0 }, .nullable = true }};
+    const narrow = [_]scan.GroupColType{.{ .lane = .dec, .dec = .{ .precision = 2, .scale = 0 }, .nullable = true }};
+    const col: expr_ast.PostExpr = .{ .col = .{ .column = 0 } };
+    const tens: expr_ast.PostExpr = .{ .round = .{ .value = &col, .digits = -1 } };
+    const ten38 = std.math.pow(i128, 10, 38);
+    for ([_]i128{ 1, -1 }) |sign| {
+        // 10^38 - 6 rounds down to 10^38 - 10 and stays; 10^38 - 5 is a tie away from zero, to 10^38: 39 digits.
+        const below = [_]scan.AggValue{.{ .dec = .{ .v = sign * (ten38 - 6), .spec = .{ .precision = 38, .scale = 0 } } }};
+        const tie = [_]scan.AggValue{.{ .dec = .{ .v = sign * (ten38 - 5), .spec = .{ .precision = 38, .scale = 0 } } }};
+        try std.testing.expectEqual(sign * (ten38 - 10), (try evalPost(tens, &wide, &below)).dec.v);
+        try std.testing.expectError(error.DecimalOverflow, evalPost(tens, &wide, &tie));
+        // A DECIMAL(2, 0) rounded to tens is a DECIMAL(3, 0), as DuckDB types it: 94 to 90, 95 to 100, both held.
+        const low = [_]scan.AggValue{.{ .dec = .{ .v = sign * 94, .spec = .{ .precision = 2, .scale = 0 } } }};
+        const high = [_]scan.AggValue{.{ .dec = .{ .v = sign * 95, .spec = .{ .precision = 2, .scale = 0 } } }};
+        try std.testing.expectEqual(sign * 90, (try evalPost(tens, &narrow, &low)).dec.v);
+        const widened = try evalPost(tens, &narrow, &high);
+        try std.testing.expectEqual(sign * 100, widened.dec.v);
+        try std.testing.expectEqual(@as(u8, 3), widened.dec.spec.precision);
+    }
+    // Digits that keep the scale cannot overflow, and a scale above 0 does not widen: 99.99 rounds to 100 in a
+    // DECIMAL(4, 2) held as DECIMAL(4, 0).
+    const cents = [_]scan.GroupColType{.{ .lane = .dec, .dec = .{ .precision = 4, .scale = 2 }, .nullable = true }};
+    const row = [_]scan.AggValue{.{ .dec = .{ .v = 9999, .spec = .{ .precision = 4, .scale = 2 } } }};
+    const whole: expr_ast.PostExpr = .{ .round = .{ .value = &col, .digits = 0 } };
+    const at_tens = try evalPost(tens, &cents, &row);
+    try std.testing.expectEqual(@as(i128, 100), (try evalPost(whole, &cents, &row)).dec.v);
+    try std.testing.expectEqual(@as(i128, 100), at_tens.dec.v);
+    try std.testing.expectEqual(@as(u8, 4), at_tens.dec.spec.precision);
 }
 
 test "ROUND keeps a non-finite input whatever the digits, and zeroes only a finite input that overflows" {

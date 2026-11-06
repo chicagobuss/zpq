@@ -8,7 +8,9 @@
   once per group from the group's aggregates, typed as DuckDB types it (exact `+ - *` over integers and DECIMALs, `/` in
   DOUBLE, `round` half away from zero) and matches DuckDB. Integer results are checked in the SQL type DuckDB gives
   the operation (`count(*) + 9223372036854775807` and `max(int32_col) + 2147483647` overflow, as there), an AVG is
-  computed from the exact sum and count, and `round` keeps an infinity or NaN. A scan strategy that cuts groups early stands aside for such
+  computed from the exact sum and count in the DOUBLE DuckDB's own plan gives (grouped or filtered: its `long double`
+  finalizer; otherwise the sum cast to a double, then divided), `round` keeps an infinity or NaN, and a DECIMAL `round`
+  that leaves the result's precision (`round(sum(d), -1)` of 38 nines) is an overflow error. A scan strategy that cuts groups early stands aside for such
   a query. `%`, `||`, other functions and CASE inside the expression are refused by name.
 - **SELECT sugar in SQL.** `SELECT DISTINCT a, b` (one group per distinct row, NULLs together), `GROUP BY ALL`, `ORDER BY ... NULLS FIRST
   | LAST` (on aggregate results and on plain rows with a `LIMIT`; a row group whose statistics cannot bound its NULLs is

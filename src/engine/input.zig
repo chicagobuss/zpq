@@ -4,6 +4,7 @@ const profile = @import("../profile.zig");
 const local_fs = @import("../local_fs.zig");
 const local_reader = @import("../io/local_reader.zig");
 const fastpath = @import("../core/writer/fastpath.zig");
+const scan_read_ahead = @import("../core/scan/read_ahead.zig");
 const s3 = @import("../io/s3.zig");
 const s3_window = @import("../io/s3_window.zig");
 const tls = @import("../io/tls.zig");
@@ -1127,7 +1128,94 @@ pub const LocalIo = struct {
     plan: ?LocalPlan = null,
     resident: f64 = 0,
     coverage: f64 = 0,
+    /// How a pass over these files' mappings reads ahead of its workers (`scan.read_ahead`): every local scan on Linux
+    /// has one, used by whichever of its passes runs on the mapping (the cut-steered shapes, a mapped choice, the
+    /// count-ranked first pass), never by one the reader serves. Residency is weighed per item as it is advised.
+    read_ahead: ?scan_read_ahead.Config = null,
 };
+
+/// The mapped read-ahead of local inputs (`LocalIo.read_ahead`). Its window is a quarter of the query's budget, within
+/// the reader's own window (`s3_window.windowFor`) and never past a quarter of the host's memory: the pages are the
+/// page cache's, but a window past what the host holds would evict them before the workers reach them. Nor past what
+/// one of the device's hardware queues holds in flight (`deviceWindow`): advice past that waits in the block layer
+/// behind what is queued already, and the faults the workers issue meanwhile wait behind it. The scan caps it again by
+/// what the query's ledger has free as it advises (`ReadAhead.cap`).
+fn mappedReadAhead(arena: std.mem.Allocator, args: QueryArgs, opened: OpenedInputs) ?scan_read_ahead.Config {
+    if (@import("builtin").os.tag != .linux or !allLocal(opened)) return null;
+    const avail: u64 = system.discoverAvailableMemory(null);
+    var window: u64 = @min(@min(s3_window.windowFor(args.max_memory), args.max_memory / 4), avail / 4);
+    // One sysfs read per device the files sit on, not per file.
+    var block: usize = std.math.maxInt(usize);
+    var seen: ?[2]u32 = null;
+    for (opened.inputs) |in| {
+        const dev = deviceOf(arena, in.name) orelse {
+            block = @min(block, default_read_ahead);
+            continue;
+        };
+        if (seen) |d| if (d[0] == dev[0] and d[1] == dev[1]) continue;
+        seen = dev;
+        block = @min(block, deviceReadAhead(arena, dev));
+        window = deviceWindow(window, deviceQueueBytes(arena, dev), deviceReadAhead(arena, dev));
+    }
+    if (window == 0) return null;
+    // Residency and advice through each file's descriptor, where the mapping kept one (`scan_read_ahead.Config.fds`).
+    const fds = arena.alloc(i32, opened.mmaps.len) catch return .{ .window = window, .block = block };
+    for (opened.mmaps, fds) |m, *fd| fd.* = if (m) |mapped| mapped.fd orelse -1 else -1;
+    return .{ .window = window, .block = block, .fds = fds };
+}
+
+/// The kernel's own read-ahead default (`VM_READAHEAD_PAGES`), for a file whose device sysfs does not describe (tmpfs,
+/// an overlay, no sysfs).
+const default_read_ahead: usize = 128 << 10;
+
+/// The block device (major, minor) holding `path`.
+fn deviceOf(arena: std.mem.Allocator, path: []const u8) ?[2]u32 {
+    const linux = std.os.linux;
+    const z = arena.dupeSentinel(u8, path, 0) catch return null;
+    var st: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, z, 0, .{ .TYPE = true }, &st)) != .SUCCESS) return null;
+    return .{ st.dev_major, st.dev_minor };
+}
+
+/// The read-ahead of block device `dev`, in bytes: the most one `WILLNEED` call reads.
+fn deviceReadAhead(arena: std.mem.Allocator, dev: [2]u32) usize {
+    const kb = deviceQueue(arena, dev, "read_ahead_kb") orelse return default_read_ahead;
+    return kb << 10;
+}
+
+/// `window` within what one of a device's hardware queues holds in flight (`queue`, from `deviceQueueBytes`; null
+/// where sysfs does not say), but never below the device's own read-ahead (`read_ahead`): one fault puts that much in
+/// flight by itself, so a device whose queue holds less (a USB bridge's two requests of 1 MiB beside a 2 MiB
+/// read-ahead) still advises one read-ahead's worth instead of nothing.
+pub fn deviceWindow(window: u64, queue: ?u64, read_ahead: u64) u64 {
+    const q = queue orelse return window;
+    return @min(window, @max(q, read_ahead));
+}
+
+/// What one hardware queue of block device `dev` holds in flight, in bytes: its requests (`nr_requests`) at their
+/// largest (`max_sectors_kb`). Null where sysfs does not say.
+fn deviceQueueBytes(arena: std.mem.Allocator, dev: [2]u32) ?u64 {
+    const requests = deviceQueue(arena, dev, "nr_requests") orelse return null;
+    const kb = deviceQueue(arena, dev, "max_sectors_kb") orelse return null;
+    return std.math.mul(u64, requests, kb << 10) catch null;
+}
+
+/// A positive number from block device `dev`'s sysfs `queue/name`. A partition's queue is its disk's: the parent
+/// directory in sysfs.
+fn deviceQueue(arena: std.mem.Allocator, dev: [2]u32, name: []const u8) ?usize {
+    var buf: [32]u8 = undefined;
+    for ([_][]const u8{ "queue", "../queue" }) |dir| {
+        const file = std.fmt.allocPrintSentinel(arena, "/sys/dev/block/{d}:{d}/{s}/{s}", .{
+            dev[0], dev[1], dir, name,
+        }, 0) catch return null;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch continue;
+        defer _ = std.posix.system.close(fd);
+        const n = std.posix.read(fd, &buf) catch continue;
+        const v = std.fmt.parseInt(usize, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10) catch continue;
+        if (v > 0) return v;
+    }
+    return null;
+}
 
 /// The one choice every local read makes, scan or write: plan the reads (`metas` must be given when
 /// `localIoNeeds(...).plan`), weigh their residency, and pick the mapping or the reader (`Policy.choose`).
@@ -1176,7 +1264,14 @@ pub fn chooseLocalIo(
         @as(u64, if (local_plan != null) @intFromFloat(coverage * 1000) else std.math.maxInt(u32)),
         choice.reason,
     }));
-    return .{ .policy = policy, .choice = choice, .plan = local_plan, .resident = resident, .coverage = coverage };
+    return .{
+        .policy = policy,
+        .choice = choice,
+        .plan = local_plan,
+        .resident = resident,
+        .coverage = coverage,
+        .read_ahead = mappedReadAhead(arena, args, opened),
+    };
 }
 
 /// The inputs a query reads: `opened`'s own when `io` maps them, else the reader's over `io.plan` (`planLocalReader`),

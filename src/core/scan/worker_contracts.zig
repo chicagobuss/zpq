@@ -148,6 +148,8 @@ pub const Worker = struct {
     cursor: *std.atomic.Value(usize),
     /// Set once a pass is abandoned (`Census.distinct`): the worker claims no more items.
     stop: ?*const std.atomic.Value(bool) = null,
+    /// Shared by the pass's workers over mapped inputs: each claim advises the items after it (`read_ahead.zig`).
+    read_ahead: ?*@import("read_ahead.zig").ReadAhead = null,
     /// What a sketch's count pass reads: the outer filter's columns and the keys, no aggregate's (`Plan.forCalls`).
     count_columns: ?agg_plan.Columns = null,
     agg_calls: []const expr_agg.AggCall,

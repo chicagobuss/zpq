@@ -156,7 +156,8 @@ pub fn decimalShape(s: []const u8) ?DecimalShape {
         if (frac_len == 0 or i != s.len) return null;
     }
     const zero_int = int_len == 1 and s[int_start] == '0';
-    if (int_len + frac_len > max_decimal_digits) return null;
+    // Precision counts the digits of the unscaled value: `0.5` has one, not two.
+    if (@intFromBool(!zero_int) * int_len + frac_len > max_decimal_digits) return null;
     // Significant digits: the digit string without its leading zeros.
     var lead: usize = 0;
     for (s[int_start..]) |c| {
@@ -208,7 +209,7 @@ pub fn parseDecimal(s: []const u8, scale: u8, max_int: u8) ?i128 {
     if (int_len + frac <= 18) {
         r = v;
     } else {
-        if (int_len + frac > max_decimal_digits) return null;
+        if (@intFromBool(!zero_int) * int_len + frac > max_decimal_digits) return null;
         r = 0;
         for (s[int_start..]) |c| {
             if (c == '.') continue;
@@ -602,8 +603,9 @@ pub fn schemaElement(name: []const u8, t: Type) schema.SchemaElement {
                 .isAdjustedToUTC = t.tz,
                 .unit = if (t.nanos) .{ .NANOS = .{} } else .{ .MICROS = .{} },
             } };
-            // The legacy annotation means UTC-adjusted microseconds; a local timestamp carries only the logical type.
-            if (t.tz and !t.nanos) e.converted_type = .TIMESTAMP_MICROS;
+            // Parquet's compatibility table annotates microseconds with the legacy TIMESTAMP_MICROS, local or UTC alike
+            // (readers of only the legacy annotation read local timestamps that way); nanoseconds have none.
+            if (!t.nanos) e.converted_type = .TIMESTAMP_MICROS;
         },
         .boolean => e.type = .BOOLEAN,
         .string, .null_only => {
@@ -694,6 +696,20 @@ test "csv review P1-3: a DOUBLE holds its text's number, or the column is STRING
     }
     try testing.expectEqual(Kind.float64, classify("0e0", true).kind);
     try testing.expectEqual(Kind.float64, classify("0.000e-5", true).kind);
+}
+
+test "csv review P2-2 and P2-3: DECIMAL(38,38) is a decimal; microsecond timestamps carry TIMESTAMP_MICROS" {
+    const s = "0.12345678901234567890123456789012345678";
+    const t = classify(s, true);
+    try testing.expectEqual(Kind.decimal, t.kind);
+    try testing.expectEqual(@as(u32, 38), t.precision());
+    const unscaled: i128 = 12345678901234567890123456789012345678;
+    try testing.expectEqual(@as(?i128, unscaled), parseDecimal(s, 38, decimalIntCapacity(t)));
+    const micros: ?schema.ConvertedType = .TIMESTAMP_MICROS;
+    try testing.expectEqual(micros, schemaElement("t", .{ .kind = .timestamp }).converted_type);
+    try testing.expectEqual(micros, schemaElement("t", .{ .kind = .timestamp, .tz = true }).converted_type);
+    const nanos = schemaElement("t", .{ .kind = .timestamp, .nanos = true });
+    try testing.expectEqual(@as(?schema.ConvertedType, null), nanos.converted_type);
 }
 
 test "csv dates and timestamps: valid calendar, exact fractions, offsets as instants" {

@@ -207,7 +207,11 @@ pub const Scanner = struct {
             return null;
         }
         if (s.carry != 0) {
-            s.failure = .{ .kind = .unterminated_quote, .offset = s.field_start };
+            // Quotes open at the end of the file. A field that does not start with one has a stray quote in it, and
+            // that quote opened the run: report it as such (a field that starts quoted was never closed).
+            const stray = s.field_start < s.bytes.len and s.bytes[s.field_start] != s.quote;
+            const kind: Malformed = if (stray) .quote_in_unquoted_field else .unterminated_quote;
+            s.failure = .{ .kind = kind, .offset = s.field_start };
             return error.MalformedCsv;
         }
         if (!s.in_record and s.field_start >= s.bytes.len) return null;
@@ -515,6 +519,21 @@ test "csv malformed fields are refused at their byte, by the scanner and the ref
     }
 }
 
+test "csv review P2-4: a stray quote is reported as one, at its field, by the scanner and the reference" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const csv = "a,b\n1,ab\"c\n";
+    const want = (try reference.parse(a, csv, .{})).malformed;
+    try testing.expectEqual(Malformed.quote_in_unquoted_field, want.kind);
+    try testing.expectEqual(@as(usize, 6), want.offset);
+    for ([_][]const usize{ &.{}, &.{ 5, 8 }, &.{3} }) |cuts| {
+        const got = (try parseChunked(a, csv, .{}, cuts)).malformed;
+        try testing.expectEqual(want.kind, got.kind);
+        try testing.expectEqual(want.offset, got.offset);
+    }
+}
+
 test "csv recordStart finds the first unquoted newline across 64-byte blocks" {
     var buf: [300]u8 = undefined;
     @memset(&buf, 'x');
@@ -628,7 +647,8 @@ fn fuzzChunked(_: void, smith: *std.testing.Smith) anyerror!void {
     const csv = buf[0..smith.slice(&buf)];
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var prng = std.Random.DefaultPrng.init(csv.len);
+    // Cuts from the input's bytes, so mutations of one length do not all share a cut set.
+    var prng = std.Random.DefaultPrng.init(std.hash.Wyhash.hash(0, csv));
     try checkChunkedAgrees(arena.allocator(), csv, prng.random());
 }
 

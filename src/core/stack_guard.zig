@@ -32,6 +32,12 @@ pub const Guard = struct {
         return .{ .floor = low + (here - low) / share_den * (share_den - share_num) };
     }
 
+    /// A guard that lets the walk use `bytes` of the stack from the caller's frame, however much the thread has: for
+    /// tests, which cannot depend on how deep the C parser before the walk can go.
+    pub fn within(bytes: usize) Guard {
+        return .{ .floor = @frameAddress() -| bytes };
+    }
+
     /// Whether the walk may go one frame deeper. Cheap enough for every call.
     pub inline fn ok(self: Guard) bool {
         return @frameAddress() > self.floor;

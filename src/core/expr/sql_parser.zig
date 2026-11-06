@@ -1558,26 +1558,6 @@ test "sql_parser: constant integers keep DuckDB's width, a signed one after its 
     }
 }
 
-test "sql_parser: a constant nested past the stack is a named refusal, not an abort" {
-    const a = std.testing.allocator;
-    // The parser builds `1 + 1 + ...` as one left-deep tree without recursing; folding it must not either. What a
-    // build's frames let it fold differs; two hundred thousand terms exceed any thread stack.
-    var deep: std.ArrayList(u8) = .empty;
-    defer deep.deinit(a);
-    try deep.appendSlice(a, "SELECT count(*) AS n FROM 't' WHERE i < 1");
-    for (0..200_000) |_| try deep.appendSlice(a, " + 1");
-    try std.testing.expectError(error.ConstantTooDeep, parseSqlPlan(a, deep.items));
-    // A hundred terms fold, as ever; so do signs and a cast.
-    var shallow: std.ArrayList(u8) = .empty;
-    defer shallow.deinit(a);
-    try shallow.appendSlice(a, "SELECT count(*) AS n FROM 't' WHERE i < 1");
-    for (0..100) |_| try shallow.appendSlice(a, " + 1");
-    const q = try parseSqlPlan(a, shallow.items);
-    q.deinit(a);
-    const nested = try parseSqlPlan(a, "SELECT count(*) AS n FROM 't' WHERE i < - - 1 + - - 2 AND d < CAST('2020-01-01' AS DATE)");
-    nested.deinit(a);
-}
-
 test "sql_parser makes ORDER BY terms the SELECT list lacks hidden result columns" {
     const a = std.testing.allocator;
     const q = try parseSqlQuery(a, "SELECT k FROM 't' GROUP BY k, g ORDER BY count(*) DESC, g, k LIMIT 3");

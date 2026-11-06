@@ -16,6 +16,8 @@ pub const Lower = struct {
     /// The stack a constant's fold may use, set where a fold starts (`folded`): a constant tree is as deep as the query
     /// writes it, and nothing else bounds the recursion over it.
     stack: ?stack_guard.Guard = null,
+    /// Bytes of stack a fold may use in place of what the thread has (`stack_guard.Guard.within`): for tests.
+    stack_limit: ?usize = null,
     hidden: std.ArrayList(*const c.LpNode) = .empty,
     rows: std.ArrayList(syntax.RowKey) = .empty,
 
@@ -284,7 +286,7 @@ pub const Lower = struct {
     }
 
     fn folded(self: *Lower, node: *const c.LpNode) ![]const u8 {
-        self.stack = .start();
+        self.stack = if (self.stack_limit) |bytes| .within(bytes) else .start();
         defer self.stack = null;
         return switch (try self.constant(node)) {
             .int => |i| std.fmt.allocPrint(self.arena, "{d}", .{i.v}),
@@ -395,3 +397,27 @@ pub const Lower = struct {
         };
     }
 };
+
+test "a constant tree deeper than the stack budget is refused by name, and folds within it" {
+    const gpa = std.testing.allocator;
+    const lp_arena = c.arena_create(64 * 1024) orelse return error.OutOfMemory;
+    defer c.arena_destroy(lp_arena);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    // The parser builds `1 + 1 + ...` as one left-deep tree without recursing; the fold recurses once per level.
+    try text.appendSlice(gpa, "SELECT count(*) FROM t WHERE i < 1");
+    for (0..2000) |_| try text.appendSlice(gpa, " + 1");
+    try text.append(gpa, 0);
+    var message: [*c]const u8 = null;
+    const stmts = c.lp_parse_all(text.items[0 .. text.items.len - 1 :0], lp_arena, &message);
+    const where = stmts.*.items[0].*.u.select.where orelse return error.SqlParseError;
+
+    var out: std.heap.ArenaAllocator = .init(gpa);
+    defer out.deinit();
+    var tight: Lower = .{ .arena = out.allocator(), .lp_arena = lp_arena, .stack_limit = 4096 };
+    try std.testing.expectError(error.ConstantTooDeep, tight.predicate(where, 0));
+    // The thread's own budget holds two thousand levels, so the same tree folds there.
+    var roomy: Lower = .{ .arena = out.allocator(), .lp_arena = lp_arena };
+    const folded = try roomy.predicate(where, 0);
+    try std.testing.expectEqualStrings("2001", folded.comparison.value);
+}

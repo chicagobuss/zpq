@@ -25,6 +25,14 @@
    "copy": "COPY (SELECT k AS pk, (k % 4)::BIGINT AS g FROM range(0, 50) t(k)) TO '{path}' (FORMAT PARQUET)"
   },
   {
+   "name": "nullorder",
+   "copy": "COPY (SELECT * FROM (VALUES (0, NULL), (0, NULL), (1, 1.0), (1, 1.0), (2, 2.0), (2, 2.0)) t(fk, y)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
+   "name": "nullorder_dim",
+   "copy": "COPY (SELECT * FROM (VALUES (0, 'a'), (1, 'b'), (2, 'c')) t(pk, g)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
    "script": "tools/check/prepare_join_gate.py",
    "files": [
     "join-gate",
@@ -1687,6 +1695,186 @@
       }
      }
     }
+   }
+  },
+  {
+   "id": "review:r11:groupjoin-desc-nulls-first-limit",
+   "fixture": "nullorder",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, avg(y) AS ay FROM '{fixture:nullorder}', '{fixture:nullorder_dim}' WHERE fk = pk GROUP BY fk ORDER BY ay DESC NULLS FIRST, fk LIMIT 1"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, avg(y) AS ay FROM '{fixture:nullorder}', '{fixture:nullorder_dim}' WHERE fk = pk GROUP BY fk ORDER BY ay DESC NULLS FIRST, fk LIMIT 1"
+   }
+  },
+  {
+   "id": "review:r11:groupjoin-desc-nulls-last-limit",
+   "fixture": "nullorder",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, avg(y) AS ay FROM '{fixture:nullorder}', '{fixture:nullorder_dim}' WHERE fk = pk GROUP BY fk ORDER BY ay DESC NULLS LAST, fk LIMIT 1"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, avg(y) AS ay FROM '{fixture:nullorder}', '{fixture:nullorder_dim}' WHERE fk = pk GROUP BY fk ORDER BY ay DESC NULLS LAST, fk LIMIT 1"
+   }
+  },
+  {
+   "id": "review:r11:groupjoin-asc-nulls-first",
+   "fixture": "nullorder",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, sum(y) AS s FROM '{fixture:nullorder}', '{fixture:nullorder_dim}' WHERE fk = pk GROUP BY fk ORDER BY s ASC NULLS FIRST, fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, sum(y) AS s FROM '{fixture:nullorder}', '{fixture:nullorder_dim}' WHERE fk = pk GROUP BY fk ORDER BY s ASC NULLS FIRST, fk"
+   }
+  },
+  {
+   "id": "review:r11:groupjoin-asc-nulls-last",
+   "fixture": "nullorder",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, sum(y) AS s FROM '{fixture:nullorder}', '{fixture:nullorder_dim}' WHERE fk = pk GROUP BY fk ORDER BY s NULLS LAST, fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT fk, sum(y) AS s FROM '{fixture:nullorder}', '{fixture:nullorder_dim}' WHERE fk = pk GROUP BY fk ORDER BY s NULLS LAST, fk"
+   }
+  },
+  {
+   "id": "review:r11:dimension-desc-nulls-first-limit",
+   "fixture": "nullorder",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g, avg(y) AS ay FROM '{fixture:nullorder}', '{fixture:nullorder_dim}' WHERE fk = pk GROUP BY g ORDER BY ay DESC NULLS FIRST, g LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT g, avg(y) AS ay FROM '{fixture:nullorder}', '{fixture:nullorder_dim}' WHERE fk = pk GROUP BY g ORDER BY ay DESC NULLS FIRST, g LIMIT 2"
+   }
+  },
+  {
+   "id": "review:r11:dimension-nulls-default",
+   "fixture": "nullorder",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g, avg(y) AS ay FROM '{fixture:nullorder}', '{fixture:nullorder_dim}' WHERE fk = pk GROUP BY g ORDER BY ay DESC, g"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT g, avg(y) AS ay FROM '{fixture:nullorder}', '{fixture:nullorder_dim}' WHERE fk = pk GROUP BY g ORDER BY ay DESC, g"
    }
   }
  ]

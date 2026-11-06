@@ -1284,8 +1284,9 @@ static void sql_node(LpNode *node, LpBuf *out) {
             sql_expr(node->u.order_term.expr, out, 0);
             if (node->u.order_term.direction == LP_SORT_DESC) lp_buf_puts(out, " DESC");
             else if (node->u.order_term.direction == LP_SORT_ASC) lp_buf_puts(out, " ASC");
-            if (node->u.order_term.nulls == 1) lp_buf_puts(out, " NULLS FIRST");
-            else if (node->u.order_term.nulls == 2) lp_buf_puts(out, " NULLS LAST");
+            /* The parser records NULLS FIRST as LP_SORT_ASC and NULLS LAST as LP_SORT_DESC (parse.c). */
+            if (node->u.order_term.nulls == LP_SORT_ASC) lp_buf_puts(out, " NULLS FIRST");
+            else if (node->u.order_term.nulls == LP_SORT_DESC) lp_buf_puts(out, " NULLS LAST");
             break;
 
         /* --- LIMIT --- */

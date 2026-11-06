@@ -1278,7 +1278,7 @@ pub const GroupJoin = struct {
         for (g.order.keys) |key| {
             const a = g.value(j, g.outputs[key.column], x, null) catch return x < y;
             const b = g.value(j, g.outputs[key.column], y, null) catch return x < y;
-            switch (output_values.orderValues(a, b, key.descending)) {
+            switch (output_values.orderByKey(a, b, key)) {
                 .lt => return true,
                 .gt => return false,
                 .eq => {},
@@ -1353,4 +1353,35 @@ test "an aborted scan frees the later row groups' partials waiting on it (review
     try fold.finish(1);
     try std.testing.expect(g.pending[1].load(.acquire) != null);
     g.deinit();
+}
+
+test "the group-join's cut keeps a NULL group first under NULLS FIRST (review R12)" {
+    const a = std.testing.allocator;
+    var bits = [_]u64{7};
+    var rank = [_]u32{0};
+    const j: Join = .{
+        .kind = .inner, .build_name = "dim", .key_name = "pk", .n = 3,
+        .keys = .{ .dense = .{ .lo = 0, .bits = &bits, .rank = &rank } },
+        .payloads = &.{}, .bytes = 0,
+    };
+    const keys = try a.alloc(usize, 1);
+    keys[0] = 0;
+    const calls = try a.alloc(GroupJoin.Call, 1);
+    calls[0] = .{ .func = .sum, .arg = .{ .literal = .{ .f64 = 1.0 } }, .lane = .f64 };
+    const outputs = try a.alloc(GroupJoin.Output, 2);
+    outputs[0] = .{ .key = 0 };
+    outputs[1] = .{ .agg = 0 };
+    const g = try GroupJoin.init(a, &j, keys, calls, outputs, 0);
+    defer g.deinit();
+    // Slot 0's rows held only NULLs; slots 1 and 2 sum to 1 and 2.
+    g.seen[0] = 7;
+    g.has[0][0] = 6;
+    g.f[0][1] = 1;
+    g.f[0][2] = 2;
+    g.order = .{ .keys = &.{.{ .column = 1, .descending = true, .nulls_first = true }}, .limit = 1 };
+    const rows = try g.rows(&j, a);
+    defer a.free(rows);
+    defer for (rows) |row| a.free(row);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i128, 0), rows[0][0].i);
 }

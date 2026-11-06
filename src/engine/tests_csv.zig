@@ -618,3 +618,25 @@ test "csv write: the report's DECIMAL precision is the data's, as the footer wri
     try testing.expectEqual(@as(u32, 7), report.types[1].precision());
     try testing.expectEqual(@as(u8, 2), report.types[1].scale);
 }
+
+test "csv write: a record with too many fields is counted to its own end, not into the next" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    const csv = try tmpPath(&b1, &tmp, "long.csv");
+    const out = try tmpPath(&b2, &tmp, "long.parquet");
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    for ([_]struct { []const u8, usize }{
+        .{ "a,b,c\n1,2,3\n4,5,6,7\n7,8,9\n", 4 },
+        .{ "a,b,c\n1,2,3\n4,5,6,7,8\n7,8,9\n", 5 },
+        .{ "a,b,c\n1,2,3\n4,5,6,7", 4 },
+    }) |c| {
+        try writeFile(csv, c[0]);
+        var diag: Diag = .{};
+        try testing.expectError(error.CsvFieldCount, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .diag = &diag }));
+        try testing.expectEqual(@as(usize, 3), diag.detail.csv.expected);
+        try testing.expectEqual(c[1], diag.detail.csv.got);
+        try testing.expectEqual(@as(u64, 3), diag.detail.csv.line);
+    }
+}

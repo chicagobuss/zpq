@@ -179,6 +179,8 @@ const Fixture = struct {
     recipe: ?[]const u8 = null,
     script: ?[]const u8 = null,
     files: ?[]const []const u8 = null,
+    /// The extension of a script's files (`csv` for CSV input); Parquet by default.
+    ext: []const u8 = "parquet",
     /// A file zpq itself writes: CLI arguments, `{path}` the file and `{fixture:NAME}` an earlier fixture.
     zpq: ?[]const []const u8 = null,
 };
@@ -616,7 +618,7 @@ fn prepareFixtures(run: *Run, arena: std.mem.Allocator, file: File, file_i: usiz
             } else {
                 try argv.append(arena, f.script orelse return error.BadFixture);
                 for (names) |n| {
-                    const path = try std.fmt.allocPrint(arena, "{s}/f{d}-{s}.parquet", .{ run.work, file_i, n });
+                    const path = try std.fmt.allocPrint(arena, "{s}/f{d}-{s}.{s}", .{ run.work, file_i, n, f.ext });
                     try argv.append(arena, path);
                     try out.put(n, path);
                 }

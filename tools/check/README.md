@@ -33,6 +33,9 @@ the answer decodes; anything else asks DuckDB again. `--no-cache` asks DuckDB ev
 }
 ```
 
+A script's files are named `f<i>-<name>.parquet`, or with the extension its `ext` gives (`"ext": "csv"` for the CSV
+corpus, `prepare_csv.py`).
+
 A case names a fixture (`main` by default, or a file path as `input`) and a query: `sql` (with `{path}` and
 `{fixture:NAME}`), `query` (`aggregate`, `filter`, `group_by`, `column_order`, `columns`, `select`, `codec`), or
 `cli`, the zpq CLI's arguments, one process per point (`{out}` and `{out.SUFFIX}` name the file it writes; `force`

@@ -494,7 +494,8 @@ pub const Source = struct {
                 .kind = .field_count,
                 .offset = record_start,
                 .expected_fields = ncols,
-                .got_fields = col + 1 + countRest(&scanner),
+                // The extra field may end its record; only one that does not has more to count.
+                .got_fields = col + 1 + if (f.last) 0 else countRest(&scanner),
             }, span.lines, lo_b);
             const raw = bytes[f.start..f.end];
             const text = csv_scan.decodeField(raw, p.dialect.quote, &scratch, scratch_alloc) catch |e| switch (e) {
@@ -780,7 +781,7 @@ pub fn run(
             if (source.firstFailure()) |f| failure.* = f.*;
             // Refused its memory: run again on a narrower path, half the workers and their chunks in flight, as a
             // query that does not fit does; one worker that still does not fit fails. The bytes do not change.
-            if (e == error.OutOfMemory and workers > 1 and restartable) {
+            if ((e == error.OutOfMemory or e == error.ExceededMemoryBudget) and workers > 1 and restartable) {
                 if (args.output_fd) |fd| try local_fs.truncateToStart(fd);
                 workers = @max(1, workers / 2);
                 chunk = chunkBytes(opts, narrowed, workers, mapped.bytes.len);
@@ -1034,11 +1035,13 @@ fn writeOnce(
         .source = source.pieceSource(),
     };
     w.cpu_budget = sizing.budget;
-    w.piece_pool = .{ .gpa = ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = &ledger };
+    // Idle pieces kept for reuse are on the ledger too: a sixteenth of a small budget, not a fixed 32 MiB of it.
+    w.piece_pool = .{ .gpa = ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = &ledger, .limit = @min(32 << 20, args.max_memory / 16) };
     defer w.piece_pool.deinit();
     w.piece_pages.child = w.outAlloc();
     const t_scan = nowMonoNs();
-    try window_mod.runWindowedReencode(&w, sizing.workers, ctx.env);
+    // A draw the ledger refused is the budget's refusal, not the host's: named so, as a Parquet write names it.
+    window_mod.runWindowedReencode(&w, sizing.workers, ctx.env) catch |e| return slicing.refusal(memory.refusal(e));
     t.decode_wall_ns = @intCast(nowMonoNs() - t_scan);
     t.core.sink_ns += w.sink_ns;
     t.core.encode_ns += w.core.encode_ns;

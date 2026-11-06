@@ -239,6 +239,25 @@ pub const Func = enum {
     /// `abs(x)` of a number, in the argument's own type: an integer whose magnitude its column's SQL type cannot hold
     /// (`abs(-2147483648)` of an INTEGER) is an overflow error, as DuckDB's.
     abs,
+    // The string functions below count and cut text in characters (UTF-8 code points), as DuckDB's do; their arguments
+    // after the first are constants. A string in, a string out, except `length`.
+    /// `length(s)`: the number of characters (BIGINT); NULL for NULL.
+    length,
+    /// `substring(s, start[, len])` (also `substr`): 1-based `start` (negative counts from the end), a negative `len`
+    /// takes the characters before `start`.
+    substring,
+    /// `left(s, n)` / `right(s, n)`: the first / last `n` characters; a negative `n` drops that many from the other end.
+    left,
+    right,
+    /// `trim(s)`, `ltrim(s)`, `rtrim(s)`: spaces removed from both ends, the start, the end.
+    trim,
+    ltrim,
+    rtrim,
+    /// `replace(s, from, to)`: every non-overlapping `from`, left to right (an empty `from` changes nothing).
+    replace,
+    /// `lpad(s, n, pad)` / `rpad(s, n, pad)`: `s` cut or padded with `pad` to `n` characters.
+    lpad,
+    rpad,
 };
 
 /// What an integer value stands for in time, so the date/time functions read it in its unit. Output keeps printing
@@ -453,7 +472,7 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs => c.args[0].mayBeNull(),
+                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => c.args[0].mayBeNull(),
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
                 .coalesce => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;

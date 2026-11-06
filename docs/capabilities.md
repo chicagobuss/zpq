@@ -40,7 +40,11 @@ the thread, not fixed) is refused (`ConstantTooDeep`).
 **Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`), string concat (`||`),
 `coalesce(a, b, ...)` over any expressions, `nullif(col, literal)` (NULL where the column equals the literal; a CASE, so
 a column and a literal) and `abs(x)` of an integer, DOUBLE or DECIMAL expression (the magnitude in the argument's type:
-the minimum of an integer column's SQL type, `abs(-2147483648)` of an INTEGER, is an overflow error, as DuckDB's), `strlen(s)` (bytes; NULL for NULL), searched `CASE WHEN cond THEN v ...
+the minimum of an integer column's SQL type, `abs(-2147483648)` of an INTEGER, is an overflow error, as DuckDB's),
+and the string functions `length`, `substring`/`substr`, `left`, `right`, `trim`/`ltrim`/`rtrim` (spaces), `replace`,
+`lpad`/`rpad`, which count and cut text in characters (UTF-8 code points, as DuckDB does: a combining mark is a
+character) and take constants after the text (a column there is refused; an empty `lpad`/`rpad` pad is an error
+only where padding is needed, as in DuckDB). A coded column is mapped once per dictionary entry, `strlen(s)` (bytes; NULL for NULL), searched `CASE WHEN cond THEN v ...
 [ELSE v] END`, parens, unary minus. A CASE evaluates a branch only on the rows that take it, and coalesce an argument
 only on the rows every earlier one left NULL, so a fault where no row needs the value is no error; the simple form
 `CASE c WHEN v ...` is the searched form `WHEN c = v` for a column and literals. DECIMAL arithmetic is exact (see below).

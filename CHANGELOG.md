@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **String functions in SQL.** `length`, `substring` / `substr`, `left`, `right`, `trim` / `ltrim` / `rtrim`, `replace` and
+  `lpad` / `rpad` run over a text column or expression, in a SELECT, an aggregate or a GROUP BY key, and match DuckDB
+  (characters are code points; a negative `substring` length reads backwards). Each distinct text is computed once, and
+  a dictionary-coded column once per entry. Arguments after the text must be constants.
 - **`nullif` and `abs` in SQL.** `nullif(col, literal)` and `abs(x)` of an integer, DOUBLE or DECIMAL expression (in a
   SELECT, inside an aggregate or as a GROUP BY key) and `nullif(x, y)` and `abs(x)` over aggregates
   (`sum(a) / nullif(sum(b), 0)`) now run and match DuckDB, including its overflow error for the minimum of an integer

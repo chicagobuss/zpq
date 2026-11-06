@@ -259,6 +259,7 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         ),
         error.IntegerOverflowRound => diagnosticPrint("zpq query: integer overflow in round\n", .{}),
         error.IntegerOverflowAbs => diagnosticPrint("zpq query: integer overflow in abs\n", .{}),
+        error.InsufficientPadding => diagnosticPrint("zpq query: lpad/rpad needs padding and its pad text is empty\n", .{}),
         error.PostAggTypeUnknown => diagnosticPrint(
             "zpq query: arithmetic on the min or max of an expression or of a FLOAT column is not supported: its\n" ++
                 "SQL type is not one zpq resolves. Use a column of another type, or sum() the expression\n",

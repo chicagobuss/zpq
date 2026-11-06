@@ -729,11 +729,29 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "date_part") or asciiEqIgnoreCase(name, "datepart")) return .date_part;
     if (asciiEqIgnoreCase(name, "regexp_replace")) return .regexp_replace;
     if (asciiEqIgnoreCase(name, "abs")) return .abs;
+    if (asciiEqIgnoreCase(name, "length")) return .length;
+    if (asciiEqIgnoreCase(name, "substring") or asciiEqIgnoreCase(name, "substr")) return .substring;
+    if (asciiEqIgnoreCase(name, "left")) return .left;
+    if (asciiEqIgnoreCase(name, "right")) return .right;
+    if (asciiEqIgnoreCase(name, "trim")) return .trim;
+    if (asciiEqIgnoreCase(name, "ltrim")) return .ltrim;
+    if (asciiEqIgnoreCase(name, "rtrim")) return .rtrim;
+    if (asciiEqIgnoreCase(name, "replace")) return .replace;
+    if (asciiEqIgnoreCase(name, "lpad")) return .lpad;
+    if (asciiEqIgnoreCase(name, "rpad")) return .rpad;
     return null;
 }
 
 /// Validate arity + argument types per function and return the result
 /// type. coalesce requires ≥2 args, all promotable to a common type.
+fn isIntLiteral(e: ast.Expr) bool {
+    return e == .literal and e.literal == .i64;
+}
+
+fn isStrLiteral(e: ast.Expr) bool {
+    return e == .literal and e.literal == .str;
+}
+
 fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.FileMetaData) Error!ast.Type {
     switch (func) {
         .coalesce => {
@@ -787,6 +805,38 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             const a = args[0];
             if (a.typeOf() == .str or a.temporal() != null or a.isBoolean()) return error.TypeMismatch;
             return a.typeOf();
+        },
+        .length => {
+            if (args.len != 1) return error.WrongArity;
+            if (args[0].typeOf() != .str) return error.TypeMismatch;
+            return .i64;
+        },
+        // The text, then constants: they are read once for the call, DuckDB reads them per row.
+        .substring => {
+            if (args.len != 2 and args.len != 3) return error.WrongArity;
+            if (args[0].typeOf() != .str) return error.TypeMismatch;
+            for (args[1..]) |a| if (!isIntLiteral(a.*)) return error.TypeMismatch;
+            return .str;
+        },
+        .left, .right => {
+            if (args.len != 2) return error.WrongArity;
+            if (args[0].typeOf() != .str or !isIntLiteral(args[1].*)) return error.TypeMismatch;
+            return .str;
+        },
+        .trim, .ltrim, .rtrim => {
+            if (args.len != 1) return error.WrongArity;
+            if (args[0].typeOf() != .str) return error.TypeMismatch;
+            return .str;
+        },
+        .replace => {
+            if (args.len != 3) return error.WrongArity;
+            if (args[0].typeOf() != .str or !isStrLiteral(args[1].*) or !isStrLiteral(args[2].*)) return error.TypeMismatch;
+            return .str;
+        },
+        .lpad, .rpad => {
+            if (args.len != 3) return error.WrongArity;
+            if (args[0].typeOf() != .str or !isIntLiteral(args[1].*) or !isStrLiteral(args[2].*)) return error.TypeMismatch;
+            return .str;
         },
         // Only text casts to text: zpq has no number, date or bytes-escaping spelling to match DuckDB's.
         .cast_text => {
@@ -1142,6 +1192,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                     if (a.temporal() != args[0].temporal()) break null;
                 } else args[0].temporal(),
                 .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,
+                .length, .substring, .left, .right, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
             },
             .int = if (func == .abs and args[0].* == .col_ref) blk: {
                 const elem = metadata.leafSchemaElement(file, args[0].col_ref.col_idx) orelse break :blk null;

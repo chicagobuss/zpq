@@ -50,6 +50,8 @@ pub const Error = error{
     IntegerOverflowDiv,
     /// `abs` of the minimum of its integer type (DuckDB: "Overflow on abs(-2147483648)").
     IntegerOverflowAbs,
+    /// `lpad` / `rpad` with an empty pad of a text that needs padding (DuckDB: "Insufficient padding in LPAD.").
+    InsufficientPadding,
     /// A DECIMAL column reached exact evaluation without its unscaled values (see `ColumnT.unscaled`).
     DecimalUnavailable,
     /// A CASE condition over a repeated (nested) column.
@@ -1276,7 +1278,191 @@ fn evalCall(
         .regexp_replace => return evalRegexpReplace(arena, batch, column_lookup, c, false),
         .cast_text => return evalCastText(arena, batch, column_lookup, c.args[0].*),
         .abs => return evalAbs(arena, batch, column_lookup, c),
+        .length => return evalLength(arena, batch, column_lookup, c.args[0].*),
+        .substring, .left, .right, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => return evalStringFn(arena, batch, column_lookup, c),
     }
+}
+
+/// The text of a string argument as the batch holds it: a bare column as decoded (codes and all), anything else
+/// evaluated first.
+fn stringArgument(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, arg: ast.Expr) Error!struct { col: Batch.Column, s: ColumnT([]const u8) } {
+    const col = if (arg == .col_ref)
+        batch.cols[column_lookup[arg.col_ref.col_idx] orelse return error.BadColumn]
+    else
+        try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    const s = switch (col) {
+        .string => |v| v,
+        else => return error.TypeMismatch,
+    };
+    if (s.max_rep > 0) return error.NestedNotSupported;
+    // A column decoded to lengths alone (for `= ''`) has no texts to work on.
+    if (s.codes == null and s.values.len != s.rowCount()) return error.LengthsOnlyColumn;
+    return .{ .col = col, .s = s };
+}
+
+/// Characters of `text`: its UTF-8 code points (a continuation byte starts none).
+fn charCount(text: []const u8) usize {
+    var n: usize = 0;
+    for (text) |b| n += @intFromBool(b & 0xC0 != 0x80);
+    return n;
+}
+
+/// The byte offset where character `k` (0-based) starts; the length for `k` at or past the end.
+fn charOffset(text: []const u8, k: usize) usize {
+    if (k == 0) return 0;
+    var seen: usize = 0;
+    for (text, 0..) |b, i| {
+        if (b & 0xC0 != 0x80) {
+            if (seen == k) return i;
+            seen += 1;
+        }
+    }
+    return text.len;
+}
+
+/// Characters `lo..hi` (1-based, inclusive, already clipped to the text) of `text`.
+fn charRange(text: []const u8, n: usize, lo: i128, hi: i128) []const u8 {
+    const first = @max(lo, 1);
+    const last = @min(hi, @as(i128, @intCast(n)));
+    if (first > last) return "";
+    return text[charOffset(text, @intCast(first - 1))..charOffset(text, @intCast(last))];
+}
+
+/// A mapped text: a slice of the input, or `bytes[start..end]` of the buffer results are built in (an offset, as the
+/// buffer moves while it grows).
+const Mapped = union(enum) { text: []const u8, built: [2]usize };
+
+fn appendMapped(bytes: *std.ArrayList(u8), arena: std.mem.Allocator, parts: []const []const u8) Error!Mapped {
+    const start = bytes.items.len;
+    for (parts) |p| try bytes.appendSlice(arena, p);
+    return .{ .built = .{ start, bytes.items.len } };
+}
+
+/// One text through a string function; `bytes` holds what is built. Characters are code points, positions 1-based.
+fn applyStringFn(arena: std.mem.Allocator, bytes: *std.ArrayList(u8), c: ast.Call, text: []const u8) Error!Mapped {
+    const int = struct {
+        fn at(call: ast.Call, k: usize) i128 {
+            return call.args[k].literal.i64;
+        }
+    }.at;
+    switch (c.func) {
+        .substring => {
+            const n: i128 = @intCast(charCount(text));
+            const start = int(c, 1);
+            const pos: i128 = if (start > 0) start else if (start < 0) n + start + 1 else 0;
+            var lo = pos;
+            var hi = n;
+            if (c.args.len == 3) {
+                const len = int(c, 2);
+                if (len >= 0) {
+                    hi = pos + len - 1;
+                } else {
+                    lo = pos + len;
+                    hi = pos - 1;
+                }
+            }
+            return .{ .text = charRange(text, @intCast(n), lo, hi) };
+        },
+        .left, .right => {
+            const n: i128 = @intCast(charCount(text));
+            const k = int(c, 1);
+            return .{ .text = switch (c.func) {
+                .left => charRange(text, @intCast(n), 1, if (k >= 0) k else n + k),
+                else => charRange(text, @intCast(n), if (k >= 0) n - k + 1 else -k + 1, n),
+            } };
+        },
+        .trim, .ltrim, .rtrim => {
+            var lo: usize = 0;
+            var hi: usize = text.len;
+            if (c.func != .rtrim) while (lo < hi and text[lo] == ' ') : (lo += 1) {};
+            if (c.func != .ltrim) while (hi > lo and text[hi - 1] == ' ') : (hi -= 1) {};
+            return .{ .text = text[lo..hi] };
+        },
+        .replace => {
+            const from = c.args[1].literal.str;
+            const to = c.args[2].literal.str;
+            if (from.len == 0 or std.mem.indexOf(u8, text, from) == null) return .{ .text = text };
+            const start = bytes.items.len;
+            var at: usize = 0;
+            while (std.mem.indexOfPos(u8, text, at, from)) |hit| {
+                try bytes.appendSlice(arena, text[at..hit]);
+                try bytes.appendSlice(arena, to);
+                at = hit + from.len;
+            }
+            try bytes.appendSlice(arena, text[at..]);
+            return .{ .built = .{ start, bytes.items.len } };
+        },
+        .lpad, .rpad => {
+            const want = int(c, 1);
+            if (want <= 0) return .{ .text = "" };
+            const n = charCount(text);
+            if (n >= want) return .{ .text = charRange(text, n, 1, want) };
+            const pad = c.args[2].literal.str;
+            const pad_chars = charCount(pad);
+            if (pad_chars == 0) return error.InsufficientPadding;
+            const need: usize = @intCast(want - @as(i128, @intCast(n)));
+            const start = bytes.items.len;
+            if (c.func == .rpad) try bytes.appendSlice(arena, text);
+            var left_over = need;
+            while (left_over > 0) {
+                const take = @min(left_over, pad_chars);
+                try bytes.appendSlice(arena, charRange(pad, pad_chars, 1, @intCast(take)));
+                left_over -= take;
+            }
+            if (c.func == .lpad) try bytes.appendSlice(arena, text);
+            return .{ .built = .{ start, bytes.items.len } };
+        },
+        else => unreachable,
+    }
+}
+
+/// The string functions of one text and constants, applied once per distinct text: per dictionary entry where the
+/// chunk is coded, per value otherwise (the last text's answer is kept for a run of equal ones). A NULL row stays NULL
+/// and only a row the batch wants can fault.
+fn evalStringFn(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const arg = try stringArgument(arena, batch, column_lookup, c.args[0].*);
+    const s = arg.s;
+    const inputs = if (s.codes != null) s.dict else s.values;
+    var bytes: std.ArrayList(u8) = .empty;
+    const mapped = try arena.alloc(Mapped, inputs.len);
+    var last: ?usize = null;
+    for (inputs, mapped, 0..) |text, *m, i| {
+        m.* = .{ .text = "" };
+        if (s.codes == null and (rowIsNull(arg.col, i) or (batch.sel != null and !batch.sel.?.isActive(i)))) continue;
+        if (last) |l| if (std.mem.eql(u8, inputs[l], text)) {
+            m.* = mapped[l];
+            continue;
+        };
+        last = i;
+        m.* = try applyStringFn(arena, &bytes, c, text);
+    }
+    const texts = try arena.alloc([]const u8, inputs.len);
+    for (mapped, texts) |m, *t| t.* = switch (m) {
+        .text => |x| x,
+        .built => |b| bytes.items[b[0]..b[1]],
+    };
+    const values = if (s.codes) |codes| blk: {
+        const out = try arena.alloc([]const u8, codes.len);
+        for (codes, out) |code, *o| o.* = if (code < texts.len) texts[code] else "";
+        break :blk out;
+    } else texts;
+    return .{ .string = .{ .values = values, .def_levels = s.def_levels, .max_def = s.max_def, .has_nulls = s.has_nulls } };
+}
+
+/// `length(s)`: characters of each text, once per dictionary entry where the chunk is coded.
+fn evalLength(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, arg_expr: ast.Expr) Error!Batch.Column {
+    const arg = try stringArgument(arena, batch, column_lookup, arg_expr);
+    const s = arg.s;
+    const out = try arena.alloc(i64, s.rowCount());
+    if (s.codes) |codes| {
+        const lens = try arena.alloc(i64, s.dict.len);
+        defer arena.free(lens);
+        for (s.dict, lens) |v, *l| l.* = @intCast(charCount(v));
+        for (codes, out) |code, *o| o.* = if (code < lens.len) lens[code] else 0;
+    } else for (s.values, out) |v, *o| {
+        o.* = @intCast(charCount(v));
+    }
+    return .{ .i64 = .{ .values = out, .def_levels = s.def_levels, .max_def = s.max_def, .has_nulls = s.has_nulls } };
 }
 
 /// `abs(x)`: the magnitude in the argument's type. A NULL row stays NULL. Only a row the batch wants can fault: an
@@ -1491,7 +1677,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text, .abs => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => unreachable,
     }
     return .{ .i64 = .{
         .values = out,
@@ -3067,4 +3253,103 @@ test "regexp_replace replaces a coded column once per entry, and keeps NULL and 
         error.LengthsOnlyColumn,
         evalExpr(a, &.{ .cols = &.{lengths_only}, .num_rows = 4 }, &lookup, call),
     );
+}
+
+/// `func(text, extra...)` through the string kernel, the extra arguments literals.
+fn stringFn(func: ast.Func, text: []const u8, extra: []const ast.Expr) ![]const u8 {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const args = try a.alloc(*ast.Expr, extra.len + 1);
+    args[0] = try a.create(ast.Expr);
+    args[0].* = .{ .literal = .{ .str = text } };
+    for (extra, args[1..]) |e, *slot| {
+        slot.* = try a.create(ast.Expr);
+        slot.*.* = e;
+    }
+    const call: ast.Call = .{ .func = func, .args = args, .result_type = .str, .depth = 1 };
+    var bytes: std.ArrayList(u8) = .empty;
+    const mapped = try applyStringFn(a, &bytes, call, text);
+    // Copy out of the arena the answer lives in.
+    return std.testing.allocator.dupe(u8, switch (mapped) {
+        .text => |t| t,
+        .built => |b| bytes.items[b[0]..b[1]],
+    });
+}
+
+fn expectString(want: []const u8, func: ast.Func, text: []const u8, extra: []const ast.Expr) !void {
+    const got = try stringFn(func, text, extra);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings(want, got);
+}
+
+fn intArg(v: i64) ast.Expr {
+    return .{ .literal = .{ .i64 = v } };
+}
+
+fn strArg(v: []const u8) ast.Expr {
+    return .{ .literal = .{ .str = v } };
+}
+
+test "substring takes characters as DuckDB does: negative starts from the end, a negative length backwards" {
+    // DuckDB 2.0.0's answers for 'héllo wörld' (11 characters, 13 bytes): rows are starts, columns the lengths.
+    const s = "héllo wörld";
+    const lens = [_]?i64{ null, -3, -1, 0, 1, 3, 5, 100 };
+    const table = [_]struct { start: i64, want: [8][]const u8 }{
+        .{ .start = -12, .want = .{ s, "", "", "", "", "hé", "héll", s } },
+        .{ .start = -5, .want = .{ "wörld", "lo ", " ", "", "w", "wör", "wörld", "wörld" } },
+        .{ .start = -1, .want = .{ "d", "örl", "l", "", "d", "d", "d", "d" } },
+        .{ .start = 0, .want = .{ s, "", "", "", "", "hé", "héll", s } },
+        .{ .start = 1, .want = .{ s, "", "", "", "h", "hél", "héllo", s } },
+        .{ .start = 2, .want = .{ "éllo wörld", "h", "h", "", "é", "éll", "éllo ", "éllo wörld" } },
+        .{ .start = 11, .want = .{ "d", "örl", "l", "", "d", "d", "d", "d" } },
+        .{ .start = 12, .want = .{ "", "rld", "d", "", "", "", "", "" } },
+        .{ .start = 13, .want = .{ "", "ld", "", "", "", "", "", "" } },
+    };
+    for (table) |row| for (lens, row.want) |len, want| {
+        if (len) |l| try expectString(want, .substring, s, &.{ intArg(row.start), intArg(l) }) else try expectString(want, .substring, s, &.{intArg(row.start)});
+    };
+    try expectString("", .substring, "", &.{ intArg(1), intArg(3) });
+    try expectString("日本", .substring, "日本語", &.{ intArg(1), intArg(2) });
+}
+
+test "left, right, trim, replace and the pads match DuckDB's answers" {
+    const s = "héllo wörld";
+    try expectString("hél", .left, s, &.{intArg(3)});
+    try expectString("héllo wö", .left, s, &.{intArg(-3)});
+    try expectString("", .left, s, &.{intArg(0)});
+    try expectString(s, .left, s, &.{intArg(100)});
+    try expectString("", .left, s, &.{intArg(-100)});
+    try expectString("rld", .right, s, &.{intArg(3)});
+    try expectString("lo wörld", .right, s, &.{intArg(-3)});
+    try expectString("", .right, s, &.{intArg(0)});
+    try expectString(s, .right, s, &.{intArg(100)});
+    try expectString("😀😀", .left, "😀😀x", &.{intArg(2)});
+    // Only spaces trim.
+    try expectString("a b", .trim, "  a b  ", &.{});
+    try expectString("a ", .ltrim, "  a ", &.{});
+    try expectString("  a", .rtrim, "  a ", &.{});
+    try expectString("", .trim, "   ", &.{});
+    try expectString("\ta\t", .trim, "\ta\t", &.{});
+    try expectString("ba", .replace, "aaa", &.{ strArg("aa"), strArg("b") });
+    try expectString("aaaaaa", .replace, "aaa", &.{ strArg("a"), strArg("aa") });
+    try expectString(s, .replace, s, &.{ strArg(""), strArg("x") });
+    try expectString("", .replace, "abcabc", &.{ strArg("abc"), strArg("") });
+    try expectString("héllo world", .replace, s, &.{ strArg("ö"), strArg("o") });
+    // Padding counts characters, cuts a longer text, and an empty pad only matters when padding is needed.
+    try expectString("*-*héllo", .lpad, "héllo", &.{ intArg(8), strArg("*-") });
+    try expectString("héllo*-*", .rpad, "héllo", &.{ intArg(8), strArg("*-") });
+    try expectString("héllo", .lpad, "héllo", &.{ intArg(5), strArg("*") });
+    try expectString("hél", .lpad, "héllo", &.{ intArg(3), strArg("*") });
+    try expectString("hél", .rpad, "héllo", &.{ intArg(3), strArg("") });
+    try expectString("", .lpad, "héllo", &.{ intArg(0), strArg("*") });
+    try expectString("", .lpad, "héllo", &.{ intArg(-1), strArg("*") });
+    try expectString("aba", .lpad, "", &.{ intArg(3), strArg("ab") });
+    try expectString("日本日héllo", .lpad, "héllo", &.{ intArg(8), strArg("日本") });
+    try std.testing.expectError(error.InsufficientPadding, stringFn(.lpad, "héllo", &.{ intArg(8), strArg("") }));
+    try std.testing.expectError(error.InsufficientPadding, stringFn(.rpad, "héllo", &.{ intArg(8), strArg("") }));
+    // Characters, not bytes, and not grapheme clusters.
+    try std.testing.expectEqual(@as(usize, 11), charCount("héllo wörld"));
+    try std.testing.expectEqual(@as(usize, 2), charCount("a\u{301}"));
+    try std.testing.expectEqual(@as(usize, 5), charCount("👨‍👩‍👧"));
 }

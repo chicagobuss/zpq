@@ -127,6 +127,12 @@ pub fn fileSize(fd: fd_t) !usize {
     return @intCast(end);
 }
 
+/// Empty the regular file open at `fd` and write from its start again: a write run again into its unpublished output.
+pub fn truncateToStart(fd: fd_t) error{ TruncateFailed, SeekFailed }!void {
+    if (posix.errno(posix.system.ftruncate(fd, 0)) != .SUCCESS) return error.TruncateFailed;
+    if (posix.errno(posix.system.lseek(fd, 0, posix.SEEK.SET)) != .SUCCESS) return error.SeekFailed;
+}
+
 pub fn writeAll(fd: fd_t, bytes: []const u8) error{ WriteFailed, BrokenPipe, NoSpaceLeft }!void {
     var i: usize = 0;
     while (i < bytes.len) {

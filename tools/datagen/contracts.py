@@ -375,7 +375,8 @@ def writer_defaults(out_dir):
 
 def layout(out_dir):
     """Re-encoding writes' inputs: one row group of 100,000 equal short strings then 100,000 unique 1 KiB ones (the
-    T9/T10 repros); 16, 32 and 48 copies of one string column (one-row slices must amortize per-piece overhead);
+    T9/T10 repros); 16, 32 and 48 copies of one string column (one-row slices must amortize per-piece overhead), and
+    that column alone in eight row groups (a fan-out write);
     and 230,001 rows in row groups of 33,333 that output targets cut across."""
     rng = random.Random(5)
     vals = ["same-value"] * 100_000 + ["".join(rng.choice("0123456789abcdef") for _ in range(32)) * 32
@@ -386,6 +387,11 @@ def layout(out_dir):
     for width in (16, 32, 48):
         wide = pa.Table.from_arrays([wide_values] * width, names=[f"c{i}" for i in range(width)])
         pq.write_table(wide, out_dir / f"layout_wide{width}.parquet", row_group_size=wide.num_rows, compression="zstd")
+    # Eight row groups of that one column, for a write that fans it out to many: every row group's input fits a
+    # producer's share, and the outputs beside each other can still not.
+    with pq.ParquetWriter(out_dir / "layout_fanout.parquet", pa.schema([("c0", pa.string())]), compression="zstd") as w:
+        for _ in range(8):
+            w.write_table(pa.table({"c0": wide_values}))
     n = 230_001
     r2 = random.Random(7)
     pq.write_table(pa.table({

@@ -1054,6 +1054,7 @@ fn runWrite(
     args.output = publication.prepare(io, qa.output, qa.inputs) catch |err|
         return engineError(allocator, err, &diag);
     args.output_fd = publication.fd;
+    args.output_restartable = publication.fd != null;
 
     if (pool.per_call_stats) pool.resetStats();
     const result = engine.runQuery(.{

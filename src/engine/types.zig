@@ -90,6 +90,10 @@ pub const QueryArgs = struct {
     fsync: bool = @import("../output_publication.zig").default_fsync,
     /// An already-open sink and an empty scalar result cut.
     output_fd: ?local_fs.fd_t = null,
+    /// `output_fd` is the caller's own unpublished temp file (`output_publication`), empty when the query starts: a
+    /// write may truncate it and write it again (`write.runWrite`). A descriptor it is not set for (stdout, a pipe)
+    /// may already have handed its bytes on.
+    output_restartable: bool = false,
     /// CLI-only: the answer is only written to Parquet, so a GROUP BY may build it as typed columns
     /// (`scan.MultiAggArgs.typed_answer`), never read back as rows.
     typed_answer: bool = false,

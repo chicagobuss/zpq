@@ -128,6 +128,10 @@ pub const Reason = enum(u8) {
     cold_direct = 8,
     /// `--cache` or `"cache": true`: through the page cache, never `O_DIRECT`.
     page_cache = 9,
+    /// A write the reader's run refused for memory, run again over the mapping (`write.runWrite`).
+    retry_mapped = 10,
+    /// A write to a descriptor it cannot restart (stdout, a pipe) under an explicit `--max-memory`.
+    unrestartable_output = 11,
 
     pub fn phrase(self: Reason) []const u8 {
         return switch (self) {
@@ -141,6 +145,8 @@ pub const Reason = enum(u8) {
             .mapping => "read through the mapping",
             .cold_direct => "cold, O_DIRECT where the file allows it; --cache reads through the page cache",
             .page_cache => "through the page cache (--cache)",
+            .retry_mapped => "the reader's run refused for memory; retried on the mapping",
+            .unrestartable_output => "output cannot be restarted under an explicit --max-memory",
         };
     }
 };

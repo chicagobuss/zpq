@@ -1140,6 +1140,9 @@ pub fn chooseLocalIo(
     policy: local_reader.Policy,
     /// A caller that decodes each row group whole up to a share, and slices past it (a write): see `readerFits`.
     whole: ?WholeDecode,
+    /// Set: the mapping, for this reason, whatever else would be chosen (a write's retry, or an output it cannot
+    /// restart).
+    mapped: ?local_reader.Reason,
     prof: ?*profile.Thread,
 ) !LocalIo {
     const needs = localIoNeeds(opened, policy);
@@ -1165,6 +1168,7 @@ pub fn chooseLocalIo(
     if (local_plan) |lp| if (!lp.exact) {
         choice = .{ .mode = .mmap, .reason = .mapping };
     };
+    if (mapped) |reason| choice = .{ .mode = .mmap, .reason = reason };
     profile.record(prof, .io_choice, nowMonoNs(), nowMonoNs(), profile.args(.{
         policy.profile,
         choice.mode,

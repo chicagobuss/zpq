@@ -665,6 +665,7 @@ fn runQuery(
         .plan_source = plan_source,
         .output = if (fmt == .parquet) engine_output orelse "-" else null,
         .output_fd = if (fmt == .parquet) (if (to_stdout) 1 else publication.fd) else null,
+        .output_restartable = fmt == .parquet and !to_stdout and publication.fd != null,
         .typed_answer = fmt == .parquet,
         .text_output = if (fmt != .parquet) .{
             .format = fmt,

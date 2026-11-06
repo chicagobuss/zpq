@@ -134,15 +134,38 @@ fn writtenCodec(rgs: []const schema.RowGroup, none_written: schema.CompressionCo
     return seen orelse none_written;
 }
 
+/// A write answers or refuses alike whatever the page cache holds. Its first choice reads a cold input through the
+/// reader only when every row group fits a producer's share (`input.readerFits`); the guarantee is the retry. A run
+/// over the reader that the budget refuses is run again over the mapping, as a resident input is read, once its output
+/// is gone: a path it created is removed as it fails, an S3 upload aborted, and the caller's own unpublished temp
+/// file (`QueryArgs.output_restartable`) truncated here. A descriptor it cannot restart (stdout, a pipe) may already
+/// have passed bytes on, so under an explicit `--max-memory` such a write takes the mapping from the start.
 pub fn runWrite(ctx: Context, initial_args: QueryArgs, out_path: []const u8) !WriteResult {
     var cache: engine_types.bound_plan.Cache = .{};
     const args = initial_args.withPlanCache(&cache);
     var changed = false;
-    return runWriteOver(ctx, args, out_path, &changed) catch |err| if (changed) error.InputChanged else err;
+    const restartable = args.output_fd == null or args.output_restartable;
+    var through_reader = false;
+    const first: ?local_reader.Reason = if (!restartable and args.max_memory_explicit != null) .unrestartable_output else null;
+    return runWriteOver(ctx, args, out_path, &changed, first, &through_reader) catch |err| {
+        if (changed) return error.InputChanged;
+        if (err != error.ExceededMemoryBudget or !through_reader or !restartable) return err;
+        if (args.output_fd) |fd| try local_fs.truncateToStart(fd);
+        return runWriteOver(ctx, args, out_path, &changed, .retry_mapped, &through_reader) catch |again|
+            if (changed) error.InputChanged else again;
+    };
 }
 
-/// As `executeAggregateOver`.
-fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *bool) !WriteResult {
+/// As `executeAggregateOver`. `mapped`: the mapping for this reason, whatever the choice would be (`runWrite`);
+/// `through_reader` says whether the run read a local input through the reader.
+fn runWriteOver(
+    ctx: Context,
+    args: QueryArgs,
+    out_path: []const u8,
+    changed: *bool,
+    mapped: ?local_reader.Reason,
+    through_reader: *bool,
+) !WriteResult {
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -213,7 +236,8 @@ fn runWriteOver(ctx: Context, args: QueryArgs, out_path: []const u8, changed: *b
     // would need more of the budget than the mapping gives it: such a write reads through the mapping
     // (`input.readerFits`).
     const whole: input.WholeDecode = .{ .cols = fetch_arr, .share = window_mod.producerShareFloor(ctx, args) };
-    const io = try input.chooseLocalIo(ctx.gpa, arena, args, opened, metas, io_policy, whole, prof);
+    const io = try input.chooseLocalIo(ctx.gpa, arena, args, opened, metas, io_policy, whole, mapped, prof);
+    through_reader.* = io.choice.mode != .mmap;
     // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
     var reader: ?*local_reader.Reader = null;
     defer if (on_linux) if (reader) |rd| rd.destroy();

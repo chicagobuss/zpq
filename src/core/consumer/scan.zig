@@ -994,6 +994,12 @@ fn scanRGForAggImpl(
     var whole: []bool = &.{};
     // Compacted rows keep the ungated decode.
     var gated = if (keep == null) try GatedFilter.init(ra, in, target, dec.page_indexes) else null;
+    // The lookup captures each row's slot as it narrows, once: the build columns publish, and a group-join folds, from
+    // them. A plan that defers nothing decodes as no plan does.
+    if (join_lookup.ofFilter(in.filter)) |j| if (joinSlots(j, in)) {
+        if (gated == null) gated = try GatedFilter.undeferred(ra, in);
+        gated.?.slots = try ra.alloc(u32, batch_rows);
+    };
     if (gated) |*g| dec.filter_gated = g.deferred;
     reportGated(ws, in, dec.payload, if (gated) |g| g.deferred else null);
     const all_columns = try ra.alloc(usize, in.read.len);
@@ -1087,8 +1093,9 @@ fn scanRGForAggImpl(
         else
             try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     };
+    const slots: []const u32 = if (gated) |g| g.slots else &.{};
     if (join_lookup.ofFilter(in.filter)) |j| {
-        try publishLookups(j, ra, in, &batch_cols, lookup, &sel, dec.uses.value);
+        try publishLookups(j, ra, in, &batch_cols, lookup, &sel, slots, dec.uses.value);
         batch.cols = batch_cols.items;
     }
     // Length-only predicate columns refill here when the fold or an owner still reads the bytes, and only the
@@ -1111,7 +1118,7 @@ fn scanRGForAggImpl(
     profile.record(prof, .filter, t_decode_end, t_eval_end, profile.args(.{ batch_rows, selected }));
     // A group-join folds into its build's slots: the query's group tables stay empty (`join/lookup.zig`).
     if (join_lookup.ofFilter(in.filter)) |j| if (j.group) |g| {
-        try g.foldRowGroup(j, ra, in.rg_index, &batch, lookup, &sel);
+        try g.foldRowGroup(j, ra, in.rg_index, &batch, lookup, &sel, slots);
         return selected;
     };
 
@@ -1890,9 +1897,11 @@ fn publishLookups(
     batch_cols: *std.ArrayList(filter_eval.Batch.Column),
     lookup: []?usize,
     sel: *const filter_selection.SelectionVector,
+    /// The rows' slots, when the lookup captured them; else they come from the FK here.
+    slots: []const u32,
     values: []const bool,
 ) !void {
-    var at: ?[]const u32 = null;
+    var at: ?[]const u32 = if (slots.len != 0) slots else null;
     for (j.payloads, 0..) |_, p| {
         const ci = j.virtual_base + p;
         if (ci >= in.read.len or !in.read[ci]) continue;
@@ -1903,6 +1912,16 @@ fn publishLookups(
         lookup[ci] = batch_cols.items.len;
         try batch_cols.append(ra, col);
     }
+}
+
+/// Whether a row group's slots are worth capturing: the query reads a build column or folds a group-join.
+fn joinSlots(j: *const join_lookup.Join, in: AggRowGroup) bool {
+    if (j.group != null) return true;
+    for (j.payloads, 0..) |_, p| {
+        const ci = j.virtual_base + p;
+        if (ci < in.read.len and in.read[ci]) return true;
+    }
+    return false;
 }
 
 /// Whether the sliced decode takes this join: it publishes the build columns per slice from the slots the lookup
@@ -2013,11 +2032,7 @@ fn scanRGSlicedExact(
     var published: usize = 0;
     if (join) |j| {
         if (gated == null) gated = try GatedFilter.undeferred(pages.allocator(), in);
-        const reads_build = for (j.payloads, 0..) |_, p| {
-            const ci = j.virtual_base + p;
-            if (ci < in.read.len and in.read[ci]) break true;
-        } else false;
-        if (reads_build or group != null) gated.?.slots = try pages.allocator().alloc(u32, num_rows);
+        if (joinSlots(j, in)) gated.?.slots = try pages.allocator().alloc(u32, num_rows);
     }
     reportGated(ws, in, found, if (gated) |g| g.deferred else null);
     // A gated filter takes its own pass even when the aggregates read only its columns, none of them payload.

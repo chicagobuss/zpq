@@ -897,11 +897,15 @@ pub const GroupJoin = struct {
     }
 
     /// Fold one probe row group's selected rows (every one matched: the lookup ran in the filter).
-    pub fn foldRowGroup(g: *GroupJoin, j: *const Join, a: std.mem.Allocator, rg_index: usize, batch: *const filter_eval.Batch, lookup: []const ?usize, sel: *const selection.SelectionVector) !void {
-        const fk_pos = lookup[j.fk_leaf] orelse return error.BadColumn;
+    /// `slots`: the rows' slots when the lookup captured them, else empty and they come from the FK.
+    pub fn foldRowGroup(g: *GroupJoin, j: *const Join, a: std.mem.Allocator, rg_index: usize, batch: *const filter_eval.Batch, lookup: []const ?usize, sel: *const selection.SelectionVector, slots: []const u32) !void {
         var fold: Fold = .{ .g = g };
         errdefer fold.deinit();
-        try fold.add(a, try slotsFor(j, batch.cols[fk_pos], sel, a), batch, lookup, sel);
+        const at = if (slots.len != 0) slots else blk: {
+            const fk_pos = lookup[j.fk_leaf] orelse return error.BadColumn;
+            break :blk try slotsFor(j, batch.cols[fk_pos], sel, a);
+        };
+        try fold.add(a, at, batch, lookup, sel);
         try fold.finish(rg_index);
     }
 

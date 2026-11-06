@@ -1633,3 +1633,56 @@ test "a join whose group-join the budget refuses frees what it allocated, reques
         }));
     }
 }
+
+test "a group-join whose scan fails leaks nothing, request after request" {
+    // Beside review R10's deterministic case (`join/lookup.zig`): a failed row group 0 and the later row groups' folds
+    // at several job counts. The decode error's replay resets the group-join, so this does not force R10's ordering.
+    const fact = "ci/fixtures/parquet/full_match.parquet"; // 8 row groups, `ts` unique
+    std.Io.Dir.cwd().access(std.testing.io, fact, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const sql_parser = @import("../core/expr/sql_parser.zig");
+    const engine_join = @import("join.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().copyFile(fact, tmp.dir, "dim.parquet", std.testing.io, .{});
+    // The probe: the same file with row group 0's first page of `b` unreadable.
+    {
+        const bytes = try metadata.readFileSlice(fact, gpa);
+        defer gpa.free(bytes);
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const meta = try metadata.open(arena_state.allocator(), bytes);
+        const b = try metadata.resolveColumn(&meta, "b");
+        const at: usize = @intCast(meta.row_groups.items[0].columns.items[b].meta_data.?.data_page_offset);
+        @memset(bytes[at..][0..16], 0xff);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fact.parquet", .data = bytes });
+    }
+    var path_buf: [2][96]u8 = undefined;
+    const probe = try std.fmt.bufPrint(&path_buf[0], ".zig-cache/tmp/{s}/fact.parquet", .{tmp.sub_path});
+    const dim = try std.fmt.bufPrint(&path_buf[1], ".zig-cache/tmp/{s}/dim.parquet", .{tmp.sub_path});
+    const sql = try std.fmt.allocPrint(gpa, "SELECT f.ts, sum(f.b) AS s, count(*) AS n FROM '{s}' f JOIN '{s}' d ON f.ts = d.ts GROUP BY f.ts", .{ probe, dim });
+    defer gpa.free(sql);
+    for ([_]usize{ 1, 4, 8, 8, 8, 8 }) |jobs| {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var schemas: engine_join.LocalSchemas = .{ .arena = arena };
+        defer schemas.deinit();
+        const pq = (try sql_parser.parseSqlJoinPlan(arena, sql, .{ .ctx = &schemas, .footer = engine_join.LocalSchemas.footer })).?;
+        if (runQuery(.{ .gpa = gpa, .env = .empty, .io = std.testing.io }, .{
+            .inputs = &.{probe},
+            .plan_source = @import("syntax_plan.zig").source(pq.syntax.?),
+            .aggregate = pq.aggregate_str,
+            .filter = pq.filter_str,
+            .group_by = pq.group_by_str,
+            .select = pq.select_str,
+            .select_cols = pq.select_cols,
+            .result_order = pq.result_order,
+            .parallelism = jobs,
+        })) |r| {
+            var result = r;
+            result.deinit(gpa);
+            return error.TestExpectedError;
+        } else |_| {}
+    }
+}

@@ -873,7 +873,7 @@ pub const GroupJoin = struct {
 
     /// Forget every fold: a refused scan replays from its first row group (`scan.runMultiAggregate`).
     pub fn reset(g: *GroupJoin) void {
-        for (g.pending) |*p| if (p.swap(null, .acquire)) |partial| partial.free(g.gpa);
+        g.discardPending();
         g.next.store(0, .monotonic);
         g.overflow.store(false, .monotonic);
         g.zero();
@@ -887,7 +887,15 @@ pub const GroupJoin = struct {
         return bits[s >> 6] & (@as(u64, 1) << @intCast(s & 63)) != 0;
     }
 
+    /// Free every partial still waiting for an earlier row group, unapplied: what a replay or an aborted scan left.
+    fn discardPending(g: *GroupJoin) void {
+        for (g.pending) |*p| if (p.swap(null, .acquire)) |partial| partial.free(g.gpa);
+    }
+
+    /// After the workers have joined. A scan that failed before its rows were taken leaves later row groups' partials
+    /// waiting on the one that failed; they are discarded with the rest.
     pub fn deinit(g: *GroupJoin) void {
+        g.discardPending();
         const gpa = g.gpa;
         for (g.f) |x| gpa.free(x);
         for (g.i) |x| gpa.free(x);
@@ -1325,3 +1333,24 @@ pub const GroupJoin = struct {
         return out;
     }
 };
+
+test "an aborted scan frees the later row groups' partials waiting on it (review R10)" {
+    const a = std.testing.allocator;
+    const j: Join = .{ .kind = .inner, .build_name = "dimension", .key_name = "pk", .n = 1, .keys = undefined, .payloads = &.{}, .bytes = 0 };
+    const keys = try a.alloc(usize, 1);
+    keys[0] = 0;
+    const calls = try a.alloc(GroupJoin.Call, 1);
+    calls[0] = .{ .func = .count, .arg = null, .lane = .i64 };
+    const outputs = try a.alloc(GroupJoin.Output, 2);
+    outputs[0] = .{ .key = 0 };
+    outputs[1] = .{ .agg = 0 };
+    const g = try GroupJoin.init(a, &j, keys, calls, outputs, 2);
+    // Row group 1 folds and waits on row group 0, which fails: the query releases the group-join without a drain.
+    var fold: GroupJoin.Fold = .{ .g = g };
+    errdefer fold.deinit();
+    try fold.slots.append(a, 0);
+    try fold.counts.append(a, 1);
+    try fold.finish(1);
+    try std.testing.expect(g.pending[1].load(.acquire) != null);
+    g.deinit();
+}

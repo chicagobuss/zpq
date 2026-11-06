@@ -23,6 +23,22 @@
     "join-gate-clean",
     "join-gate-dim"
    ]
+  },
+  {
+   "script": "tools/check/prepare_join_review.py",
+   "files": [
+    "review-fact",
+    "review-dim",
+    "review-dup",
+    "review-long-string",
+    "review-ts-f",
+    "review-ts-d",
+    "review-u-f",
+    "review-u-d",
+    "review-dec-f",
+    "review-dec-d",
+    "review-uniq"
+   ]
   }
  ],
  "cases": [
@@ -404,6 +420,456 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT d.kind, count(*) AS n, sum(f.amt) AS s FROM '{fixture:dim}' d, '{fixture:fact}' f, '{fixture:dim_sparse}' x WHERE d.pk = f.fk AND f.sfk = x.spk AND x.sgrp <> 2 GROUP BY d.kind ORDER BY d.kind"
+   }
+  },
+  {
+   "id": "review:r1:reduced-inner-duplicates",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, count(*) AS n FROM '{fixture:review-fact}' f, '{fixture:review-dim}' d, '{fixture:review-dup}' x WHERE f.fk = d.pk AND f.fk = x.xpk GROUP BY d.grp ORDER BY d.grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "holds a key of xpk twice: this build joins N:1 only"
+   }
+  },
+  {
+   "id": "review:r1:reduced-inner-unique",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, count(*) AS n FROM '{fixture:review-fact}' f, '{fixture:review-dim}' d, '{fixture:review-uniq}' x WHERE f.fk = d.pk AND f.fk = x.upk AND x.ug = 1 GROUP BY d.grp ORDER BY d.grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, count(*) AS n FROM '{fixture:review-fact}' f, '{fixture:review-dim}' d, '{fixture:review-uniq}' x WHERE f.fk = d.pk AND f.fk = x.upk AND x.ug = 1 GROUP BY d.grp ORDER BY d.grp"
+   }
+  },
+  {
+   "id": "review:r2:in-limit-0",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:review-fact}' WHERE fk IN (SELECT pk FROM '{fixture:review-dim}' LIMIT 0)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "LIMIT or OFFSET is not supported"
+   }
+  },
+  {
+   "id": "review:r2:in-order-limit-offset",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:review-fact}' WHERE fk IN (SELECT pk FROM '{fixture:review-dim}' ORDER BY pk LIMIT 1 OFFSET 3)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "LIMIT or OFFSET is not supported"
+   }
+  },
+  {
+   "id": "review:r2:in-order-only",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:review-fact}' WHERE fk IN (SELECT pk FROM '{fixture:review-dim}' ORDER BY pk)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:review-fact}' WHERE fk IN (SELECT pk FROM '{fixture:review-dim}' ORDER BY pk)"
+   }
+  },
+  {
+   "id": "review:r3:correlated",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:review-fact}' f WHERE f.fk IN (SELECT d.pk FROM '{fixture:review-dim}' d WHERE f.v = 101)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a correlated subquery"
+   }
+  },
+  {
+   "id": "review:r3:uncorrelated",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:review-fact}' f WHERE f.fk IN (SELECT d.pk FROM '{fixture:review-dim}' d WHERE d.v > 1001)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:review-fact}' f WHERE f.fk IN (SELECT d.pk FROM '{fixture:review-dim}' d WHERE d.v > 1001)"
+   }
+  },
+  {
+   "id": "review:r4:timestamp-units",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:review-ts-f}', '{fixture:review-ts-d}' WHERE t = tk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "the join compares t with a key of another SQL type"
+   }
+  },
+  {
+   "id": "review:r4:unsigned-signed",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:review-u-f}', '{fixture:review-u-d}' WHERE u = s"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "the join compares u with a key of another SQL type"
+   }
+  },
+  {
+   "id": "review:r4:decimal-scales",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:review-dec-f}', '{fixture:review-dec-d}' WHERE d = dk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "is not an integer, DATE, TIME or TIMESTAMP column"
+   }
+  },
+  {
+   "id": "review:r5:long-string-1m",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(CASE WHEN blob LIKE 'x%' THEN amt ELSE 0 END) AS s FROM '{fixture:review-fact}' JOIN '{fixture:review-long-string}' ON fk = pk",
+    "--max-memory",
+    "1M"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "does not fit --max-memory"
+   }
+  },
+  {
+   "id": "review:r5:long-string",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(CASE WHEN blob LIKE 'x%' THEN amt ELSE 0 END) AS s FROM '{fixture:review-fact}' JOIN '{fixture:review-long-string}' ON fk = pk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(CASE WHEN blob LIKE 'x%' THEN amt ELSE 0 END) AS s FROM '{fixture:review-fact}' JOIN '{fixture:review-long-string}' ON fk = pk"
+   }
+  },
+  {
+   "id": "review:r7:string-topk",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT name, count(*) AS n FROM '{fixture:review-fact}' JOIN '{fixture:review-dim}' ON fk = pk GROUP BY name ORDER BY n DESC, name LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT name, count(*) AS n FROM '{fixture:review-fact}' JOIN '{fixture:review-dim}' ON fk = pk GROUP BY name ORDER BY n DESC, name LIMIT 2"
+   }
+  },
+  {
+   "id": "review:r7:string-topk:plan",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT name, count(*) AS n FROM '{fixture:review-fact}' JOIN '{fixture:review-dim}' ON fk = pk GROUP BY name ORDER BY n DESC LIMIT 2",
+    "--explain"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "plan",
+    "holds": {
+     "strategy": "plain_hash",
+     "record_path": null
+    }
+   }
+  },
+  {
+   "id": "review:r8:qualified-collision",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, sum(d.v) AS s FROM '{fixture:review-fact}' f JOIN '{fixture:review-dim}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY d.grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "ambiguous column name"
    }
   }
  ]

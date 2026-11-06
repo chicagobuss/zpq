@@ -31,6 +31,7 @@ const system = @import("../core/system.zig");
 const tls = @import("../io/tls.zig");
 const multipart_sink = @import("../io/multipart_sink.zig");
 const Diag = @import("../core/diag.zig").Diag;
+const Text = @import("../core/diag.zig").Text;
 const engine_types = @import("types.zig");
 const Context = engine_types.Context;
 const envDisables = @import("env.zig").envDisables;
@@ -205,8 +206,22 @@ fn runWriteOver(
     const meta0 = &metas[0];
     // Same name is not enough: a byte-copy concatenation (and a shared footer) is only valid when the columns are
     // structurally identical, or the footer lies about the copied bytes.
-    for (metas[1..]) |*m| {
-        if (metadata.schemaMismatch(meta0.schema.items, m.schema.items, .exact) != null) return error.SchemaMismatch;
+    for (metas[1..], 1..) |*m, i| {
+        const at = metadata.schemaMismatch(meta0.schema.items, m.schema.items, .exact) orelse continue;
+        // Name the input and the column where they part, as a scan's refusal does.
+        if (at < meta0.schema.items.len and at < m.schema.items.len) {
+            var first: Text = .{};
+            var other: Text = .{};
+            describeElement(&first, meta0.schema.items[at]);
+            describeElement(&other, m.schema.items[at]);
+            Diag.setInput(args.diag, opened.inputs[i].name, null);
+            Diag.set(args.diag, first.get(), .{ .schema_mismatch = .{
+                .file = i,
+                .first_input = opened.inputs[0].name,
+                .other = other,
+            } });
+        }
+        return error.SchemaMismatch;
     }
     const tree0 = try schema_tree.SchemaTree.build(arena, meta0.schema.items);
 
@@ -1027,6 +1042,17 @@ pub fn buildSelectSchema(
     }
 
     return out;
+}
+
+/// A schema element as a refusal names it: its name, and what a byte copy needs to agree on besides.
+fn describeElement(t: *Text, e: schema.SchemaElement) void {
+    t.set(e.name);
+    t.append(" ");
+    t.append(if (e.type) |ty| @tagName(ty) else "group");
+    if (e.repetition_type) |r| {
+        t.append(" ");
+        t.append(@tagName(r));
+    }
 }
 
 /// Whether the output can share blocks with the inputs: a local file zpq made (never a caller's descriptor it may not

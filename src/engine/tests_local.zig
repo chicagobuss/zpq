@@ -1027,6 +1027,91 @@ test "regression: inputs whose legacy DECIMAL scales differ are refused on every
     try std.testing.expectEqual(@as(i128, 48), r.aggregate.output.aggs[0].value.i);
 }
 
+test "a byte-copy concatenation names the input and column whose schema differs" {
+    const dir = "ci/fixtures/parquet/";
+    std.Io.Dir.cwd().access(std.testing.io, dir ++ "legacy_decimal_s2.parquet", .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    const inputs: []const []const u8 = &.{
+        dir ++ "legacy_decimal_s2.parquet",
+        dir ++ "legacy_decimal_s2.parquet",
+        dir ++ "legacy_decimal_s4.parquet",
+    };
+    var diag: Diag = .{};
+    try std.testing.expectError(error.SchemaMismatch, runQuery(ctx, .{ .inputs = inputs, .output = out, .diag = &diag }));
+    try std.testing.expectEqualStrings(inputs[2], diag.input.?);
+    const m = diag.detail.schema_mismatch;
+    try std.testing.expectEqual(@as(usize, 2), m.file);
+    try std.testing.expectEqualStrings(inputs[0], m.first_input);
+    try std.testing.expect(std.mem.startsWith(u8, diag.column.get(), "value "));
+    try std.testing.expectError(error.FileNotFound, local_fs.openRead(out));
+}
+
+test "a byte-copy concatenation keeps every input's chunks verbatim, aligned, its page indexes and filters carried" {
+    const dir = "ci/fixtures/parquet/";
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "filtered_records_ordered.parquet", "bloom_keys.parquet" }) |name| {
+        var in_buf: [96]u8 = undefined;
+        const in = try std.fmt.bufPrint(&in_buf, "{s}{s}", .{ dir, name });
+        std.Io.Dir.cwd().access(std.testing.io, in, .{}) catch return error.SkipZigTest;
+        var path_buf: [96]u8 = undefined;
+        const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+        var r = try runQuery(ctx, .{ .inputs = &.{ in, in, in }, .output = out });
+        r.deinit(gpa);
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const src = try local_fs.readFile(a, in);
+        const got = try local_fs.readFile(a, out);
+        const src_meta = try metadata.open(a, src);
+        const out_meta = try metadata.open(a, got);
+        const n = src_meta.row_groups.items.len;
+        try std.testing.expectEqual(3 * n, out_meta.row_groups.items.len);
+        try std.testing.expectEqual(3 * src_meta.num_rows, out_meta.num_rows);
+        var filters: usize = 0;
+        var indexes: usize = 0;
+        for (out_meta.row_groups.items, 0..) |out_rg, k| {
+            const src_rg = src_meta.row_groups.items[k % n];
+            const run = (try fastpath.rowGroupByteRange(&src_rg, src.len)).?;
+            for (src_rg.columns.items, out_rg.columns.items) |sc, oc| {
+                const sm = sc.meta_data.?;
+                const om = oc.meta_data.?;
+                const s: usize = @intCast(sm.dictionary_page_offset orelse sm.data_page_offset);
+                const o: usize = @intCast(om.dictionary_page_offset orelse om.data_page_offset);
+                const len: usize = @intCast(sm.total_compressed_size);
+                try std.testing.expectEqualSlices(u8, src[s..][0..len], got[o..][0..len]);
+                if (fastpath.alignGap(0, run.start, run.len) != null)
+                    try std.testing.expectEqual(s % fastpath.share_block, o % fastpath.share_block);
+                if (oc.offset_index_offset) |io| {
+                    var reader = thrift.Reader.init(got[@intCast(io)..][0..@intCast(oc.offset_index_length.?)]);
+                    const index = try schema.OffsetIndex.read(a, &reader);
+                    for (index.page_locations.items) |pl| {
+                        const at: usize = @intCast(pl.offset);
+                        const size: usize = @intCast(pl.compressed_page_size);
+                        try std.testing.expectEqualSlices(u8, src[at - o + s ..][0..size], got[at..][0..size]);
+                    }
+                    indexes += 1;
+                }
+                if (om.bloom_filter_offset) |bo| {
+                    const bytes = got[@intCast(bo)..][0..@intCast(om.bloom_filter_length.?)];
+                    try std.testing.expect(sbbf.parseHeader(bytes) != null);
+                    if (sm.bloom_filter_offset) |so|
+                        try std.testing.expectEqualSlices(u8, src[@intCast(so)..][0..bytes.len], bytes);
+                    filters += 1;
+                }
+            }
+        }
+        try std.testing.expect(indexes + filters > 0);
+    }
+}
+
 /// The answer's group rows as `v,v,...;` lines, sorted, so a test reads the same text whatever the group order.
 fn sortedGroupText(gpa: std.mem.Allocator, ctx: Context, args: QueryArgs) ![]u8 {
     var r = try runQuery(ctx, args);

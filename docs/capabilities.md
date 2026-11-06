@@ -163,6 +163,13 @@ pipe, stdout, S3) the runs are read and written as before, the same bytes. `ZPQ_
 The layout is a fixed 4 KiB whatever the filesystem, so a copy's bytes are the same wherever it is written. Its cost
 is at most 4,095 bytes per run and always fewer than the run's whole blocks; the summary's `byte_copy` reports it.
 
+**Concatenation.** Several inputs (a glob or a file list) with no filter, `--select` or computed column are one byte
+copy: each input's row groups are copied whole, in input order, under one footer. The inputs' schemas must agree
+column for column (names, physical and logical types, repetition, nesting and DECIMAL scale and precision); the first
+that differs is refused, naming the file and the column where it parts from the first input's. Inputs that declare
+different column orders are re-encoded instead. File key-value metadata (an embedded Arrow schema among it) is not
+carried by any write, so it never decides a concatenation.
+
 `--codec` sets the output codec. Without it, re-encoded output is SNAPPY and a plain copy keeps each column chunk's own
 codec; with it, a plain copy recompresses any chunk stored in another codec. The `codec` field of the write summary names
 the codec every written chunk uses, or is `"MIXED"` when a plain copy without `--codec` keeps chunks in more than one

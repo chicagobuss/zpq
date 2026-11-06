@@ -318,6 +318,9 @@ pub const Filter = union(enum) {
     like: LikeMatch,
     and_filter: Composite,
     or_filter: Composite,
+    /// A join's foreign key: keeps the rows whose key has a build match (`join/lookup.zig`). Only a join binder makes
+    /// one, as a top-level AND conjunct.
+    lookup: Lookup,
 
     /// Walk the AST collecting every leaf's column index.
     /// Useful for the "fetch only filter columns first" pattern.
@@ -333,9 +336,15 @@ pub const Filter = union(enum) {
             .boolean => |f| try list.append(allocator, f.col_idx),
             .null_check => |f| try list.append(allocator, f.col_idx),
             .like => |f| try list.append(allocator, f.col_idx),
+            .lookup => |f| try list.append(allocator, f.col_idx),
             .and_filter, .or_filter => |c| for (c.children) |child| try child.collectColumns(list, allocator),
         }
     }
+};
+
+pub const Lookup = struct {
+    col_idx: usize,
+    join: *const @import("../join/lookup.zig").Join,
 };
 
 /// The column a leaf reads; null for a composite.
@@ -384,6 +393,7 @@ pub fn eql(a: Filter, b: Filter) bool {
             l.trust_missing_nan_count == b.double.trust_missing_nan_count and l.trust_stats == b.double.trust_stats,
         .null_check => |n| n.col_idx == b.null_check.col_idx and n.is_not == b.null_check.is_not and
             n.trust_stats == b.null_check.trust_stats,
+        .lookup => |l| l.col_idx == b.lookup.col_idx and l.join == b.lookup.join,
         .like => |m| m.col_idx == b.like.col_idx and m.kind == b.like.kind and m.negate == b.like.negate and
             m.fold == b.like.fold and std.mem.eql(u8, m.operand, b.like.operand),
         inline .int32, .int64, .uint64, .decimal, .boolean => |l, tag| blk: {
@@ -447,6 +457,7 @@ fn withTrust(arena: std.mem.Allocator, f: Filter, plausible: bool) std.mem.Alloc
             if (plausible) out.trust_stats = true;
             break :blk .{ .null_check = out };
         },
+        .lookup => f,
         .and_filter, .or_filter => |c| blk: {
             const children = try arena.alloc(Filter, c.children.len);
             for (c.children, children) |child, *n| n.* = try withTrust(arena, child, plausible);
@@ -502,6 +513,8 @@ pub fn cost(f: Filter) Cost {
     return switch (f) {
         .int32, .int64, .uint64, .float, .double, .decimal, .boolean, .null_check => .fixed,
         .string => |l| if (l.value.len == 0 and (l.op == .Eq or l.op == .NotEq)) .fixed else .string,
+        // A probe of a build structure per row: dearer than a compare, so it runs on what the cheap leaves left.
+        .lookup => .string,
         .like => |m| if (m.fold) .like_search else switch (m.kind) {
             .exact, .prefix, .suffix => .like_anchored,
             .contains, .general => .like_search,

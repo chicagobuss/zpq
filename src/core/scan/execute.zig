@@ -6,6 +6,7 @@ const filter_eval = @import("../filter/eval.zig");
 const filter_selection = @import("../filter/selection.zig");
 const BoundAggregate = @import("types.zig").BoundAggregate;
 const std = @import("std");
+const join_lookup = @import("../join/lookup.zig");
 const testing = std.testing;
 const nowMonoNs = @import("../../clock.zig").monoNs;
 const profile = @import("../../profile.zig");
@@ -204,6 +205,21 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
     // plus the shared-string prefix, an admitted record scan and its serial decode retry before the general chain,
     // and each arms its paths only over inputs a scan reads again, whole, from the start.
     var attempt = args;
+    // A join publishes its build columns on the established row-group scan alone: no strategy that decodes its own
+    // way (owned records, shared strings, dense domains, pairs) sees them.
+    const bound_filter = if (args.bound_aggregate) |b| b.filter else null;
+    const joined = join_lookup.inFilter(bound_filter);
+    if (joined) {
+        attempt.shared_strings = false;
+        attempt.integer_records = false;
+        attempt.msd_records = false;
+        attempt.byte_records = false;
+        attempt.private_runs = false;
+        attempt.distinct_pairs = .off;
+        attempt.grouped_distinct_bitmap = .off;
+        attempt.count_ranked_distinct = .off;
+        attempt.dense = false;
+    }
     var chain: Chain = .{ .parts_tried = args.partagg };
     const ledger_before = if (args.ledger) |l| l.used.load(.monotonic) else 0;
     var may_fit = false;
@@ -215,6 +231,8 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
             merge_memory = .{ .child = gpa, .budget = l };
             attempt.merge_memory = &merge_memory;
         }
+        // A refused scan replays from its first row group: the group-join forgets what it folded.
+        if (join_lookup.ofFilter(bound_filter)) |j| if (j.group) |g| g.reset();
         if (prepareAggregate(gpa, arena, attempt, false)) |r| return r else |e0| {
             const e = if (args.ledger != null) merge_memory.refusal(e0) else e0;
             if (e == error.CountRankedDistinctDeclined) {

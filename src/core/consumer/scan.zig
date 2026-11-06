@@ -12,6 +12,7 @@ const schema = @import("../schema.zig");
 const filter_ast = @import("../filter/ast.zig");
 const filter_eval = @import("../filter/eval.zig");
 const filter_selection = @import("../filter/selection.zig");
+const join_lookup = @import("../join/lookup.zig");
 const expr_ast = @import("../expr/ast.zig");
 const expr_eval = @import("../expr/eval.zig");
 const expr_agg = @import("../expr/agg.zig");
@@ -475,7 +476,12 @@ pub fn scanRGForAgg(
     ws: AggWorkspace,
 ) !u64 {
     var execution = ws;
-    if (ws.auto_decode_batches and ws.decode_batch_rows == 0 and ws.expr_batch_rows != 0 and
+    // A join's virtual columns are published by the whole-row-group decode alone (`publishLookups`).
+    if (join_lookup.inFilter(in.filter)) {
+        execution.auto_decode_batches = false;
+        execution.decode_batch_rows = 0;
+    }
+    if (execution.auto_decode_batches and ws.decode_batch_rows == 0 and ws.expr_batch_rows != 0 and
         (target != .grouped or exactTileTarget(in, target) or (decode_options.encoded and
             target.grouped.part == null and target.grouped.records == null)))
         execution.decode_batch_rows = automaticCacheRowsWithHints(ws.planning_charged orelse ws.charged orelse gpa, in, target, ws.scan_workers, ws.cache_hints) catch 0;
@@ -860,6 +866,12 @@ fn planDecode(
         break :blk decode_options.encoded and cm.dictionary_page_offset != null and
             !@import("../filter/membership.zig").dictionaryCoversChunk(&cm);
     } else false;
+    // A join's lookups publish on the whole decode alone: one that does not fit is refused, and the query replays
+    // narrower (fewer workers, a larger share each), as any refused scan does.
+    if (join_lookup.inFilter(in.filter)) {
+        if (fits_share and admitWhole(ws, full)) return plan;
+        return error.ExceededMemoryBudget;
+    }
     const whole = !keep_dictionary and !stream and !force_cache and fits_share and admitWhole(ws, full);
     if (whole) return plan;
     // A sliced row group gives the region back: the slices draw beside it, so a region kept across sliced groups
@@ -950,9 +962,12 @@ fn scanRGForAggImpl(
     const batch_rows = if (keep != null) sel.count() else num_rows;
 
     const t_decode_start = nowMonoNs();
+    const uses = try planCodeUses(ra, in, target);
+    // A group-join folds its arguments' values itself: never as a histogram or codes alone.
+    if (join_lookup.ofFilter(in.filter)) |j| if (j.group) |g| for (g.calls) |c| if (c.arg) |e| e.collectColumns(uses.value);
     var dec: ChunkDecoder = .{
         .in = in,
-        .uses = try planCodeUses(ra, in, target),
+        .uses = uses,
         .page_indexes = page_indexes,
         .filter_pages = filter_pages,
         .num_rows = num_rows,
@@ -1060,7 +1075,7 @@ fn scanRGForAggImpl(
         t.record(.decode, t_decode_start, t_decode_end, decode_args);
     }
 
-    const batch: filter_eval.Batch = .{
+    var batch: filter_eval.Batch = .{
         .cols = batch_cols.items,
         .num_rows = batch_rows,
         .expr_batch_rows = ws.expr_batch_rows,
@@ -1071,6 +1086,10 @@ fn scanRGForAggImpl(
         else
             try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     };
+    if (join_lookup.ofFilter(in.filter)) |j| {
+        try publishLookups(j, ra, in, &batch_cols, lookup, &sel, dec.uses.value);
+        batch.cols = batch_cols.items;
+    }
     // Length-only predicate columns refill here when the fold or an owner still reads the bytes, and only the
     // rows the filter kept. `codePlainKeys` has to see those bytes, not the empty length-only placeholders.
     if (dec.payload != null or in.filter != null) dec.gate = &sel;
@@ -1089,6 +1108,11 @@ fn scanRGForAggImpl(
     ws.timings.eval_ns += @intCast(t_eval_end - t_decode_end);
     const selected: usize = if (in.filter != null) sel.count() else num_rows;
     profile.record(prof, .filter, t_decode_end, t_eval_end, profile.args(.{ batch_rows, selected }));
+    // A group-join folds into its build's slots: the query's group tables stay empty (`join/lookup.zig`).
+    if (join_lookup.ofFilter(in.filter)) |j| if (j.group) |g| {
+        try g.foldRowGroup(j, ra, in.rg_index, &batch, lookup, &sel);
+        return selected;
+    };
 
     switch (target) {
         .grouped => {
@@ -1856,6 +1880,28 @@ test "dictionary rewrite grouping and scalar distinct read mixed pages with null
 /// `scanRGForAgg`'s decode and fold, a slice of rows at a time. Null when some column has no sliced form.
 /// At the end of the group, retained scratch is at most one eighth of the ledger it is charged to. A group that
 /// still does not fit is refused.
+/// A join's build columns, read by the query, as coded columns over the rows its lookup kept: after the filter, so
+/// every selected row has a match. Virtual leaves have no chunk in any row group, so the decode loop passed them.
+fn publishLookups(
+    j: *const join_lookup.Join,
+    ra: std.mem.Allocator,
+    in: AggRowGroup,
+    batch_cols: *std.ArrayList(filter_eval.Batch.Column),
+    lookup: []?usize,
+    sel: *const filter_selection.SelectionVector,
+    values: []const bool,
+) !void {
+    for (j.payloads, 0..) |_, p| {
+        const ci = j.virtual_base + p;
+        if (ci >= in.read.len or !in.read[ci]) continue;
+        const fk_pos = lookup[j.fk_leaf] orelse return error.BadColumn;
+        // Codes alone serve coded consumers (filters, CASE conditions, grouping); values only where one reads them.
+        const col = try join_lookup.column(j, p, batch_cols.items[fk_pos], sel, ra, ci < values.len and values[ci]);
+        lookup[ci] = batch_cols.items.len;
+        try batch_cols.append(ra, col);
+    }
+}
+
 fn scanRGSliced(
     gpa: std.mem.Allocator,
     in: AggRowGroup,
@@ -1868,6 +1914,8 @@ fn scanRGSliced(
     full: usize,
     stream_rows: usize,
 ) !?u64 {
+    // A join's lookups publish only on the whole-row-group decode: refuse rather than read a build column as absent.
+    if (join_lookup.inFilter(in.filter)) return error.JoinNeedsWholeRowGroup;
     return scanRGSlicedExact(gpa, in, stats, decode_options, target, ws, budget, handled, full, stream_rows, false);
 }
 

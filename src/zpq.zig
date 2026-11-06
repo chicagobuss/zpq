@@ -15,6 +15,7 @@ pub const core = struct {
     pub const spawn = @import("core/spawn.zig");
     pub const huge_pages = @import("core/huge_pages.zig");
     pub const memory = @import("core/memory.zig");
+    pub const join_lookup = @import("core/join/lookup.zig");
     pub const filter = struct {
         pub const ast = @import("core/filter/ast.zig");
         pub const encoded = @import("core/filter/encoded.zig");
@@ -37,6 +38,10 @@ pub const core = struct {
         // build, so the module isn't compiled there (no @cImport, no C dep).
         pub const sql_parser = if (@import("build_options").enable_sql)
             @import("core/expr/sql_parser.zig")
+        else
+            struct {};
+        pub const sql_join = if (@import("build_options").enable_sql)
+            @import("core/expr/sql_join.zig")
         else
             struct {};
     };

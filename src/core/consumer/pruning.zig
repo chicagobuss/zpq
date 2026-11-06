@@ -23,7 +23,8 @@ fn collectConjunctiveLeaves(f: filter_ast.Filter, list: *std.ArrayList(Conjuncti
     switch (f) {
         // A NULL-member AND passes no row; what its leaves prove of pages says nothing of that.
         .and_filter => |c| if (!c.null_member) for (c.children) |child| try collectConjunctiveLeaves(child, list, allocator),
-        .or_filter => {},
+        // A lookup proves nothing of a page's statistics.
+        .or_filter, .lookup => {},
         else => {
             const col_idx = switch (f) {
                 .int32 => |l| l.col_idx,

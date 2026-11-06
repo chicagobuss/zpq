@@ -685,6 +685,8 @@ pub fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
         .null_check => |nc| .{ .null_check = .{ .col_idx = nc.col_idx, .is_not = !nc.is_not } },
         // NOT (x LIKE p) == x NOT LIKE p — flip the negate flag.
         .like => |m| .{ .like = .{ .col_idx = m.col_idx, .kind = m.kind, .operand = m.operand, .negate = !m.negate, .fold = m.fold } },
+        // An anti join is not a negated lookup's rows (NULL keys): no binder negates one.
+        .lookup => error.UnsupportedType,
         // De Morgan, a node at a time: the tree is at most a few levels deep (see `ast.Composite`).
         .and_filter, .or_filter => |c| blk: {
             const children = try arena.alloc(ast.Filter, c.children.len);

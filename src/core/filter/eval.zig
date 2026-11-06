@@ -519,6 +519,10 @@ pub fn evaluate(
         if (col.codes()) |codes| return evalCodedLeaf(filter, ci, col, codes, sel, column_lookup.len, arena);
     }
     switch (filter) {
+        .lookup => |leaf| {
+            const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
+            try @import("../join/lookup.zig").narrow(leaf.join, batch.cols[col_pos], sel, arena);
+        },
         .int32 => |leaf| {
             const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
             const col = batch.cols[col_pos];
@@ -712,7 +716,8 @@ fn leafColumn(f: ast.Filter) ?usize {
         .string => |l| l.col_idx,
         .boolean => |l| l.col_idx,
         .like => |l| l.col_idx,
-        .null_check, .and_filter, .or_filter => null,
+        // A lookup reads its key's codes or values itself (dictionary-direct).
+        .null_check, .and_filter, .or_filter, .lookup => null,
     };
 }
 

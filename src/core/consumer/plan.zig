@@ -7,6 +7,7 @@ const schema = @import("../schema.zig");
 const filter_ast = @import("../filter/ast.zig");
 const filter_eval = @import("../filter/eval.zig");
 const filter_selection = @import("../filter/selection.zig");
+const join_lookup = @import("../join/lookup.zig");
 const expr_ast = @import("../expr/ast.zig");
 const expr_agg = @import("../expr/agg.zig");
 const agg_coded = @import("../expr/agg_coded.zig");
@@ -317,11 +318,24 @@ pub fn streamWindowRows(in: AggRowGroup, target: AggTarget, num_rows: usize) usi
 /// `GatedFilter.narrow`; the decode paths reach conjuncts only through `GatedFilter`.
 pub const Conjunct = union(enum) {
     predicate: filter_ast.Filter,
+    /// A join's foreign key looked up in its build (`join/lookup.zig`): it reads the key alone, so the key decodes
+    /// deferred, at the survivors of the conjuncts before it, on every path that takes this plan.
+    lookup: filter_ast.Lookup,
+
+    fn of(f: filter_ast.Filter) Conjunct {
+        return switch (f) {
+            .lookup => |l| .{ .lookup = l },
+            else => .{ .predicate = f },
+        };
+    }
 
     /// Mark the columns this conjunct reads.
     pub fn reads(c: Conjunct, marks: []bool) void {
         switch (c) {
             .predicate => |f| filter_ast.markColumns(f, marks),
+            .lookup => |l| if (l.col_idx < marks.len) {
+                marks[l.col_idx] = true;
+            },
         }
     }
 
@@ -330,6 +344,7 @@ pub const Conjunct = union(enum) {
     pub fn soleColumn(c: Conjunct) ?usize {
         return switch (c) {
             .predicate => |f| filter_ast.leafColumn(f),
+            .lookup => |l| l.col_idx,
         };
     }
 };
@@ -360,7 +375,7 @@ pub const GatedFilter = struct {
         if (c.in_set != null or c.null_member or c.children.len < 2) return null;
         if (target == .grouped and target.grouped.records != null) return null;
         const conjuncts = try a.alloc(Conjunct, c.children.len);
-        for (conjuncts, c.children) |*k, child| k.* = .{ .predicate = child };
+        for (conjuncts, c.children) |*k, child| k.* = Conjunct.of(child);
         const n = in.read.len;
         const deferred = try a.alloc(bool, n);
         @memset(deferred, false);
@@ -439,10 +454,19 @@ pub const GatedFilter = struct {
             if (!w) continue;
             switch (k) {
                 .predicate => |f| try run.append(a, f),
+                .lookup => {},
             }
         }
-        if (run.items.len == 1) return filter_eval.evaluate(run.items[0], batch, sel, lookup, a);
-        if (run.items.len > 1) return filter_eval.evaluate(.{ .and_filter = .{ .children = run.items } }, batch, sel, lookup, a);
+        if (run.items.len == 1) try filter_eval.evaluate(run.items[0], batch, sel, lookup, a);
+        if (run.items.len > 1) try filter_eval.evaluate(.{ .and_filter = .{ .children = run.items } }, batch, sel, lookup, a);
+        // Lookups probe what the predicates in this row left.
+        for (g.conjuncts, which) |k, w| if (w) switch (k) {
+            .lookup => |l| {
+                const pos = lookup[l.col_idx] orelse return error.BadColumn;
+                try join_lookup.narrow(l.join, batch.cols[pos], sel, a);
+            },
+            .predicate => {},
+        };
     }
 
     /// Narrow by every conjunct not yet narrowed whose columns are all decoded; with `all`, the rest too.
@@ -810,6 +834,8 @@ fn markFilter(u: CodeUses, f: filter_ast.Filter) void {
         .boolean => |l| mark(u.value, l.col_idx),
         .null_check => |l| mark(u.levels, l.col_idx),
         .like => |l| mark(u.code, l.col_idx),
+        // A coded foreign key is looked up once per dictionary entry (`join.lookup.narrow`).
+        .lookup => |l| mark(u.code, l.col_idx),
     }
 }
 

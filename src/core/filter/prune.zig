@@ -67,6 +67,8 @@ pub fn pruneRowGroup(
         // LIKE: prefix patterns are stat-prunable via min/max (a future
         // win); conservatively keep for now. Correctness is in eval.
         .like => .unknown,
+        // The build's verified key range could prune row groups; the prototype keeps them.
+        .lookup => .unknown,
         .and_filter, .or_filter => |c| blk: {
             if (c.neverTrue(filter == .and_filter)) break :blk .skip;
             var d = pruneRowGroup(rg, c.children[0], file_meta);
@@ -954,7 +956,7 @@ pub fn prunePage(
         },
     }
     switch (filter) {
-        .null_check, .like, .and_filter, .or_filter => {},
+        .null_check, .like, .lookup, .and_filter, .or_filter => {},
         inline else => |leaf| if (!statistics.boundsReadable(rg, leaf.col_idx, file_meta)) return .unknown,
     }
     return switch (filter) {
@@ -967,7 +969,7 @@ pub fn prunePage(
         .string => |leaf| prunePageBytes(page_idx, leaf.col_idx, leaf.op, leaf.value, .BYTE_ARRAY, col_indexes),
         .boolean => |leaf| prunePageBoolean(page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes),
         .null_check => |nc| prunePageNullCheck(page_idx, nc.col_idx, nc.is_not, col_indexes),
-        .like => .unknown,
+        .like, .lookup => .unknown,
         .and_filter, .or_filter => |c| blk: {
             if (c.neverTrue(filter == .and_filter)) break :blk .skip;
             var d = prunePage(rg, page_idx, c.children[0], col_indexes, file_meta, trust_stats);

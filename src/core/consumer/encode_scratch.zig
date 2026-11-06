@@ -12,6 +12,8 @@ pub const EncodeScratch = struct {
     mutex: std.Io.Mutex = .init,
     idle: ?*Node = null,
     retained: usize = 0,
+    /// Idle mappings plus the excess capacity still charged while a job borrows a larger mapping.
+    held: usize = 0,
     live: usize = 0,
 
     const Node = struct {
@@ -29,6 +31,7 @@ pub const EncodeScratch = struct {
     pub fn deinit(self: *EncodeScratch) void {
         std.debug.assert(self.live == 0);
         self.dropIdle();
+        std.debug.assert(self.held == 0);
     }
 
     fn dropIdle(self: *EncodeScratch) void {
@@ -37,6 +40,7 @@ pub const EncodeScratch = struct {
             const bytes = node.bytes;
             const alignment = node.alignment;
             self.ledger.release(bytes.len);
+            self.held -= bytes.len;
             self.child.rawFree(bytes, alignment, @returnAddress());
         }
         self.retained = 0;
@@ -78,6 +82,7 @@ pub const EncodeScratch = struct {
             self.retained -= node.bytes.len;
             // The job's reservation covers the requested pages. Excess capacity stays charged even while live.
             self.ledger.release(size);
+            self.held -= size;
             node.extra = node.bytes.len - size;
             self.live += 1;
             return node.data;
@@ -112,12 +117,14 @@ pub const EncodeScratch = struct {
         defer self.mutex.unlock(self.io);
         self.live -= 1;
         self.ledger.release(node.extra);
+        self.held -= node.extra;
         node.extra = 0;
-        if (!self.ledger.tight() and node.bytes.len <= self.limit - self.retained) {
+        if (!self.ledger.tight() and node.bytes.len <= self.limit - self.held) {
             if (self.ledger.drawExact(node.bytes.len) != null) {
                 node.next = self.idle;
                 self.idle = node;
                 self.retained += node.bytes.len;
+                self.held += node.bytes.len;
                 return;
             }
         }
@@ -186,6 +193,28 @@ test "encode scratch keeps excess capacity charged while a smaller job borrows i
     a.free(small);
     try t.expectEqual(backing, cache.retained);
     try t.expectEqual(backing, ledger.used.load(.monotonic));
+    cache.deinit();
+    try t.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
+
+test "encode scratch window cap includes excess capacity in live blocks" {
+    const t = std.testing;
+    const page = std.heap.pageSize();
+    var ledger: memory.SharedBudget = .{ .limit = 1 << 20 };
+    var cache: EncodeScratch = .{ .io = t.io, .child = t.allocator, .ledger = &ledger, .limit = 5 * page };
+    defer cache.deinit();
+    const a = cache.allocator();
+    const large = try a.alloc(u8, 4 * page);
+    a.free(large);
+    const small = try a.alloc(u8, page);
+    const other = try a.alloc(u8, 3 * page);
+    a.free(other);
+    try t.expectEqual(@as(usize, 0), cache.retained);
+    try t.expectEqual(3 * page, cache.held);
+    try t.expectEqual(cache.held, ledger.used.load(.monotonic));
+    a.free(small);
+    try t.expect(cache.held <= cache.limit);
+    try t.expectEqual(cache.held, ledger.used.load(.monotonic));
     cache.deinit();
     try t.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
 }

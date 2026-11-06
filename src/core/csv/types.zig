@@ -213,12 +213,14 @@ pub fn parseDecimal(s: []const u8, scale: u8, max_int: u8) ?i128 {
         r = 0;
         for (s[int_start..]) |c| {
             if (c == '.') continue;
-            r = r * 10 + (c - '0');
+            r = std.math.add(i128, std.math.mul(i128, r, 10) catch return null, c - '0') catch return null;
         }
     }
     if (neg and r == 0) return null; // negative zero: a double, not a decimal
+    // Padding to the scale is checked too: a column never asks for more than 38 digits, a caller might.
     var k = frac;
-    while (k < scale) : (k += 1) r *= 10;
+    while (k < scale) : (k += 1) r = std.math.mul(i128, r, 10) catch return null;
+    if (@abs(r) >= std.math.pow(u128, 10, max_decimal_digits)) return null;
     return if (neg) -r else r;
 }
 
@@ -301,7 +303,9 @@ const Normal = struct {
         if (i < text.len) e = std.fmt.parseInt(i64, text[i + 1 ..], 10) catch return null;
         const f = first orelse return n; // zero: no digits
         n.len -= trailing;
-        n.exp = e + (point orelse seen) - f - 1;
+        // Checked: an exponent at i64's ends plus the digits' shift has no power of ten here; such a number does
+        // not round-trip (it is zero or infinity as a double), so the caller takes it as text.
+        n.exp = std.math.add(i64, e, (point orelse seen) - f - 1) catch return null;
         return n;
     }
 
@@ -710,6 +714,59 @@ test "csv review P2-2 and P2-3: DECIMAL(38,38) is a decimal; microsecond timesta
     try testing.expectEqual(micros, schemaElement("t", .{ .kind = .timestamp, .tz = true }).converted_type);
     const nanos = schemaElement("t", .{ .kind = .timestamp, .nanos = true });
     try testing.expectEqual(@as(?schema.ConvertedType, null), nanos.converted_type);
+}
+
+test "csv review P1-4: an exponent at the ends of i64 is text, never an overflow" {
+    const double: Type = .{ .kind = .float64, .sig = 1 };
+    for ([_][]const u8{
+        "0.1e-9223372036854775808",
+        "0.0001e-9223372036854775805",
+        "1e-9223372036854775808",
+        "1e-9223372036854775809",
+        "1e9223372036854775807",
+        "1e+9223372036854775807",
+        "10e9223372036854775807",
+        "1e99999999999999999999",
+    }) |s| {
+        try testing.expectEqual(Kind.string, classify(s, true).kind);
+        try testing.expectEqual(@as(?f64, null), parseFloat(s));
+        try testing.expect(!fits(double, s, true));
+    }
+}
+
+fn fuzzValue(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buf: [64]u8 = undefined;
+    const s = buf[0..smith.slice(&buf)];
+    const t = classify(s, std.unicode.utf8ValidateSlice(s));
+    // Whatever a value is classified as, it is a value of that type; and no text makes a parser trap.
+    if (!fits(t, s, std.unicode.utf8ValidateSlice(s))) return error.ClassifiedValueDoesNotFit;
+    _ = parseFloat(s);
+    _ = parseDecimal(s, 38, 38);
+    _ = parseTimestamp(s);
+    _ = parseInt(s);
+}
+
+test "csv review P1-4: a decimal parse past 38 digits is refused, never an overflow" {
+    const forty = "1234567890123456789012345678901234567890";
+    try testing.expectEqual(@as(?i128, null), parseDecimal(forty, 0, 40));
+    try testing.expectEqual(@as(?i128, null), parseDecimal("123456789012345678901234567890", 38, 38));
+    try testing.expectEqual(@as(?i128, null), parseDecimal("1.5", 38, 38));
+    try testing.expect(parseDecimal("0.5", 37, 1) != null);
+}
+
+test "fuzz: csv value text classifies to a type it fits, and no parser traps" {
+    try std.testing.fuzz({}, fuzzValue, .{ .corpus = &.{
+        "0.1e-9223372036854775808",
+        "1e9223372036854775807",
+        "-0.000e-9223372036854775807",
+        "9.99999999999999e308",
+        "4.9e-324",
+        "12345678901234567890123456789012345678",
+        "-0.5",
+        "9999-12-31 23:59:59.999999999+23:59",
+        "0001-01-01T00:00:00-23:59",
+        "nan",
+    } });
 }
 
 test "csv dates and timestamps: valid calendar, exact fractions, offsets as instants" {

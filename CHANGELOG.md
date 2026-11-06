@@ -66,6 +66,11 @@
   can't copy chunks, or a codec change) now keeps each worker's encode scratch between jobs, still charged to
   `--max-memory`, instead of mapping fresh pages for every job. Page faults drop by about a third; rewriting a 60 M-row
   lineitem is 5–13% faster at 16 threads on a Ryzen 9 9950X. Output bytes don't change.
+- **Uncached scans read ahead of their workers.** When a query reads a file that isn't in the page cache through
+  its memory mapping, zpq now asks the kernel for each worker's next planned chunks just before they are needed,
+  within a window bounded by `--max-memory` and one device queue. For a column behind a filter, it asks only for the
+  pages the filter keeps. Cached files are left alone. On a Ryzen 9 9950X, ClickBench run uncached is 7% faster
+  across all 43 queries (Q08 22%, Q21 3–11%), and cached queries are unchanged.
 - **Grouped `COUNT(DISTINCT)` is faster again.** Grouping on the distinct pairs now uses a partition count sized to
   each worker's share of L2, instead of one sized from the input's row count. A `COUNT(DISTINCT)` beside a count cut
   (`ORDER BY count(*) DESC LIMIT n`) now runs its distinct pass on per-group sets merged in parallel when one group the

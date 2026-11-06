@@ -1137,7 +1137,7 @@ pub const LocalIo = struct {
 /// The mapped read-ahead of local inputs (`LocalIo.read_ahead`). Its window is a quarter of the query's budget, within
 /// the reader's own window (`s3_window.windowFor`) and never past a quarter of the host's memory: the pages are the
 /// page cache's, but a window past what the host holds would evict them before the workers reach them. Nor past what
-/// one of the device's hardware queues holds in flight (`deviceQueueBytes`): advice past that waits in the block layer
+/// one of the device's hardware queues holds in flight (`deviceWindow`): advice past that waits in the block layer
 /// behind what is queued already, and the faults the workers issue meanwhile wait behind it. The scan caps it again by
 /// what the query's ledger has free as it advises (`ReadAhead.cap`).
 fn mappedReadAhead(arena: std.mem.Allocator, args: QueryArgs, opened: OpenedInputs) ?scan_read_ahead.Config {
@@ -1155,7 +1155,7 @@ fn mappedReadAhead(arena: std.mem.Allocator, args: QueryArgs, opened: OpenedInpu
         if (seen) |d| if (d[0] == dev[0] and d[1] == dev[1]) continue;
         seen = dev;
         block = @min(block, deviceReadAhead(arena, dev));
-        if (deviceQueueBytes(arena, dev)) |q| window = @min(window, q);
+        window = deviceWindow(window, deviceQueueBytes(arena, dev), deviceReadAhead(arena, dev));
     }
     if (window == 0) return null;
     // Residency and advice through each file's descriptor, where the mapping kept one (`scan_read_ahead.Config.fds`).
@@ -1181,6 +1181,15 @@ fn deviceOf(arena: std.mem.Allocator, path: []const u8) ?[2]u32 {
 fn deviceReadAhead(arena: std.mem.Allocator, dev: [2]u32) usize {
     const kb = deviceQueue(arena, dev, "read_ahead_kb") orelse return default_read_ahead;
     return kb << 10;
+}
+
+/// `window` within what one of a device's hardware queues holds in flight (`queue`, from `deviceQueueBytes`; null
+/// where sysfs does not say), but never below the device's own read-ahead (`read_ahead`): one fault puts that much in
+/// flight by itself, so a device whose queue holds less (a USB bridge's two requests of 1 MiB beside a 2 MiB
+/// read-ahead) still advises one read-ahead's worth instead of nothing.
+pub fn deviceWindow(window: u64, queue: ?u64, read_ahead: u64) u64 {
+    const q = queue orelse return window;
+    return @min(window, @max(q, read_ahead));
 }
 
 /// What one hardware queue of block device `dev` holds in flight, in bytes: its requests (`nr_requests`) at their

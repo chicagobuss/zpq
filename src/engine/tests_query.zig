@@ -1452,11 +1452,17 @@ test "cold mapped passes read ahead of their workers and answer as the faulting 
         for ([_][*:0]const u8{ "ZPQ_IO_ADVISE=auto", "ZPQ_IO_ADVISE=always" }) |mode| {
             try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.os.linux.fadvise(fd, 0, 0, std.os.linux.POSIX_FADV.DONTNEED)));
             read_ahead.test_peak_ahead.store(0, .monotonic);
+            read_ahead.test_seen.store(0, .monotonic);
             const lines = [_:null]?[*:0]const u8{mode};
             var got = try runQuery(.{ .gpa = gpa, .env = .{ .block = .{ .slice = &lines } }, .io = std.testing.io }, args);
             defer got.deinit(gpa);
-            // Cold, the mapped passes advised what their workers were about to decode.
-            try std.testing.expect(read_ahead.test_peak_ahead.load(.monotonic) > 0);
+            // Cold, the mapped passes looked at the chunks their workers were about to decode, ahead of them: advised
+            // them, or found them resident where the kernel's own read-around around the workers' faults had already
+            // brought them (a device whose read_ahead_kb spans the next row groups, as a 2 MiB one does these). Auto
+            // advises only what is missing, so how much it advises is the device's to decide; always advises it all.
+            try std.testing.expect(read_ahead.test_seen.load(.monotonic) > 0);
+            if (std.mem.eql(u8, std.mem.span(mode), "ZPQ_IO_ADVISE=always"))
+                try std.testing.expect(read_ahead.test_peak_ahead.load(.monotonic) > 0);
             try std.testing.expectEqualDeep(want.aggregate.output.group_rows, got.aggregate.output.group_rows);
             try std.testing.expectEqualDeep(want.aggregate.output.aggs, got.aggregate.output.aggs);
         }

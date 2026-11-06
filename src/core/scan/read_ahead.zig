@@ -62,6 +62,8 @@ pub const Config = struct {
 
 /// Tests: the most bytes any pass held advised ahead of its claims, page-rounded.
 pub var test_peak_ahead: std.atomic.Value(u64) = .init(0);
+/// Tests: the bytes passes advised or found resident already, page-rounded: what the read-ahead looked at.
+pub var test_seen: std.atomic.Value(u64) = .init(0);
 
 /// How far ahead of the latest claim advice reaches, in items per worker.
 const ahead_per_worker = 2;
@@ -210,11 +212,13 @@ pub const ReadAhead = struct {
             const file_off = lo -| @intFromPtr(src.ptr);
             if (!self.config.force and cached(fd, file_off, lo, len, page)) {
                 _ = self.resident.fetchAdd(len, .monotonic);
+                if (builtin.is_test) _ = test_seen.fetchAdd(len, .monotonic);
             } else {
                 if (!self.take(len, limit)) return;
                 willNeed(fd, file_off, lo, len);
                 held.* += len;
                 _ = self.advised.fetchAdd(len, .monotonic);
+                if (builtin.is_test) _ = test_seen.fetchAdd(len, .monotonic);
             }
             lo += len;
         }
@@ -291,11 +295,13 @@ pub const ReadAhead = struct {
             const file_off = lo - @intFromPtr(self.sources[self.work[self.item].file].ptr);
             if (!self.config.force and cached(fd, file_off, lo, len, page)) {
                 _ = self.resident.fetchAdd(len, .monotonic);
+                if (builtin.is_test) _ = test_seen.fetchAdd(len, .monotonic);
             } else {
                 if (!self.take(len, limit)) break;
                 willNeed(fd, file_off, lo, len);
                 self.item_bytes[self.item] += len;
                 _ = self.advised.fetchAdd(len, .monotonic);
+                if (builtin.is_test) _ = test_seen.fetchAdd(len, .monotonic);
             }
             // Past this block: the chunk's next block, or its next chunk.
             const chunk_lo = @intFromPtr(range.ptr) - self.offset;

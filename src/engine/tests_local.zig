@@ -262,6 +262,20 @@ test "at a tight budget the local-I/O choice maps a write whose row group it wou
     try testing.expect(!engine_input.readerFits(budget / 2 + 1, budget, &metas, null));
 }
 
+test "the read-ahead's device window: one hardware queue, never below the device's own read-ahead" {
+    const testing = std.testing;
+    const budget: u64 = 256 << 20;
+    // An NVMe SSD: 1023 requests of 128 KiB, 128 KiB read-ahead: the queue binds, at 128 MB.
+    try testing.expectEqual(@as(u64, 1023 * (128 << 10)), engine_input.deviceWindow(budget, 1023 * (128 << 10), 128 << 10));
+    // A USB SSD: 2 requests of 1 MiB, 2 MiB read-ahead: one read-ahead's worth, 2 MiB.
+    try testing.expectEqual(@as(u64, 2 << 20), engine_input.deviceWindow(budget, 2 * (1 << 20), 2 << 20));
+    // A queue holding less than one read-ahead still advises one, as a single fault reads that much.
+    try testing.expectEqual(@as(u64, 4 << 20), engine_input.deviceWindow(budget, 512 << 10, 4 << 20));
+    // Never past the window the budget gave; sysfs silent: the window as it was.
+    try testing.expectEqual(@as(u64, 1 << 20), engine_input.deviceWindow(1 << 20, 2 << 20, 8 << 20));
+    try testing.expectEqual(budget, engine_input.deviceWindow(budget, null, 2 << 20));
+}
+
 test "windowed re-encode writes the same bytes at every parallelism" {
     const fixture = "ci/fixtures/parquet/full_match.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;

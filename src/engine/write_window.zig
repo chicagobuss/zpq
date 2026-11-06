@@ -11,6 +11,7 @@ const core_memory = @import("../core/memory.zig");
 const EncodeScratch = @import("../core/consumer/encode_scratch.zig").EncodeScratch;
 const huge_pages = @import("../core/huge_pages.zig");
 const system = @import("../core/system.zig");
+const hw = @import("../core/hw.zig");
 const filter_ast = @import("../core/filter/ast.zig");
 const filter_eval = @import("../core/filter/eval.zig");
 const scan = @import("../core/scan.zig");
@@ -1488,7 +1489,11 @@ fn winWriter(w: *WinCtx) void {
 }
 
 pub fn runWindowedReencode(w: *WinCtx, async_budget: usize) !void {
-    return runWindowed(WinCtx, w, w.jobs.len, async_budget);
+    // SMT siblings share the private caches and execution resources this pipeline saturates. Use independent
+    // affinity domains where topology proves them, with one combined ready-work budget for decode and encode.
+    const visible = std.Thread.getCpuCount() catch 1;
+    w.cpu_budget = hw.independentOwnerWorkers(@max(1, @min(w.cpu_budget, visible)));
+    return runWindowed(WinCtx, w, w.jobs.len, @min(async_budget, w.cpu_budget));
 }
 
 /// Drive the fan-out: `Ctx.writer` on a dedicated thread plus `async_budget` concurrent `Ctx.producer` calls on pool

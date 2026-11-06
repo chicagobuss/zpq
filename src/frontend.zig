@@ -186,7 +186,7 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             .{diag.input orelse "S3"},
         ),
         error.UnsupportedJoin => diagnosticPrint(
-            "zpq query: joins take two or three tables, comma or INNER JOIN ... ON, or IN (SELECT ...)\n",
+            "zpq query: a join is a star of N:1 tables, each joined to the largest by one key (comma or INNER JOIN ... ON), or IN (SELECT ...)\n",
             .{},
         ),
         error.JoinKeyNotFound => diagnosticPrint("zpq query: a join needs one key equality between its tables\n", .{}),

@@ -829,6 +829,206 @@
    }
   },
   {
+   "id": "join:star:two-dimensions",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT kind, sgrp, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND f.sfk = x.spk GROUP BY kind, sgrp ORDER BY kind, sgrp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT kind, sgrp, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND f.sfk = x.spk GROUP BY kind, sgrp ORDER BY kind, sgrp"
+   }
+  },
+  {
+   "id": "join:star:join-on-filters",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT grp, sgrp, min(amt) AS lo, max(amt) AS hi FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk JOIN '{fixture:dim_sparse}' x ON f.sfk = x.spk WHERE d.w > 1000 AND x.sgrp <> 1 AND f.q > 0 GROUP BY grp, sgrp ORDER BY grp, sgrp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT grp, sgrp, min(amt) AS lo, max(amt) AS hi FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk JOIN '{fixture:dim_sparse}' x ON f.sfk = x.spk WHERE d.w > 1000 AND x.sgrp <> 1 AND f.q > 0 GROUP BY grp, sgrp ORDER BY grp, sgrp"
+   }
+  },
+  {
+   "id": "join:star:group-by-fk",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, sgrp, sum(q) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND f.sfk = x.spk AND d.grp = 2 GROUP BY f.fk, sgrp ORDER BY s DESC, f.fk, sgrp LIMIT 7"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, sgrp, sum(q) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND f.sfk = x.spk AND d.grp = 2 GROUP BY f.fk, sgrp ORDER BY s DESC, f.fk, sgrp LIMIT 7"
+   }
+  },
+  {
+   "id": "join:star:with-reduced-table",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.name, count(*) AS n FROM '{fixture:review-fact}' f, '{fixture:review-dim}' d, '{fixture:review-uniq}' u, '{fixture:nullorder_dim}' e WHERE f.fk = d.pk AND f.fk = u.upk AND u.ug = 1 AND f.q = e.pk AND e.g <> 'b' GROUP BY d.name ORDER BY d.name"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.name, count(*) AS n FROM '{fixture:review-fact}' f, '{fixture:review-dim}' d, '{fixture:review-uniq}' u, '{fixture:nullorder_dim}' e WHERE f.fk = d.pk AND f.fk = u.upk AND u.ug = 1 AND f.q = e.pk AND e.g <> 'b' GROUP BY d.name ORDER BY d.name"
+   }
+  },
+  {
+   "id": "join:explain:star",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT kind, sgrp, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND f.sfk = x.spk GROUP BY kind, sgrp",
+    "--explain"
+   ],
+   "oracle": {
+    "compare": "plan",
+    "holds": {
+     "join": {
+      "fk": "fk",
+      "build": {
+       "key": "pk",
+       "columns": {
+        "$list": [
+         "kind"
+        ]
+       }
+      },
+      "dims": {
+       "$list": [
+        {
+         "fk": "sfk",
+         "build": {
+          "key": "spk",
+          "structure": "hash",
+          "columns": {
+           "$list": [
+            "sgrp"
+           ]
+          }
+         }
+        }
+       ]
+      },
+      "group_join": null
+     }
+    }
+   }
+  },
+  {
+   "id": "join:refuse:snowflake",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT u.ug, count(*) AS n FROM '{fixture:review-fact}' f, '{fixture:review-dim}' d, '{fixture:review-uniq}' u, '{fixture:nullorder_dim}' e WHERE f.fk = d.pk AND d.grp = u.upk AND f.q = e.pk GROUP BY u.ug ORDER BY u.ug"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a join condition reads both tables beyond its one key equality"
+   }
+  },
+  {
    "id": "join:semi:in",
    "fixture": "fact",
    "cli": [

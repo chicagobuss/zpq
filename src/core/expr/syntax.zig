@@ -60,7 +60,12 @@ pub const Join = struct {
     build: Build,
     /// More SEMI joins of the probe itself: a third table the frontend reduced onto it.
     semis: []const Semi = &.{},
+    /// A star's other dimensions: INNER, N:1, each publishing its own columns as the main build does.
+    dims: []const Dim = &.{},
 };
+
+/// One more dimension of a star: the probe's FK into it, and its build.
+pub const Dim = struct { fk: []const u8, build: Build };
 
 pub const JoinKind = enum { inner, semi };
 

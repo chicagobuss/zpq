@@ -365,7 +365,7 @@ pub const GatedFilter = struct {
     /// The main join's slot per row of the row group, captured by its lookup on the sliced filter pass for the
     /// build columns each slice publishes (`join/lookup.zig`); empty when nothing captures. `at`: the row the batch
     /// being narrowed starts at.
-    slots: []u32 = &.{},
+    slots: []const []u32 = &.{},
     at: usize = 0,
 
     /// A join's plan when `init` defers nothing: its conjuncts in their order, every column read first. The sliced
@@ -486,7 +486,10 @@ pub const GatedFilter = struct {
         for (g.conjuncts, which) |k, w| if (w) switch (k) {
             .lookup => |l| {
                 const pos = lookup[l.col_idx] orelse return error.BadColumn;
-                const capture = if (l.join.main and g.slots.len != 0) g.slots[g.at..][0..sel.len] else null;
+                const capture = if (l.join.publishes and l.join.slot_index < g.slots.len and g.slots[l.join.slot_index].len != 0)
+                    g.slots[l.join.slot_index][g.at..][0..sel.len]
+                else
+                    null;
                 try join_lookup.narrow(l.join, batch.cols[pos], sel, a, capture);
             },
             .predicate => {},

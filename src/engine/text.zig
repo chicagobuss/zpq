@@ -964,6 +964,13 @@ fn writeExplainJoin(writer: anytype, p: engine_join.Explained) !void {
         try writeExplainLookup(writer, s);
         try writer.writeByte('}');
     }
+    try writer.writeAll("],\"dims\":[");
+    for (p.dims, 0..) |d, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        try writeExplainLookup(writer, d);
+        try writer.writeByte('}');
+    }
     try writer.writeAll("],\"group_join\":");
     if (p.group) |g|
         try writer.print("{{\"slots\":{d},\"bytes\":{d}}}", .{ g.slots, g.bytes })

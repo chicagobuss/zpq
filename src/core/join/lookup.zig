@@ -158,6 +158,10 @@ pub const Join = struct {
     /// The probe's own join, whose build columns the scan publishes and whose group-join it folds; false for a SEMI
     /// lookup beside it or inside a build.
     main: bool = false,
+    /// Whether the scan publishes its build columns: the main join's and a star's other dimensions'. `slot_index` is
+    /// its place among them (the main join's 0), where the filter pass keeps its slots (`GatedFilter.slots`).
+    publishes: bool = false,
+    slot_index: usize = 0,
     /// The probe's foreign key leaf, set when the probe query binds.
     fk_leaf: usize = 0,
     /// Set when the query's GROUP BY is one the build key determines (`GroupJoin`).
@@ -208,6 +212,25 @@ pub fn ofFilter(filter: ?filter_ast.Filter) ?*const Join {
         else => {},
     }
     return null;
+}
+
+/// The filter's publishing lookups by `slot_index`: the main join and a star's other dimensions.
+pub fn publishers(a: std.mem.Allocator, filter: ?filter_ast.Filter) ![]*const Join {
+    const f = filter orelse return &.{};
+    const kids: []const filter_ast.Filter = switch (f) {
+        .lookup => (&f)[0..1],
+        .and_filter => |c| c.children,
+        else => return &.{},
+    };
+    var n: usize = 0;
+    for (kids) |k| if (k == .lookup and k.lookup.join.publishes) {
+        n = @max(n, k.lookup.join.slot_index + 1);
+    };
+    const out = try a.alloc(*const Join, n);
+    for (kids) |k| if (k == .lookup and k.lookup.join.publishes) {
+        out[k.lookup.join.slot_index] = k.lookup.join;
+    };
+    return out;
 }
 
 /// Whether a bound filter holds any lookup: a join query, which only the established row-group scan runs.

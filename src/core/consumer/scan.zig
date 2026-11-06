@@ -996,10 +996,11 @@ fn scanRGForAggImpl(
     var gated = if (keep == null) try GatedFilter.init(ra, in, target, dec.page_indexes) else null;
     // The lookup captures each row's slot as it narrows, once: the build columns publish, and a group-join folds, from
     // them. A plan that defers nothing decodes as no plan does.
-    if (join_lookup.ofFilter(in.filter)) |j| if (joinSlots(j, in)) {
+    const pubs = try join_lookup.publishers(ra, in.filter);
+    if (try joinSlotArrays(ra, pubs, in, batch_rows)) |per| {
         if (gated == null) gated = try GatedFilter.undeferred(ra, in);
-        gated.?.slots = try ra.alloc(u32, batch_rows);
-    };
+        gated.?.slots = per;
+    }
     if (gated) |*g| dec.filter_gated = g.deferred;
     reportGated(ws, in, dec.payload, if (gated) |g| g.deferred else null);
     const all_columns = try ra.alloc(usize, in.read.len);
@@ -1093,9 +1094,10 @@ fn scanRGForAggImpl(
         else
             try filter_eval.evaluate(f, &batch, &sel, lookup, ra);
     };
-    const slots: []const u32 = if (gated) |g| g.slots else &.{};
-    if (join_lookup.ofFilter(in.filter)) |j| {
-        try publishLookups(j, ra, in, &batch_cols, lookup, &sel, slots, dec.uses.value);
+    const slots: []const []u32 = if (gated) |g| g.slots else &.{};
+    for (pubs) |j| {
+        const own: []const u32 = if (j.slot_index < slots.len) slots[j.slot_index] else &.{};
+        try publishLookups(j, ra, in, &batch_cols, lookup, &sel, own, dec.uses.value);
         batch.cols = batch_cols.items;
     }
     // Length-only predicate columns refill here when the fold or an owner still reads the bytes, and only the
@@ -1118,7 +1120,7 @@ fn scanRGForAggImpl(
     profile.record(prof, .filter, t_decode_end, t_eval_end, profile.args(.{ batch_rows, selected }));
     // A group-join folds into its build's slots: the query's group tables stay empty (`join/lookup.zig`).
     if (join_lookup.ofFilter(in.filter)) |j| if (j.group) |g| {
-        try g.foldRowGroup(j, ra, in.rg_index, &batch, lookup, &sel, slots);
+        try g.foldRowGroup(j, ra, in.rg_index, &batch, lookup, &sel, if (slots.len != 0) slots[0] else &.{});
         return selected;
     };
 
@@ -1924,6 +1926,17 @@ fn joinSlots(j: *const join_lookup.Join, in: AggRowGroup) bool {
     return false;
 }
 
+/// One slot array per publishing join that captures (`joinSlots`; empty for one that does not), `rows` long; null when
+/// none does.
+fn joinSlotArrays(a: std.mem.Allocator, pubs: []const *const join_lookup.Join, in: AggRowGroup, rows: usize) !?[]const []u32 {
+    var any = false;
+    for (pubs) |j| any = any or joinSlots(j, in);
+    if (!any) return null;
+    const per = try a.alloc([]u32, pubs.len);
+    for (pubs, per) |j, *sl| sl.* = if (joinSlots(j, in)) try a.alloc(u32, rows) else &.{};
+    return per;
+}
+
 /// Whether the sliced decode takes this join: it publishes the build columns per slice from the slots the lookup
 /// captured on its filter pass. A record-owned decode keeps the whole row group.
 fn joinSliceable(target: AggTarget) bool {
@@ -1999,6 +2012,7 @@ fn scanRGSlicedExact(
     const carry = core_memory.retainedCarry(if (ws.ledger) |l| l.limit else decode_options.expand_limit);
     defer pool.trimAbove(carry);
     const pages = pool.rowGroupArena();
+    const pubs = try join_lookup.publishers(pages.allocator(), in.filter);
     var readers: std.ArrayList(SliceReader) = .empty;
     defer for (readers.items) |*r| r.deinit();
     const lookup = try pages.allocator().alloc(?usize, in.meta.schema.items.len);
@@ -2030,9 +2044,9 @@ fn scanRGSlicedExact(
     const page_indexes = try loadPageIndexes(pages.allocator(), in, stats);
     var gated = try GatedFilter.init(pages.allocator(), in, target, page_indexes);
     var published: usize = 0;
-    if (join) |j| {
+    if (join != null) {
         if (gated == null) gated = try GatedFilter.undeferred(pages.allocator(), in);
-        if (joinSlots(j, in)) gated.?.slots = try pages.allocator().alloc(u32, num_rows);
+        if (try joinSlotArrays(pages.allocator(), pubs, in, num_rows)) |per| gated.?.slots = per;
     }
     reportGated(ws, in, found, if (gated) |g| g.deferred else null);
     // A gated filter takes its own pass even when the aggregates read only its columns, none of them payload.
@@ -2074,7 +2088,7 @@ fn scanRGSlicedExact(
         if (exact) |*x| x else null,
     ) orelse return null;
     // Each slice's build columns follow its readers' columns.
-    if (join) |j| for (j.payloads, 0..) |_, p| {
+    for (pubs) |j| for (j.payloads, 0..) |_, p| {
         const ci = j.virtual_base + p;
         if (ci >= in.read.len or !in.read[ci]) continue;
         lookup[ci] = readers.items.len + published;
@@ -2161,14 +2175,15 @@ fn scanRGSlicedExact(
             try filter_selection.SelectionVector.init(sa, n);
         if (payload == null) if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
         matched += if (in.filter != null) sel.count() else n;
-        if (join) |j| if (gated.?.slots.len != 0) {
-            const at = gated.?.slots[done..][0..n];
-            try publishSlice(j, sa, in, cols, lookup, &sel, at, uses.value);
+        if (join != null) {
+            const slots = gated.?.slots;
+            for (pubs) |j| if (j.slot_index < slots.len and slots[j.slot_index].len != 0)
+                try publishSlice(j, sa, in, cols, lookup, &sel, slots[j.slot_index][done..][0..n], uses.value);
             if (fold) |*f| {
-                try f.add(sa, at, &batch, lookup, &sel);
+                try f.add(sa, slots[0][done..][0..n], &batch, lookup, &sel);
                 continue;
             }
-        };
+        }
         const input_base = std.math.add(u64, in.row_base, done) catch return error.BadColumn;
         const window = try selectedWindow(&batch, &sel, input_base, null, n);
         if (exact) |*x| {

@@ -58,6 +58,8 @@ pub const Explained = struct {
     kind: lookup.Kind,
     main: Lookup,
     semis: []const Lookup,
+    /// A star's other dimensions, each publishing its own columns.
+    dims: []const Lookup,
     /// The group-join's slots and their bytes, when one was admitted.
     group: ?struct { slots: usize, bytes: usize },
     charged: usize,
@@ -101,6 +103,8 @@ pub const Prepared = struct {
     main: Leaf,
     /// SEMI joins of the probe beside it.
     semis: []const Leaf,
+    /// A star's other dimensions: INNER lookups whose build columns bind as virtual leaves too.
+    dims: []const Leaf = &.{},
     /// What the builds hold (their arenas' capacity) and a group-join's slots once one is admitted, for `--explain`;
     /// and the group-join's part of it.
     charged: usize = 0,
@@ -125,8 +129,10 @@ pub const Prepared = struct {
         return .{ .context = self, .kind = inner.kind, .bind_fn = bind, .join = inner.join };
     }
 
+    /// Each publishing build's columns as virtual leaves, the main build's first, in the same order in every footer.
     pub fn extend(self: *Prepared, arena: std.mem.Allocator, meta: *schema.FileMetaData) !void {
         try lookup.extend(self.main.join, arena, meta);
+        for (self.dims) |d| try lookup.extend(d.join, arena, meta);
     }
 
     fn bind(raw: *const anyopaque, arena: std.mem.Allocator, meta: *const schema.FileMetaData, diag: ?*Diag, options: plans.Options) anyerror!plans.Query {
@@ -138,6 +144,7 @@ pub const Prepared = struct {
             .projection => return error.JoinRowsNotSupported,
         };
         for (self.semis) |s| a.filter = try withLookup(arena, a.filter, try leafOf(meta, s, diag));
+        for (self.dims) |d| a.filter = try withLookup(arena, a.filter, try leafOf(meta, d, diag));
         a.filter = try withLookup(arena, a.filter, try leafOf(meta, self.main, diag));
         const j = self.main.join;
         if (j.group == null and j.kind == .inner) {
@@ -170,10 +177,13 @@ pub const Prepared = struct {
     pub fn explained(self: *const Prepared, a: std.mem.Allocator) !Explained {
         const semis = try a.alloc(Explained.Lookup, self.semis.len);
         for (self.semis, semis) |s, *out| out.* = try Explained.Lookup.of(a, s);
+        const dims = try a.alloc(Explained.Lookup, self.dims.len);
+        for (self.dims, dims) |d, *out| out.* = try Explained.Lookup.of(a, d);
         return .{
             .kind = self.main.join.kind,
             .main = try Explained.Lookup.of(a, self.main),
             .semis = semis,
+            .dims = dims,
             .group = if (self.group_bytes != 0) .{ .slots = self.main.join.n, .bytes = self.group_bytes } else null,
             .charged = self.charged,
         };
@@ -213,7 +223,7 @@ fn leafOf(meta: *const schema.FileMetaData, l: Leaf, diag: ?*Diag) !filter_ast.F
         Diag.setColumn(diag, l.fk);
         return error.JoinKeyTypeMismatch;
     }
-    if (l.join.main) l.join.fk_leaf = fk;
+    if (l.join.publishes) l.join.fk_leaf = fk;
     return .{ .lookup = .{ .col_idx = fk, .join = l.join } };
 }
 
@@ -357,9 +367,18 @@ pub fn prepare(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: types.Que
     errdefer p.releaseBuilds();
     const main = try build(p, arena, sj.fk, sj.build, if (sj.kind == .semi) .semi else .inner, threads, args.diag);
     main.join.main = true;
+    main.join.publishes = true;
     const semis = try arena.alloc(Leaf, sj.semis.len);
     for (sj.semis, semis) |s, *out| out.* = try build(p, arena, s.fk, s.build, semiKind(s), threads, args.diag);
+    // A star's dimensions publish after the main build, each with its own slots.
+    const dims = try arena.alloc(Leaf, sj.dims.len);
+    for (sj.dims, dims, 1..) |d, *out, slot| {
+        out.* = try build(p, arena, d.fk, d.build, .inner, threads, args.diag);
+        out.join.publishes = true;
+        out.join.slot_index = slot;
+    }
     p.main = main;
     p.semis = semis;
+    p.dims = dims;
     return p;
 }

@@ -639,27 +639,26 @@ pub fn parseSqlJoinPlan(allocator: std.mem.Allocator, sql: []const u8, schemas: 
     const markers = report.markers;
     const z = try allocator.dupeSentinel(u8, folded, 0);
     const paths = (try sql_join.tables(allocator, z)) orelse return null;
-    const first = try resolveJoin(allocator, z, paths, schemas, markers);
+    const first = try resolveJoin(allocator, z, paths, schemas, markers, false);
     // A probe query that still holds `IN (SELECT ...)` semi-joins the probe itself.
-    var probe_sql = first.probe_sql;
-    var semis: std.ArrayList(syntax.Semi) = .empty;
-    while (true) {
-        const pz = try allocator.dupeSentinel(u8, probe_sql, 0);
-        const inner = (try sql_join.tables(allocator, pz)) orelse break;
-        const r = try resolveJoin(allocator, pz, inner, schemas, markers);
-        // A reduced query holds one IN, the one the reduction wrote: no other subquery passes its table count.
-        try semis.append(allocator, .{ .fk = r.fk, .build = r.build, .unique = first.reduced == .probe });
-        probe_sql = r.probe_sql;
-    }
-    var pq = try parseFolded(true, allocator, probe_sql, markers);
+    const peeled = try peelSemis(allocator, first.probe_sql, schemas, markers, first.reduced);
+    var pq = try parseFolded(true, allocator, peeled.rest, markers);
     const q = try allocator.create(syntax.Query);
     q.* = pq.syntax.?.*;
-    q.join = .{ .kind = first.kind, .fk = first.fk, .build = first.build, .semis = semis.items };
+    q.join = .{ .kind = first.kind, .fk = first.fk, .build = first.build, .semis = peeled.semis, .dims = first.dims };
     pq.syntax = q;
     return pq;
 }
 
-const Resolved = struct { kind: syntax.JoinKind, fk: []const u8, build: syntax.Build, probe_sql: []const u8, reduced: ?sql_join.Side };
+const Resolved = struct {
+    kind: syntax.JoinKind,
+    fk: []const u8,
+    build: syntax.Build,
+    dims: []const syntax.Dim,
+    probe_sql: []const u8,
+    /// Its INs are reductions' (`sql_join.Plan.reduced`): their builds' keys must be unique.
+    reduced: bool,
+};
 
 const Owners = struct {
     metas: []const *const schema.FileMetaData,
@@ -670,7 +669,8 @@ const Owners = struct {
     }
 };
 
-fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u8, schemas: Schemas, markers: literals.Markers) !Resolved {
+/// `unique_ins`: the query this one came out of reduced, so every IN in it is a reduction's too.
+fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u8, schemas: Schemas, markers: literals.Markers, unique_ins: bool) anyerror!Resolved {
     const metas = try a.alloc(*const schema.FileMetaData, paths.len);
     const rows = try a.alloc(u64, paths.len);
     for (paths, metas, rows) |path, *m, *r| {
@@ -679,17 +679,45 @@ fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u
     }
     const owners: Owners = .{ .metas = metas };
     const p = try sql_join.plan(a, sql, .{ .paths = paths, .has = Owners.has, .rows = rows, .ctx = &owners });
-    var build: syntax.Build = .{ .path = p.build_path, .key = p.build_key, .columns = p.build_columns };
-    if (p.build_where) |w| {
-        const text = try std.fmt.allocPrintSentinel(a, "SELECT count(*) FROM '{s}' WHERE {s}", .{ p.build_path, w }, 0);
-        if (try sql_join.tables(a, text)) |inner| {
-            // The build's own filter is a SEMI join: a third table the binder reduced onto it.
-            const nested = try resolveJoin(a, text, inner, schemas, markers);
-            build.semis = try a.dupe(syntax.Semi, &.{.{ .fk = nested.fk, .build = nested.build, .unique = p.reduced == .build }});
-            build.filter = (try parseFolded(true, a, nested.probe_sql, markers)).syntax.?.filter;
-        } else build.filter = (try parseFolded(true, a, text, markers)).syntax.?.filter;
+    const unique = unique_ins or p.reduced;
+    const dims = try a.alloc(syntax.Dim, p.dims.len);
+    for (p.dims, dims) |d, *out| out.* = .{
+        .fk = d.fk,
+        .build = try resolveBuild(a, d.path, d.key, d.columns, d.where, schemas, markers, unique),
+    };
+    return .{
+        .kind = if (p.kind == .semi) .semi else .inner,
+        .fk = p.fk,
+        .build = try resolveBuild(a, p.build_path, p.build_key, p.build_columns, p.build_where, schemas, markers, unique),
+        .dims = dims,
+        .probe_sql = p.probe_sql,
+        .reduced = unique,
+    };
+}
+
+/// One build: its own conjuncts, and the SEMI joins the binder reduced onto it (tables of a chain).
+fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, columns: []const []const u8, where: ?[]const u8, schemas: Schemas, markers: literals.Markers, unique: bool) !syntax.Build {
+    var build: syntax.Build = .{ .path = path, .key = key, .columns = columns };
+    const w = where orelse return build;
+    const text = try std.fmt.allocPrint(a, "SELECT count(*) FROM '{s}' WHERE {s}", .{ path, w });
+    const peeled = try peelSemis(a, text, schemas, markers, unique);
+    build.semis = peeled.semis;
+    build.filter = (try parseFolded(true, a, peeled.rest, markers)).syntax.?.filter;
+    return build;
+}
+
+/// Every `IN (SELECT ...)` of `sql`, as SEMI joins of its table, and the query left once they are out.
+fn peelSemis(a: std.mem.Allocator, sql: []const u8, schemas: Schemas, markers: literals.Markers, unique: bool) !struct { semis: []const syntax.Semi, rest: []const u8 } {
+    var rest = sql;
+    var semis: std.ArrayList(syntax.Semi) = .empty;
+    while (true) {
+        const z = try a.dupeSentinel(u8, rest, 0);
+        const inner = (try sql_join.tables(a, z)) orelse break;
+        const r = try resolveJoin(a, z, inner, schemas, markers, unique);
+        try semis.append(a, .{ .fk = r.fk, .build = r.build, .unique = unique });
+        rest = r.probe_sql;
     }
-    return .{ .kind = if (p.kind == .semi) .semi else .inner, .fk = p.fk, .build = build, .probe_sql = p.probe_sql, .reduced = p.reduced };
+    return .{ .semis = semis.items, .rest = rest };
 }
 
 pub fn parseSqlPlan(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {

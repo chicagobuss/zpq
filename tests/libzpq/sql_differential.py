@@ -99,7 +99,7 @@ def main():
             assert z.query_raw(sql).encode() == cli(sql, 1).stdout
             errors = ["SELECT", f"SELECT absent FROM '{path}'", "SELECT * FROM 'missing.parquet'",
                       f"SELECT * FROM '{d}/missing*.parquet'", "SELECT 1; SELECT 2;",
-                      f"SELECT * FROM '{path}' ORDER BY id NULLS FIRST",
+                      f"SELECT row_number() OVER (ORDER BY id) FROM '{path}'",
                       "SELECT * FROM '" + "x" * 5000 + "'",
                       f"SELECT * FROM '{d}/" + "x" * 5000 + "*'",
                       "SELECT * FROM '" + "x" * 17000 + "'"]

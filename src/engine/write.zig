@@ -245,7 +245,12 @@ fn runWriteOver(
     // would need more of the budget than the mapping gives it: such a write reads through the mapping
     // (`input.readerFits`).
     const whole: input.WholeDecode = .{ .cols = fetch_arr, .share = window_mod.producerShareFloor(ctx, args) };
-    const io = try input.chooseLocalIo(ctx.gpa, arena, args, opened, metas, io_policy, whole, mapped, prof);
+    const range_copy: ?local_reader.Reason = if (mapped == null and rangeCopies(args, opened, out_path, proj, blooms))
+        .range_copy
+    else
+        null;
+    const io_mapped = mapped orelse range_copy;
+    const io = try input.chooseLocalIo(ctx.gpa, arena, args, opened, metas, io_policy, whole, io_mapped, prof);
     through_reader.* = io.choice.mode != .mmap;
     // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.
     var reader: ?*local_reader.Reader = null;
@@ -410,6 +415,7 @@ fn runWriteOver(
         .arena = arena,
         .args = args,
         .inputs = write_inputs,
+        .input_fds = try inputFds(arena, opened),
         .ledger = &ledger,
         .metas = metas,
         .meta0 = meta0,
@@ -486,6 +492,8 @@ const WriteRows = struct {
     args: QueryArgs,
     /// What the row groups are read from: the mapping's inputs, or the local reader's, gated per row group.
     inputs: []const scan.Input,
+    /// Each input's open file, when it is local and its mapping kept the descriptor: what a byte copy range-copies.
+    input_fds: []const ?local_fs.fd_t = &.{},
     ledger: *core_memory.SharedBudget,
     metas: []const schema.FileMetaData,
     meta0: *const schema.FileMetaData,
@@ -521,6 +529,10 @@ const WriteRows = struct {
     filter_threaded: ?std.Io.Threaded = null,
     filters: ?consumer.FilterJobs = null,
 
+    fn inputFd(self: *const WriteRows, i: usize) ?local_fs.fd_t {
+        return if (i < self.input_fds.len) self.input_fds[i] else null;
+    }
+
     fn deinit(self: *WriteRows) void {
         if (self.filters) |*f| f.deinit();
         if (self.filter_threaded) |*runtime| runtime.deinit();
@@ -541,6 +553,7 @@ const WriteRows = struct {
                         .bytes = in.bytes,
                         .meta = meta_p,
                         .rg = src_rg,
+                        .fd = self.inputFd(ii),
                         .file_index = ii,
                         .rg_index = self.rgs_in - 1,
                         .gate = in.gate,
@@ -589,6 +602,7 @@ const WriteRows = struct {
                 self.rg_kept += rw.rgs_kept;
                 self.t.core.sink_ns += rw.core.sink_ns;
                 self.t.core.encode_ns += rw.core.encode_ns;
+                consumer.addCopyCounts(&self.t.core, rw.core);
             }
         } else if (!self.need_encoder) {
             // Byte copy: kept column chunks verbatim, in order, on this thread; a chunk stored in another codec than
@@ -616,9 +630,9 @@ const WriteRows = struct {
                 .results = self.ctx.gpa,
                 .arena = self.arena,
             };
-            for (self.inputs, self.metas) |in, *meta_i| {
+            for (self.inputs, self.metas, 0..) |in, *meta_i, ii| {
                 self.bytes_in += in.bytes.len;
-                const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0 };
+                const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0, .fd = self.inputFd(ii) };
                 for (meta_i.row_groups.items, 0..) |*src_rg, ri| {
                     self.rgs_in += 1;
                     self.rows_in += src_rg.num_rows;
@@ -720,6 +734,7 @@ const WriteRows = struct {
                         .meta = meta_p,
                         .rg = src_rg,
                         .passthrough = passthrough,
+                        .fd = self.inputFd(ii),
                         .file_index = ii,
                         .rg_index = self.rgs_in - 1,
                         .gate = in.gate,
@@ -824,6 +839,7 @@ const WriteRows = struct {
                 self.rg_kept += w.rgs_kept;
                 self.t.core.sink_ns += w.sink_ns;
                 self.t.core.decode_ns += w.core.decode_ns;
+                consumer.addCopyCounts(&self.t.core, w.core);
                 self.t.core.eval_ns += w.core.eval_ns;
                 self.t.core.encode_ns += w.core.encode_ns;
             }
@@ -989,13 +1005,71 @@ pub fn buildSelectSchema(
     return out;
 }
 
+/// Whether every chunk of this write will be range-copied rather than read: a byte copy (no filter, computed column,
+/// `--select`, codec change or decoded Bloom filter) into a local file on the device of every input. The reader would
+/// only read ahead what the kernel copies; the mapping reads just the footers and indexes.
+fn rangeCopies(args: QueryArgs, opened: input.OpenedInputs, out_path: []const u8, proj: anytype, blooms: anytype) bool {
+    if (proj.filter != null or proj.any_computed or proj.select_items != null or args.codec != null) return false;
+    for (blooms.leaves) |fpp| if (fpp != null) return false;
+    if (std.mem.startsWith(u8, out_path, "s3://")) return false;
+    if (args.output_fd) |fd| if (!local_fs.isRegular(fd)) return false;
+    const out_dev = local_fs.deviceOf(args.output_fd, out_path) orelse return false;
+    for (opened.mmaps) |m| {
+        const fd = (m orelse return false).fd orelse return false;
+        if (local_fs.deviceOf(fd, "") != out_dev) return false;
+    }
+    return opened.mmaps.len > 0;
+}
+
+/// Each input's descriptor, from its mapping: null for S3 input, and for a mapping that gave its descriptor back.
+fn inputFds(arena: std.mem.Allocator, opened: input.OpenedInputs) ![]const ?local_fs.fd_t {
+    const fds = try arena.alloc(?local_fs.fd_t, opened.inputs.len);
+    for (fds, opened.mmaps) |*fd, m| fd.* = if (m) |mapped| mapped.fd else null;
+    return fds;
+}
+
 pub const FdSink = struct {
     fd: local_fs.fd_t,
     written: u64 = 0,
     writeback_to: u64 = 0,
+    /// How a range is copied: `local_fs.copyFileRange`, but for tests that force each fallback.
+    copy: *const fn (local_fs.fd_t, u64, local_fs.fd_t, usize) local_fs.CopyRangeError!usize = local_fs.copyFileRange,
 
+    /// Range copies only into a regular file: a pipe or a terminal takes plain writes.
     pub fn sink(self: *FdSink) streaming.Sink {
-        return .{ .ctx = self, .write_fn = writeFn, .write_segments_fn = writeSegmentsFn };
+        return .{
+            .ctx = self,
+            .write_fn = writeFn,
+            .write_segments_fn = writeSegmentsFn,
+            .copy_range_fn = if (local_fs.isRegular(self.fd)) copyRangeFn else null,
+        };
+    }
+
+    /// As much of `range` as the kernel copies; an error that says it will not, or a short copy, leaves the rest to
+    /// plain writes (`SinkOut.copyRange`), so the file's bytes are the same.
+    pub fn copyRangeFn(ctx: *anyopaque, range: streaming.SourceRange) anyerror!usize {
+        const self: *FdSink = @ptrCast(@alignCast(ctx));
+        // Filesystems share only whole blocks, and copy a call that has any partial one whole: the blocks inside the
+        // range go in a call of their own, between its unaligned head and tail.
+        const block = fastpath.share_block;
+        const end = range.offset + range.len;
+        const first = @min(std.mem.alignForward(u64, range.offset, block), end);
+        const last = @max(std.mem.alignBackward(u64, end, block), first);
+        var done: usize = 0;
+        for ([_]u64{ first, last, end }) |stop| {
+            while (range.offset + done < stop) {
+                const want: usize = @intCast(stop - range.offset - done);
+                const n = self.copy(range.fd, range.offset + done, self.fd, want) catch |e| switch (e) {
+                    error.Unsupported => break,
+                    else => return e,
+                };
+                if (n == 0) break;
+                done += n;
+            }
+            if (range.offset + done < stop) break;
+        }
+        try self.advance(done);
+        return done;
     }
 
     pub fn writeFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
@@ -1103,6 +1177,78 @@ test "FdSink segments keep one contiguous writeback range across page and vector
     try FdSink.writeFn(&sink, "footer");
     try std.testing.expectEqual(@as(u64, (128 << 20) + 12), sink.written);
     try std.testing.expectEqual(@as(u64, 128 << 20), sink.writeback_to);
+}
+
+test "FdSink range copies write the input's bytes whether the kernel copies all, part or none of them" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const block = fastpath.share_block;
+    var src_bytes: [3 * block + 123]u8 = undefined;
+    for (&src_bytes, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    const src_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/src", .{tmp.sub_path});
+    const src_w = try local_fs.createFile(src_path);
+    try local_fs.writeAll(src_w, &src_bytes);
+    local_fs.close(src_w);
+    const src = try local_fs.openRead(src_path);
+    defer local_fs.close(src);
+    const Fake = struct {
+        var budget: usize = 0;
+        /// What a kernel does that refuses these files (another filesystem, none at all).
+        fn refuse(_: local_fs.fd_t, _: u64, _: local_fs.fd_t, _: usize) local_fs.CopyRangeError!usize {
+            return error.Unsupported;
+        }
+        /// A copy that stops early (a signal, a quota, a filesystem's own limit), then refuses.
+        fn short(in: local_fs.fd_t, off: u64, out: local_fs.fd_t, len: usize) local_fs.CopyRangeError!usize {
+            if (budget == 0) return error.Unsupported;
+            const n = try local_fs.copyFileRange(in, off, out, @min(len, budget));
+            budget -= n;
+            return n;
+        }
+        fn none(_: local_fs.fd_t, _: u64, _: local_fs.fd_t, _: usize) local_fs.CopyRangeError!usize {
+            return 0;
+        }
+    };
+    const copiers = [_]*const fn (local_fs.fd_t, u64, local_fs.fd_t, usize) local_fs.CopyRangeError!usize{
+        Fake.refuse, Fake.short, Fake.none, local_fs.copyFileRange,
+    };
+    for (copiers, 0..) |copier, k| {
+        Fake.budget = 1000;
+        var out_buf: [256]u8 = undefined;
+        const out_path = try std.fmt.bufPrint(&out_buf, ".zig-cache/tmp/{s}/out{d}", .{ tmp.sub_path, k });
+        const fd = try local_fs.createFile(out_path);
+        var fd_sink: FdSink = .{ .fd = fd, .copy = copier };
+        var out: streaming.SinkOut = .{ .sink = fd_sink.sink() };
+        try out.write("PAR1");
+        // A run with whole blocks inside, at its input offset modulo the block, after zero padding.
+        const placed = try fastpath.copyRun(&out, src, 5, src_bytes[5..]);
+        try out.write("tail");
+        local_fs.close(fd);
+        try t.expectEqual(@as(usize, 5), placed.at % block);
+        try t.expectEqual(if (copier == Fake.short) @as(usize, 1000) else if (copier == local_fs.copyFileRange)
+            placed.kernel
+        else
+            0, placed.kernel);
+        const got = try local_fs.readFile(t.allocator, out_path);
+        defer t.allocator.free(got);
+        try t.expectEqualStrings("PAR1", got[0..4]);
+        for (got[4..placed.at]) |b| try t.expectEqual(@as(u8, 0), b);
+        try t.expectEqualSlices(u8, src_bytes[5..], got[placed.at..][0 .. src_bytes.len - 5]);
+        try t.expectEqualStrings("tail", got[placed.at + src_bytes.len - 5 ..]);
+        try t.expectEqual(@as(u64, got.len), fd_sink.written);
+    }
+}
+
+test "FdSink takes plain writes into a pipe" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.pipe(&fds));
+    defer local_fs.close(fds[0]);
+    defer local_fs.close(fds[1]);
+    var fd_sink: FdSink = .{ .fd = fds[1] };
+    try std.testing.expect(fd_sink.sink().copy_range_fn == null);
 }
 
 // ============================================================

@@ -37,6 +37,8 @@ NEEDS = {
     "sudo": "--privileged needs passwordless sudo",
     "strace": "syscall tracing and fault injection need strace",
     "libzpq": "library recovery needs libzpq.so (zig build libzpq)",
+    "cow_dir": "the clone path needs ZPQ_TEST_COW_DIR naming a directory on a filesystem that shares blocks "
+               "(btrfs, or XFS with reflink)",
 }
 EARLIER = b"earlier result must remain"
 CONTRACTS = []
@@ -545,6 +547,64 @@ def a_failing_device_keeps_the_earlier_target(root, clean, corrupt, distinct, sm
                 no_staging(fs.mnt)
                 sudo("dmsetup", "load", fs.dm, "--table", f"0 32768 linear {fs.loop} 0")
                 sudo("dmsetup", "resume", fs.dm)
+
+
+def shared_bytes(path):
+    """Bytes of `path` in extents FIEMAP marks shared with another file."""
+    import fcntl
+    head = struct.Struct("=QQIIII")
+    extent = struct.Struct("=QQQ2QI3I")
+    count = 4096
+    with open(path, "rb") as f:
+        buf = bytearray(head.pack(0, 2**64 - 1, 1, 0, count, 0) + bytes(extent.size * count))  # FIEMAP_FLAG_SYNC
+        fcntl.ioctl(f.fileno(), 0xC020660B, buf)  # FS_IOC_FIEMAP
+    mapped = head.unpack_from(buf)[3]
+    assert mapped < count, "more extents than the probe reads"
+    total = 0
+    for i in range(mapped):
+        _, _, length, _, _, flags, *_ = extent.unpack_from(buf, head.size + i * extent.size)
+        if flags & 0x2000:  # FIEMAP_EXTENT_SHARED
+            total += length
+    return total
+
+
+@contract
+def a_byte_copy_shares_its_input_blocks_on_a_cow_filesystem(root, clean, corrupt, distinct, small):
+    import fcntl
+    import json
+    cow = os.environ.get("ZPQ_TEST_COW_DIR")
+    if not cow or not Path(cow).is_dir():
+        raise Skip("cow_dir")
+    with tempfile.TemporaryDirectory(dir=cow, prefix="zpq-cow-") as d:
+        d = Path(d)
+        probe, copy = d / "probe", d / "probe-clone"
+        probe.write_bytes(bytes(8192))
+        with open(probe, "rb") as a, open(copy, "wb") as b:
+            try:
+                fcntl.ioctl(b.fileno(), 0x40049409, a.fileno())  # FICLONE
+            except OSError:
+                raise Skip("cow_dir")
+        # Snappy, the codec a filtered write keeps, so its fully matching row groups are copied too.
+        src = d / "clean.parquet"
+        pq.write_table(pq.read_table(clean), src, compression="snappy", row_group_size=25_000)
+        ref = pq.read_table(clean, columns=["k", "s"])
+        for args in (["--columns", "k,s"], ["--columns", "k,s", "--filter", "k >= 0"]):
+            out = d / "out.parquet"
+            p = run(src, *args, "-o", out, "--summary=json")
+            summary = json.loads(p.stderr.decode().strip().splitlines()[-1])
+            copied = summary["byte_copy"]
+            assert copied["path"] == "range_copy" and copied["kernel_bytes"] == copied["bytes"], copied
+            # Every whole block of every copied chunk is shared: each chunk loses at most a block at each end.
+            chunks = sum(rg.num_columns for rg in (pq.read_metadata(out).row_group(i)
+                                                    for i in range(pq.read_metadata(out).num_row_groups)))
+            assert shared_bytes(out) >= copied["bytes"] - chunks * 2 * 4096, (shared_bytes(out), copied)
+            # The same bytes through plain writes (a pipe), and the same values in every reader.
+            piped = run(src, *args, "--format", "parquet", "-o", "-").stdout
+            assert piped == out.read_bytes(), args
+            assert pq.read_table(out).equals(ref), args
+            assert duckdb.sql(f"SELECT count(*), sum(k), sum(hash(s)) FROM '{out}'").fetchall() == \
+                duckdb.sql(f"SELECT count(*), sum(k), sum(hash(s)) FROM '{clean}'").fetchall(), args
+            out.unlink()
 
 
 def main():

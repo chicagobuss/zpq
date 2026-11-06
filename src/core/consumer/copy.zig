@@ -113,8 +113,8 @@ pub fn copyRG(
                 rg_total += copied.meta_data.?.total_uncompressed_size;
                 continue;
             }
-            const delta = offsetDelta(out.pos(), range.start);
-            try timedWrite(&out, slice, timings);
+            const at = try timedRun(&out, src, range.start, slice, timings);
+            const delta = offsetDelta(at, range.start);
             // Carry the page index forward, written right after this chunk's data.
             var copied = try carryChunk(out_arena, &out, src, src_chunk, delta, emit_page_index);
             try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write, new_cols.items.len);
@@ -145,8 +145,7 @@ pub fn copyRG(
     const range = try fastpath.rowGroupByteRange(rg, std.math.maxInt(usize)) orelse return error.InvalidColumnOffsets;
     const rg_slice = try sourceBytes(src, range);
 
-    const delta = offsetDelta(out.pos(), range.start);
-    try timedWrite(&out, rg_slice, timings);
+    const delta = offsetDelta(try timedRun(&out, src, range.start, rg_slice, timings), range.start);
 
     var cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
     try cols.ensureTotalCapacity(out_arena, rg.columns.items.len);
@@ -445,6 +444,19 @@ fn timedWrite(out: *streaming.SinkOut, bytes: []const u8, timings: *Timings) !vo
     profile.record(timings.prof, .sink_write, t_sink_start, t_sink_end, profile.args(.{bytes.len}));
 }
 
+/// Copy verbatim input bytes `bytes` (at `start` in `src`) as `fastpath.copyRun` places them; returns where they went.
+fn timedRun(out: *streaming.SinkOut, src: RGSrc, start: usize, bytes: []const u8, timings: *Timings) !usize {
+    const t_sink_start = nowMonoNs();
+    const placed = try fastpath.copyRun(out, src.fd, start, bytes);
+    const t_sink_end = nowMonoNs();
+    timings.sink_ns += @intCast(t_sink_end - t_sink_start);
+    timings.copied_bytes += bytes.len;
+    timings.kernel_bytes += placed.kernel;
+    timings.pad_bytes += placed.pad;
+    profile.record(timings.prof, .sink_write, t_sink_start, t_sink_end, profile.args(.{bytes.len}));
+    return placed.at;
+}
+
 const TimedCopyOut = struct {
     out: *streaming.SinkOut,
     timings: *Timings,
@@ -455,6 +467,16 @@ const TimedCopyOut = struct {
 
     pub fn write(t: *TimedCopyOut, bytes: []const u8) !void {
         try timedWrite(t.out, bytes, t.timings);
+    }
+
+    // `copyPolicyChunk` rewrites these chunks' headers: written, never shared, so neither is reached through it.
+    pub fn pad(t: *TimedCopyOut, n: usize) !void {
+        try t.out.pad(n);
+    }
+
+    pub fn copyRange(t: *TimedCopyOut, _: ?std.posix.fd_t, _: u64, bytes: []const u8) !usize {
+        try t.write(bytes);
+        return 0;
     }
 };
 

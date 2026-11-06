@@ -780,9 +780,19 @@ fn writeSummary(output: ?[]const u8, rows: usize, s: SummaryStats, elapsed: i64)
     });
     if (s.codec) |codec| try w.print("\"{s}\",", .{@tagName(codec)}) else try w.writeAll(if (s.codec_applicable) "\"MIXED\"," else "null,");
     try engine.writeMembershipJson(&w, s.membership);
+    const c = s.timings.core;
+    if (c.copied_bytes > 0) {
+        // Kernel bytes were shared with the input (a reflink filesystem) or copied without user space; nothing here
+        // can tell which.
+        const path = if (c.kernel_bytes == c.copied_bytes)
+            "range_copy"
+        else if (c.kernel_bytes == 0) "write" else "mixed";
+        try w.print(",\"byte_copy\":{{\"bytes\":{d},\"kernel_bytes\":{d},\"written_bytes\":{d},\"pad_bytes\":{d},\"path\":\"{s}\"}}", .{
+            c.copied_bytes, c.kernel_bytes, c.copied_bytes - c.kernel_bytes, c.pad_bytes, path,
+        });
+    }
     // Wall-clock phases run one after another (S3 reads also continue under the scan) and sum to at most total_ms.
     // Worker phases are summed over every worker, so with N workers they can reach N times the scan's wall time.
-    const c = s.timings.core;
     const ms = std.time.ns_per_ms;
     try w.print(",\"total_ms\":{d},\"total_us\":{d},\"output_us\":{d},\"wall_ms\":{{\"open\":{d},\"parse\":{d},\"scan\":{d},\"footer\":{d}}},\"worker_ms\":{{\"decode\":{d},\"filter\":{d},\"fold\":{d},\"encode\":{d},\"sink\":{d}}}}}\n", .{
         @divTrunc(elapsed, std.time.ns_per_ms),   @divTrunc(elapsed, std.time.ns_per_us),   s.output_ns / std.time.ns_per_us,

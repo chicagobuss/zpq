@@ -152,6 +152,15 @@ budget a machine needs a few times `--row-group-bytes` of memory, or an explicit
 groups a filter's statistics prove fully matching are copied as they are, keeping their source's row groups. Computed
 columns are evaluated only for the rows the filter keeps.
 
+**Copies share blocks.** A copied run of input bytes (a whole row group, or one projected column chunk) is placed at
+the same offset modulo 4 KiB as in its input, after up to 4,095 zero bytes no footer offset points at, whenever the
+run holds at least one whole 4 KiB block; a run that holds none goes where it is. Into a local file, each run is
+copied with `copy_file_range`: a filesystem that shares blocks (btrfs, XFS with reflink, ZFS block cloning) shares
+the run's whole blocks with the input instead of writing them, which takes almost no time and no new space, and
+another copies them in the kernel. A pipe, another filesystem than the input's, or S3 gets the same bytes written.
+The layout is a fixed 4 KiB whatever the filesystem, so a copy's bytes are the same wherever it is written. Its cost
+is at most 4,095 bytes per run and always fewer than the run's whole blocks; the summary's `byte_copy` reports it.
+
 `--codec` sets the output codec. Without it, re-encoded output is SNAPPY and a plain copy keeps each column chunk's own
 codec; with it, a plain copy recompresses any chunk stored in another codec. The `codec` field of the write summary names
 the codec every written chunk uses, or is `"MIXED"` when a plain copy without `--codec` keeps chunks in more than one

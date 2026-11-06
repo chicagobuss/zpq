@@ -46,11 +46,35 @@ const QueryArgs = types.QueryArgs;
 const BufSink = struct {
     buf: *std.ArrayListUnmanaged(u8),
     gpa: std.mem.Allocator,
+    /// Input ranges a range copy can take, left out of `buf` for the writer to copy into place (`placeCopy`).
+    marks: ?*std.ArrayListUnmanaged(Mark) = null,
+    /// The zeros before the first byte, which the writer pads to instead, and whether any run was aligned: the
+    /// buffer's offsets assume it starts at a multiple of `fastpath.share_block`.
+    lead: usize = 0,
+    aligned: bool = false,
+
     fn writeFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *BufSink = @ptrCast(@alignCast(ctx));
         try self.buf.appendSlice(self.gpa, bytes);
     }
+
+    fn padFn(ctx: *anyopaque, n: usize) anyerror!void {
+        const self: *BufSink = @ptrCast(@alignCast(ctx));
+        self.aligned = true;
+        const empty = self.buf.items.len == 0 and (self.marks == null or self.marks.?.items.len == 0);
+        if (empty) self.lead += n else try self.buf.appendNTimes(self.gpa, 0, n);
+    }
+
+    fn copyRangeFn(ctx: *anyopaque, range: streaming.SourceRange) anyerror!usize {
+        const self: *BufSink = @ptrCast(@alignCast(ctx));
+        const marks = self.marks orelse return 0;
+        try marks.append(self.gpa, .{ .at = self.buf.items.len, .offset = range.offset, .len = range.len });
+        return range.len;
+    }
 };
+
+/// Input bytes `[offset, offset + len)` that belong in a byte-copied row group's buffer before its byte `at`.
+const Mark = struct { at: usize, offset: u64, len: usize };
 
 /// Address space one re-encoded row group reserves for its working memory (committed only as touched; past it, the
 /// general allocator).
@@ -92,6 +116,8 @@ pub const RGJob = struct {
     /// query is byte-copy-eligible → copy the chunk verbatim instead of
     /// decode→filter→encode. Set only when safe (see bytecopy_ok in runWrite).
     passthrough: bool = false,
+    /// The input file, open, when it is local: a byte copy of the row group can go by range copy.
+    fd: ?std.posix.fd_t = null,
     /// Input file and row group (counted across files), for profile spans.
     file_index: usize = 0,
     rg_index: usize = 0,
@@ -118,6 +144,14 @@ pub fn skipRowGroup(in: scan.Input, rg: usize) void {
 const EncodedRG = struct {
     bytes: []u8 = &.{}, // a byte-copied RG's bytes (gpa-owned; writer frees after sink.write)
     rg: ?schema.RowGroup = null, // its footer meta, offsets relative to 0 (meta_arena-owned)
+    /// A byte copy's input ranges, interleaved with `bytes` (gpa-owned): the writer copies them from the input,
+    /// which it releases after.
+    marks: []Mark = &.{},
+    /// Bytes the copy spans: `bytes` and the marks, after `lead` zeros the writer pads to instead. With `aligned`,
+    /// its offsets assume offset 0 is a multiple of `fastpath.share_block`.
+    len: usize = 0,
+    lead: usize = 0,
+    aligned: bool = false,
     /// A re-encoded row group's kept rows, decoded, for the writer to cut into output row groups.
     piece: ?*Piece = null,
     /// Too big for a producer to decode at once: the writer decodes it a slice at a time in its turn
@@ -289,20 +323,62 @@ fn copyRGToBuffer(
 ) !EncodedRG {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(gpa);
-    var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
-    const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
+    var marks: std.ArrayListUnmanaged(Mark) = .empty;
+    errdefer marks.deinit(gpa);
+    var bufsink = BufSink{ .buf = &buf, .gpa = gpa, .marks = &marks };
+    const sink: streaming.Sink = .{
+        .ctx = @ptrCast(&bufsink),
+        .write_fn = BufSink.writeFn,
+        .pad_fn = BufSink.padFn,
+        .copy_range_fn = BufSink.copyRangeFn,
+    };
     var local_off: u64 = 0;
     var timings: consumer.Timings = .{ .prof = prof };
-    const src: consumer.RGSrc = .{ .bytes = job.bytes, .byte_origin = 0 };
+    const src: consumer.RGSrc = .{ .bytes = job.bytes, .byte_origin = 0, .fd = job.fd };
     const out = try consumer.copyRG(meta_alloc, job.rg, src, kept_set, sink, &local_off, &timings, false, null, .{
         .fpp = bloom_leaves,
         .dictionary_bloom = dictionary_bloom,
         .meta = job.meta,
         .scratch = gpa,
     });
+    const owned_marks = try marks.toOwnedSlice(gpa);
+    errdefer gpa.free(owned_marks);
     const owned = try buf.toOwnedSlice(gpa);
     timings.prof = null;
-    return .{ .bytes = owned, .rg = out.rg, .surviving = out.surviving_rows, .timings = timings };
+    return .{
+        .bytes = owned,
+        .rg = out.rg,
+        .marks = owned_marks,
+        .len = @intCast(local_off),
+        .lead = bufsink.lead,
+        .aligned = bufsink.aligned,
+        .surviving = out.surviving_rows,
+        .timings = timings,
+    };
+}
+
+/// Write byte-copied row group `enc` of `job` at the writer's offset, and return its offsets' base: where the buffer's
+/// offset 0 lands. An aligned copy is padded so its offsets keep their remainder modulo `fastpath.share_block`; its
+/// marks are copied from the input, by range copy when the sink can.
+fn placeCopy(w: *WinCtx, job: RGJob, enc: EncodedRG) !u64 {
+    const block = fastpath.share_block;
+    var out: streaming.SinkOut = .{ .sink = w.sink, .offset = @intCast(w.out_offset) };
+    const pad = if (enc.aligned) (enc.lead % block + block - out.offset % block) % block else 0;
+    try out.pad(pad);
+    const base = out.offset - enc.lead;
+    var lit: usize = 0;
+    for (enc.marks) |m| {
+        try out.write(enc.bytes[lit..m.at]);
+        const start: usize = @intCast(m.offset);
+        w.core.kernel_bytes += try out.copyRange(job.fd, m.offset, job.bytes[start..][0..m.len]);
+        lit = m.at;
+    }
+    try out.write(enc.bytes[lit..]);
+    std.debug.assert(out.offset - base == enc.len);
+    w.core.copied_bytes += enc.timings.copied_bytes;
+    w.core.pad_bytes += enc.timings.pad_bytes - enc.lead + pad;
+    w.out_offset = out.offset;
+    return base;
 }
 
 /// The writer's cutter: takes pieces in input order, holds their rows until an output row group's worth is in, then
@@ -1132,8 +1208,8 @@ fn winProducer(w: *WinCtx, i: usize) void {
         w.completions.post(w.io);
         return;
     };
-    // A deferred row group's input is the writer's to release.
-    if (!enc.deferred) w.jobs[i].leave();
+    // A deferred row group's input is the writer's to release, as is one whose bytes it copies from the input.
+    if (!enc.deferred and enc.marks.len == 0) w.jobs[i].leave();
     // Near the ledger's limit a producer keeps no pages between row groups: they would stand beside the writer's
     // slices and the other producers' row groups, charged and idle.
     if (w.memory) |m| if (m.budget.tight()) {
@@ -1421,7 +1497,7 @@ fn winWriter(w: *WinCtx) void {
             if (enc.piece) |p| p.unref(w.gpa);
         } else if (w.first_err != null) {
             if (enc.piece) |p| p.unref(w.gpa);
-            if (enc.deferred) w.jobs[next].leave();
+            if (enc.deferred or enc.marks.len > 0) w.jobs[next].leave();
         } else if (enc.piece) |p| {
             // The window bounds rows waiting for the writer; held by the assembler they count toward a row group.
             asm_.feed(p) catch |e| {
@@ -1464,18 +1540,19 @@ fn winWriter(w: *WinCtx) void {
             asm_.flush() catch |e| {
                 w.first_err = e;
             };
+            defer if (enc.marks.len > 0) w.jobs[next].leave();
             if (w.first_err == null and enc.surviving > 0) {
                 var rgm = rg;
-                consumer.rebaseRowGroupOffsets(&rgm, @intCast(w.out_offset));
                 const t0 = nowMonoNs();
-                w.sink.write(enc.bytes) catch |e| {
+                const base = placeCopy(w, w.jobs[next], enc) catch |e| blk: {
                     w.first_err = e;
+                    break :blk 0;
                 };
                 const t1 = nowMonoNs();
                 w.sink_ns += @intCast(t1 - t0);
-                profile.record(prof, .sink_write, t0, t1, profile.args(.{enc.bytes.len}));
+                profile.record(prof, .sink_write, t0, t1, profile.args(.{enc.len}));
                 if (w.first_err == null) {
-                    w.out_offset += enc.bytes.len;
+                    consumer.rebaseRowGroupOffsets(&rgm, @intCast(base));
                     w.rows_kept += enc.surviving;
                     w.rgs_kept += 1;
                     w.new_row_groups.append(w.arena, rgm) catch |e| {
@@ -1490,6 +1567,7 @@ fn winWriter(w: *WinCtx) void {
             w.first_err = e;
         };
         if (enc.bytes.len > 0) w.outAlloc().free(enc.bytes);
+        if (enc.marks.len > 0) w.outAlloc().free(enc.marks);
         profile.gauge(prof, .buffered_bytes, -@as(i64, @intCast(held)));
         _ = w.inflight.fetchSub(held, .acq_rel);
         for (0..windowPermits(WinCtx, w, next)) |_| w.window.post(w.io);
@@ -1699,7 +1777,7 @@ fn recompressWriter(w: *RecompressCtx) void {
             if (consumer.copyRG(
                 w.arena,
                 job.rg,
-                .{ .bytes = job.bytes, .byte_origin = 0 },
+                .{ .bytes = job.bytes, .byte_origin = 0, .fd = job.fd },
                 w.kept,
                 w.sink,
                 &w.out_offset,
@@ -2365,6 +2443,78 @@ test "piece allocation failures release their rows" {
             _ = try p.arena.allocator().alloc(u8, 8192);
         }
     }.run, .{});
+}
+
+test "a windowed byte copy places the bytes a direct copy writes, its ranges copied from the input" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const path = "ci/fixtures/parquet/filtered_records_ordered.parquet";
+    const bytes = metadata.readFileSlice(path, a) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    const fd = try @import("../local_fs.zig").openRead(path);
+    defer @import("../local_fs.zig").close(fd);
+    const meta = try metadata.open(a, bytes);
+    const kept_cols = [_]bool{ true, false, true };
+    // A sink that range-copies by reading the descriptor, as a kernel would, counting what it took.
+    const Ranged = struct {
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+        gpa: std.mem.Allocator,
+        took: usize = 0,
+        fn write(ctx: *anyopaque, b: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.buf.appendSlice(self.gpa, b);
+        }
+        fn copy(ctx: *anyopaque, r: streaming.SourceRange) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            const at = self.buf.items.len;
+            try self.buf.resize(self.gpa, at + r.len);
+            const n = std.os.linux.pread(r.fd, self.buf.items[at..].ptr, r.len, @intCast(r.offset));
+            try t.expectEqual(r.len, n);
+            self.took += n;
+            return n;
+        }
+    };
+    for ([_]?[]const bool{ null, &kept_cols }) |kept| for ([_]bool{ false, true }) |ranged| {
+        // Direct: each row group straight to the output, at its absolute offsets.
+        var direct: streaming.MemorySink = .{ .arena = a };
+        try direct.buffer.appendSlice(a, "PAR1");
+        var direct_off: u64 = 4;
+        var timings: consumer.Timings = .{};
+        // Windowed: a producer's buffer of literals and ranges, placed by the writer.
+        var placed: Ranged = .{ .gpa = a };
+        try placed.buf.appendSlice(a, "PAR1");
+        var w: WinCtx = undefined;
+        w.sink = .{
+            .ctx = &placed,
+            .write_fn = Ranged.write,
+            .copy_range_fn = if (ranged) Ranged.copy else null,
+        };
+        w.out_offset = 4;
+        w.core = .{};
+        for (meta.row_groups.items) |*rg| {
+            const src: consumer.RGSrc = .{ .bytes = bytes, .byte_origin = 0, .fd = fd };
+            const want = try consumer.copyRG(a, rg, src, kept, direct.sink(), &direct_off, &timings, false, null, .{
+                .meta = &meta,
+                .dictionary_bloom = false,
+            });
+            const job: RGJob = .{ .bytes = bytes, .meta = &meta, .rg = rg, .passthrough = true, .fd = fd };
+            const enc = try copyRGToBuffer(a, a, job, kept, null, &.{}, false);
+            try t.expect(enc.marks.len > 0);
+            const base = try placeCopy(&w, job, enc);
+            var got = enc.rg.?;
+            consumer.rebaseRowGroupOffsets(&got, @intCast(base));
+            for (want.rg.?.columns.items, got.columns.items) |wc, gc|
+                try t.expectEqual(wc.meta_data.?.data_page_offset, gc.meta_data.?.data_page_offset);
+        }
+        try t.expectEqualSlices(u8, direct.buffer.items, placed.buf.items);
+        try t.expectEqual(direct_off, w.out_offset);
+        if (ranged) try t.expect(placed.took > 0) else try t.expectEqual(@as(usize, 0), placed.took);
+        try t.expectEqual(placed.took, w.core.kernel_bytes);
+    };
 }
 
 test "encode reservations cover placement and retained regions become charged pages" {

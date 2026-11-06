@@ -16,6 +16,8 @@
 //!
 //! Output: a freshly allocated `[]u8` containing a complete Parquet file:
 //!   `[PAR1][rg0_data][rg1_data]...[footer thrift][u32 footer_len][PAR1]`
+//! Each copied run (a row group, or a projected chunk) holding a whole `share_block` starts at its input offset
+//! modulo that block, after zero bytes no offset names (`alignGap`), so a sink that range-copies can share blocks.
 //!
 //! Caveats:
 //!   - The page index (offset/column index) is **carried forward**: the
@@ -55,6 +57,38 @@ pub const Error = error{
 } || std.mem.Allocator.Error ||
     @typeInfo(@typeInfo(@TypeOf(schema.PageHeader.read)).@"fn".return_type.?).error_union.error_set ||
     error{ BadPageHeader, TruncatedPage, Overflow };
+
+/// The block copied bytes keep their offset modulo: a fixed 4 KiB, never the filesystem's block size, so the output's
+/// bytes do not depend on where it is written. It is the block size of every reflink filesystem's default format.
+pub const share_block = 4096;
+
+/// The zero bytes to put before a verbatim run of input bytes `[start, start + len)` at output offset `pos`, so that it
+/// keeps its offset modulo `share_block` and a filesystem can share its whole blocks with the input instead of copying
+/// them. Null when the run holds no whole block: it has nothing to share and goes where it is. A gap is under one
+/// block, so it is always smaller than what the run can share. Depends on the run and `pos` alone.
+pub fn alignGap(pos: usize, start: usize, len: usize) ?usize {
+    const first = std.mem.alignForward(usize, start, share_block);
+    if (start +| len < first +| share_block) return null;
+    return (start % share_block + share_block - pos % share_block) % share_block;
+}
+
+/// Where `copyRun` put a run, and how: `kernel` of its bytes went by the output's range copy, after `pad` zeros.
+pub const Placed = struct { at: usize, kernel: usize = 0, pad: usize = 0 };
+
+/// Append verbatim input bytes `bytes`, found at offset `start` of the input (open on `fd`, when known), at their
+/// `alignGap` position. `out` gives `pos()`, `pad(n)` and `copyRange(fd, offset, bytes)`, which appends `bytes` and
+/// says how many went by a range copy; the output bytes are the same however many did.
+pub fn copyRun(out: anytype, fd: ?std.posix.fd_t, start: usize, bytes: []const u8) !Placed {
+    var placed: Placed = .{ .at = out.pos() };
+    // Called for a zero gap too: a sink that places this output elsewhere learns the run is aligned.
+    if (alignGap(placed.at, start, bytes.len)) |gap| {
+        try out.pad(gap);
+        placed.pad = gap;
+        placed.at += gap;
+    }
+    placed.kernel = try out.copyRange(fd, start, bytes);
+    return placed;
+}
 
 /// One input file. `bytes` covers (at minimum) the tail/head/footer
 /// plus the bytes of every kept column-chunk of every surviving row
@@ -117,6 +151,15 @@ const BufferOut = struct {
 
     pub fn write(self: *BufferOut, bytes: []const u8) Error!void {
         try self.bytes.appendSlice(self.arena, bytes);
+    }
+
+    pub fn pad(self: *BufferOut, n: usize) Error!void {
+        try self.bytes.appendNTimes(self.arena, 0, n);
+    }
+
+    pub fn copyRange(self: *BufferOut, _: ?std.posix.fd_t, _: u64, bytes: []const u8) Error!usize {
+        try self.write(bytes);
+        return 0;
     }
 };
 
@@ -233,8 +276,8 @@ fn copyRowGroup(
         return .{ .columns = cols, .total_byte_size = uncompressedBytes(cols.items), .num_rows = src.num_rows };
     }
     const range = try rowGroupByteRange(src, input.len) orelse return null;
-    const delta = offsetDelta(out.pos(), range.start);
-    try out.write(input[range.start .. range.start + range.len]);
+    const placed = try copyRun(out, null, range.start, input[range.start .. range.start + range.len]);
+    const delta = offsetDelta(placed.at, range.start);
 
     var cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
     errdefer cols.deinit(arena);
@@ -312,12 +355,14 @@ pub fn copyPolicyChunk(
 ) !schema.ColumnChunk {
     const cm = src.meta_data orelse return error.InvalidColumnOffsets;
     const range = chunkRange(&cm, input.len) orelse return error.InvalidColumnOffsets;
+    if (cm.writer_stats == .trust) {
+        const placed = try copyRun(out, null, range.start, input[range.start..][0..range.len]);
+        const moved = offsetDelta(placed.at, range.start);
+        return if (emit_index) try rebaseChunk(a, out, input, src, moved) else copiedChunk(input, src, moved);
+    }
+    // Rewritten headers change the chunk's bytes: it is written, never shared, so it is not aligned either.
     const start = out.pos();
     const delta = offsetDelta(start, range.start);
-    if (cm.writer_stats == .trust) {
-        try out.write(input[range.start..][0..range.len]);
-        return if (emit_index) try rebaseChunk(a, out, input, src, delta) else copiedChunk(input, src, delta);
-    }
     const bytes = input[range.start..][0..range.len];
     const old_start: i64 = @intCast(range.start);
     const old_offsets = [_]?i64{ cm.data_page_offset, cm.dictionary_page_offset, cm.index_page_offset };
@@ -669,6 +714,24 @@ pub fn reserializeOffsetIndexShifted(arena: std.mem.Allocator, bytes: []const u8
 const testing = std.testing;
 const metadata = @import("../parquet/metadata.zig");
 const readFileSlice = metadata.readFileSlice;
+
+test "alignGap aligns a run with a whole block to its input offset modulo 4096, and leaves the rest in place" {
+    const b = share_block;
+    // No whole block inside: nothing to share, no gap, wherever it lands.
+    try testing.expectEqual(@as(?usize, null), alignGap(4, 100, b - 1));
+    try testing.expectEqual(@as(?usize, null), alignGap(4, b + 1, 2 * b - 2));
+    // Exactly one whole block.
+    try testing.expectEqual(@as(?usize, 0), alignGap(b, b, b));
+    try testing.expectEqual(@as(?usize, 1), alignGap(b - 1, b, b));
+    // The gap is the distance to the next output offset with the input's remainder: under one block.
+    try testing.expectEqual(@as(?usize, 96), alignGap(4, 100, 3 * b));
+    try testing.expectEqual(@as(?usize, b - 4), alignGap(104, 100, 3 * b));
+    for ([_]usize{ 0, 1, 7, 4095, 4096, 123457 }) |pos| for ([_]usize{ 0, 4, 4095, 4097, 99999 }) |start| {
+        const gap = alignGap(pos, start, 5 * b) orelse return error.TestUnexpectedResult;
+        try testing.expect(gap < b);
+        try testing.expectEqual(start % b, (pos + gap) % b);
+    };
+}
 
 test "build with all survivors round-trips through metadata.open" {
     const fixture_path = "data/benchmark_100mb.parquet";

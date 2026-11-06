@@ -39,6 +39,8 @@ pub const Error = error{
 pub const RGSrc = struct {
     bytes: []const u8,
     byte_origin: u64,
+    /// The input file `bytes` are read from, open, when it is a local file: a byte copy can then go by range copy.
+    fd: ?std.posix.fd_t = null,
 };
 
 /// Per-phase wall-clock counters in nanoseconds. Both consumers
@@ -53,10 +55,22 @@ pub const Timings = struct {
     /// Counted by the drivers, not by `ProjectedRG`, which a top-N runs twice over a row group it keeps rows of.
     rows_scanned: u64 = 0,
     rows_matched: u64 = 0,
+    /// Verbatim input bytes a byte copy wrote; of those, the ones its sink's range copy took (shared or copied in the
+    /// kernel), and the zero bytes that aligned them (`fastpath.alignGap`).
+    copied_bytes: u64 = 0,
+    kernel_bytes: u64 = 0,
+    pad_bytes: u64 = 0,
     /// The accumulating thread's profile buffer; spans reuse the timestamps these counters are taken from. A Timings
     /// accumulates on one thread at a time, which is what makes handing it the buffer safe.
     prof: ?*profile.Thread = null,
 };
+
+/// Add `from`'s byte-copy counters to `to`.
+pub fn addCopyCounts(to: *Timings, from: Timings) void {
+    to.copied_bytes += from.copied_bytes;
+    to.kernel_bytes += from.kernel_bytes;
+    to.pad_bytes += from.pad_bytes;
+}
 
 /// The column chunk this thread last began to decode. A marker, not a scope: set as each chunk (or slice) starts, and
 /// read only once a decode error has ended the query, so it names where that error was raised. A worker hands its own

@@ -132,6 +132,8 @@ pub const Reason = enum(u8) {
     retry_mapped = 10,
     /// A write to a descriptor it cannot restart (stdout, a pipe) under an explicit `--max-memory`.
     unrestartable_output = 11,
+    /// A byte copy into a file on its inputs' device: the kernel copies (or shares) the chunks, unread by zpq.
+    range_copy = 12,
 
     pub fn phrase(self: Reason) []const u8 {
         return switch (self) {
@@ -147,6 +149,7 @@ pub const Reason = enum(u8) {
             .page_cache => "through the page cache (--cache)",
             .retry_mapped => "the reader's run refused for memory; retried on the mapping",
             .unrestartable_output => "output cannot be restarted under an explicit --max-memory",
+            .range_copy => "a byte copy on the inputs' device copies in the kernel, without reading",
         };
     }
 };

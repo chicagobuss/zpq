@@ -78,6 +78,21 @@ pub fn sameFile(a: []const u8, b: []const u8) !bool {
     return ast.ino == bst.ino and ast.dev == bst.dev;
 }
 
+/// The device the file open at `fd`, or at `path` (a file, or the directory a new file would go in), is on: files on
+/// one device can be range-copied between in the kernel. Null when it cannot be told, or off Linux.
+pub fn deviceOf(fd: ?fd_t, path: []const u8) ?u64 {
+    if (builtin.os.tag != .linux) return null;
+    const linux = std.os.linux;
+    var st = std.mem.zeroes(linux.Statx);
+    const rc = if (fd) |f| linux.statx(f, "", linux.AT.EMPTY_PATH, .{}, &st) else blk: {
+        const dir = std.fs.path.dirname(path) orelse ".";
+        const dir_z = posix.toPosixPath(dir) catch return null;
+        break :blk linux.statx(linux.AT.FDCWD, &dir_z, 0, .{}, &st);
+    };
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return @as(u64, st.dev_major) << 32 | st.dev_minor;
+}
+
 /// Create or truncate `path` for writing, mode 0644.
 pub fn createFile(path: []const u8) !fd_t {
     return posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
@@ -125,6 +140,43 @@ pub fn fileSize(fd: fd_t) !usize {
     if (posix.errno(end) != .SUCCESS) return error.SeekFailed;
     if (posix.errno(posix.system.lseek(fd, 0, posix.SEEK.SET)) != .SUCCESS) return error.SeekFailed;
     return @intCast(end);
+}
+
+/// Whether `fd` is a regular file (not a pipe, socket or device): what a range copy can write to.
+pub fn isRegular(fd: fd_t) bool {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var st = std.mem.zeroes(linux.Statx);
+        return linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &st)) == .SUCCESS and
+            linux.S.ISREG(st.mode);
+    }
+    var st: posix.system.Stat = undefined;
+    return posix.errno(posix.system.fstat(fd, &st)) == .SUCCESS and posix.S.ISREG(st.mode);
+}
+
+pub const CopyRangeError = error{ Unsupported, WriteFailed, NoSpaceLeft, InputOutput };
+
+/// Append up to `len` bytes of `in_fd`, read from `in_offset`, at `out_fd`'s file position, in the kernel
+/// (`copy_file_range`: a reflink filesystem shares the blocks it can; another copies them without user space).
+/// Returns the bytes copied, possibly fewer than asked and 0 at the input's end. `error.Unsupported` when the kernel
+/// will not range-copy between these files (another filesystem, a filesystem without it, a kernel before 4.5, not
+/// Linux): nothing was copied, and the caller writes the bytes itself.
+pub fn copyFileRange(in_fd: fd_t, in_offset: u64, out_fd: fd_t, len: usize) CopyRangeError!usize {
+    if (builtin.os.tag != .linux) return error.Unsupported;
+    const linux = std.os.linux;
+    var off: linux.off_t = std.math.cast(linux.off_t, in_offset) orelse return error.Unsupported;
+    while (true) {
+        // The output offset is the file position, which plain writes before and after this one share.
+        const rc = linux.copy_file_range(in_fd, &off, out_fd, null, len, 0);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return rc,
+            .INTR => continue,
+            .XDEV, .OPNOTSUPP, .INVAL, .NOSYS, .BADF, .PERM, .TXTBSY, .OVERFLOW, .ISDIR => return error.Unsupported,
+            .NOSPC, .DQUOT => return error.NoSpaceLeft,
+            .IO => return error.InputOutput,
+            else => return error.WriteFailed,
+        }
+    }
 }
 
 /// Empty the regular file open at `fd` and write from its start again: a write run again into its unpublished output.

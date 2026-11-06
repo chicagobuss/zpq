@@ -196,6 +196,19 @@ $ zpq query tiny.parquet --filter 'value > 10' --aggregate 'count(*) AS n' --sum
 so its `rows_scanned` and `rows_matched` count only what was read. The counts are the same at every `-j`, except for
 a LIMIT top-N, whose workers may each read a row group before a cut passes over the rest.
 
+### Byte copy
+
+A write that copied input bytes as they are (a plain copy, or row groups a filter's statistics prove fully matching)
+adds `byte_copy`; other answers have no such field.
+
+| Field | Counts |
+|---|---|
+| `bytes` | input bytes copied verbatim |
+| `kernel_bytes` | of those, the bytes `copy_file_range` took: shared with the input on a filesystem that shares blocks, else copied in the kernel (nothing in the process can tell which) |
+| `written_bytes` | `bytes - kernel_bytes`: written through the process, as to a pipe, S3 or another filesystem |
+| `pad_bytes` | zero bytes placed before copied runs to keep them at their input offset modulo 4 KiB |
+| `path` | `range_copy` (every byte by the kernel), `write` (none) or `mixed` |
+
 ### Time
 
 Every field is whole milliseconds (`_ms`, rounded down) or microseconds (`_us`).

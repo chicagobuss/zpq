@@ -373,6 +373,139 @@ test "copyRG no-projection: writes only this RG's bounding box, not src.bytes" {
     try testing.expectEqual(@as(i64, 40), out.rg.?.columns.items[1].meta_data.?.data_page_offset);
 }
 
+/// Byte-copy every row group of `path` through `copyRG` (projected to `kept`, or whole), its Bloom filters placed after
+/// the last, into one buffer starting past the magic. The output's footer is not written: the checks read its chunks.
+fn copyFixture(a: std.mem.Allocator, path: []const u8, kept: ?[]const bool) !struct {
+    src: []const u8,
+    meta: schema.FileMetaData,
+    out: []const u8,
+    rgs: []schema.RowGroup,
+} {
+    const testing = std.testing;
+    const src = metadata.readFileSlice(path, a) catch |err| {
+        if (err == error.FileNotFound) return error.SkipZigTest;
+        return err;
+    };
+    const meta = try metadata.open(a, src);
+    var msink: streaming.MemorySink = .{ .arena = a };
+    try msink.buffer.appendSlice(a, "PAR1");
+    var out_offset: u64 = 4;
+    var timings: Timings = .{};
+    var rgs: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+    for (meta.row_groups.items) |*rg| {
+        const rg_src: RGSrc = .{ .bytes = src, .byte_origin = 0 };
+        const copied = try copyRG(a, rg, rg_src, kept, msink.sink(), &out_offset, &timings, true, null, .{
+            .meta = &meta,
+            .dictionary_bloom = false,
+        });
+        try rgs.append(a, copied.rg.?);
+    }
+    var out: streaming.SinkOut = .{ .sink = msink.sink(), .offset = @intCast(out_offset) };
+    try fastpath.placeFilters(&out, rgs.items);
+    try testing.expectEqual(msink.buffer.items.len, out.offset);
+    try testing.expect(timings.copied_bytes > 0);
+    try testing.expectEqual(@as(u64, 0), timings.kernel_bytes);
+    return .{ .src = src, .meta = meta, .out = msink.buffer.items, .rgs = rgs.items };
+}
+
+/// Every byte of `out` that no chunk, page index or Bloom filter of `rgs` covers (past the magic) reads as zero: the
+/// gaps the aligned layout leaves are zeros, whatever the input held there.
+fn expectGapsZero(out: []const u8, rgs: []const schema.RowGroup) !void {
+    const covered = try std.testing.allocator.alloc(bool, out.len);
+    defer std.testing.allocator.free(covered);
+    @memset(covered, false);
+    @memset(covered[0..4], true);
+    const cover = struct {
+        fn f(c: []bool, off: ?i64, len: ?i64) void {
+            const o: usize = @intCast(off orelse return);
+            @memset(c[o..][0..@intCast(len orelse return)], true);
+        }
+    }.f;
+    for (rgs) |rg| for (rg.columns.items) |c| {
+        const m = c.meta_data.?;
+        cover(covered, m.dictionary_page_offset orelse m.data_page_offset, m.total_compressed_size);
+        cover(covered, c.offset_index_offset, if (c.offset_index_length) |l| l else null);
+        cover(covered, c.column_index_offset, if (c.column_index_length) |l| l else null);
+        cover(covered, m.bloom_filter_offset, if (m.bloom_filter_length) |l| l else null);
+    };
+    for (out, covered) |byte, c| if (!c) try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "byte copy keeps each shareable run at its input offset modulo 4096, page indexes rebased, gaps zero" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const kept_cols = [_]bool{ true, false, true };
+    for ([_]?[]const bool{ null, &kept_cols }) |kept| {
+        const r = try copyFixture(a, "ci/fixtures/parquet/filtered_records_ordered.parquet", kept);
+        var aligned: usize = 0;
+        var pages: usize = 0;
+        for (r.meta.row_groups.items, r.rgs) |src_rg, out_rg| {
+            var oi: usize = 0;
+            for (src_rg.columns.items, 0..) |src_c, ci| {
+                if (kept) |k| if (!k[ci]) continue;
+                const out_c = out_rg.columns.items[oi];
+                oi += 1;
+                const sm = src_c.meta_data.?;
+                const om = out_c.meta_data.?;
+                const s: usize = @intCast(sm.dictionary_page_offset orelse sm.data_page_offset);
+                const o: usize = @intCast(om.dictionary_page_offset orelse om.data_page_offset);
+                const len: usize = @intCast(sm.total_compressed_size);
+                try testing.expectEqualSlices(u8, r.src[s..][0..len], r.out[o..][0..len]);
+                // A whole-group copy is one run, aligned by its first chunk; a projected chunk is a run of its own.
+                const run_start: usize = if (kept == null)
+                    @intCast((try fastpath.rowGroupByteRange(&src_rg, r.src.len)).?.start)
+                else
+                    s;
+                const run_len: usize = if (kept == null)
+                    (try fastpath.rowGroupByteRange(&src_rg, r.src.len)).?.len
+                else
+                    len;
+                if (fastpath.alignGap(0, run_start, run_len) != null) {
+                    try testing.expectEqual(s % fastpath.share_block, o % fastpath.share_block);
+                    aligned += 1;
+                }
+                // Each rebased page location names the same page, now at its output offset.
+                const io: usize = @intCast(out_c.offset_index_offset.?);
+                var reader = thrift.Reader.init(r.out[io..][0..@intCast(out_c.offset_index_length.?)]);
+                const index = try schema.OffsetIndex.read(a, &reader);
+                for (index.page_locations.items) |pl| {
+                    const at: usize = @intCast(pl.offset);
+                    const was = at - o + s;
+                    const size: usize = @intCast(pl.compressed_page_size);
+                    try testing.expectEqualSlices(u8, r.src[was..][0..size], r.out[at..][0..size]);
+                    pages += 1;
+                }
+            }
+        }
+        try testing.expect(aligned > 0);
+        try testing.expect(pages > 0);
+        try expectGapsZero(r.out, r.rgs);
+    }
+}
+
+test "byte copy relocates each carried Bloom filter after the row groups" {
+    const testing = std.testing;
+    const bloom = @import("../parquet/bloom.zig");
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const r = try copyFixture(a, "ci/fixtures/parquet/bloom_keys.parquet", null);
+    var filters: usize = 0;
+    for (r.meta.row_groups.items, r.rgs) |src_rg, out_rg| for (src_rg.columns.items, out_rg.columns.items) |sc, oc| {
+        const so = sc.meta_data.?.bloom_filter_offset orelse continue;
+        const om = oc.meta_data.?;
+        const at: usize = @intCast(om.bloom_filter_offset.?);
+        const len: usize = @intCast(om.bloom_filter_length.?);
+        try testing.expect(bloom.parseHeader(r.out[at..]) != null);
+        try testing.expectEqualSlices(u8, r.src[@intCast(so)..][0..len], r.out[at..][0..len]);
+        filters += 1;
+    };
+    try testing.expect(filters > 0);
+    try expectGapsZero(r.out, r.rgs);
+}
+
 // --- DECIMAL decode: fixture-free encode→decode round-trip ---
 // The decimal *decode* tests in decimal.zig read parquet-testing fixtures
 // and skip in CI without the corpus (as do all of column.zig's decode

@@ -23,6 +23,12 @@ pub const Sink = struct {
     ctx: *anyopaque,
     write_fn: *const fn (*anyopaque, []const u8) anyerror!void,
     write_segments_fn: ?*const fn (*anyopaque, []const []const u8) anyerror!void = null,
+    /// Append the bytes of `range` from its file without passing them through user space (a local file:
+    /// `copy_file_range`, which shares blocks on a CoW filesystem), returning how many it appended: a prefix of the
+    /// range, possibly none. The caller writes the rest itself, so the output bytes are the same either way.
+    copy_range_fn: ?*const fn (*anyopaque, SourceRange) anyerror!usize = null,
+    /// Append `n` zero bytes. Without it they are written.
+    pad_fn: ?*const fn (*anyopaque, usize) anyerror!void = null,
 
     pub fn writeSegments(self: Sink, segments: []const []const u8) anyerror!void {
         if (self.write_segments_fn) |write_segments| return write_segments(self.ctx, segments);
@@ -32,7 +38,26 @@ pub const Sink = struct {
     pub fn write(self: Sink, bytes: []const u8) anyerror!void {
         return self.write_fn(self.ctx, bytes);
     }
+
+    pub fn pad(self: Sink, n: usize) anyerror!void {
+        if (self.pad_fn) |pad_zeros| return pad_zeros(self.ctx, n);
+        var left = n;
+        while (left > 0) {
+            const take = @min(left, zeros.len);
+            try self.write(zeros[0..take]);
+            left -= take;
+        }
+    }
 };
+
+/// Bytes of an input file: `len` of them from `offset` in the file open on `fd`.
+pub const SourceRange = struct {
+    fd: std.posix.fd_t,
+    offset: u64,
+    len: usize,
+};
+
+const zeros: [fastpath.share_block]u8 = @splat(0);
 
 pub const Error = fastpath.Error;
 
@@ -66,6 +91,24 @@ pub const SinkOut = struct {
     pub fn write(self: *SinkOut, bytes: []const u8) anyerror!void {
         try self.sink.write(bytes);
         self.offset += bytes.len;
+    }
+
+    pub fn pad(self: *SinkOut, n: usize) anyerror!void {
+        try self.sink.pad(n);
+        self.offset += n;
+    }
+
+    /// Append `bytes`, which are input bytes at `offset` of the file open on `fd` when that is known: through the
+    /// sink's range copy as far as it goes, the rest written. Returns the bytes the range copy took.
+    pub fn copyRange(self: *SinkOut, fd: ?std.posix.fd_t, offset: u64, bytes: []const u8) anyerror!usize {
+        var taken: usize = 0;
+        if (fd) |f| if (self.sink.copy_range_fn) |copy| {
+            taken = try copy(self.sink.ctx, .{ .fd = f, .offset = offset, .len = bytes.len });
+            std.debug.assert(taken <= bytes.len);
+        };
+        if (taken < bytes.len) try self.sink.write(bytes[taken..]);
+        self.offset += bytes.len;
+        return taken;
     }
 };
 

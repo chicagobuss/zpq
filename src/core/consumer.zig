@@ -65,6 +65,7 @@ pub const resolveDecodeFailure = types.resolveDecodeFailure;
 pub const isDecodeError = types.isDecodeError;
 pub const RGOut = types.RGOut;
 pub const rebaseRowGroupOffsets = types.rebaseRowGroupOffsets;
+pub const addCopyCounts = types.addCopyCounts;
 const decode_order = @import("decode_order.zig");
 
 const output = @import("consumer/output.zig");

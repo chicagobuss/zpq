@@ -29,6 +29,8 @@ const streaming = @import("../core/writer/streaming.zig");
 const fastpath = @import("../core/writer/fastpath.zig");
 const Diag = @import("../core/diag.zig").Diag;
 const local_fs = @import("../local_fs.zig");
+const local_reader = @import("../io/local_reader.zig");
+const RowGroupGate = @import("../core/scan.zig").RowGroupGate;
 const profile = @import("../profile.zig");
 const nowMonoNs = @import("../clock.zig").monoNs;
 const window_mod = @import("write_window.zig");
@@ -56,6 +58,9 @@ pub const Options = struct {
     sample_bytes: usize = 4 << 20,
     /// Forced-path control: the chunk size (chunks never change the output's bytes).
     chunk_bytes: ?usize = null,
+    /// Forced-path controls for the reader: its profile (as `ZPQ_IO_PROFILE`), and what a chunk's read takes past it.
+    io_profile: ?local_reader.Policy.Profile = null,
+    overhang: ?usize = null,
 
     pub const Pinned = struct { column: []const u8, type: Type };
 };
@@ -89,9 +94,13 @@ pub const Report = struct {
     failure: Failure = .{},
     /// Writes started again after a value changed its column's type.
     restarts: usize = 0,
+    /// Writes started again on fewer workers after the budget refused one.
+    narrowed: usize = 0,
     /// Per column, whether a restart widened it (allocated by the write, on the caller's allocator).
     widened: []bool = &.{},
     chunks: usize = 0,
+    /// How the file was read: the mapping, or the local reader (and why).
+    io: ?local_reader.Choice = null,
     /// The types written (on the caller's allocator), for the summary.
     types: []Type = &.{},
     names: []const []const u8 = &.{},
@@ -247,6 +256,11 @@ fn classifyText(s: []const u8, ascii: bool) Type {
     return csv_types.classify(s, ascii or std.unicode.utf8ValidateSlice(s));
 }
 
+/// The text was unescaped into the producer's scratch, which the next field reuses.
+fn unescaped(t: csv_scan.Text, scratch: *const std.ArrayList(u8)) bool {
+    return t.bytes.ptr == scratch.items.ptr;
+}
+
 fn isNull(t: csv_scan.Text, nulls: []const []const u8) bool {
     if (t.quoted) return false;
     if (t.bytes.len == 0) return true;
@@ -275,6 +289,13 @@ pub const Source = struct {
     /// Classify instead of convert: each chunk's join of its values' types, for a restart.
     classify: bool = false,
     seen: []Type = &.{},
+    /// What producers read: the local reader's buffer, laid out like the file (`plan.bytes` offsets), or the mapping.
+    buf: []const u8,
+    /// The reader's per-chunk gate: a chunk's bytes are in once it opens, and go back once its piece is freed.
+    gate: ?RowGroupGate = null,
+    /// Bytes each chunk's read takes past its end: the record straddling its successor's first byte is in it.
+    overhang: usize = 0,
+    opts: Options = .{},
 
     pub fn init(a: std.mem.Allocator, p: *const Plan, chunk: usize) !Source {
         const data = p.bytes.len - p.data_start;
@@ -297,6 +318,7 @@ pub const Source = struct {
             .max_abs = try a.alloc(u128, count * ncols),
             .failures = try a.alloc(Failure, count),
             .failed = try a.alloc(bool, count),
+            .buf = p.bytes,
         };
         @memset(s.ready, .unset);
         @memset(s.max_abs, 0);
@@ -308,12 +330,23 @@ pub const Source = struct {
         return @min(s.plan.bytes.len, s.plan.data_start + i * s.chunk);
     }
 
-    /// Chunk `i`'s records: from the first record start at or after its first byte to its successor's.
-    fn records(s: *Source, io: std.Io, i: usize) !struct { lo: usize, hi: usize, lines: u64 } {
+    /// Chunk `i`'s planned read: its bytes and the overhang past them, clipped to the file.
+    fn readEnd(s: *const Source, i: usize) usize {
+        if (s.gate == null) return s.plan.bytes.len;
+        return @min(s.plan.bytes.len, s.bound(i + 1) + s.overhang);
+    }
+
+    /// Chunk `i`'s records, from the first record start at or after its first byte to its successor's, and the bytes
+    /// to parse them from: its read, or the mapping for a record longer than the overhang.
+    fn records(s: *Source, io: std.Io, i: usize) !struct { lo: usize, hi: usize, lines: u64, bytes: []const u8 } {
         const p = s.plan;
+        const map = p.bytes;
+        if (s.gate) |g| try g.wait(g.ctx, i);
         const lo_b = s.bound(i);
         const hi_b = s.bound(i + 1);
-        s.stats[i] = csv_scan.chunkStats(p.bytes[lo_b..hi_b], p.dialect.quote);
+        const end = s.readEnd(i);
+        const view = s.buf[0..end];
+        s.stats[i] = csv_scan.chunkStats(view[lo_b..hi_b], p.dialect.quote);
         s.ready[i].set(io);
         // Chunks are dispatched in order, so every earlier one is already counting its quotes.
         var parity: u1 = 0;
@@ -324,15 +357,16 @@ pub const Source = struct {
             lines += s.stats[k].newlines;
         }
         const q = p.dialect.quote;
-        const lo = if (i == 0) p.data_start else csv_scan.recordStart(p.bytes, lo_b, parity == 1, q) orelse p.bytes.len;
-        const next_parity = parity ^ s.stats[i].quote_parity;
-        const hi = if (i + 1 >= s.count)
-            p.bytes.len
-        else
-            csv_scan.recordStart(p.bytes, hi_b, next_parity == 1, q) orelse p.bytes.len;
+        const in_lo = parity == 1;
+        const in_hi = (parity ^ s.stats[i].quote_parity) == 1;
+        // In the read when the newline is there; past the overhang, from the mapping (a record that long is rare).
+        const lo = if (i == 0) p.data_start else csv_scan.recordStart(view, lo_b, in_lo, q) orelse
+            csv_scan.recordStart(map, lo_b, in_lo, q) orelse map.len;
+        const hi = if (i + 1 >= s.count) map.len else csv_scan.recordStart(view, hi_b, in_hi, q) orelse
+            csv_scan.recordStart(map, hi_b, in_hi, q) orelse map.len;
         // Starts found from exact quote states only increase: a decrease is quotes that do not pair.
         if (hi < lo) return s.fail(i, .{ .malformed = .inconsistent_quotes, .offset = hi_b }, lines, lo_b);
-        return .{ .lo = lo, .hi = hi, .lines = lines };
+        return .{ .lo = lo, .hi = hi, .lines = lines, .bytes = if (hi <= end) view else map };
     }
 
     fn fail(s: *Source, i: usize, f: Failure, lines: u64, from: usize) Error {
@@ -361,7 +395,7 @@ pub const Source = struct {
         const p = s.plan;
         const span = try s.records(io, i);
         const ncols = p.names.len;
-        const bytes = p.bytes;
+        const bytes = span.bytes;
         const lo_b = s.bound(i);
         var builder: Builder = undefined;
         const a: std.mem.Allocator = if (piece) |pc| pc.arena.allocator() else std.heap.page_allocator;
@@ -373,7 +407,9 @@ pub const Source = struct {
             return;
         }
         const ascii = !hasHighBit(bytes[span.lo..span.hi]);
-        var scanner = csv_scan.Scanner.init(bytes, span.lo, true, p.dialect);
+        // Strings stay slices of the mapping, which outlives the write; the reader's chunk pages do not.
+        const own_strings = bytes.ptr != p.bytes.ptr;
+        var scanner = csv_scan.Scanner.init(bytes, span.lo, bytes.len == p.bytes.len, p.dialect);
         const scratch_alloc = std.heap.smp_allocator;
         var scratch: std.ArrayList(u8) = .empty;
         defer scratch.deinit(scratch_alloc);
@@ -407,7 +443,7 @@ pub const Source = struct {
             if (s.classify) {
                 if (!isNull(text, p.nulls))
                     seen[col] = seen[col].join(classifyText(text.bytes, ascii));
-            } else if (!(try builder.add(a, col, text, ascii, p.nulls, text.bytes.ptr == scratch.items.ptr))) {
+            } else if (!(try builder.add(a, col, text, ascii, p.nulls, own_strings or unescaped(text, &scratch)))) {
                 const t = p.types[col];
                 var fl: Failure = .{
                     .kind = if (p.pinned[col]) .pinned_type else .type_changed,
@@ -440,6 +476,12 @@ pub const Source = struct {
                 }
             }
         }
+        // Every record of the chunk ends inside its read; one that does not is quotes that do not pair.
+        if (record_start < span.hi) return s.fail(i, .{
+            .kind = .malformed,
+            .malformed = .inconsistent_quotes,
+            .offset = span.hi,
+        }, span.lines, lo_b);
         if (piece) |pc| try builder.finish(pc, s, i);
     }
 
@@ -452,6 +494,9 @@ pub const Source = struct {
         const s: *Source = @ptrCast(@alignCast(ctx));
         const piece = try w.takePiece();
         errdefer piece.unref(w.gpa);
+        // Read through the reader, a piece copies its strings, so the chunk's pages go back once it is parsed: a row
+        // group spans many chunks, and pinning their reads until it is encoded would need a window that holds it.
+        defer if (s.gate) |g| g.done(g.ctx, i, 1);
         try s.produce(w.io, piece, i);
         return piece;
     }
@@ -511,7 +556,7 @@ const Builder = struct {
     }
 
     /// Append one field to column `col`; false when the value is not one of the column's type.
-    /// `escaped`: the text was unescaped into the producer's scratch, which the next field reuses.
+    /// `copy`: the text's bytes do not outlive the chunk (unescaped into scratch, or the reader's pages).
     inline fn add(
         b: *Builder,
         a: std.mem.Allocator,
@@ -519,7 +564,7 @@ const Builder = struct {
         text: csv_scan.Text,
         ascii: bool,
         nulls: []const []const u8,
-        escaped: bool,
+        copy: bool,
     ) !bool {
         const t = b.types[col];
         const buf = &b.cols[col];
@@ -576,7 +621,7 @@ const Builder = struct {
                 if (t.kind == .string and !ascii and !std.unicode.utf8ValidateSlice(s)) return false;
                 if (t.kind == .null_only) return false;
                 // Every other string stays a slice of the input, which outlives the write.
-                const owned = if (escaped) try a.dupe(u8, s) else s;
+                const owned = if (copy) try a.dupe(u8, s) else s;
                 try x.values.append(a, owned);
                 if (x.max_def > 0) try x.def_levels.append(a, 1);
             },
@@ -640,8 +685,8 @@ pub fn run(
     };
     defer mapped.unmap();
     var p = try plan(arena, mapped.bytes, opts, failure);
-    const workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
-    const chunk = chunkBytes(opts, args, workers, mapped.bytes.len);
+    var workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
+    var chunk = chunkBytes(opts, args, workers, mapped.bytes.len);
     // Everything the report holds is allocated before the output exists: once it is finished, nothing may fail.
     const widened = try report_alloc.alloc(bool, p.names.len);
     @memset(widened, false);
@@ -653,8 +698,19 @@ pub fn run(
     while (true) {
         var source = try Source.init(arena, &p, chunk);
         report.chunks = source.count;
-        const result = writeOnce(ctx, args, path, mapped, out_path, &source, t_open) catch |e| {
+        source.opts = opts;
+        var narrowed = args;
+        narrowed.parallelism = workers;
+        const result = writeOnce(ctx, narrowed, path, out_path, &source, mapped, report, t_open) catch |e| {
             if (source.firstFailure()) |f| failure.* = f.*;
+            // Refused its memory: run again on a narrower path, half the workers and their chunks in flight, as a
+            // query that does not fit does; one worker that still does not fit fails. The bytes do not change.
+            if (e == error.OutOfMemory and workers > 1 and args.output_fd == null) {
+                workers = @max(1, workers / 2);
+                chunk = chunkBytes(opts, narrowed, workers, mapped.bytes.len);
+                report.narrowed += 1;
+                continue;
+            }
             if (e != error.CsvTypeChanged or opts.strict or args.output_fd != null) return e;
             // Widen to what every value holds, then start again.
             const seen = try classifyFile(ctx, arena, &p, chunk, workers, failure);
@@ -749,13 +805,66 @@ fn resolveBlooms(
     return out;
 }
 
+/// What a chunk's read takes past its end: the record straddling the next chunk's first byte, in all but rare files.
+const overhang_bytes: usize = 256 << 10;
+
+/// Read the file through the local reader when `auto` (or `ZPQ_IO_PROFILE`) says so: a cold file into a buffer laid
+/// out like it, chunk by chunk ahead of the producers, each chunk's pages drawn from the write's ledger and given back
+/// once its piece is freed. A resident file stays on the mapping. The mapping's descriptor is read, so the file is the
+/// one sniffed.
+fn startReader(
+    ctx: Context,
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    source: *Source,
+    mapped: local_fs.Mapped,
+    ledger: *core_memory.SharedBudget,
+    report: *Report,
+) !?*local_reader.Reader {
+    if (@import("builtin").os.tag != .linux) return null;
+    var policy = local_reader.Policy.fromEnv(ctx.env);
+    policy.cache = args.cache;
+    if (source.opts.io_profile) |forced| policy.profile = forced;
+    const p = source.plan;
+    const fd = mapped.fd orelse return null;
+    const whole = [_]local_reader.Range{.{ .start = p.data_start, .end = p.bytes.len }};
+    const resident = if (policy.profile == .auto) local_reader.sampleRanges(ctx.gpa, mapped.bytes, &whole).share else 0;
+    const choice = policy.choose(resident, 1.0);
+    report.io = choice;
+    if (choice.mode == .mmap) return null;
+    const rd = try local_reader.Reader.create(ctx.gpa, .{
+        .mode = choice.mode,
+        .threads = policy.threads,
+        // An eighth of the budget, beside the pieces in flight and the row groups encoding: chunks are small and read
+        // in order, so a short window keeps the device busy.
+        .window = policy.window orelse @max(8 << 20, args.max_memory / 8),
+        .ledger = ledger,
+        .direct = choice.directRead(),
+    });
+    errdefer rd.destroy();
+    const f = try rd.borrowFile(fd, mapped.bytes.len);
+    source.overhang = source.opts.overhang orelse overhang_bytes;
+    source.gate = f.gate();
+    source.buf = f.bytes();
+    const ranges = try arena.alloc(?[]local_reader.Range, source.count);
+    for (ranges, 0..) |*r, i| {
+        const one = try arena.alloc(local_reader.Range, 1);
+        one[0] = .{ .start = source.bound(i), .end = source.readEnd(i) };
+        r.* = one;
+    }
+    try rd.planFile(f, ranges, 0);
+    try rd.start();
+    return rd;
+}
+
 fn writeOnce(
     ctx: Context,
     args: QueryArgs,
     path: []const u8,
-    mapped: local_fs.Mapped,
     out_path: []const u8,
     source: *Source,
+    mapped: local_fs.Mapped,
+    report: *Report,
     t_open: i64,
 ) !WriteResult {
     var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
@@ -768,6 +877,9 @@ fn writeOnce(
 
     var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     defer if (args.profiler) |pr| pr.noteLedger(ledger.peak.load(.monotonic), args.max_memory);
+    // Torn down (its threads joined, its buffer unmapped) once every piece reading it has been written.
+    const reader = try startReader(ctx, arena, args, source, mapped, &ledger, report);
+    defer if (reader) |rd| rd.destroy();
     const priority = args.compress_priority;
     var zstd_counts: compression.ZstdModeCounts = .{};
     const zstd: compression.ZstdPlan = .{ .lambda = priority.lambda(), .counts = &zstd_counts };
@@ -802,7 +914,10 @@ fn writeOnce(
     var completions_sem: std.Io.Semaphore = .{ .permits = 0 };
     var w = window_mod.WinCtx{
         .worker_io = ctx.worker_io,
-        .rg_target = args.row_group.under(args.max_memory_explicit),
+        // A CSV write holds its row groups' rows and their encodings and nothing else, so they are cut under the
+        // budget whether or not it was given: a sixteenth of it, as an explicit --max-memory caps a re-encode's.
+        // At the default budget of a host with 1 GiB or more to give, that is the 64 MiB target, unchanged.
+        .rg_target = args.row_group.under(args.max_memory),
         .out_elems = source.elems,
         .out_paths = source.paths,
         .page_indexes = &page_indexes,

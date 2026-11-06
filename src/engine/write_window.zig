@@ -859,10 +859,17 @@ const EncodeExecutor = struct {
             .buffer = buffer,
             .workers = workers,
             .slots = .{ .permits = @max(1, w.cpu_budget) },
-            .byte_limit = if (w.memory) |m| @min(m.budget.limit / 2, workers *| (64 << 20)) else workers *| (64 << 20),
+            .byte_limit = @min(encodeShare(w), workers *| (64 << 20)),
         };
         errdefer e.deinit();
         for (0..workers) |_| try e.group.concurrent(w.io, worker, .{e});
+    }
+
+    /// The ledger's share for row groups encoding: half, or a quarter beside a piece source, whose chunks read ahead
+    /// and wait on the same ledger.
+    fn encodeShare(w: *const WinCtx) u64 {
+        const m = w.memory orelse return std.math.maxInt(u64);
+        return m.budget.limit / @as(u64, if (w.source != null) 4 else 2);
     }
 
     fn deinit(e: *EncodeExecutor) void {

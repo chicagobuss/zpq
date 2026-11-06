@@ -6,6 +6,7 @@ const csv_write = @import("csv_write.zig");
 const engine_types = @import("types.zig");
 const metadata = @import("../core/parquet/metadata.zig");
 const schema = @import("../core/schema.zig");
+const local_reader = @import("../io/local_reader.zig");
 
 const testing = std.testing;
 const Context = engine_types.Context;
@@ -185,6 +186,89 @@ test "csv write: malformed input is refused at its line, byte and column" {
         // Nothing that looks like output is left behind.
         try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, out, .{}));
     };
+}
+
+test "csv write: the local reader writes the mapping's bytes, records longer than a chunk's read included" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    const in = try tmpPath(&b1, &tmp, "read.csv");
+    const out = try tmpPath(&b2, &tmp, "read.parquet");
+    // Records of every kind, then one whose quoted field spans many chunks and far more than a read's overhang.
+    var csv: std.ArrayList(u8) = .empty;
+    try csv.appendSlice(a, try sampleCsv(a, 8_000, null));
+    try csv.appendSlice(a, "8000,1.00,\"");
+    for (0..300_000) |i| try csv.append(a, "ab,\n\r x\"\""[i % 10]);
+    try csv.appendSlice(a, "\",2024-01-01,2024-01-01 00:00:00.000000,true,00001\r\n");
+    try csv.appendSlice(a, (try sampleCsv(a, 4_000, null))[30..]); // without its header
+    try writeFile(in, csv.items);
+
+    var first: ?[]u8 = null;
+    defer if (first) |f| testing.allocator.free(f);
+    for ([_]local_reader.Policy.Profile{ .mmap, .pread, .uring }) |profile| for ([_]?usize{ null, 16 << 10 }) |chunk| {
+        var failure: csv_write.Failure = .{};
+        const opts: csv_write.Options = .{ .io_profile = profile, .chunk_bytes = chunk, .overhang = 4096 };
+        const r = try runCsv(in, out, 4, opts, &failure);
+        try testing.expectEqual(@as(i64, 12_001), r.rows_matched);
+        const bytes = try metadata.readFileSlice(out, testing.allocator);
+        if (first) |f| {
+            defer testing.allocator.free(bytes);
+            try testing.expectEqualSlices(u8, f, bytes);
+        } else first = bytes;
+    };
+    // A refusal says the same through the reader.
+    try writeFile(in, "a,b\n1,x\n2,ab\"c\n3,y\n");
+    for ([_]local_reader.Policy.Profile{ .mmap, .pread }) |profile| {
+        var failure: csv_write.Failure = .{};
+        const opts: csv_write.Options = .{ .io_profile = profile, .chunk_bytes = 4, .overhang = 4 };
+        try testing.expectError(error.CsvMalformed, runCsv(in, out, 2, opts, &failure));
+        try testing.expectEqual(@as(u64, 3), failure.line);
+        try testing.expectEqual(@as(u64, 10), failure.offset);
+    }
+}
+
+test "csv write: a small budget cuts smaller row groups and writes the same rows, through the reader or the mapping" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    var b3: [128]u8 = undefined;
+    const in = try tmpPath(&b1, &tmp, "budget.csv");
+    const big = try tmpPath(&b2, &tmp, "big.parquet");
+    const small = try tmpPath(&b3, &tmp, "small.parquet");
+    const rows = 60_000;
+    try writeFile(in, try sampleCsv(a, rows, null));
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    var report: csv_write.Report = .{};
+    _ = try csv_write.run(ctx, .{ .inputs = &.{in}, .parallelism = 4 }, in, big, .{}, &report, a);
+    for ([_]local_reader.Policy.Profile{ .mmap, .pread }) |profile| {
+        const budget: usize = 24 << 20;
+        const args: engine_types.QueryArgs = .{ .inputs = &.{in}, .parallelism = 4, .max_memory = budget };
+        const r = try csv_write.run(ctx, args, in, small, .{ .io_profile = profile }, &report, a);
+        try testing.expectEqual(@as(i64, rows), r.rows_matched);
+        const x = try metadata.open(a, try metadata.readFileSlice(big, a));
+        const y = try metadata.open(a, try metadata.readFileSlice(small, a));
+        // Row groups of at most a sixteenth of the budget, so more of them; the same rows, NULLs and bounds.
+        try testing.expect(y.row_groups.items.len > x.row_groups.items.len);
+        for (0..x.schema.items.len - 1) |c| {
+            var nx: i64 = 0;
+            var ny: i64 = 0;
+            for (x.row_groups.items) |rg| nx += rg.columns.items[c].meta_data.?.statistics.?.null_count.?;
+            for (y.row_groups.items) |rg| ny += rg.columns.items[c].meta_data.?.statistics.?.null_count.?;
+            try testing.expectEqual(nx, ny);
+        }
+        const first = y.row_groups.items[0].columns.items[0].meta_data.?.statistics.?;
+        try testing.expectEqual(@as(i64, 0), std.mem.readInt(i64, first.min_value.?[0..8], .little));
+        const last = y.row_groups.items[y.row_groups.items.len - 1].columns.items[0].meta_data.?.statistics.?;
+        try testing.expectEqual(@as(i64, rows - 1), std.mem.readInt(i64, last.max_value.?[0..8], .little));
+    }
 }
 
 /// The report's allocator, with a fault on call `at`: `touch` moves the input's mtime (its bytes unchanged), `fail`

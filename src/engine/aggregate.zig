@@ -403,6 +403,7 @@ fn executeAggregateOver(
                     null;
                 break :blk try explainConjuncts(arena, filter, &ms[0]);
             },
+            .join = if (args.join) |j| try j.explained(arena) else null,
         };
     }
     // Declared after `opened`, so it is torn down (its threads joined) before the mappings go.

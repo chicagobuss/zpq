@@ -369,6 +369,8 @@ pub const AggregateExplanation = struct {
     result: ResultExplanation = .{},
     /// The top-level AND's children in the order they run (`filter_ast.rankConjuncts`); one for a lone predicate.
     conjuncts: []const Conjunct = &.{},
+    /// The query's join, its builds read: what each holds and costs.
+    join: ?@import("join.zig").Explained = null,
 };
 
 pub const Conjunct = struct { column: []const u8, cost: filter_ast.Cost };

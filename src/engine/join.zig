@@ -53,16 +53,58 @@ fn open(arena: std.mem.Allocator, path: []const u8) !Opened {
     return .{ .map = m, .meta = try metadata.open(arena, m.bytes) };
 }
 
-/// One lookup conjunct of a filter: the FK it reads, by name, and the build it probes.
-const Leaf = struct { fk: []const u8, join: *lookup.Join };
+/// What `--explain` says of a join: copied out of the builds, which the query's end releases.
+pub const Explained = struct {
+    kind: lookup.Kind,
+    main: Lookup,
+    semis: []const Lookup,
+    /// The group-join's slots and their bytes, when one was admitted.
+    group: ?struct { slots: usize, bytes: usize },
+    charged: usize,
+
+    pub const Lookup = struct {
+        fk: []const u8,
+        input: []const u8,
+        key: []const u8,
+        structure: []const u8,
+        keys: usize,
+        bytes: usize,
+        columns: []const []const u8,
+        semis: []const Lookup,
+
+        fn of(a: std.mem.Allocator, l: Leaf) !Lookup {
+            const j = l.join;
+            const columns = try a.alloc([]const u8, j.payloads.len);
+            for (j.payloads, columns) |p, *c| c.* = try a.dupe(u8, p.name);
+            const semis = try a.alloc(Lookup, l.semis.len);
+            for (l.semis, semis) |s, *out| out.* = try of(a, s);
+            return .{
+                .fk = try a.dupe(u8, l.fk),
+                .input = try a.dupe(u8, j.build_name),
+                .key = try a.dupe(u8, j.key_name),
+                .structure = @tagName(j.keys),
+                .keys = j.n,
+                .bytes = j.bytes,
+                .columns = columns,
+                .semis = semis,
+            };
+        }
+    };
+};
+
+/// One lookup conjunct of a filter: the FK it reads, by name, and the build it probes; with that build's own SEMI
+/// joins, the inner tables of a chain (`--explain` shows them).
+pub const Leaf = struct { fk: []const u8, join: *lookup.Join, semis: []const Leaf = &.{} };
 
 pub const Prepared = struct {
     /// The probe's own join: its build columns bind as virtual leaves, its group-join folds.
     main: Leaf,
     /// SEMI joins of the probe beside it.
     semis: []const Leaf,
-    /// What the builds hold (their arenas' capacity) and a group-join's slots once one is admitted, for `--explain`.
+    /// What the builds hold (their arenas' capacity) and a group-join's slots once one is admitted, for `--explain`;
+    /// and the group-join's part of it.
     charged: usize = 0,
+    group_bytes: usize = 0,
     ledger: *core_memory.SharedBudget,
     gpa: std.mem.Allocator,
     /// Every allocation a build or the group-join makes draws from the query's ledger as it is made (`charge`): the
@@ -105,7 +147,8 @@ pub const Prepared = struct {
                 return if (self.charge.refusal(err) == error.ExceededMemoryBudget) error.JoinBuildExceedsBudget else err;
             };
             if (admitted) |g| {
-                self.charged += lookup.GroupJoin.bytesFor(j.n, g.calls);
+                self.group_bytes = lookup.GroupJoin.bytesFor(j.n, g.calls);
+                self.charged += self.group_bytes;
                 j.group = g;
             }
         }
@@ -121,6 +164,19 @@ pub const Prepared = struct {
         j.group = null;
         g.deinit();
         return rows;
+    }
+
+    /// The join as `--explain` reports it, on `a` (which outlives the builds).
+    pub fn explained(self: *const Prepared, a: std.mem.Allocator) !Explained {
+        const semis = try a.alloc(Explained.Lookup, self.semis.len);
+        for (self.semis, semis) |s, *out| out.* = try Explained.Lookup.of(a, s);
+        return .{
+            .kind = self.main.join.kind,
+            .main = try Explained.Lookup.of(a, self.main),
+            .semis = semis,
+            .group = if (self.group_bytes != 0) .{ .slots = self.main.join.n, .bytes = self.group_bytes } else null,
+            .charged = self.charged,
+        };
     }
 
     /// A refusal of the join's own allocations, named as the ledger's (`error.ExceededMemoryBudget`).
@@ -231,8 +287,9 @@ fn semiKind(s: syntax.Semi) lookup.Kind {
     return if (s.unique) .inner else .semi;
 }
 
-/// Read one build side (its own SEMI joins first) into a lookup, charged to the ledger as it is built.
-fn build(p: *Prepared, arena: std.mem.Allocator, b: syntax.Build, kind: lookup.Kind, threads: usize, diag: ?*Diag) !*lookup.Join {
+/// Read one build side (its own SEMI joins first) into the lookup conjunct on `fk`, charged to the ledger as it is
+/// built.
+fn build(p: *Prepared, arena: std.mem.Allocator, fk: []const u8, b: syntax.Build, kind: lookup.Kind, threads: usize, diag: ?*Diag) !Leaf {
     try p.maps.ensureUnusedCapacity(arena, 1);
     const file = open(arena, b.path) catch |err| {
         Diag.setInput(diag, b.path, err);
@@ -242,9 +299,10 @@ fn build(p: *Prepared, arena: std.mem.Allocator, b: syntax.Build, kind: lookup.K
     const meta = try arena.create(schema.FileMetaData);
     meta.* = file.meta;
     var filter: ?filter_ast.Filter = if (b.filter) |f| try filters.bindSyntax(arena, f, meta, diag) else null;
-    for (b.semis) |s| {
-        const inner = try build(p, arena, s.build, semiKind(s), threads, diag);
-        filter = try withLookup(arena, filter, try leafOf(meta, .{ .fk = s.fk, .join = inner }, diag));
+    const semis = try arena.alloc(Leaf, b.semis.len);
+    for (b.semis, semis) |s, *inner| {
+        inner.* = try build(p, arena, s.fk, s.build, semiKind(s), threads, diag);
+        filter = try withLookup(arena, filter, try leafOf(meta, inner.*, diag));
     }
     const payload = try arena.alloc(usize, b.columns.len);
     for (b.columns, payload) |name, *leaf| leaf.* = metadata.resolveColumn(meta, name) catch |err| {
@@ -277,7 +335,7 @@ fn build(p: *Prepared, arena: std.mem.Allocator, b: syntax.Build, kind: lookup.K
     };
     j.bytes = p.store.queryCapacity() - before;
     p.charged += j.bytes;
-    return j;
+    return .{ .fk = fk, .join = j, .semis = semis };
 }
 
 /// Read every build of `args`' join; null for a query without one. The probe's inputs must be local files too.
@@ -295,11 +353,11 @@ pub fn prepare(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: types.Que
     p.store = .init(p.charge.allocator());
     // No group-join exists before the probe binds.
     errdefer p.releaseBuilds();
-    const main = try build(p, arena, sj.build, if (sj.kind == .semi) .semi else .inner, threads, args.diag);
-    main.main = true;
+    const main = try build(p, arena, sj.fk, sj.build, if (sj.kind == .semi) .semi else .inner, threads, args.diag);
+    main.join.main = true;
     const semis = try arena.alloc(Leaf, sj.semis.len);
-    for (sj.semis, semis) |s, *out| out.* = .{ .fk = s.fk, .join = try build(p, arena, s.build, semiKind(s), threads, args.diag) };
-    p.main = .{ .fk = sj.fk, .join = main };
+    for (sj.semis, semis) |s, *out| out.* = try build(p, arena, s.fk, s.build, semiKind(s), threads, args.diag);
+    p.main = main;
     p.semis = semis;
     return p;
 }

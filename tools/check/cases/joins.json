@@ -1299,6 +1299,109 @@
     "error": "exit 2",
     "diag": "ambiguous column name"
    }
+  },
+  {
+   "id": "join:explain:hash",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sgrp, sum(amt) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim_sparse}' WHERE sfk = spk GROUP BY sgrp ORDER BY sgrp",
+    "--explain"
+   ],
+   "oracle": {
+    "compare": "plan",
+    "holds": {
+     "join": {
+      "kind": "inner",
+      "fk": "sfk",
+      "build": {
+       "key": "spk",
+       "structure": "hash",
+       "keys": 499,
+       "columns": {
+        "$list": [
+         "sgrp"
+        ]
+       },
+       "semis": {
+        "$len": 0
+       }
+      },
+      "semis": {
+       "$len": 0
+      },
+      "group_join": null
+     }
+    }
+   }
+  },
+  {
+   "id": "join:explain:probe-semi",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, sum(f.amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND d.grp > 1 AND x.spk = f.sfk AND x.sgrp = 1 GROUP BY f.fk ORDER BY s DESC, f.fk LIMIT 9",
+    "--explain"
+   ],
+   "oracle": {
+    "compare": "plan",
+    "holds": {
+     "join": {
+      "fk": "sfk",
+      "build": {
+       "structure": "hash",
+       "keys": 166
+      },
+      "semis": {
+       "$list": [
+        {
+         "fk": "fk",
+         "build": {
+          "key": "pk",
+          "structure": "dense",
+          "keys": 480,
+          "columns": {
+           "$len": 0
+          },
+          "semis": {
+           "$len": 0
+          }
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "join:explain:group-join",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT fk, sum(q) AS s, min(amt) AS lo, max(amt) AS hi FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND q > 0 GROUP BY fk ORDER BY fk",
+    "--explain"
+   ],
+   "oracle": {
+    "compare": "plan",
+    "holds": {
+     "join": {
+      "kind": "inner",
+      "fk": "fk",
+      "build": {
+       "key": "pk",
+       "structure": "dense",
+       "keys": 800
+      },
+      "group_join": {
+       "slots": 800
+      }
+     }
+    }
+   }
   }
  ]
 }

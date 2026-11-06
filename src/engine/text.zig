@@ -1,4 +1,5 @@
 const engine_types = @import("types.zig");
+const engine_join = @import("join.zig");
 const PrintFormat = engine_types.PrintFormat;
 const AggregateExplanation = engine_types.AggregateExplanation;
 const agg_plan = @import("../core/agg_plan.zig");
@@ -950,6 +951,51 @@ fn typeAt(types: []const AnswerType, ci: usize) AnswerType {
 /// The same single-object JSON convention as query results. Passes describe permitted work, not a runtime trace.
 /// The facts a plan was made from, each with how far it can be trusted (`exact`, `bound`, `estimate`), the strategies
 /// whose exactness preconditions hold, and the one the cost rules chose (its `reasons` say why).
+/// The join as it runs: the probe's lookup and the SEMI lookups beside it, each build with its structure, keys, bytes
+/// and the columns it publishes (a chain's inner builds under theirs), the group-join's slots, and what all of it took
+/// from `--max-memory`.
+fn writeExplainJoin(writer: anytype, p: engine_join.Explained) !void {
+    try writer.print(",\"join\":{{\"kind\":\"{s}\",", .{@tagName(p.kind)});
+    try writeExplainLookup(writer, p.main);
+    try writer.writeAll(",\"semis\":[");
+    for (p.semis, 0..) |s, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        try writeExplainLookup(writer, s);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("],\"group_join\":");
+    if (p.group) |g|
+        try writer.print("{{\"slots\":{d},\"bytes\":{d}}}", .{ g.slots, g.bytes })
+    else
+        try writer.writeAll("null");
+    try writer.print(",\"charged\":{d}}}", .{p.charged});
+}
+
+fn writeExplainLookup(writer: anytype, l: engine_join.Explained.Lookup) !void {
+    try writer.writeAll("\"fk\":\"");
+    try writeJsonString(writer, l.fk);
+    try writer.writeAll("\",\"build\":{\"input\":\"");
+    try writeJsonString(writer, l.input);
+    try writer.writeAll("\",\"key\":\"");
+    try writeJsonString(writer, l.key);
+    try writer.print("\",\"structure\":\"{s}\",\"keys\":{d},\"bytes\":{d},\"columns\":[", .{ l.structure, l.keys, l.bytes });
+    for (l.columns, 0..) |name, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeByte('"');
+        try writeJsonString(writer, name);
+        try writer.writeByte('"');
+    }
+    try writer.writeAll("],\"semis\":[");
+    for (l.semis, 0..) |s, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        try writeExplainLookup(writer, s);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
+}
+
 fn writeExplainFacts(writer: anytype, explanation: scan.AggregateExplanation) !void {
     const plan = explanation.plan;
     const f = plan.facts;
@@ -1040,6 +1086,7 @@ pub fn writeAggregateExplanationJson(writer: anytype, explanation: AggregateExpl
         try writer.print("\",\"cost\":\"{s}\"}}", .{@tagName(c.cost)});
     }
     try writer.writeByte(']');
+    if (explanation.join) |j| try writeExplainJoin(writer, j);
     try writeExplainFacts(writer, a);
     try writer.writeAll(",\"plain_bytes_estimate\":");
     if (a.plan.plain_bytes) |n| try writer.print("{d}", .{n}) else try writer.writeAll("null");

@@ -54,34 +54,48 @@ fn monthLength(y: i64, m: i64) i64 {
 /// A moment: whole days since the epoch and microseconds into the day, DuckDB's TIMESTAMP resolution.
 pub const Moment = struct { days: i64, micros: i64 };
 
-/// DuckDB's `interval`: months, days and microseconds kept apart, since a month is not a fixed number of days.
+/// DuckDB's `interval`: months, days and microseconds kept apart, since a month is not a fixed number of days. The
+/// fields have DuckDB's widths: a component past them is out of range there, and so here, even if another would
+/// cancel it.
 pub const Interval = struct {
-    months: i64 = 0,
-    days: i64 = 0,
+    months: i32 = 0,
+    days: i32 = 0,
     micros: i64 = 0,
 
-    fn plus(self: Interval, o: Interval) Interval {
-        return .{ .months = self.months + o.months, .days = self.days + o.days, .micros = self.micros + o.micros };
+    fn plus(self: Interval, o: Interval) ?Interval {
+        return .{
+            .months = std.math.add(i32, self.months, o.months) catch return null,
+            .days = std.math.add(i32, self.days, o.days) catch return null,
+            .micros = std.math.add(i64, self.micros, o.micros) catch return null,
+        };
     }
 };
 
+/// DuckDB's TIMESTAMP is microseconds in an i64 without the two values that stand for infinity.
+pub fn inTimestampRange(m: Moment) bool {
+    const us = @as(i128, m.days) * us_per_day + m.micros;
+    return us > -@as(i128, std.math.maxInt(i64)) and us < std.math.maxInt(i64);
+}
+
 /// `m + sign * iv` as DuckDB adds an interval to a TIMESTAMP: the months first, the day of the month clamped to the
 /// month's length (2000-01-31 + 1 month is 2000-02-29), then the days, then the microseconds, carried into days.
-/// Null when the year leaves the range the filter's date parser takes (0..999999).
+/// Null when an operation overflows or the result leaves the range the filter's date parser takes (years 0..999999)
+/// or TIMESTAMP's.
 pub fn addInterval(m: Moment, iv: Interval, sign: i64) ?Moment {
     const c = civilFromDays(m.days);
-    const months = c.y * 12 + (c.m - 1) + sign * iv.months;
+    const months = c.y * 12 + (c.m - 1) + sign * @as(i64, iv.months);
     const y = @divFloor(months, 12);
     const mo = @mod(months, 12) + 1;
     if (y < 0 or y > 999_999) return null;
     const d = @min(c.d, monthLength(y, mo));
-    var days = filters.daysFromCivil(y, mo, d) + sign * iv.days;
-    var micros = m.micros + sign * iv.micros;
+    var days = filters.daysFromCivil(y, mo, d) + sign * @as(i64, iv.days);
+    var micros = std.math.add(i64, m.micros, std.math.mul(i64, sign, iv.micros) catch return null) catch return null;
     days += @divFloor(micros, us_per_day);
     micros = @mod(micros, us_per_day);
     const out = civilFromDays(days);
     if (out.y < 0 or out.y > 999_999) return null;
-    return .{ .days = days, .micros = micros };
+    const moved: Moment = .{ .days = days, .micros = micros };
+    return if (inTimestampRange(moved)) moved else null;
 }
 
 // Unsigned fields: a signed `{d}` with a width prints a `+`.
@@ -113,7 +127,9 @@ pub fn parseMoment(text: []const u8, is_date: bool) Error!Moment {
     const days = @divFloor(lit.ns, 86_400 * 1_000_000_000);
     if (is_date) return .{ .days = @intCast(days), .micros = 0 };
     const tod: i128 = lit.ns - days * 86_400 * 1_000_000_000;
-    return .{ .days = @intCast(days), .micros = @intCast(@divFloor(tod, 1000)) };
+    const out: Moment = .{ .days = @intCast(days), .micros = @intCast(@divFloor(tod, 1000)) };
+    // A TIMESTAMP literal past TIMESTAMP's range is a conversion error in DuckDB, not a threshold nothing reaches.
+    return if (inTimestampRange(out)) out else error.BadValue;
 }
 
 // ---- exact decimals -----------------------------------------------------------------------------------------------
@@ -133,10 +149,17 @@ pub const Dec = struct {
         return n;
     }
 
+    /// 10^n, for n up to 76 (the most an i256 holds).
     fn pow10(n: u32) i256 {
+        std.debug.assert(n <= 76);
         var p: i256 = 1;
         for (0..n) |_| p *= 10;
         return p;
+    }
+
+    fn scaled(mant: i256, by: u32) ?i256 {
+        if (by > 76) return null;
+        return std.math.mul(i256, mant, pow10(by)) catch null;
     }
 
     /// `[+-]digits[.digits]`, with an exponent only if `allow_exp` (a string cast takes one; a bare literal with one
@@ -168,7 +191,11 @@ pub const Dec = struct {
         scale -= exp;
         if (scale < 0) {
             if (-scale > Dec.max_digits) return null;
-            mant *= pow10(@intCast(-scale));
+            // Prove the product fits 38 digits before forming it: the digits already read times a large exponent
+            // passes an i256, and counting the digits afterwards is too late.
+            const have: Dec = .{ .mant = mant, .scale = 0 };
+            if (mant != 0 and have.digits() + @as(u32, @intCast(-scale)) > Dec.max_digits) return null;
+            mant = scaled(mant, @intCast(-scale)) orelse return null;
             scale = 0;
         }
         if (scale > Dec.max_digits + 2) return null;
@@ -186,7 +213,11 @@ pub const Dec = struct {
 
     fn align_(a: Dec, b: Dec) ?struct { a: i256, b: i256, scale: u32 } {
         const scale = @max(a.scale, b.scale);
-        return .{ .a = a.mant * pow10(scale - a.scale), .b = b.mant * pow10(scale - b.scale), .scale = scale };
+        return .{
+            .a = scaled(a.mant, scale - a.scale) orelse return null,
+            .b = scaled(b.mant, scale - b.scale) orelse return null,
+            .scale = scale,
+        };
     }
 
     fn fit(self: Dec) ?Dec {
@@ -195,20 +226,21 @@ pub const Dec = struct {
 
     pub fn add(a: Dec, b: Dec) ?Dec {
         const x = align_(a, b) orelse return null;
-        return (Dec{ .mant = x.a + x.b, .scale = x.scale }).fit();
+        return (Dec{ .mant = std.math.add(i256, x.a, x.b) catch return null, .scale = x.scale }).fit();
     }
 
     pub fn sub(a: Dec, b: Dec) ?Dec {
         const x = align_(a, b) orelse return null;
-        return (Dec{ .mant = x.a - x.b, .scale = x.scale }).fit();
+        return (Dec{ .mant = std.math.sub(i256, x.a, x.b) catch return null, .scale = x.scale }).fit();
     }
 
     pub fn mul(a: Dec, b: Dec) ?Dec {
-        return (Dec{ .mant = a.mant * b.mant, .scale = a.scale + b.scale }).fit();
+        return (Dec{ .mant = std.math.mul(i256, a.mant, b.mant) catch return null, .scale = a.scale + b.scale }).fit();
     }
 
     /// The value as an integer when it has no fractional part.
     pub fn toInt(self: Dec) ?i64 {
+        if (self.scale > 76) return null;
         const p = pow10(self.scale);
         if (@rem(self.mant, p) != 0) return null;
         return std.math.cast(i64, @divTrunc(self.mant, p));
@@ -216,7 +248,8 @@ pub const Dec = struct {
 
     /// At `scale` digits after the point, ties away from zero (DuckDB's rounding of a decimal or string cast).
     pub fn rescale(self: Dec, scale: u32) ?Dec {
-        if (scale >= self.scale) return (Dec{ .mant = self.mant * pow10(scale - self.scale), .scale = scale }).fit();
+        if (scale >= self.scale) return (Dec{ .mant = scaled(self.mant, scale - self.scale) orelse return null, .scale = scale }).fit();
+        if (self.scale - scale > 76) return null;
         const p = pow10(self.scale - scale);
         const q = @divTrunc(self.mant, p);
         const r = @rem(self.mant, p);
@@ -319,21 +352,31 @@ fn intervalOf(number: []const u8, unit_word: []const u8, report: *Report) Error!
     };
     const per_second = u.unit == .micros and u.size == 1_000_000;
     const total: i64 = if (per_second) blk: {
-        if (dec.scale > 6) return error.BadInterval;
-        const micros = dec.rescale(6) orelse return error.BadInterval;
-        break :blk std.math.cast(i64, micros.mant) orelse return error.BadInterval;
+        if (dec.scale > 6) {
+            report.set("INTERVAL '{s}' {s} has digits past the microsecond", .{ number, unit_word });
+            return error.BadInterval;
+        }
+        const micros = dec.rescale(6) orelse return intervalRange(report, number, unit_word);
+        break :blk std.math.cast(i64, micros.mant) orelse return intervalRange(report, number, unit_word);
     } else blk: {
         const whole = dec.toInt() orelse {
             report.set("INTERVAL '{s}' {s} is not a whole number of {s}; only seconds take a fraction", .{ number, unit_word, unit_word });
             return error.BadInterval;
         };
-        break :blk std.math.mul(i64, whole, u.size) catch return error.BadInterval;
+        break :blk std.math.mul(i64, whole, u.size) catch return intervalRange(report, number, unit_word);
     };
+    // Each component has its field's width, checked as it is read: DuckDB refuses `2147483648 days` whatever follows
+    // it, and `INTERVAL '2147483648 days -2147483648 days'` is no zero.
     return switch (u.unit) {
-        .months => .{ .months = total },
-        .days => .{ .days = total },
+        .months => .{ .months = std.math.cast(i32, total) orelse return intervalRange(report, number, unit_word) },
+        .days => .{ .days = std.math.cast(i32, total) orelse return intervalRange(report, number, unit_word) },
         .micros => .{ .micros = total },
     };
+}
+
+fn intervalRange(report: *Report, number: []const u8, unit_word: []const u8) error{BadInterval} {
+    report.set("INTERVAL '{s}' {s} is out of range", .{ number, unit_word });
+    return error.BadInterval;
 }
 
 const Parsed = struct { iv: Interval, end: usize };
@@ -346,7 +389,10 @@ fn intervalAt(s: []const u8, at: usize, report: *Report) Error!?Parsed {
     if (j >= s.len) return null;
     var iv: Interval = .{};
     if (s[j] == '\'') {
-        const e = quotedEnd(s, j) orelse return error.BadInterval;
+        const e = quotedEnd(s, j) orelse {
+            report.set("INTERVAL's quoted amount is not closed", .{});
+            return error.BadInterval;
+        };
         const body = std.mem.trim(u8, s[j + 1 .. e - 1], " \t");
         j = e;
         if (std.mem.indexOfAny(u8, body, " \t") == null) {
@@ -365,7 +411,7 @@ fn intervalAt(s: []const u8, at: usize, report: *Report) Error!?Parsed {
                     report.set("INTERVAL '{s}' has a number with no unit", .{body});
                     return error.BadInterval;
                 };
-                iv = iv.plus(try intervalOf(number, unit_word, report));
+                iv = iv.plus(try intervalOf(number, unit_word, report)) orelse return intervalRange(report, body, "");
             }
         }
     } else if (std.ascii.isDigit(s[j]) or s[j] == '-' or s[j] == '+' or s[j] == '.') {
@@ -437,7 +483,7 @@ fn foldTyped(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u
         const parsed = (try intervalAt(s, skipSpace(s, op + 1), report)) orelse break;
         const sign: i64 = if (s[op] == '+') 1 else -1;
         cur.at = addInterval(cur.at, parsed.iv, sign) orelse {
-            report.set("the date arithmetic leaves the supported range", .{});
+            report.set("the date arithmetic leaves TIMESTAMP's supported range", .{});
             return error.BadValue;
         };
         cur.kind = .timestamp;
@@ -637,6 +683,41 @@ test "sql_literals: an interval the fold cannot take is a named error" {
     try expectRewriteError("d < DATE '2020-01-01' + INTERVAL '1.5' DAY", error.BadInterval);
     try expectRewriteError("d < DATE '2020-01-01' + INTERVAL '5'", error.BadInterval);
     try expectRewriteError("d < DATE '2020-01-01' + INTERVAL (1 + 1) DAY", error.IntervalNotSupported);
+}
+
+test "sql_literals: oversized constants and out-of-range components are named errors, never an abort" {
+    // Each component has DuckDB's field width, checked as it is read: no later component can cancel it.
+    try expectRewriteError("d < DATE '2024-01-01' + INTERVAL '9223372036854775807' DAY", error.BadInterval);
+    try expectRewriteError("d < DATE '2024-01-01' + INTERVAL '9223372036854775807 days 1 day'", error.BadInterval);
+    try expectRewriteError("d < DATE '2024-01-01' + INTERVAL '2147483648 days -2147483648 days'", error.BadInterval);
+    try expectRewriteError("d < DATE '2024-01-01' + INTERVAL '2147483647 days 1 day'", error.BadInterval);
+    try expectRewriteError("d < DATE '2024-01-01' + INTERVAL '178956971 years'", error.BadInterval);
+    try expectRewriteError("d < DATE '2024-01-01' + INTERVAL '2562047789 hours'", error.BadInterval);
+    // In range as an interval, past TIMESTAMP's range as a date.
+    try expectRewriteError("d < DATE '2024-01-01' + INTERVAL '2147483647 days'", error.BadValue);
+    try expectRewriteError("d < DATE '2024-01-01' + INTERVAL '178956970 years'", error.BadValue);
+    try expectRewriteError("d < DATE '294247-01-01' + INTERVAL '1' YEAR", error.BadValue);
+    try expectRewriteError("d < TIMESTAMP '294247-01-10 04:00:54.775806' + INTERVAL '1' MICROSECOND", error.BadValue);
+    // A TIMESTAMP literal has TIMESTAMP's range, to the last microsecond below the infinity value.
+    try expectRewriteError("d < TIMESTAMP '999999-01-01 00:00:00'", error.BadValue);
+    try expectRewriteError("d < TIMESTAMP '294247-01-10 04:00:54.775807'", error.BadValue);
+    try expectRewrite("d < TIMESTAMP '294247-01-10 04:00:54.775806'", "d < CAST('294247-01-10 04:00:54.775806' AS TIMESTAMP)");
+    // A DATE has the filter's date range, which a TIMESTAMP does not.
+    try expectRewrite("d < DATE '999999-01-01'", "d < CAST('999999-01-01' AS DATE)");
+}
+
+test "sql_literals: decimal arithmetic proves a product fits before it forms it" {
+    // Forty nines times 10^38 passes an i256; the digits are counted before the multiplication.
+    try std.testing.expect(Dec.parse("9999999999999999999999999999999999999999e38", true) == null);
+    try std.testing.expect(Dec.parse("1e38", true) == null);
+    try std.testing.expect(Dec.parse("9e37", true) != null);
+    // Operands whose common scale passes an i256, and a product of 76 digits, are refused, not wrapped.
+    const tiny = Dec.parse("0.0000000000000000000000000000000000000001", false).?;
+    const big = Dec.parse("99999999999999999999999999999999999999", false).?;
+    try std.testing.expect(tiny.add(big) == null);
+    try std.testing.expect(tiny.sub(big) == null);
+    try std.testing.expect(big.mul(big) == null);
+    try std.testing.expect(big.rescale(38) == null);
 }
 
 test "sql_literals: x::TYPE becomes CAST for the operand just before it" {

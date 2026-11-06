@@ -139,11 +139,33 @@ pub const Lower = struct {
         return self.copy(std.mem.span(value));
     }
 
-    /// A constant tree's value. Integers keep DuckDB's width (INTEGER, BIGINT) so an overflow DuckDB would raise is
-    /// refused here, not folded to a value; a number with a fraction is an exact decimal; `/` is DOUBLE there and `%`
-    /// is no operator here, so both refuse.
+    /// An integer constant's DuckDB type: INTEGER, BIGINT or HUGEINT.
+    const Width = enum {
+        i32,
+        i64,
+        i128,
+
+        /// The narrowest type holding `v`, as DuckDB types an integer literal, signed ones after their sign.
+        fn of(v: i128) Width {
+            if (v >= std.math.minInt(i32) and v <= std.math.maxInt(i32)) return .i32;
+            if (v >= std.math.minInt(i64) and v <= std.math.maxInt(i64)) return .i64;
+            return .i128;
+        }
+
+        fn holds(self: Width, v: i128) bool {
+            return switch (self) {
+                .i32 => v >= std.math.minInt(i32) and v <= std.math.maxInt(i32),
+                .i64 => v >= std.math.minInt(i64) and v <= std.math.maxInt(i64),
+                .i128 => true,
+            };
+        }
+    };
+
+    /// A constant tree's value. Integers keep DuckDB's width (INTEGER, BIGINT, HUGEINT) so an overflow DuckDB would
+    /// raise is refused here, not folded to a value; a number with a fraction is an exact decimal; `/` is DOUBLE there
+    /// and `%` is no operator here, so both refuse.
     const Const = union(enum) {
-        int: struct { v: i128, wide: bool },
+        int: struct { v: i128, width: Width },
         dec: lits.Dec,
         text: []const u8,
         date: lits.Moment,
@@ -164,8 +186,8 @@ pub const Lower = struct {
         return switch (node.kind) {
             c.LP_EXPR_LITERAL_INT => blk: {
                 const token = std.mem.span(node.u.literal.value);
-                const v = std.fmt.parseInt(i64, token, 10) catch break :blk .{ .dec = lits.Dec.parse(token, false) orelse return error.BadValue };
-                break :blk .{ .int = .{ .v = v, .wide = v > std.math.maxInt(i32) or v < std.math.minInt(i32) } };
+                const v = std.fmt.parseInt(i128, token, 10) catch break :blk .{ .dec = lits.Dec.parse(token, false) orelse return error.BadValue };
+                break :blk .{ .int = .{ .v = v, .width = Width.of(v) } };
             },
             c.LP_EXPR_LITERAL_FLOAT => .{ .dec = lits.Dec.parse(std.mem.span(node.u.literal.value), false) orelse return error.BadValue },
             c.LP_EXPR_LITERAL_STRING => .{ .text = std.mem.span(node.u.literal.value) },
@@ -178,7 +200,11 @@ pub const Lower = struct {
                 };
                 if (!negate) break :blk inner;
                 break :blk switch (inner) {
-                    .int => |i| .{ .int = .{ .v = -i.v, .wide = i.wide } },
+                    // `-2147483648` is an INTEGER though `2147483648` is a BIGINT: the type follows the signed value.
+                    .int => |i| blk2: {
+                        const v = std.math.negate(i.v) catch return error.BadValue;
+                        break :blk2 .{ .int = .{ .v = v, .width = Width.of(v) } };
+                    },
                     .dec => |d| .{ .dec = .{ .mant = -d.mant, .scale = d.scale } },
                     else => return error.BadValue,
                 };
@@ -189,17 +215,15 @@ pub const Lower = struct {
                 const l = try self.constant(node.u.binary.left orelse return error.BadValue);
                 const r = try self.constant(node.u.binary.right orelse return error.BadValue);
                 if (l == .int and r == .int) {
-                    const v = switch (op) {
-                        c.LP_OP_ADD => l.int.v + r.int.v,
-                        c.LP_OP_SUB => l.int.v - r.int.v,
-                        else => l.int.v * r.int.v,
-                    };
-                    const wide = l.int.wide or r.int.wide;
+                    const v = (switch (op) {
+                        c.LP_OP_ADD => std.math.add(i128, l.int.v, r.int.v),
+                        c.LP_OP_SUB => std.math.sub(i128, l.int.v, r.int.v),
+                        else => std.math.mul(i128, l.int.v, r.int.v),
+                    }) catch return error.BadValue;
                     // The result type is the wider operand's: past it DuckDB raises an overflow error.
-                    if (wide) {
-                        if (v > std.math.maxInt(i64) or v < std.math.minInt(i64)) return error.BadValue;
-                    } else if (v > std.math.maxInt(i32) or v < std.math.minInt(i32)) return error.BadValue;
-                    break :blk .{ .int = .{ .v = v, .wide = wide } };
+                    const width: Width = @enumFromInt(@max(@intFromEnum(l.int.width), @intFromEnum(r.int.width)));
+                    if (!width.holds(v)) return error.BadValue;
+                    break :blk .{ .int = .{ .v = v, .width = width } };
                 }
                 const a = number(l) orelse return error.BadValue;
                 const b = number(r) orelse return error.BadValue;
@@ -227,6 +251,8 @@ pub const Lower = struct {
                 .date, .timestamp => |m| .{ .days = m.days, .micros = if (is_date) 0 else m.micros },
                 else => return error.BadValue,
             };
+            // A DATE past TIMESTAMP's range does not convert to one.
+            if (!is_date and !lits.inTimestampRange(at)) return error.BadValue;
             return if (is_date) .{ .date = at } else .{ .timestamp = at };
         }
         const is_dec = std.ascii.eqlIgnoreCase(base, "decimal") or std.ascii.eqlIgnoreCase(base, "numeric") or std.ascii.eqlIgnoreCase(base, "dec");

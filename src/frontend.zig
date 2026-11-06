@@ -246,6 +246,11 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             "zpq query: a DATE, TIMESTAMP or DECIMAL literal compares with a column of its own kind, and `{s}` is not one\n",
             .{diag.column.get()},
         ),
+        error.TemporalOutOfRange => diagnosticPrint(
+            "zpq query: the DATE or TIMESTAMP literal does not convert to `{s}`'s timestamp type (TIMESTAMP reaches\n" ++
+                "year 294247, TIMESTAMP_NS year 2262), so it compares with no value\n",
+            .{diag.column.get()},
+        ),
         error.UnsupportedType => diagnosticPrint("zpq query: unsupported type in filter\n", .{}),
         error.BloomFilterUnsupportedColumn => diagnosticPrint(
             "zpq query: --bloom-filter cannot apply to `{s}`: BOOLEAN, INT96, nested\n" ++

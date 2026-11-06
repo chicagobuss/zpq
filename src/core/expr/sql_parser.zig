@@ -1536,6 +1536,28 @@ test "sql_parser binds GROUP BY aliases and positions to SELECT items, as DuckDB
     try std.testing.expectError(error.AggregateInGroupBy, parseSqlQuery(a, "SELECT URL, count(*) FROM 't' GROUP BY 2"));
 }
 
+test "sql_parser: constant integers keep DuckDB's width, a signed one after its sign" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT count(*) AS n FROM 't' WHERE i > -2147483648 - 1",
+        "SELECT count(*) AS n FROM 't' WHERE i > 2147483647 + 1",
+        "SELECT count(*) AS n FROM 't' WHERE i > -9223372036854775808 - 1",
+        "SELECT count(*) AS n FROM 't' WHERE i > 9223372036854775807 + 1",
+        "SELECT count(*) AS n FROM 't' WHERE i > 3037000500 * 3037000500",
+        "SELECT count(*) AS n FROM 't' WHERE i > 170141183460469231731687303715884105727 + 1",
+    }) |sql| try std.testing.expectError(error.BadValue, parseSqlPlan(a, sql));
+    for ([_][]const u8{
+        "SELECT count(*) AS n FROM 't' WHERE i > -2147483647 - 1",
+        "SELECT count(*) AS n FROM 't' WHERE i > 2147483648 - 1",
+        "SELECT count(*) AS n FROM 't' WHERE i > -9223372036854775807 - 1",
+        "SELECT count(*) AS n FROM 't' WHERE i > 9223372036854775808 - 1",
+        "SELECT count(*) AS n FROM 't' WHERE i > -2147483648",
+    }) |sql| {
+        const q = try parseSqlPlan(a, sql);
+        q.deinit(a);
+    }
+}
+
 test "sql_parser makes ORDER BY terms the SELECT list lacks hidden result columns" {
     const a = std.testing.allocator;
     const q = try parseSqlQuery(a, "SELECT k FROM 't' GROUP BY k, g ORDER BY count(*) DESC, g, k LIMIT 3");

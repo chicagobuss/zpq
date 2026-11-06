@@ -47,6 +47,9 @@ pub const Error = error{
     /// A typed DATE, TIMESTAMP or DECIMAL literal against a column of another kind (`DATE '2024-01-01'` against text):
     /// DuckDB casts the column, not the literal, and zpq has no such cast.
     TypedLiteralColumn,
+    /// A typed DATE or TIMESTAMP literal that does not convert to the column's timestamp type (a TIMESTAMP past
+    /// TIMESTAMP_NS's years, a DATE past TIMESTAMP's): DuckDB's cast fails, so there is no threshold to compare.
+    TemporalOutOfRange,
 } || std.mem.Allocator.Error;
 
 /// How deep grouping parentheses may nest. Each level adds at most an OR and an AND node, and evaluation clones the
@@ -814,10 +817,25 @@ fn buildTypedLiteralComparison(
     }
     const tk = temporalKind(elem) orelse return refuse(diag, elem);
     if (tk.literal != .date_time) return refuse(diag, elem);
-    if (elem.type == .INT96) return .{ .decimal = try int96Leaf(operand.col_idx, op, t.text) };
     const lit = try parseDateTimeNs(t.text);
+    if (!convertsToColumn(lit.ns, t.kind == .date, tk.ns_per_tick)) {
+        Diag.setColumn(diag, elem.name);
+        return error.TemporalOutOfRange;
+    }
+    if (elem.type == .INT96) return .{ .decimal = try int96Leaf(operand.col_idx, op, t.text) };
     const inexact = lit.sub_ns or @mod(lit.ns, tk.ns_per_tick) != 0;
     return markStored(bindExact(operand.col_idx, op, tk.lane, @divFloor(lit.ns, tk.ns_per_tick), inexact));
+}
+
+/// Whether a typed literal (`ns` since the epoch) converts to a timestamp column's type, which DuckDB does before it
+/// compares: a DATE to TIMESTAMP (microseconds in an i64) and either to TIMESTAMP_NS (nanoseconds in one). A TIMESTAMP
+/// literal's own range was checked where it was folded, and a DATE column compares dates as they are.
+fn convertsToColumn(ns: i128, date_literal: bool, ns_per_tick: i128) bool {
+    if (ns_per_tick == ns_per_day) return true;
+    const limit: i128 = std.math.maxInt(i64);
+    if (ns_per_tick == 1 and (ns <= -limit or ns >= limit)) return false;
+    const us = @divFloor(ns, 1000);
+    return !date_literal or (us > -limit and us < limit);
 }
 
 /// `24.00` as `24`, `-7.0` as `-7`; a value with a nonzero fraction, or no point, is returned as it is.

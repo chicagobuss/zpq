@@ -24,7 +24,13 @@ the months first with the day clamped to the month's length), `.06 - 0.01`, `24 
 column of its own kind: DATE and TIMESTAMP with DATE and TIMESTAMP columns (a TIMESTAMP against a DATE keeps its time of
 day, as DuckDB compares them as TIMESTAMPs), DECIMAL with a numeric column. Against any other column it is refused
 (`TypedLiteralColumn`), as is an INTERVAL anywhere but added to or subtracted from a DATE or TIMESTAMP literal, a
-fraction of a whole-number unit, a cast to another type, and `/` or `%` in a constant.
+fraction of a whole-number unit, a cast to another type, and `/` or `%` in a constant. Constants keep DuckDB's types and
+ranges, and what DuckDB refuses is refused by name, never wrapped, clamped or aborted on: an integer constant has the
+narrowest of INTEGER, BIGINT and HUGEINT that holds it after its sign (`-2147483648 - 1` overflows INTEGER), an INTERVAL
+component fits its field (32-bit months and days, 64-bit microseconds) before any other can cancel it, a TIMESTAMP stays
+within year 294247 (a DATE plus an INTERVAL included), a decimal stays within 38 digits, and a DATE or TIMESTAMP
+literal that does not convert to a column's timestamp type (`TemporalOutOfRange`: TIMESTAMP_NS stops at year 2262)
+compares with nothing.
 
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 

@@ -204,6 +204,14 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             "zpq query: an IN (SELECT ...) that reads the outer query (a correlated subquery) is not supported in this release\n",
             .{},
         ),
+        error.JoinKeyType => diagnosticPrint(
+            "zpq query: the join's key {s} is not an integer, DATE, TIME or TIMESTAMP column stored as INT32 or INT64\n",
+            .{diag.column.get()},
+        ),
+        error.JoinPayloadType => diagnosticPrint(
+            "zpq query: a column the query reads from '{s}' holds NULLs or a type a join does not carry in this release\n",
+            .{diag.input orelse "the build"},
+        ),
         error.JoinKeyTypeMismatch => diagnosticPrint(
             "zpq query: the join compares {s} with a key of another SQL type; a join's keys must share one\n",
             .{diag.column.get()},

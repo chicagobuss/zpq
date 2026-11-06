@@ -20,6 +20,7 @@ const filter_ast = @import("../filter/ast.zig");
 const filter_eval = @import("../filter/eval.zig");
 const selection = @import("../filter/selection.zig");
 const column_mod = @import("../parquet/column.zig");
+const metadata = @import("../parquet/metadata.zig");
 
 pub const Kind = enum { inner, semi };
 
@@ -108,8 +109,42 @@ const Hash = struct {
     }
 };
 
+/// The SQL domain a key's stored integers compare in. Two keys join only within one: the same integers mean the same
+/// value there, where a timestamp in another unit, an unsigned value over a signed one or a DECIMAL of another scale
+/// would match integers that are not equal values (or miss ones that are). A DECIMAL key is not in this release: the
+/// build reads a DECIMAL as its f64 view.
+pub const KeyDomain = union(enum) {
+    /// Plain or signed integers, of any width (they widen to i64 exactly).
+    signed,
+    /// Unsigned integers, stored in this physical type: an INT32 and an INT64 differ above 2^31.
+    unsigned: schema.Type,
+    date,
+    timestamp: struct { unit: std.meta.Tag(schema.TimeUnit), utc: bool },
+    time: struct { unit: std.meta.Tag(schema.TimeUnit), utc: bool },
+
+    /// Null for a key no lookup takes (not stored as INT32 or INT64, or a logical type with no integer equality).
+    pub fn of(e: schema.SchemaElement) ?KeyDomain {
+        const t = e.type orelse return null;
+        if (t != .INT32 and t != .INT64) return null;
+        const lt = e.effectiveLogicalType() orelse return .signed;
+        return switch (lt) {
+            .INTEGER => |i| if (i.isSigned) .signed else .{ .unsigned = t },
+            .DATE => .date,
+            .TIMESTAMP => |ts| .{ .timestamp = .{ .unit = std.meta.activeTag(ts.unit), .utc = ts.isAdjustedToUTC } },
+            .TIME => |tm| .{ .time = .{ .unit = std.meta.activeTag(tm.unit), .utc = tm.isAdjustedToUTC } },
+            else => null,
+        };
+    }
+
+    pub fn eql(a: KeyDomain, b: KeyDomain) bool {
+        return std.meta.eql(a, b);
+    }
+};
+
 pub const Join = struct {
     kind: Kind,
+    /// The build key's domain: the probe's FK must be in it (`KeyDomain`).
+    domain: KeyDomain = .signed,
     /// For messages: the build file and its key column.
     build_name: []const u8,
     key_name: []const u8,
@@ -602,6 +637,8 @@ fn lap(what: []const u8, since: i64) i64 {
 /// The build lives in `a` (used from this thread only) as long as the query; `gpa` (thread-safe) backs each row
 /// group's survivors until the build is laid out.
 pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, meta: *const schema.FileMetaData, spec: Spec) !*Join {
+    const domain = KeyDomain.of(metadata.leafSchemaElement(meta, spec.key) orelse return error.JoinKeyType) orelse
+        return error.JoinKeyType;
     const parts = try a.alloc(Part, meta.row_groups.items.len);
     @memset(parts, .{});
     const arenas = try a.alloc(std.heap.ArenaAllocator, parts.len);
@@ -625,7 +662,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
         hi = @max(hi, p.hi);
     }
     const j = try a.create(Join);
-    j.* = .{ .kind = spec.kind, .build_name = spec.build_name, .key_name = spec.key_name, .n = n, .keys = undefined, .payloads = &.{}, .bytes = 0 };
+    j.* = .{ .kind = spec.kind, .build_name = spec.build_name, .key_name = spec.key_name, .n = n, .keys = undefined, .payloads = &.{}, .bytes = 0, .domain = domain };
     // Bytes per structure, from the survivors' own domain: a bit per possible key plus a rank per 64, against two
     // slots per key of an 8-byte key and a 4-byte slot.
     const span: u128 = if (n == 0) 0 else @as(u128, @intCast(@as(i128, hi) - lo)) + 1;

@@ -118,6 +118,12 @@ fn leafOf(meta: *const schema.FileMetaData, l: Leaf, diag: ?*Diag) !filter_ast.F
         Diag.setColumn(diag, l.fk);
         return err;
     };
+    // The FK compares with the build key only within one SQL domain (`lookup.KeyDomain`).
+    const same = if (metadata.leafSchemaElement(meta, fk)) |e| if (lookup.KeyDomain.of(e)) |d| d.eql(l.join.domain) else false else false;
+    if (!same) {
+        Diag.setColumn(diag, l.fk);
+        return error.JoinKeyTypeMismatch;
+    }
     if (l.join.main) l.join.fk_leaf = fk;
     return .{ .lookup = .{ .col_idx = fk, .join = l.join } };
 }

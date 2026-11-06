@@ -393,7 +393,7 @@ fn copyFixture(a: std.mem.Allocator, path: []const u8, kept: ?[]const bool) !str
     var timings: Timings = .{};
     var rgs: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
     for (meta.row_groups.items) |*rg| {
-        const rg_src: RGSrc = .{ .bytes = src, .byte_origin = 0 };
+        const rg_src: RGSrc = .{ .bytes = src, .byte_origin = 0, .file_offsets = true };
         const copied = try copyRG(a, rg, rg_src, kept, msink.sink(), &out_offset, &timings, true, null, .{
             .meta = &meta,
             .dictionary_bloom = false,

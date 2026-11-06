@@ -118,12 +118,19 @@ pub const RGJob = struct {
     passthrough: bool = false,
     /// The input file, open, when it is local: a byte copy of the row group can go by range copy.
     fd: ?std.posix.fd_t = null,
+    /// `bytes` is addressed by the file's own offsets (a local file): see `consumer.RGSrc.file_offsets`.
+    file_offsets: bool = false,
     /// Input file and row group (counted across files), for profile spans.
     file_index: usize = 0,
     rg_index: usize = 0,
     /// The input's fetch gate (`scan.Input.gate`), and this row group's index in its file.
     gate: ?scan.RowGroupGate = null,
     file_rg: usize = 0,
+
+    /// Its bytes as a byte copy reads them.
+    pub fn source(self: RGJob) consumer.RGSrc {
+        return .{ .bytes = self.bytes, .byte_origin = 0, .fd = self.fd, .file_offsets = self.file_offsets };
+    }
 
     /// Wait until the row group's bytes are in, when they are still being fetched.
     pub fn arrive(self: RGJob) !void {
@@ -334,7 +341,7 @@ fn copyRGToBuffer(
     };
     var local_off: u64 = 0;
     var timings: consumer.Timings = .{ .prof = prof };
-    const src: consumer.RGSrc = .{ .bytes = job.bytes, .byte_origin = 0, .fd = job.fd };
+    const src: consumer.RGSrc = job.source();
     const out = try consumer.copyRG(meta_alloc, job.rg, src, kept_set, sink, &local_off, &timings, false, null, .{
         .fpp = bloom_leaves,
         .dictionary_bloom = dictionary_bloom,
@@ -1777,7 +1784,7 @@ fn recompressWriter(w: *RecompressCtx) void {
             if (consumer.copyRG(
                 w.arena,
                 job.rg,
-                .{ .bytes = job.bytes, .byte_origin = 0, .fd = job.fd },
+                job.source(),
                 w.kept,
                 w.sink,
                 &w.out_offset,
@@ -2496,12 +2503,19 @@ test "a windowed byte copy places the bytes a direct copy writes, its ranges cop
         w.out_offset = 4;
         w.core = .{};
         for (meta.row_groups.items) |*rg| {
-            const src: consumer.RGSrc = .{ .bytes = bytes, .byte_origin = 0, .fd = fd };
+            const src: consumer.RGSrc = .{ .bytes = bytes, .byte_origin = 0, .fd = fd, .file_offsets = true };
             const want = try consumer.copyRG(a, rg, src, kept, direct.sink(), &direct_off, &timings, false, null, .{
                 .meta = &meta,
                 .dictionary_bloom = false,
             });
-            const job: RGJob = .{ .bytes = bytes, .meta = &meta, .rg = rg, .passthrough = true, .fd = fd };
+            const job: RGJob = .{
+                .bytes = bytes,
+                .meta = &meta,
+                .rg = rg,
+                .passthrough = true,
+                .fd = fd,
+                .file_offsets = true,
+            };
             const enc = try copyRGToBuffer(a, a, job, kept, null, &.{}, false);
             try t.expect(enc.marks.len > 0);
             const base = try placeCopy(&w, job, enc);

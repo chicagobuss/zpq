@@ -416,6 +416,7 @@ fn runWriteOver(
         .args = args,
         .inputs = write_inputs,
         .input_fds = try inputFds(arena, opened),
+        .input_local = try inputLocal(arena, opened),
         .ledger = &ledger,
         .metas = metas,
         .meta0 = meta0,
@@ -494,6 +495,8 @@ const WriteRows = struct {
     inputs: []const scan.Input,
     /// Each input's open file, when it is local and its mapping kept the descriptor: what a byte copy range-copies.
     input_fds: []const ?local_fs.fd_t = &.{},
+    /// Whether each input is a local file, whose chunk offsets are its own (an S3 input's are rebased into its fetch).
+    input_local: []const bool = &.{},
     ledger: *core_memory.SharedBudget,
     metas: []const schema.FileMetaData,
     meta0: *const schema.FileMetaData,
@@ -533,6 +536,10 @@ const WriteRows = struct {
         return if (i < self.input_fds.len) self.input_fds[i] else null;
     }
 
+    fn fileOffsets(self: *const WriteRows, i: usize) bool {
+        return i < self.input_local.len and self.input_local[i];
+    }
+
     fn deinit(self: *WriteRows) void {
         if (self.filters) |*f| f.deinit();
         if (self.filter_threaded) |*runtime| runtime.deinit();
@@ -554,6 +561,7 @@ const WriteRows = struct {
                         .meta = meta_p,
                         .rg = src_rg,
                         .fd = self.inputFd(ii),
+                        .file_offsets = self.fileOffsets(ii),
                         .file_index = ii,
                         .rg_index = self.rgs_in - 1,
                         .gate = in.gate,
@@ -632,7 +640,12 @@ const WriteRows = struct {
             };
             for (self.inputs, self.metas, 0..) |in, *meta_i, ii| {
                 self.bytes_in += in.bytes.len;
-                const rg_src: consumer.RGSrc = .{ .bytes = in.bytes, .byte_origin = 0, .fd = self.inputFd(ii) };
+                const rg_src: consumer.RGSrc = .{
+                    .bytes = in.bytes,
+                    .byte_origin = 0,
+                    .fd = self.inputFd(ii),
+                    .file_offsets = self.fileOffsets(ii),
+                };
                 for (meta_i.row_groups.items, 0..) |*src_rg, ri| {
                     self.rgs_in += 1;
                     self.rows_in += src_rg.num_rows;
@@ -735,6 +748,7 @@ const WriteRows = struct {
                         .rg = src_rg,
                         .passthrough = passthrough,
                         .fd = self.inputFd(ii),
+                        .file_offsets = self.fileOffsets(ii),
                         .file_index = ii,
                         .rg_index = self.rgs_in - 1,
                         .gate = in.gate,
@@ -1028,6 +1042,12 @@ fn inputFds(arena: std.mem.Allocator, opened: input.OpenedInputs) ![]const ?loca
     return fds;
 }
 
+fn inputLocal(arena: std.mem.Allocator, opened: input.OpenedInputs) ![]const bool {
+    const local = try arena.alloc(bool, opened.inputs.len);
+    for (local, opened.mmaps) |*l, m| l.* = m != null;
+    return local;
+}
+
 pub const FdSink = struct {
     fd: local_fs.fd_t,
     written: u64 = 0,
@@ -1223,7 +1243,7 @@ test "FdSink range copies write the input's bytes whether the kernel copies all,
         var out: streaming.SinkOut = .{ .sink = fd_sink.sink() };
         try out.write("PAR1");
         // A run with whole blocks inside, at its input offset modulo the block, after zero padding.
-        const placed = try fastpath.copyRun(&out, src, 5, src_bytes[5..]);
+        const placed = try fastpath.copyRun(&out, src, true, 5, src_bytes[5..]);
         try out.write("tail");
         local_fs.close(fd);
         try t.expectEqual(@as(usize, 5), placed.at % block);

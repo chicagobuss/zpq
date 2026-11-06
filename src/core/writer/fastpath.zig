@@ -76,12 +76,13 @@ pub fn alignGap(pos: usize, start: usize, len: usize) ?usize {
 pub const Placed = struct { at: usize, kernel: usize = 0, pad: usize = 0 };
 
 /// Append verbatim input bytes `bytes`, found at offset `start` of the input (open on `fd`, when known), at their
-/// `alignGap` position. `out` gives `pos()`, `pad(n)` and `copyRange(fd, offset, bytes)`, which appends `bytes` and
-/// says how many went by a range copy; the output bytes are the same however many did.
-pub fn copyRun(out: anytype, fd: ?std.posix.fd_t, start: usize, bytes: []const u8) !Placed {
+/// `alignGap` position when `start` is a file offset (`aligned`), else where they are. `out` gives `pos()`, `pad(n)`
+/// and `copyRange(fd, offset, bytes)`, which appends `bytes` and says how many went by a range copy; the output
+/// bytes are the same however many did.
+pub fn copyRun(out: anytype, fd: ?std.posix.fd_t, aligned: bool, start: usize, bytes: []const u8) !Placed {
     var placed: Placed = .{ .at = out.pos() };
     // Called for a zero gap too: a sink that places this output elsewhere learns the run is aligned.
-    if (alignGap(placed.at, start, bytes.len)) |gap| {
+    if (if (aligned) alignGap(placed.at, start, bytes.len) else null) |gap| {
         try out.pad(gap);
         placed.pad = gap;
         placed.at += gap;
@@ -276,7 +277,7 @@ fn copyRowGroup(
         return .{ .columns = cols, .total_byte_size = uncompressedBytes(cols.items), .num_rows = src.num_rows };
     }
     const range = try rowGroupByteRange(src, input.len) orelse return null;
-    const placed = try copyRun(out, null, range.start, input[range.start .. range.start + range.len]);
+    const placed = try copyRun(out, null, true, range.start, input[range.start .. range.start + range.len]);
     const delta = offsetDelta(placed.at, range.start);
 
     var cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
@@ -356,7 +357,7 @@ pub fn copyPolicyChunk(
     const cm = src.meta_data orelse return error.InvalidColumnOffsets;
     const range = chunkRange(&cm, input.len) orelse return error.InvalidColumnOffsets;
     if (cm.writer_stats == .trust) {
-        const placed = try copyRun(out, null, range.start, input[range.start..][0..range.len]);
+        const placed = try copyRun(out, null, true, range.start, input[range.start..][0..range.len]);
         const moved = offsetDelta(placed.at, range.start);
         return if (emit_index) try rebaseChunk(a, out, input, src, moved) else copiedChunk(input, src, moved);
     }

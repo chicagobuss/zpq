@@ -41,6 +41,9 @@ pub const RGSrc = struct {
     byte_origin: u64,
     /// The input file `bytes` are read from, open, when it is a local file: a byte copy can then go by range copy.
     fd: ?std.posix.fd_t = null,
+    /// The chunks' offsets are the input file's own (a local file), not positions in a buffer of fetched ranges (S3):
+    /// a byte copy keeps its runs at those offsets modulo `fastpath.share_block`, whatever `fd` holds.
+    file_offsets: bool = false,
 };
 
 /// Per-phase wall-clock counters in nanoseconds. Both consumers

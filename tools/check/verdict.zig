@@ -139,6 +139,7 @@ pub fn run(in_raw: Inputs, spec: Spec) !Reason {
         .{ "golden_rows", modeGoldenRows },
         .{ "readers_agree", modeReadersAgree },
         .{ "written_as", modeWrittenAs },
+        .{ "written_hash", modeWrittenHash },
         .{ "json_parses", modeJsonParses },
         .{ "summary", modeSummary },
         .{ "stderr_types", modeStderrTypes },
@@ -1860,6 +1861,46 @@ fn modeWrittenAs(in: Inputs, spec: Spec) !Reason {
     const widths = try in.arena.alloc(u8, written.names.len);
     @memset(widths, 64);
     return corpusRows(in, written.rows, want.rows, widths);
+}
+
+/// A written file's rows against a query's as multisets, holding neither: for files too big to load (a CSV suite's
+/// gigabytes). The names must match in order; DuckDB casts each written column to the query's type (a value the
+/// type cannot hold is a failure) and folds each side to its row count and two independent sums of row hashes, so
+/// only a word comes back. Equal values compare equal whatever type an engine wrote them in.
+fn modeWrittenHash(in: Inputs, spec: Spec) !Reason {
+    const sql = try oracleSql(in, spec);
+    const want = duck(in, try std.fmt.allocPrint(in.arena, "SELECT * FROM ({s}) LIMIT 0", .{sql})) catch |err|
+        return refusedReason(in, err);
+    const file = try std.fmt.allocPrint(in.arena, "read_parquet('{s}')", .{in.path});
+    const got = duck(in, try std.fmt.allocPrint(in.arena, "SELECT * FROM {s} LIMIT 0", .{file})) catch |err|
+        return refusedReason(in, err);
+    const got_names = try std.mem.join(in.arena, ",", got.names);
+    const want_names = try std.mem.join(in.arena, ",", want.names);
+    if (!std.mem.eql(u8, got_names, want_names)) return fail(in, "columns {s} want {s}", .{ got_names, want_names });
+    var cast: std.ArrayList(u8) = .empty;
+    var plain: std.ArrayList(u8) = .empty;
+    for (want.names, want.types, 0..) |name, ty, i| {
+        if (i != 0) {
+            try cast.appendSlice(in.arena, ", ");
+            try plain.appendSlice(in.arena, ", ");
+        }
+        try cast.print(in.arena, "CAST(\"{s}\" AS {s})", .{ name, ty });
+        try plain.print(in.arena, "\"{s}\"", .{name});
+    }
+    const fold = "count(*) AS n, sum(hash(r)::HUGEINT) AS a, sum(hash(r::VARCHAR)::HUGEINT) AS b";
+    const verdict = try std.fmt.allocPrint(in.arena,
+        \\WITH w AS (SELECT {s} FROM (SELECT ROW({s}) AS r FROM {s})),
+        \\t AS (SELECT {s} FROM (SELECT ROW({s}) AS r FROM ({s})))
+        \\SELECT CASE WHEN w.n <> t.n THEN 'rows ' || w.n || ', want ' || t.n
+        \\WHEN w.a <> t.a OR w.b <> t.b THEN 'rows differ' ELSE 'same' END AS v FROM w, t
+    , .{ fold, cast.items, file, fold, plain.items, sql });
+    const ans = try in.oracle.askAfter(in.arena, in.setup, verdict);
+    if (ans.refused) |why| return fail(in, "{s}", .{std.mem.trim(u8, why, " \t\r\n")});
+    if (ans.rows.len != 1) return fail(in, "no verdict", .{});
+    const v = ans.rows[0].get("v") orelse return fail(in, "no verdict", .{});
+    if (v != .string) return fail(in, "no verdict", .{});
+    if (!std.mem.eql(u8, v.string, "same")) return fail(in, "{s}", .{v.string});
+    return null;
 }
 
 /// `--explain` JSON holding `plan`: a planner choice the case's answers depend on, pinned so they test that path.

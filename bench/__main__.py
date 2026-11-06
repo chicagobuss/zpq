@@ -102,7 +102,11 @@ def run(a):
     why = None if a.smoke else busy()
     if why:
         raise SystemExit(f"bench: {why}; this host is not quiet")
-    tmp = Path(tempfile.mkdtemp(prefix="zpq-bench-", dir="/dev/shm" if Path("/dev/shm").is_dir() else None))
+    # Written answers live here while they are judged: tmpfs by default, or `--tmp` where RAM is short or answers big.
+    tmp_root = Path(a.tmp).expanduser() if a.tmp else Path("/dev/shm") if Path("/dev/shm").is_dir() else None
+    if tmp_root:
+        tmp_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="zpq-bench-", dir=tmp_root))
     with env.timing_lock():
         spawner = lane.Spawner(a.spawn_python, a.memory_max, scope=not a.no_scope)
         judge = lane.Judge(a.zpq_check, a.duckdb, a.pyarrow, housekeeping, None if a.no_cache else a.cache)
@@ -149,6 +153,8 @@ def main():
     r.add_argument("--timeout", type=float, default=120)
     r.add_argument("--out", default=str(Path.home() / "bench/runs"))
     r.add_argument("--resume")
+    r.add_argument("--tmp", help="where answers are written while judged (default /dev/shm); a disk directory where "
+                   "RAM is short or answers are gigabytes (the csv suite)")
     r.add_argument("--duckdb", default=str(engines.DUCKDB))
     r.add_argument("--polars", default=str(engines.POLARS))
     r.add_argument("--zpq-check", default=str(ROOT / "zig-out/bin/zpq-check"))

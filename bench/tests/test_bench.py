@@ -177,7 +177,7 @@ class Replay(unittest.TestCase):
 
 @unittest.skipUnless(engines.POLARS.is_file(), "no Polars 2 interpreter")
 class CsvSuite(unittest.TestCase):
-    def test_every_engine_writes_parquet_judged_on_values_against_the_texts_exact_reading(self):
+    def test_every_engine_writes_parquet_judged_on_values_against_the_texts_exact_reading_streamed(self):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "csv").mkdir()
             for name in suites.CSV_TYPES:
@@ -189,7 +189,8 @@ class CsvSuite(unittest.TestCase):
                 suites.DATA = old
         self.assertEqual({c["dataset"] for c in cases}, set(suites.CSV_TYPES))
         for c in cases:
-            self.assertEqual((c["output"], c["truth"]["mode"], c["polars"]["form"]), ("parquet", "written_as", "csv"))
+            self.assertEqual((c["output"], c["truth"]["mode"], c["polars"]["form"]), ("parquet", "written_hash", "csv"))
+            self.assertIn("memory_limit", c["truth"]["setup"])  # the judge's DuckDB stays small beside the engines
             self.assertEqual(c["zpq"], ["query", c["inputs"][0]])
             sql = c["truth"]["sql"]
             # The text as written: every field VARCHAR, a quoted "" never NULL, then each column's exact type.

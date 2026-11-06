@@ -71,13 +71,14 @@ def ranks(sql):
 
 
 def case(suite, dataset, query_id, inputs, zpq, duck_sql, polars, truth_sql=None, setup="", output="rows",
-         codec=None, level=None, mode=None):
+         codec=None, level=None, mode=None, truth_setup=None):
     truth_sql = truth_sql or duck_sql
     mode = mode or ("written_sql" if output == "parquet" else "tied_rows")
     return {"id": f"{suite}/{dataset}/{query_id}", "suite": suite, "dataset": dataset, "query_id": str(query_id),
             "inputs": [str(p) for p in inputs], "output": output, "codec": codec, "level": level, "zpq": zpq,
             "duckdb": {"setup": setup, "sql": duck_sql}, "polars": polars,
-            "truth": {"setup": setup, "sql": truth_sql, "mode": mode, "ranks": ranks(truth_sql)}}
+            "truth": {"setup": setup if truth_setup is None else truth_setup, "sql": truth_sql, "mode": mode,
+                      "ranks": ranks(truth_sql)}}
 
 
 def fair_form(sql, path):
@@ -286,8 +287,11 @@ def writes():
 
 # The CSV inputs (REPORT-opus §11) and the type zpq writes for each column, in order: the truth reads the text as
 # DuckDB's RFC 4180 reader splits it (every field VARCHAR, a quoted "" the empty string, never NULL) and casts it to
-# these. Written files are judged on their values (`written_as`), so an engine that writes DOUBLE where zpq writes
-# DECIMAL passes on the numbers; one that changes a value (a quoted "" read as NULL) fails.
+# these. Written files are judged on their values (`written_hash`: each written column cast to the truth's type, the
+# two sides' rows compared as multisets of hashes inside DuckDB, so the judge holds neither gigabyte-sized side), so an
+# engine that writes DOUBLE where zpq writes DECIMAL passes on the numbers; one that changes a value (a quoted "" read
+# as NULL) fails.
+CSV_TRUTH_SETUP = "SET threads=8; SET memory_limit='2GB'; SET preserve_insertion_order=false;"
 CSV_TYPES = json.loads((Path(__file__).parent / "csv_types.json").read_text())
 
 
@@ -306,7 +310,7 @@ def csv():
             raise FileNotFoundError(2, "missing", str(path))
         out.append(case("csv", name, "to-parquet", [path], ["query", str(path)], f"FROM read_csv({quote(path)})",
                         {"form": "csv"}, truth_sql=csv_truth(path, columns), output="parquet", codec="snappy",
-                        mode="written_as"))
+                        mode="written_hash", truth_setup=CSV_TRUTH_SETUP))
     return out
 
 

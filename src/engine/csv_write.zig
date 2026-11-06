@@ -40,7 +40,7 @@ const engine_types = @import("types.zig");
 const Context = engine_types.Context;
 const QueryArgs = engine_types.QueryArgs;
 const WriteResult = engine_types.WriteResult;
-const Type = csv_types.Type;
+pub const Type = csv_types.Type;
 
 /// What a CSV source is told; every field has a default that sniffs or detects it.
 pub const Options = struct {
@@ -61,6 +61,8 @@ pub const Options = struct {
     /// Forced-path controls for the reader: its profile (as `ZPQ_IO_PROFILE`), and what a chunk's read takes past it.
     io_profile: ?local_reader.Policy.Profile = null,
     overhang: ?usize = null,
+    /// Forced-path control for tests: chunk `fault_chunk`'s producer fails before it reads, as a failed read does.
+    fault_chunk: ?usize = null,
 
     pub const Pinned = struct { column: []const u8, type: Type };
 };
@@ -285,6 +287,9 @@ pub const Source = struct {
     /// Per chunk: why it stopped, if it did.
     failures: []Failure,
     failed: []bool,
+    /// Per chunk, the error that stopped its producer before it published its quote count (`ready` is set either
+    /// way): the chunks after it cannot find their records, and say why.
+    lost: []?anyerror,
     rows: std.atomic.Value(u64) = .init(0),
     /// Classify instead of convert: each chunk's join of its values' types, for a restart.
     classify: bool = false,
@@ -318,9 +323,11 @@ pub const Source = struct {
             .max_abs = try a.alloc(u128, count * ncols),
             .failures = try a.alloc(Failure, count),
             .failed = try a.alloc(bool, count),
+            .lost = try a.alloc(?anyerror, count),
             .buf = p.bytes,
         };
         @memset(s.ready, .unset);
+        @memset(s.lost, null);
         @memset(s.max_abs, 0);
         @memset(s.failed, false);
         return s;
@@ -341,7 +348,7 @@ pub const Source = struct {
     fn records(s: *Source, io: std.Io, i: usize) !struct { lo: usize, hi: usize, lines: u64, bytes: []const u8 } {
         const p = s.plan;
         const map = p.bytes;
-        if (s.gate) |g| try g.wait(g.ctx, i);
+        if (s.gate) |g| g.wait(g.ctx, i) catch |e| return s.abandon(io, i, e);
         const lo_b = s.bound(i);
         const hi_b = s.bound(i + 1);
         const end = s.readEnd(i);
@@ -353,6 +360,8 @@ pub const Source = struct {
         var lines: u64 = p.head_lines;
         for (0..i) |k| {
             s.ready[k].waitUncancelable(io);
+            // An earlier chunk that never counted its quotes leaves this one no quote state to start from.
+            if (s.lost[k]) |e| return e;
             parity ^= s.stats[k].quote_parity;
             lines += s.stats[k].newlines;
         }
@@ -367,6 +376,15 @@ pub const Source = struct {
         // Starts found from exact quote states only increase: a decrease is quotes that do not pair.
         if (hi < lo) return s.fail(i, .{ .malformed = .inconsistent_quotes, .offset = hi_b }, lines, lo_b);
         return .{ .lo = lo, .hi = hi, .lines = lines, .bytes = if (hi <= end) view else map };
+    }
+
+    /// Chunk `i`'s producer stops before publishing its quote count: publish `err` in its place, so every chunk
+    /// after it, waiting on it, stops with it instead of waiting for good.
+    fn abandon(s: *Source, io: std.Io, i: usize, err: anyerror) anyerror {
+        if (s.ready[i].isSet()) return err;
+        s.lost[i] = err;
+        s.ready[i].set(io);
+        return err;
     }
 
     fn fail(s: *Source, i: usize, f: Failure, lines: u64, from: usize) Error {
@@ -492,11 +510,13 @@ pub const Source = struct {
 
     fn produceErased(ctx: *anyopaque, w: *window_mod.WinCtx, i: usize) anyerror!*window_mod.Piece {
         const s: *Source = @ptrCast(@alignCast(ctx));
-        const piece = try w.takePiece();
-        errdefer piece.unref(w.gpa);
         // Read through the reader, a piece copies its strings, so the chunk's pages go back once it is parsed: a row
         // group spans many chunks, and pinning their reads until it is encoded would need a window that holds it.
+        // Given back on every exit, a failed one too.
         defer if (s.gate) |g| g.done(g.ctx, i, 1);
+        if (s.opts.fault_chunk == i) return s.abandon(w.io, i, error.LocalReadFailed);
+        const piece = w.takePiece() catch |e| return s.abandon(w.io, i, e);
+        errdefer piece.unref(w.gpa);
         try s.produce(w.io, piece, i);
         return piece;
     }

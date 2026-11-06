@@ -339,3 +339,46 @@ test "csv write: a failure after the write leaves no output: an input changed un
         }
     }
 }
+
+test "csv write: a chunk whose read failed stops the chunks after it, never strands them at its quote count" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The reviewer's reproducer: chunk 0's read fails, chunk 1's bytes are in; producer 0 runs, then producer 1.
+    const bytes = "id,v\n1,2\n3,4\n5,6\n7,8\n";
+    var failure: csv_write.Failure = .{};
+    const p = try csv_write.plan(a, bytes, .{}, &failure);
+    var source = try csv_write.Source.init(a, &p, 6);
+    try testing.expect(source.count >= 2);
+    source.classify = true;
+    source.seen = try a.alloc(csv_write.Type, source.count * p.names.len);
+    const Gate = struct {
+        fn wait(_: *anyopaque, chunk: usize) anyerror!void {
+            if (chunk == 0) return error.LocalReadFailed;
+        }
+        fn done(_: *anyopaque, _: usize, _: usize) void {}
+    };
+    var dummy: u8 = 0;
+    source.gate = .{ .ctx = &dummy, .wait = Gate.wait, .done = Gate.done };
+    try testing.expectError(error.LocalReadFailed, source.produce(testing.io, null, 0));
+    try testing.expectError(error.LocalReadFailed, source.produce(testing.io, null, 1));
+
+    // Through the whole write: one producer fails mid-file, through the reader or the mapping, at any -j; the write
+    // stops with that error, every reader unit goes back, and nothing is left behind.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    const in = try tmpPath(&b1, &tmp, "fault.csv");
+    const out = try tmpPath(&b2, &tmp, "fault.parquet");
+    try writeFile(in, try sampleCsv(a, 20_000, null));
+    for ([_]?local_reader.Policy.Profile{ null, .pread }) |profile| for ([_]usize{ 1, 3, 8 }) |j| {
+        var f: csv_write.Failure = .{};
+        try testing.expectError(error.LocalReadFailed, runCsv(in, out, j, .{
+            .chunk_bytes = 16 << 10,
+            .io_profile = profile,
+            .fault_chunk = 7,
+        }, &f));
+        try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, out, .{}));
+    };
+}

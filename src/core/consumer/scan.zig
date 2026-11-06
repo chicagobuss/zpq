@@ -476,10 +476,11 @@ pub fn scanRGForAgg(
     ws: AggWorkspace,
 ) !u64 {
     var execution = ws;
-    // A join's virtual columns are published by the whole-row-group decode alone (`publishLookups`).
+    // A join's build columns have no chunk to cost a cache window by: its row groups slice when memory asks (or a
+    // batch size is set), and one the slices cannot take publishes on the whole-row-group decode alone.
     if (join_lookup.inFilter(in.filter)) {
         execution.auto_decode_batches = false;
-        execution.decode_batch_rows = 0;
+        if (!joinSliceable(target)) execution.decode_batch_rows = 0;
     }
     if (execution.auto_decode_batches and ws.decode_batch_rows == 0 and ws.expr_batch_rows != 0 and
         (target != .grouped or exactTileTarget(in, target) or (decode_options.encoded and
@@ -866,9 +867,9 @@ fn planDecode(
         break :blk decode_options.encoded and cm.dictionary_page_offset != null and
             !@import("../filter/membership.zig").dictionaryCoversChunk(&cm);
     } else false;
-    // A join's lookups publish on the whole decode alone: one that does not fit is refused, and the query replays
-    // narrower (fewer workers, a larger share each), as any refused scan does.
-    if (join_lookup.inFilter(in.filter)) {
+    // A join the slices cannot take publishes on the whole decode alone: one that does not fit is refused, and the
+    // query replays narrower (fewer workers, a larger share each), as any refused scan does.
+    if (join_lookup.inFilter(in.filter) and !joinSliceable(target)) {
         if (fits_share and admitWhole(ws, full)) return plan;
         return error.ExceededMemoryBudget;
     }
@@ -1448,10 +1449,10 @@ fn filterPhase(
         // Whole words evaluate in place, at the rows earlier phases kept. Bits past `n` are clear only at the end.
         const in_place = survivors.alignedWindow(done, n) catch null;
         var sel = in_place orelse try filter_selection.SelectionVector.init(sa, n);
-        if (gated) |g|
-            try g.narrow(which, &batch, &sel, lookup, sa)
-        else
-            try filter_eval.evaluate(in.filter.?, &batch, &sel, lookup, sa);
+        if (gated) |g| {
+            g.at = done;
+            try g.narrow(which, &batch, &sel, lookup, sa);
+        } else try filter_eval.evaluate(in.filter.?, &batch, &sel, lookup, sa);
         if (in_place == null) for (0..n) |i| if (!sel.isActive(i)) survivors.set(done + i, false);
     }
     if (gated) |g| for (g.done, which) |*d, w| {
@@ -1891,14 +1892,40 @@ fn publishLookups(
     sel: *const filter_selection.SelectionVector,
     values: []const bool,
 ) !void {
+    var at: ?[]const u32 = null;
     for (j.payloads, 0..) |_, p| {
         const ci = j.virtual_base + p;
         if (ci >= in.read.len or !in.read[ci]) continue;
         const fk_pos = lookup[j.fk_leaf] orelse return error.BadColumn;
+        if (at == null) at = try join_lookup.slotsFor(j, batch_cols.items[fk_pos], sel, ra);
         // Codes alone serve coded consumers (filters, CASE conditions, grouping); values only where one reads them.
-        const col = try join_lookup.column(j, p, batch_cols.items[fk_pos], sel, ra, ci < values.len and values[ci]);
+        const col = try join_lookup.column(j, p, at.?, sel, ra, ci < values.len and values[ci]);
         lookup[ci] = batch_cols.items.len;
         try batch_cols.append(ra, col);
+    }
+}
+
+/// Whether the sliced decode takes this join: it publishes the build columns per slice from the slots the lookup
+/// captured on its filter pass. A record-owned decode keeps the whole row group.
+fn joinSliceable(target: AggTarget) bool {
+    return !(target == .grouped and target.grouped.records != null);
+}
+
+/// The build columns of `j` a slice reads, from `at`, the slots of its rows: each at the position `lookup` gave it.
+fn publishSlice(
+    j: *const join_lookup.Join,
+    sa: std.mem.Allocator,
+    in: AggRowGroup,
+    cols: []filter_eval.Batch.Column,
+    lookup: []const ?usize,
+    sel: *const filter_selection.SelectionVector,
+    at: []const u32,
+    values: []const bool,
+) !void {
+    for (j.payloads, 0..) |_, p| {
+        const ci = j.virtual_base + p;
+        if (ci >= in.read.len or !in.read[ci]) continue;
+        cols[lookup[ci].?] = try join_lookup.column(j, p, at, sel, sa, ci < values.len and values[ci]);
     }
 }
 
@@ -1914,8 +1941,9 @@ fn scanRGSliced(
     full: usize,
     stream_rows: usize,
 ) !?u64 {
-    // A join's lookups publish only on the whole-row-group decode: refuse rather than read a build column as absent.
-    if (join_lookup.inFilter(in.filter)) return error.JoinNeedsWholeRowGroup;
+    // A join the slices cannot take publishes only on the whole-row-group decode: refuse rather than read a build
+    // column as absent.
+    if (join_lookup.inFilter(in.filter) and !joinSliceable(target)) return error.JoinNeedsWholeRowGroup;
     return scanRGSlicedExact(gpa, in, stats, decode_options, target, ws, budget, handled, full, stream_rows, false);
 }
 
@@ -1940,7 +1968,11 @@ fn scanRGSlicedExact(
     // Bitmap admission is optional; its refusal must not mark the decoder's allocator as refused.
     const seen_alloc = ws.planning_charged orelse side;
     const distinct_ci = if (decode_options.encoded) scalarByteDistinct(in, target) else null;
-    const rewrite_ci = if (decode_options.encoded) rewriteInput(target) else null;
+    // A join's build columns publish per slice from the slots its lookup captured on the filter pass; a group-join
+    // folds the slices into one partial for the row group. Neither has a reader to window pages by.
+    const join = join_lookup.ofFilter(in.filter);
+    const group = if (join) |j| j.group else null;
+    const rewrite_ci = if (decode_options.encoded and join == null) rewriteInput(target) else null;
     var distinct_seen: ScalarDistinctSeen = .{};
     defer distinct_seen.deinit(seen_alloc);
     const pool = try poolOn(&ws.scratch.slice, side);
@@ -1954,13 +1986,14 @@ fn scanRGSlicedExact(
     @memset(lookup, null);
     // The columns the whole-chunk path reads as levels only (`decodeLevelsOnly`), read so here too.
     const uses = try planCodeUses(pages.allocator(), in, target);
+    if (group) |g| for (g.calls) |c| if (c.arg) |e| e.collectColumns(uses.value);
     const levels_only = try pages.allocator().alloc(bool, in.read.len);
     for (levels_only, 0..) |*l, ci| l.* = decode_options.encoded and target == .scalar and ci < uses.levels.len and
         uses.levels[ci] and !uses.code[ci] and !uses.value[ci];
     // Exact DECIMAL folds through tiles whose sums reach the table only once the row group has folded, so their size
     // cannot change which error wins (`exact_tiles`).
     var exact: ?exact_tiles.ExactTiles = null;
-    if (exact_ok and exactTileTarget(in, target)) {
+    if (exact_ok and group == null and exactTileTarget(in, target)) {
         const no_stats = for (handled) |h| {
             if (h) break false;
         } else true;
@@ -1977,6 +2010,15 @@ fn scanRGSlicedExact(
     // page-indexed column is pruned by its own statistics there, not deferred, so it is not deferred here either.
     const page_indexes = try loadPageIndexes(pages.allocator(), in, stats);
     var gated = try GatedFilter.init(pages.allocator(), in, target, page_indexes);
+    var published: usize = 0;
+    if (join) |j| {
+        if (gated == null) gated = try GatedFilter.undeferred(pages.allocator(), in);
+        const reads_build = for (j.payloads, 0..) |_, p| {
+            const ci = j.virtual_base + p;
+            if (ci < in.read.len and in.read[ci]) break true;
+        } else false;
+        if (reads_build or group != null) gated.?.slots = try pages.allocator().alloc(u32, num_rows);
+    }
     reportGated(ws, in, found, if (gated) |g| g.deferred else null);
     // A gated filter takes its own pass even when the aggregates read only its columns, none of them payload.
     const payload: ?[]const bool = found orelse if (gated != null) blk: {
@@ -2016,6 +2058,15 @@ fn scanRGSlicedExact(
         ws,
         if (exact) |*x| x else null,
     ) orelse return null;
+    // Each slice's build columns follow its readers' columns.
+    if (join) |j| for (j.payloads, 0..) |_, p| {
+        const ci = j.virtual_base + p;
+        if (ci >= in.read.len or !in.read[ci]) continue;
+        lookup[ci] = readers.items.len + published;
+        published += 1;
+    };
+    var fold: ?join_lookup.GroupJoin.Fold = if (group) |g| .{ .g = g } else null;
+    errdefer if (fold) |*f| f.deinit();
     const per_row = @max(1, full / num_rows);
     // Half of what the ledger has left, so another worker's slice still fits beside this one; slicing changes no
     // answer, only how many rows decode at once.
@@ -2079,8 +2130,8 @@ fn scanRGSlicedExact(
             rows_now = sliceRows(@min(@min(reserved, l.sliceAvailable() / 2 + kept) / took.?, forced), num_rows);
         };
         const sa = if (on_region) ws.rg_arena.allocator() else slice.allocator();
-        const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len);
-        for (readers.items, cols) |*r, *c| {
+        const cols = try sa.alloc(filter_eval.Batch.Column, readers.items.len + published);
+        for (readers.items, cols[0..readers.items.len]) |*r, *c| {
             c.* = r.next(sa, n) catch |err| {
                 // A record slice may read pages that the ordinary indexed plan skips. Replay establishes its error.
                 if (in.filter != null and target == .grouped and target.grouped.records != null and isDecodeError(err))
@@ -2095,12 +2146,21 @@ fn scanRGSlicedExact(
             try filter_selection.SelectionVector.init(sa, n);
         if (payload == null) if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
         matched += if (in.filter != null) sel.count() else n;
+        if (join) |j| if (gated.?.slots.len != 0) {
+            const at = gated.?.slots[done..][0..n];
+            try publishSlice(j, sa, in, cols, lookup, &sel, at, uses.value);
+            if (fold) |*f| {
+                try f.add(sa, at, &batch, lookup, &sel);
+                continue;
+            }
+        };
         const input_base = std.math.add(u64, in.row_base, done) catch return error.BadColumn;
         const window = try selectedWindow(&batch, &sel, input_base, null, n);
         if (exact) |*x| {
             var any_pull = false;
             const pulls = try sa.alloc(?exact_tiles.CodePull, cols.len);
-            for (readers.items, pulls) |*rd, *p| {
+            @memset(pulls, null);
+            for (readers.items, pulls[0..readers.items.len]) |*rd, *p| {
                 if (rd.stream_left != 0) {
                     p.* = .{ .ctx = rd, .pull = SliceReader.pullStream, .rows = rd.stream_left };
                     any_pull = true;
@@ -2225,6 +2285,7 @@ fn scanRGSlicedExact(
         }
         if (discovering and target.grouped.table.discoveryDone(target.grouped.pos_base + done + n)) break;
     }
+    if (fold) |*f| try f.finish(in.rg_index);
     if (exact) |*x| switch (target) {
         .grouped => |g| {
             // A partitioned worker's local table flushes as `foldGroupedWindows` flushes it, around the row group.

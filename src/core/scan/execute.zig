@@ -2590,6 +2590,8 @@ fn splitRowGroups(
     workers: usize,
 ) !?[]WorkItem {
     if (workers < 2) return null;
+    // A group-join's partials are ordered by row group, one each.
+    if (join_lookup.ofFilter(plan.query.filter)) |j| if (j.group != null) return null;
     var alive: usize = 0;
     var bytes: u64 = 0;
     var sample: ?WorkItem = null;

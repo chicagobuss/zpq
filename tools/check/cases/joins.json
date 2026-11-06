@@ -2,7 +2,7 @@
  "fixtures": [
   {
    "name": "fact",
-   "copy": "COPY (SELECT i AS id, (CASE WHEN i % 23 = 0 THEN NULL ELSE i % 997 END)::BIGINT AS fk, (i * 1.25)::DOUBLE AS amt, (i % 7)::BIGINT AS q, (i % 997)::BIGINT * 100003 AS sfk FROM range(1, 20000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 4096)"
+   "copy": "COPY (SELECT i AS id, (CASE WHEN i % 23 = 0 THEN NULL ELSE i % 997 END)::BIGINT AS fk, (i * 1.25)::DOUBLE AS amt, (i % 7)::BIGINT AS q, (i % 997)::BIGINT * 100003 AS sfk, ((i % 1000) * 0.01)::DECIMAL(12, 2) AS dec FROM range(1, 20000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 4096)"
   },
   {
    "name": "dim",
@@ -21,7 +21,9 @@
    "files": [
     "join-gate",
     "join-gate-clean",
-    "join-gate-dim"
+    "join-gate-dim",
+    "join-gate-big",
+    "join-gate-big-clean"
    ]
   },
   {
@@ -59,6 +61,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
@@ -83,6 +99,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
@@ -107,6 +137,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
@@ -131,6 +175,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
@@ -155,6 +213,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
@@ -179,6 +251,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
@@ -203,6 +289,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
@@ -227,6 +327,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
@@ -251,11 +365,101 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT fk, sum(w) AS sw FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk GROUP BY fk ORDER BY sw DESC, fk LIMIT 5"
+   }
+  },
+  {
+   "id": "join:exact:scalar",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(dec) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND q > 0"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(dec) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND q > 0"
+   }
+  },
+  {
+   "id": "join:exact:group-dimension",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT grp, sum(dec) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk GROUP BY grp ORDER BY grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT grp, sum(dec) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk GROUP BY grp ORDER BY grp"
    }
   },
   {
@@ -347,6 +551,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
@@ -371,6 +589,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
@@ -395,6 +627,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
@@ -442,11 +688,93 @@
     {
      "jobs": 4,
      "max_memory": "64M"
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT sum(amt) AS s, count(*) AS n FROM '{fixture:join-gate-clean}', '{fixture:join-gate-dim}' WHERE fk = pk AND sd >= '1994-01-01'"
+   }
+  },
+  {
+   "id": "join:decode-error:fk-gated:large",
+   "fixture": "join-gate-big",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(amt) AS s, count(*) AS n FROM '{fixture:join-gate-big}', '{fixture:join-gate-dim}' WHERE fk = pk AND sd >= '1994-01-01'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 8
+    },
+    {
+     "jobs": 8,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "1024"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "8M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(amt) AS s, count(*) AS n FROM '{fixture:join-gate-big-clean}', '{fixture:join-gate-dim}' WHERE fk = pk AND sd >= '1994-01-01'"
+   }
+  },
+  {
+   "id": "join:large:dimension-attribute",
+   "fixture": "join-gate-big-clean",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT grp, sum(amt) AS s, count(*) AS n FROM '{fixture:join-gate-big-clean}', '{fixture:join-gate-dim}' WHERE fk = pk AND sd >= '1994-01-01' GROUP BY grp ORDER BY grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 8
+    },
+    {
+     "jobs": 8,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "1024"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "8M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT grp, sum(amt) AS s, count(*) AS n FROM '{fixture:join-gate-big-clean}', '{fixture:join-gate-dim}' WHERE fk = pk AND sd >= '1994-01-01' GROUP BY grp ORDER BY grp"
    }
   },
   {
@@ -466,6 +794,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {
@@ -487,6 +829,20 @@
     },
     {
      "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    },
+    {
+     "jobs": 16,
+     "max_memory": "512K"
     }
    ],
    "oracle": {

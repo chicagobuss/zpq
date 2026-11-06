@@ -521,7 +521,7 @@ pub fn evaluate(
     switch (filter) {
         .lookup => |leaf| {
             const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
-            try @import("../join/lookup.zig").narrow(leaf.join, batch.cols[col_pos], sel, arena);
+            try @import("../join/lookup.zig").narrow(leaf.join, batch.cols[col_pos], sel, arena, null);
         },
         .int32 => |leaf| {
             const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;

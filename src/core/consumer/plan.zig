@@ -362,6 +362,29 @@ pub const GatedFilter = struct {
     order: []usize,
     deferred: []bool,
     done: []bool,
+    /// The main join's slot per row of the row group, captured by its lookup on the sliced filter pass for the
+    /// build columns each slice publishes (`join/lookup.zig`); empty when nothing captures. `at`: the row the batch
+    /// being narrowed starts at.
+    slots: []u32 = &.{},
+    at: usize = 0,
+
+    /// A join's plan when `init` defers nothing: its conjuncts in their order, every column read first. The sliced
+    /// decode narrows by it so the lookup captures slots.
+    pub fn undeferred(a: std.mem.Allocator, in: AggRowGroup) !GatedFilter {
+        const filter = in.filter.?;
+        const children: []const filter_ast.Filter = if (filter == .and_filter and filter.and_filter.in_set == null and
+            !filter.and_filter.null_member) filter.and_filter.children else (&filter)[0..1];
+        const conjuncts = try a.alloc(Conjunct, children.len);
+        for (conjuncts, children) |*k, child| k.* = Conjunct.of(child);
+        const n = in.read.len;
+        const deferred = try a.alloc(bool, n);
+        @memset(deferred, false);
+        const order = try a.alloc(usize, n);
+        for (order, 0..) |*o, ci| o.* = ci;
+        const done = try a.alloc(bool, conjuncts.len);
+        @memset(done, false);
+        return .{ .conjuncts = conjuncts, .order = order, .deferred = deferred, .done = done };
+    }
 
     pub fn init(
         a: std.mem.Allocator,
@@ -463,7 +486,8 @@ pub const GatedFilter = struct {
         for (g.conjuncts, which) |k, w| if (w) switch (k) {
             .lookup => |l| {
                 const pos = lookup[l.col_idx] orelse return error.BadColumn;
-                try join_lookup.narrow(l.join, batch.cols[pos], sel, a);
+                const capture = if (l.join.main and g.slots.len != 0) g.slots[g.at..][0..sel.len] else null;
+                try join_lookup.narrow(l.join, batch.cols[pos], sel, a, capture);
             },
             .predicate => {},
         };

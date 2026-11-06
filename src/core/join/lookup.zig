@@ -229,10 +229,9 @@ fn keyAt(comptime T: type, c: filter_eval.ColumnT(T), r: usize) ?i64 {
     return @intCast(c.values[r]);
 }
 
-/// Slots of `fk`'s selected rows (`EMPTY` where no build key matches), dictionary-direct when `fk` is coded: each
-/// dictionary entry is looked up once and its rows take its slot.
-fn slotsOf(j: *const Join, comptime T: type, c: filter_eval.ColumnT(T), sel: *const selection.SelectionVector, a: std.mem.Allocator) ![]u32 {
-    const out = try a.alloc(u32, sel.len);
+/// Slots of `fk`'s selected rows into `out` (`EMPTY` where no build key matches), dictionary-direct when `fk` is coded:
+/// each dictionary entry is looked up once and its rows take its slot. Rows `sel` drops are left as they were.
+fn slotsOf(j: *const Join, comptime T: type, c: filter_eval.ColumnT(T), sel: *const selection.SelectionVector, out: []u32, a: std.mem.Allocator) !void {
     if (c.codes) |codes| {
         const by_code = try a.alloc(u32, c.dict.len);
         defer a.free(by_code);
@@ -242,47 +241,53 @@ fn slotsOf(j: *const Join, comptime T: type, c: filter_eval.ColumnT(T), sel: *co
             const is_null = if (c.def_levels) |dl| dl[r] < c.max_def else false;
             out[r] = if (is_null) EMPTY else by_code[codes[r]];
         }
-        return out;
+        return;
     }
     var it = sel.iterator();
     while (it.next()) |r| out[r] = if (keyAt(T, c, r)) |k| j.slot(k) orelse EMPTY else EMPTY;
-    return out;
 }
 
-fn slotsOfColumn(j: *const Join, fk: filter_eval.Batch.Column, sel: *const selection.SelectionVector, a: std.mem.Allocator) filter_eval.Error![]u32 {
+fn slotsOfColumn(j: *const Join, fk: filter_eval.Batch.Column, sel: *const selection.SelectionVector, out: []u32, a: std.mem.Allocator) filter_eval.Error!void {
     return switch (fk) {
-        .i32 => |c| slotsOf(j, i32, c, sel, a),
-        .i64 => |c| slotsOf(j, i64, c, sel, a),
+        .i32 => |c| slotsOf(j, i32, c, sel, out, a),
+        .i64 => |c| slotsOf(j, i64, c, sel, out, a),
         else => error.BadColumn,
     };
 }
 
-/// Keep the selected rows whose foreign key has a build match (INNER and SEMI alike: the build is N:1).
-pub fn narrow(j: *const Join, fk: filter_eval.Batch.Column, sel: *selection.SelectionVector, a: std.mem.Allocator) filter_eval.Error!void {
-    const slots = try slotsOfColumn(j, fk, sel, a);
-    defer a.free(slots);
+/// The slots of `fk`'s selected rows, on `a`.
+pub fn slotsFor(j: *const Join, fk: filter_eval.Batch.Column, sel: *const selection.SelectionVector, a: std.mem.Allocator) filter_eval.Error![]u32 {
+    const out = try a.alloc(u32, sel.len);
+    try slotsOfColumn(j, fk, sel, out, a);
+    return out;
+}
+
+/// Keep the selected rows whose foreign key has a build match (INNER and SEMI alike: the build is N:1). With
+/// `capture` (one entry per row of `sel`), the selected rows' slots stay there for the columns published later.
+pub fn narrow(j: *const Join, fk: filter_eval.Batch.Column, sel: *selection.SelectionVector, a: std.mem.Allocator, capture: ?[]u32) filter_eval.Error!void {
+    const at = capture orelse try a.alloc(u32, sel.len);
+    defer if (capture == null) a.free(at);
+    try slotsOfColumn(j, fk, sel, at, a);
     for (sel.mask, 0..) |*w, wi| {
         var bits = w.*;
         while (bits != 0) : (bits &= bits - 1) {
             const r = wi * 64 + @ctz(bits);
-            if (slots[r] == EMPTY) w.* &= ~(@as(u64, 1) << @intCast(r & 63));
+            if (at[r] == EMPTY) w.* &= ~(@as(u64, 1) << @intCast(r & 63));
         }
     }
 }
 
-/// Payload `p` as a coded column over the rows `sel` keeps (every one has a match: the lookup conjunct ran first).
-/// Rows outside `sel` take code 0; no consumer reads them. With `values`, values are materialized beside the codes
-/// for the consumers that read values.
-pub fn column(j: *const Join, p: usize, fk: filter_eval.Batch.Column, sel: *const selection.SelectionVector, a: std.mem.Allocator, values: bool) !filter_eval.Batch.Column {
-    const slots = try slotsOfColumn(j, fk, sel, a);
-    defer a.free(slots);
+/// Payload `p` as a coded column over the rows `sel` keeps, from their slots (every one has a match: the lookup
+/// conjunct ran first). Rows outside `sel` take code 0; no consumer reads them. With `values`, values are
+/// materialized beside the codes for the consumers that read values.
+pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.SelectionVector, a: std.mem.Allocator, values: bool) !filter_eval.Batch.Column {
     const payload = j.payloads[p];
     const codes = try a.alloc(u32, sel.len);
     @memset(codes, 0);
     var it = sel.iterator();
     while (it.next()) |r| {
-        if (slots[r] == EMPTY) return error.LookupWithoutMatch;
-        codes[r] = payload.codes.get(slots[r]);
+        if (at[r] == EMPTY) return error.LookupWithoutMatch;
+        codes[r] = payload.codes.get(at[r]);
     }
     return switch (payload.dict) {
         inline else => |dict, tag| blk: {
@@ -894,81 +899,123 @@ pub const GroupJoin = struct {
     /// Fold one probe row group's selected rows (every one matched: the lookup ran in the filter).
     pub fn foldRowGroup(g: *GroupJoin, j: *const Join, a: std.mem.Allocator, rg_index: usize, batch: *const filter_eval.Batch, lookup: []const ?usize, sel: *const selection.SelectionVector) !void {
         const fk_pos = lookup[j.fk_leaf] orelse return error.BadColumn;
-        const slots = try slotsOfColumn(j, batch.cols[fk_pos], sel, a);
-        const args_f = try a.alloc([]const f64, g.calls.len);
-        const args_i = try a.alloc([]const i64, g.calls.len);
-        for (g.calls, args_f, args_i) |c, *af, *ai| {
-            af.* = &.{};
-            ai.* = &.{};
-            const e = c.arg orelse continue;
-            switch (try argColumn(a, batch, lookup, e, c.lane)) {
-                .f => |v| af.* = v,
-                .i => |v| ai.* = v,
-            }
-        }
-        // Runs of one slot, in row order: on a key-sorted probe a slot's rows are one run.
-        var runs: usize = 0;
-        var prev: u32 = EMPTY;
-        var it = sel.iterator();
-        while (it.next()) |r| {
-            if (slots[r] != prev) runs += 1;
-            prev = slots[r];
-        }
-        const gpa = g.gpa;
-        // Empty first, so a refusal anywhere below frees exactly what was allocated (`Partial.free`).
-        const p = try gpa.create(Partial);
-        p.* = .{ .slots = &.{}, .counts = &.{}, .f = &.{}, .i = &.{} };
-        errdefer p.free(gpa);
-        p.slots = try gpa.alloc(u32, runs);
-        p.counts = try gpa.alloc(u32, runs);
-        p.f = try gpa.alloc([]f64, g.calls.len);
-        @memset(p.f, &.{});
-        p.i = try gpa.alloc([]i64, g.calls.len);
-        @memset(p.i, &.{});
-        for (g.calls, p.f, p.i) |c, *f, *i| {
-            if (c.lane == .f64 and c.func != .count) f.* = try gpa.alloc(f64, runs);
-            if (c.lane == .i64 and c.func != .count) i.* = try gpa.alloc(i64, runs);
-        }
-        var at: usize = 0;
-        prev = EMPTY;
-        it = sel.iterator();
-        while (it.next()) |r| {
-            const s = slots[r];
-            if (s == EMPTY) return error.LookupWithoutMatch;
-            const fresh = s != prev;
-            if (fresh) {
-                if (prev != EMPTY) at += 1;
-                p.slots[at] = s;
-                p.counts[at] = 0;
-            }
-            prev = s;
-            p.counts[at] += 1;
-            for (g.calls, 0..) |c, ci| switch (c.lane) {
-                .f64 => if (c.func != .count) {
-                    const v = args_f[ci][r];
-                    const dst = &p.f[ci][at];
-                    dst.* = if (fresh) v else switch (c.func) {
-                        .sum => dst.* + v,
-                        .min => @min(dst.*, v),
-                        .max => @max(dst.*, v),
-                        .count => unreachable,
-                    };
-                },
-                .i64 => if (c.func != .count) {
-                    const v = if (c.arg != null) args_i[ci][r] else 1;
-                    const dst = &p.i[ci][at];
-                    dst.* = if (fresh) v else switch (c.func) {
-                        .sum => std.math.add(i64, dst.*, v) catch return error.GroupJoinOverflow,
-                        .min => @min(dst.*, v),
-                        .max => @max(dst.*, v),
-                        .count => unreachable,
-                    };
-                },
-            };
-        }
-        g.pending[rg_index].store(p, .release);
-        g.drain(false);
+        var fold: Fold = .{ .g = g };
+        errdefer fold.deinit();
+        try fold.add(a, try slotsFor(j, batch.cols[fk_pos], sel, a), batch, lookup, sel);
+        try fold.finish(rg_index);
     }
+
+    /// One row group's partial, a batch of its rows at a time in row order: a run of one slot continues across
+    /// batches, so a sliced row group folds to the same bits as a whole one.
+    pub const Fold = struct {
+        g: *GroupJoin,
+        slots: std.ArrayList(u32) = .empty,
+        counts: std.ArrayList(u32) = .empty,
+        /// Per call, its run accumulators, in the call's lane.
+        f: []std.ArrayList(f64) = &.{},
+        i: []std.ArrayList(i64) = &.{},
+
+        /// Rows `sel` keeps of `batch`, with their slots in `at` (indexed as `sel`).
+        pub fn add(fold: *Fold, a: std.mem.Allocator, at: []const u32, batch: *const filter_eval.Batch, lookup: []const ?usize, sel: *const selection.SelectionVector) !void {
+            const g = fold.g;
+            const gpa = g.gpa;
+            try fold.lanes();
+            const args_f = try a.alloc([]const f64, g.calls.len);
+            const args_i = try a.alloc([]const i64, g.calls.len);
+            for (g.calls, args_f, args_i) |c, *af, *ai| {
+                af.* = &.{};
+                ai.* = &.{};
+                const e = c.arg orelse continue;
+                switch (try argColumn(a, batch, lookup, e, c.lane)) {
+                    .f => |v| af.* = v,
+                    .i => |v| ai.* = v,
+                }
+            }
+            // Runs of one slot, in row order: on a key-sorted probe a slot's rows are one run.
+            var it = sel.iterator();
+            while (it.next()) |r| {
+                const s = at[r];
+                if (s == EMPTY) return error.LookupWithoutMatch;
+                const fresh = fold.slots.items.len == 0 or fold.slots.items[fold.slots.items.len - 1] != s;
+                if (fresh) {
+                    try fold.slots.append(gpa, s);
+                    try fold.counts.append(gpa, 0);
+                }
+                fold.counts.items[fold.counts.items.len - 1] += 1;
+                for (g.calls, 0..) |c, ci| switch (c.lane) {
+                    .f64 => if (c.func != .count) {
+                        const v = args_f[ci][r];
+                        if (fresh) try fold.f[ci].append(gpa, v) else {
+                            const dst = &fold.f[ci].items[fold.f[ci].items.len - 1];
+                            dst.* = switch (c.func) {
+                                .sum => dst.* + v,
+                                .min => @min(dst.*, v),
+                                .max => @max(dst.*, v),
+                                .count => unreachable,
+                            };
+                        }
+                    },
+                    .i64 => if (c.func != .count) {
+                        const v = if (c.arg != null) args_i[ci][r] else 1;
+                        if (fresh) try fold.i[ci].append(gpa, v) else {
+                            const dst = &fold.i[ci].items[fold.i[ci].items.len - 1];
+                            dst.* = switch (c.func) {
+                                .sum => std.math.add(i64, dst.*, v) catch return error.GroupJoinOverflow,
+                                .min => @min(dst.*, v),
+                                .max => @max(dst.*, v),
+                                .count => unreachable,
+                            };
+                        }
+                    },
+                };
+            }
+        }
+
+        fn lanes(fold: *Fold) !void {
+            const n = fold.g.calls.len;
+            if (fold.f.len == n) return;
+            fold.f = try fold.g.gpa.alloc(std.ArrayList(f64), n);
+            @memset(fold.f, .empty);
+            fold.i = try fold.g.gpa.alloc(std.ArrayList(i64), n);
+            @memset(fold.i, .empty);
+        }
+
+        /// Hand the row group's partial to the ordered merge.
+        pub fn finish(fold: *Fold, rg_index: usize) !void {
+            const g = fold.g;
+            const gpa = g.gpa;
+            try fold.lanes();
+            // Empty first: on a refusal the partial frees what has moved into it, and the caller's `deinit` the rest.
+            const p = try gpa.create(Partial);
+            p.* = .{ .slots = &.{}, .counts = &.{}, .f = &.{}, .i = &.{} };
+            errdefer p.free(gpa);
+            p.f = try gpa.alloc([]f64, g.calls.len);
+            @memset(p.f, &.{});
+            p.i = try gpa.alloc([]i64, g.calls.len);
+            @memset(p.i, &.{});
+            for (fold.f, fold.i, p.f, p.i) |*lf, *li, *df, *di| {
+                df.* = try lf.toOwnedSlice(gpa);
+                di.* = try li.toOwnedSlice(gpa);
+            }
+            p.slots = try fold.slots.toOwnedSlice(gpa);
+            p.counts = try fold.counts.toOwnedSlice(gpa);
+            fold.deinit();
+            g.pending[rg_index].store(p, .release);
+            g.drain(false);
+        }
+
+        pub fn deinit(fold: *Fold) void {
+            const gpa = fold.g.gpa;
+            for (fold.f) |*x| x.deinit(gpa);
+            for (fold.i) |*x| x.deinit(gpa);
+            gpa.free(fold.f);
+            gpa.free(fold.i);
+            fold.f = &.{};
+            fold.i = &.{};
+            fold.slots.deinit(gpa);
+            fold.counts.deinit(gpa);
+        }
+    };
 
     fn apply(g: *GroupJoin, p: *const Partial) void {
         for (p.slots, p.counts, 0..) |s, n, at| {

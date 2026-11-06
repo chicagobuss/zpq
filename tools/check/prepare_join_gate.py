@@ -3,7 +3,8 @@
 `fk` is PLAIN and read only by the join's lookup conjunct, so every path decodes it after `sd >= '1994-01-01'`, gated
 by that conjunct's survivors, and never opens the page (prepare_conjunct_gate.py's single-table shape, with the
 lookup as the later conjunct). Arguments: the corrupt fact file; the same rows uncorrupted (for the oracle); the
-dimension it joins.
+dimension it joins; then both fact files again at 1M rows in one row group, large enough for four workers to split it
+into row subgroups.
 """
 import datetime
 import pathlib
@@ -16,8 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from prepare_conjunct_gate import pages  # noqa: E402
 
 
-def fact(out, corrupt):
-    n = 200_000
+def fact(out, corrupt, n=200_000):
     sd = [datetime.date(1993, 6, 1) if 40000 <= i < 80000 else datetime.date(1994, 6, 1) for i in range(n)]
     fk = [None if i % 9 == 4 else (i * 7919) % 1200 for i in range(n)]
     amt = [float(i % 101) / 4 for i in range(n)]
@@ -47,6 +47,8 @@ def fact(out, corrupt):
 def main():
     fact(pathlib.Path(sys.argv[1]), True)
     fact(pathlib.Path(sys.argv[2]), False)
+    fact(pathlib.Path(sys.argv[4]), True, 1_000_000)
+    fact(pathlib.Path(sys.argv[5]), False, 1_000_000)
     pk = list(range(1000))
     pq.write_table(pa.table({"pk": pa.array(pk, type=pa.int64()), "grp": pa.array([k % 7 for k in pk], type=pa.int64())}),
                    pathlib.Path(sys.argv[3]))

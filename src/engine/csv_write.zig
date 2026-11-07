@@ -498,7 +498,7 @@ pub const Source = struct {
                 .got_fields = col + 1 + if (f.last) 0 else countRest(&scanner),
             }, span.lines, lo_b);
             const raw = bytes[f.start..f.end];
-            const text = csv_scan.decodeField(raw, p.dialect.quote, &scratch, scratch_alloc) catch |e| switch (e) {
+            const text = csv_scan.fieldText(f, raw, p.dialect.quote, &scratch, scratch_alloc) catch |e| switch (e) {
                 error.MalformedCsv => return s.fail(i, .{
                     .kind = .malformed,
                     .malformed = csv_scan.fieldMalformation(raw, p.dialect.quote),

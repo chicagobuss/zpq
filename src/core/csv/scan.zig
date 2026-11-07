@@ -125,6 +125,9 @@ pub const Field = struct {
     end: usize,
     /// The field ends its record.
     last: bool,
+    /// A quote byte is in the field's bytes. Without one the field is its own text (`decodeField` would return it
+    /// as it is), so a parse can take it without looking at it again.
+    has_quote: bool,
 };
 
 /// Fields of the records in `bytes` from `start` on, in order. The caller decides where to stop (a chunk stops at
@@ -140,7 +143,10 @@ pub const Scanner = struct {
     /// Structural bits of the current block not yet returned.
     pending: u64 = 0,
     newline_bits: u64 = 0,
+    quote_bits: u64 = 0,
     carry: u64 = 0,
+    /// The field being scanned had a quote in a block before the current one.
+    span_quote: bool = false,
     field_start: usize,
     /// A field of the current record has been returned.
     in_record: bool = false,
@@ -173,6 +179,7 @@ pub const Scanner = struct {
         }
         const valid: u64 = if (n >= 64) ~@as(u64, 0) else (@as(u64, 1) << @intCast(n)) - 1;
         const q = eqMask(v, s.quote) & valid;
+        s.quote_bits = q;
         const inq = prefixXor(q) ^ s.carry;
         s.carry = @bitCast(@as(i64, @bitCast(inq)) >> 63);
         s.newline_bits = eqMask(v, '\n') & valid & ~inq;
@@ -184,6 +191,7 @@ pub const Scanner = struct {
     pub inline fn next(s: *Scanner) Error!?Field {
         while (s.pending == 0) {
             if (s.done) return null;
+            s.span_quote = s.span_quote or s.quote_bits & s.fromFieldStart() != 0;
             s.block += 64;
             if (s.block >= s.bytes.len) return s.atEnd();
             s.load();
@@ -194,7 +202,10 @@ pub const Scanner = struct {
         const last = (s.newline_bits >> bit) & 1 == 1;
         var end = at;
         if (last and end > s.field_start and s.bytes[end - 1] == '\r') end -= 1;
-        const f: Field = .{ .start = s.field_start, .end = end, .last = last };
+        const below = (@as(u64, 1) << bit) - 1;
+        const has_quote = s.span_quote or s.quote_bits & s.fromFieldStart() & below != 0;
+        const f: Field = .{ .start = s.field_start, .end = end, .last = last, .has_quote = has_quote };
+        s.span_quote = false;
         s.field_start = at + 1;
         s.in_record = !last;
         return f;
@@ -218,10 +229,18 @@ pub const Scanner = struct {
         // The last record has no newline.
         var end = s.bytes.len;
         if (end > s.field_start and s.bytes[end - 1] == '\r') end -= 1;
-        const f: Field = .{ .start = s.field_start, .end = end, .last = true };
+        const f: Field = .{ .start = s.field_start, .end = end, .last = true, .has_quote = s.span_quote };
+        s.span_quote = false;
         s.field_start = s.bytes.len;
         s.in_record = false;
         return f;
+    }
+
+    /// The current block's bits at and after the current field's first byte.
+    inline fn fromFieldStart(s: *const Scanner) u64 {
+        if (s.field_start <= s.block) return ~@as(u64, 0);
+        const off = s.field_start - s.block;
+        return if (off >= 64) 0 else ~@as(u64, 0) << @intCast(off);
     }
 
     /// Where the next record starts (after the last field returned with `last`).
@@ -265,6 +284,19 @@ pub fn decodeField(
         scratch.appendAssumeCapacity(c);
     }
     return .{ .bytes = scratch.items, .quoted = true };
+}
+
+/// Field `f`'s text, `raw` its bytes: `decodeField`, but a field without a quote byte is its own text, so most fields
+/// take no second pass over their bytes.
+pub inline fn fieldText(
+    f: Field,
+    raw: []const u8,
+    quote: u8,
+    scratch: *std.ArrayList(u8),
+    a: std.mem.Allocator,
+) (Error || std.mem.Allocator.Error)!Text {
+    if (!f.has_quote) return .{ .bytes = raw, .quoted = false };
+    return decodeField(raw, quote, scratch, a);
 }
 
 /// Why `decodeField` refused `raw` (for the diagnostic; call only after it did).
@@ -415,7 +447,7 @@ pub fn parseChunked(
     bytes: []const u8,
     d: Dialect,
     cuts: []const usize,
-) std.mem.Allocator.Error!reference.Result {
+) (std.mem.Allocator.Error || error{QuoteFlagWrong})!reference.Result {
     var bounds: std.ArrayList(usize) = .empty;
     try bounds.append(a, 0);
     for (cuts) |c| if (c > bounds.items[bounds.items.len - 1] and c < bytes.len) try bounds.append(a, c);
@@ -443,7 +475,9 @@ pub fn parseChunked(
         while (true) {
             const f = (s.next() catch return .{ .malformed = s.failure }) orelse break;
             const raw = bytes[f.start..f.end];
-            const t = decodeField(raw, d.quote, &scratch, a) catch
+            // `fieldText` trusts the flag: it must be exact.
+            if (f.has_quote != (std.mem.indexOfScalar(u8, raw, d.quote) != null)) return error.QuoteFlagWrong;
+            const t = fieldText(f, raw, d.quote, &scratch, a) catch
                 return reference.malformed(fieldMalformation(raw, d.quote), f.start);
             try fields.append(a, .{ .bytes = try a.dupe(u8, t.bytes), .quoted = t.quoted });
             if (f.last) {
@@ -660,4 +694,28 @@ test "fuzz: csv chunked framing agrees with the byte-at-a-time reference" {
         "\"open,\n1,2\n",
         "\"a\"b,c\n",
     } });
+}
+
+test "csv scan: a field's quote flag is exact at every offset across 64-byte blocks" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A quoted field, an unquoted one and a long one, each shifted through two block edges: the flag must follow
+    // the field, never the block (a quote earlier in the block, or in a block the field started in).
+    for (0..140) |pad| {
+        var csv: std.ArrayList(u8) = .empty;
+        try csv.appendNTimes(a, 'x', pad);
+        try csv.appendSlice(a, ",\"a,\"\"b\",c,");
+        try csv.appendNTimes(a, 'y', 150 - pad);
+        try csv.appendSlice(a, "\n\"");
+        try csv.appendNTimes(a, 'z', pad);
+        try csv.appendSlice(a, "\",w\n");
+        var s = Scanner.init(csv.items, 0, true, .{});
+        var n: usize = 0;
+        while (try s.next()) |f| : (n += 1) {
+            const raw = csv.items[f.start..f.end];
+            try testing.expectEqual(std.mem.indexOfScalar(u8, raw, '"') != null, f.has_quote);
+        }
+        try testing.expectEqual(@as(usize, 6), n);
+    }
 }

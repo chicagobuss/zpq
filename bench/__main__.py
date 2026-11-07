@@ -4,6 +4,7 @@
                         [--reps N] [--out DIR] [--resume RUN_DIR]
     python -m bench score RUN_DIR...
     python -m bench replay OLD_RUN_DIR --out DIR      rescore a scorecard-v1 cold run under these rules
+    python -m bench site-export RUN_DIR --run-id ID --out DIR   the site's zpq-scorecard-v1 files from a saved run
 
 `run` on another host ships bench/, zpq-check and the two zpq binaries there over ssh, runs, and copies the run
 directory back. Exit: 0 COMPLETE, 2 INCOMPLETE, 3 UNCERTIFIED, 1 on error. The ship bar is reported, not an exit.
@@ -20,7 +21,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from bench import engines, env, export, lane, replay, requests, score, suites
+from bench import engines, env, export, lane, replay, requests, score, site_export, suites
 
 ROOT = engines.ROOT
 EXIT = {"COMPLETE": 0, "INCOMPLETE": 2, "UNCERTIFIED": 3}
@@ -166,6 +167,14 @@ def main():
     x = sub.add_parser("replay")
     x.add_argument("old")
     x.add_argument("--out", required=True)
+    e = sub.add_parser("site-export", help="write the site's zpq-scorecard-v1 files from a saved run")
+    e.add_argument("run")
+    e.add_argument("--run-id", required=True)
+    e.add_argument("--out", required=True)
+    e.add_argument("--lane", help="default: the header's lane")
+    e.add_argument("--candidate-sha", help="default: the header's sha")
+    e.add_argument("--baseline-sha", help="default: the header's baseline_sha")
+    e.add_argument("--reps", type=int, default=3)
     for name in ("request", "export"):
         command = sub.add_parser(name, help="prepare an offline request" if name == "request" else "export saved runs")
         command.add_argument("request")
@@ -183,6 +192,13 @@ def main():
                 print(json.dumps(result["coverage"], sort_keys=True))
         except (ValueError, OSError, KeyError, TypeError) as error:
             p.exit(1, f"bench {a.command}: {error}\n")
+        return
+    if a.command == "site-export":
+        try:
+            status = site_export.export_lane(a.run, a.run_id, a.out, a.lane, a.candidate_sha, a.baseline_sha, a.reps)
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            p.exit(1, f"bench site-export: {error}\n")
+        print(json.dumps({k: status[k] for k in ("phase", "cells", "complete", "attempts")}, sort_keys=True))
         return
     if a.command == "run":
         sys.exit(run(a))

@@ -7,6 +7,15 @@
   9950X, PDS-H-shaped filters such as `l_shipmode IN ('MAIL', 'SHIP')` with a date range are 1.8–6.3× faster.
 - **`LIKE '%text%'` is faster.** The substring search's tail now runs in vectors too: ClickBench Q20 is 11% faster.
 - **zpq builds with any Zig 0.17.x patch release,** not only 0.17.0, so 0.17.1 can be adopted when it ships.
+- **Re-encoded wide string columns read as fast as the original, or faster, in other engines.** zpq sent a string column
+  to a dictionary only while the dictionary stayed within 1 MiB, so wide values (titles, URLs) that repeat just as
+  often went to DELTA_BYTE_ARRAY, which the readers we measured decode slower than PLAIN (Polars 2.1.0 about twice as
+  slow). A dictionary may now hold up to a quarter of the values' bytes (still 1 MiB at least, and still a quarter or
+  fewer distinct values), and the other strings are PLAIN unless DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY saves the
+  bytes after the codec (half, or a tenth), judged on the chunk's first page. On the ClickBench `hits_0` shard at its
+  two row groups, reading every string column takes 0.78× (DuckDB 2.0.0) and 0.56× (Polars 2.1.0) the original file's
+  speed with 0.5.1's re-encode and 1.08× and 1.11× now (PyArrow 26: 1.09×); the Title column is 1.7× to 2.9× faster, and
+  the file is 98.7 MB where 0.5.1 wrote 116.3 MB and the original is 122.4 MB. Written bytes change; the values don't.
 - **The Lambda fan-out coordinator (`tools/serverless/fanout.py`) is faster.** 0.5.1's coordinator asked the worker for its
   capabilities and prepared the plan from every input's footer, one after the other, before any worker started, which
   added 0.3–0.7 s per query. It now caches the capability answer for a published worker version, prepares the plan

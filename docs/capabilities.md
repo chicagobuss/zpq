@@ -114,8 +114,10 @@ pages and encodings, regardless of the requested footer version. JSON requests u
 
 **Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output (`--codec lz4` means LZ4_RAW; zpq never compresses
 to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte
-arrays; DELTA_BINARY_PACKED for INT32 / INT64; for other strings DELTA_BYTE_ARRAY where values share long prefixes and
-DELTA_LENGTH_BYTE_ARRAY otherwise (PLAIN for FIXED_LEN_BYTE_ARRAY, which DELTA_LENGTH_BYTE_ARRAY does not allow).
+arrays (a quarter or fewer distinct, and a dictionary within a quarter of the values' bytes, at least 1 MiB); DELTA_BINARY_PACKED
+for INT32 / INT64; other strings PLAIN, unless a sample of the chunk's first page, compressed with the chosen codec, shows
+DELTA_BYTE_ARRAY at half PLAIN's size or less, or DELTA_LENGTH_BYTE_ARRAY a tenth smaller (FIXED_LEN_BYTE_ARRAY has no
+DELTA_LENGTH_BYTE_ARRAY).
 DECIMAL columns re-encode losslessly: INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled integer, never
 a DOUBLE. Direct projection copies preserve page indexes; re-encoded chunks get their own.
 

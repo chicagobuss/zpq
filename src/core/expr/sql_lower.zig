@@ -195,9 +195,8 @@ pub const Lower = struct {
     /// What a cast to a number or a DATE is called to the binder, and a DECIMAL's precision and scale.
     const CastTarget = struct { name: []const u8, precision: u8 = 0, scale: u8 = 0 };
 
-    /// `CAST(x AS type)` for the types zpq casts to: the integers, DOUBLE and DECIMAL(p, s), by every spelling
-    /// DuckDB has for them. Anything else (FLOAT, UBIGINT, DATE, TIMESTAMP, ...) is no cast zpq makes, and refuses: a computed DATE
-    /// would print as its day number, not as the date DuckDB prints.
+    /// `CAST(x AS type)` for the types zpq casts to: the integers, DOUBLE, DECIMAL(p, s), DATE and TIMESTAMP, by every
+    /// spelling DuckDB has for them. Anything else (FLOAT, UBIGINT, TIMESTAMPTZ, ...) is no cast zpq makes, and refuses.
     fn numericTarget(type_name: ?[*:0]const u8) ?CastTarget {
         const t = std.mem.span(type_name orelse return null);
         const open = std.mem.indexOfScalar(u8, t, '(') orelse t.len;
@@ -221,6 +220,9 @@ pub const Lower = struct {
             .{ .spelling = "DOUBLE", .name = "cast$double" },
             .{ .spelling = "DOUBLE PRECISION", .name = "cast$double" },
             .{ .spelling = "FLOAT8", .name = "cast$double" },
+            .{ .spelling = "DATE", .name = "cast$date" },
+            .{ .spelling = "TIMESTAMP", .name = "cast$timestamp" },
+            .{ .spelling = "DATETIME", .name = "cast$timestamp" },
         };
         for (names) |n| if (std.mem.eql(u8, upper, n.spelling)) return .{ .name = n.name };
         if (!std.mem.eql(u8, upper, "DECIMAL") and !std.mem.eql(u8, upper, "NUMERIC")) return null;

@@ -265,6 +265,8 @@ pub const ColRef = struct {
     nullable: bool = true,
     /// A DATE or TIMESTAMP column: the unit its integers count.
     temporal: ?Temporal = null,
+    /// The TIMESTAMP is UTC-adjusted (TIMESTAMP WITH TIME ZONE): the same integers, another SQL type.
+    utc: bool = false,
 };
 
 pub const BinOp = struct {
@@ -316,7 +318,7 @@ pub const Func = enum {
     /// `upper(s)` / `lower(s)`: DuckDB's case mapping, one code point to one (`case_map.zig`).
     upper,
     lower,
-    /// `trim(s)`, `ltrim(s)`, `rtrim(s)`: spaces removed from both ends, the start, the end.
+    /// `trim(s)`, `ltrim(s)`, `rtrim(s)`: Unicode's space separators removed from both ends, the start, the end.
     trim,
     ltrim,
     rtrim,
@@ -334,6 +336,11 @@ pub const Func = enum {
     cast_i64,
     cast_double,
     cast_dec,
+    /// `CAST(t AS DATE)` of a TIMESTAMP (the day it falls in, before 1970 included) and `CAST(x AS TIMESTAMP)` of a DATE or
+    /// another TIMESTAMP unit (microseconds). Both read the unit the argument counts in; a UTC-adjusted argument is
+    /// refused, as its cast depends on a session time zone zpq does not have.
+    cast_date,
+    cast_timestamp,
     /// `floor(x)`, `ceil(x)` / `ceiling(x)`: a DECIMAL(p, s) gives DECIMAL(p, 0), an integer or a DOUBLE a DOUBLE.
     floor,
     ceil,
@@ -394,6 +401,8 @@ pub const Call = struct {
     dec: ?Dec = null,
     /// What the result stands for in time (`Expr.temporal`).
     temporal: ?Temporal = null,
+    /// A TIMESTAMP result is UTC-adjusted (`date_trunc` or `coalesce` of UTC-adjusted values).
+    utc: bool = false,
     /// `date_trunc`/`date_part`'s part, resolved from the literal first argument.
     part: ?DatePart = null,
     /// `regexp_replace`'s pattern and replacement, compiled from its literal arguments; shared read-only by workers.
@@ -441,6 +450,51 @@ pub const Expr = union(enum) {
             .call => |c| c.temporal,
             .literal, .binop, .case_ => null,
         };
+    }
+
+    /// Whether the TIMESTAMP this expression stands for is UTC-adjusted.
+    pub fn isUtc(self: Expr) bool {
+        return switch (self) {
+            .col_ref => |c| c.utc,
+            .call => |c| c.utc,
+            .literal, .binop, .case_ => false,
+        };
+    }
+
+    /// The Parquet leaf a computed date or timestamp is written as, exported as and printed by: a DATE as INT32, a
+    /// TIMESTAMP as INT64 in its unit (UTC-adjusted or not), where the i64 lane alone says nothing.
+    pub fn temporalElement(self: Expr) ?schema.SchemaElement {
+        const t = self.temporal() orelse return null;
+        var elem: schema.SchemaElement = .{
+            .type = if (t == .date) .INT32 else .INT64,
+            .type_length = null,
+            .repetition_type = .OPTIONAL,
+            .name = "",
+            .num_children = null,
+            .scale = null,
+            .precision = null,
+            .field_id = null,
+        };
+        switch (t) {
+            .date => {
+                elem.converted_type = .DATE;
+                elem.logical_type = .{ .DATE = .{} };
+            },
+            .ts_ms, .ts_us, .ts_ns => {
+                // The legacy converted types mean UTC-adjusted: a plain TIMESTAMP carries the logical type alone.
+                elem.converted_type = if (!self.isUtc()) null else switch (t) {
+                    .ts_ms => .TIMESTAMP_MILLIS,
+                    .ts_us => .TIMESTAMP_MICROS,
+                    else => null,
+                };
+                elem.logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = self.isUtc(), .unit = switch (t) {
+                    .ts_ms => .{ .MILLIS = .{} },
+                    .ts_us => .{ .MICROS = .{} },
+                    else => .{ .NANOS = .{} },
+                } } };
+            },
+        }
+        return elem;
     }
 
     /// The DECIMAL type this expression's values have in exact arithmetic: its own for a DECIMAL expression, the
@@ -559,7 +613,7 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
+                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
                 .coalesce, .least, .greatest => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;

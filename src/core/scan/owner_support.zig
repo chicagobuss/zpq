@@ -102,9 +102,16 @@ pub fn ownerIdentity(
 pub fn passThroughSource(call: expr_agg.AggCall, meta: *const schema.FileMetaData) ?schema.SchemaElement {
     if (call.func != .min and call.func != .max) return null;
     const arg = call.arg orelse return null;
-    if (arg != .col_ref) return if (arg.isBoolean()) boolean_answer else if (arg.temporal() == .date) date_answer else null;
+    if (arg != .col_ref) return computedAnswer(arg);
     if (call.as_date) return date_answer;
     return leafSchemaElem(meta, arg.col_ref.col_idx);
+}
+
+/// The type a computed answer column (a key, min or max of an expression) passes through as, where its i64 lane alone
+/// would print and write a number: a BOOLEAN, a DATE, or a TIMESTAMP in its unit and time zone. Null for anything else.
+pub fn computedAnswer(e: expr_ast.Expr) ?schema.SchemaElement {
+    if (e.isBoolean()) return boolean_answer;
+    return e.temporalElement();
 }
 
 /// The type `min`/`max` of `make_date(col)` answers as (`AggCall.as_date`), whatever integer type `col` has, and a

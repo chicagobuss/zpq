@@ -623,6 +623,15 @@ fn columnTemporal(elem: *const schema.SchemaElement) ?ast.Temporal {
     };
 }
 
+/// Whether a TIMESTAMP column is UTC-adjusted, which DuckDB types TIMESTAMP WITH TIME ZONE.
+fn columnUtc(elem: *const schema.SchemaElement) bool {
+    if (elem.type == .INT96) return false;
+    return switch (elem.effectiveLogicalType() orelse return false) {
+        .TIMESTAMP => |ts| ts.isAdjustedToUTC,
+        else => false,
+    };
+}
+
 /// Whether DuckDB types `e` INTEGER or narrower, as `make_date` takes it: such a column (not BIGINT or UINTEGER), a
 /// literal in range, and `+`, `-`, `*`, CASE and coalesce over those, whose results `make_date` range-checks.
 fn integerArgument(e: ast.Expr, file: *const schema.FileMetaData) bool {
@@ -754,6 +763,8 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "cast$bigint")) return .cast_i64;
     if (asciiEqIgnoreCase(name, "cast$double")) return .cast_double;
     if (asciiEqIgnoreCase(name, "cast$decimal")) return .cast_dec;
+    if (asciiEqIgnoreCase(name, "cast$date")) return .cast_date;
+    if (asciiEqIgnoreCase(name, "cast$timestamp")) return .cast_timestamp;
     return null;
 }
 
@@ -896,6 +907,12 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             const a = args[0];
             if (a.typeOf() == .str or a.temporal() != null or a.isBoolean()) return error.TypeMismatch;
             return if (func == .cast_double) .f64 else .i64;
+        },
+        // A DATE or TIMESTAMP to the other (or itself): the argument must stand for a time, in whatever unit.
+        .cast_date, .cast_timestamp => {
+            if (args.len != 1) return error.WrongArity;
+            if (args[0].temporal() == null) return error.TypeMismatch;
+            return .i64;
         },
         .cast_dec => {
             if (args.len != 3) return error.WrongArity;
@@ -1186,6 +1203,7 @@ pub fn bindColumn(arena: std.mem.Allocator, file: *const schema.FileMetaData, na
             .unsigned_32 = phys == .INT32 and schema.isUnsignedIntTo32(elem),
             .dec = dec,
             .temporal = columnTemporal(&elem),
+            .utc = columnUtc(&elem),
             .nullable = blk: {
                 const path = (try metadata.leafPathSegments(arena, file, col_idx)) orelse break :blk true;
                 break :blk file.getColumnLevels(path).max_def > 0;
@@ -1369,16 +1387,23 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
             .depth = depth,
             .dec = dec,
             .temporal = switch (func) {
-                .make_date => .date,
-                .epoch_ms, .date_trunc => .ts_us,
-                // Values of one unit keep it; mixed ones are no time zpq could name.
+                .make_date, .cast_date => .date,
+                .epoch_ms, .date_trunc, .cast_timestamp => .ts_us,
+                // Values of one unit (and one time zone) keep it; mixed ones are no time zpq could name.
                 .coalesce => for (args[1..]) |a| {
-                    if (a.temporal() != args[0].temporal()) break null;
+                    if (a.temporal() != args[0].temporal() or a.isUtc() != args[0].isUtc()) break null;
                 } else args[0].temporal(),
                 .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,
                 .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => null,
                 .floor, .ceil, .sqrt, .round, .least, .greatest => null,
+            },
+            // A truncated or coalesced TIMESTAMP is as UTC-adjusted as its argument, DuckDB's TIMESTAMP WITH TIME ZONE;
+            // every cast and `epoch_ms` give a plain TIMESTAMP.
+            .utc = switch (func) {
+                .date_trunc => args[1].isUtc(),
+                .coalesce => args[0].isUtc(),
+                else => false,
             },
             .int = switch (func) {
                 .abs => if (args[0].typeOf() == .i64) abs_int else null,

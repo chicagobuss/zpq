@@ -284,19 +284,15 @@ pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
         renamed.num_children = 0;
         return renamed;
     };
-    // `make_date`'s days are a DATE, as a DATE column's are: INT32, so they are written and exported as one (their
-    // i64 lane narrowed on the way into the buffer, `output.computedLane`).
-    if (c.expr == .call and c.expr.temporal() == .date) return .{
-        .type = .INT32,
-        .type_length = null,
-        .repetition_type = repetition,
-        .name = c.alias,
-        .num_children = 0,
-        .converted_type = .DATE,
-        .logical_type = .{ .DATE = .{} },
-        .scale = null,
-        .precision = null,
-        .field_id = null,
+    // A computed date or time is the DATE or TIMESTAMP a column of it would be (`make_date`, the casts, `date_trunc`,
+    // `epoch_ms`, `coalesce` of timestamps), so it is written, exported and printed as one. A DATE is INT32 (its i64
+    // lane narrowed on the way into the buffer, `output.computedLane`); a TIMESTAMP keeps its unit.
+    if (c.expr == .call) if (c.expr.temporalElement()) |temporal| {
+        var elem = temporal;
+        elem.repetition_type = repetition;
+        elem.name = c.alias;
+        elem.num_children = 0;
+        return elem;
     };
     // An aliased UINT64 reference carries the column's raw bits through the i64 lane; keep the annotation so they
     // are printed and written as the unsigned values they are.

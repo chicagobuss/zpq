@@ -6,10 +6,16 @@
   expression, and `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `isodow` and
   `dayofyear` of a date or timestamp, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB (a DECIMAL keeps
   DECIMAL(p, 0) after `floor`, an integer floors to a DOUBLE, `least` skips NULLs, `sqrt` of a negative is NaN).
+- **Date and timestamp casts, and typed computed times.** `CAST(t AS DATE)` and `CAST(x AS TIMESTAMP)` (also `::` and
+  `DATETIME`) convert between a DATE and a TIMESTAMP in any unit, in a SELECT, an aggregate argument or a GROUP BY key,
+  and match DuckDB (a day is the floor, before 1970 too; TIMESTAMP_NS reaches microseconds to the nearest; a DATE past the
+  TIMESTAMP range is a conversion error). A computed `date_trunc`, `epoch_ms`, cast or `coalesce` of timestamps used to
+  leave as a plain INT64 in Parquet; it is now the TIMESTAMP it is (its unit, UTC-adjusted or not) in a row, a group key
+  and a `min` or `max`, as a computed DATE already was.
 - **Numeric casts in SQL.** `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))` and `x::TYPE`
   over a number, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB, including its rounding (a DECIMAL
   half away from zero, a DOUBLE to an integer half to even) and its conversion error for a value that does not fit.
-  `CAST(... AS DATE | TIMESTAMP | FLOAT)` and a text cast to a number are still refused by name.
+  `CAST(... AS FLOAT | TIMESTAMPTZ)` and a text cast to a number are still refused by name.
 - **String functions in SQL.** `length`, `substring` / `substr`, `left`, `right`, `upper` / `lower`, `trim` / `ltrim` /
   `rtrim`, `replace` and `lpad` / `rpad` run over a text column or expression, in a SELECT, an aggregate or a GROUP BY
   key, and match DuckDB (characters are code points; a negative `substring` length reads backwards; `upper` and `lower`

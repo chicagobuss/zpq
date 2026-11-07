@@ -44,7 +44,11 @@ the minimum of an integer column's SQL type, `abs(-2147483648)` of an INTEGER, i
 `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))` and `x::TYPE` of a number (a DECIMAL
 rounds half away from zero to an integer or to fewer places, a DOUBLE half to even to an integer and as `round(x * 10^s)`
 to a DECIMAL; a value that does not fit stops the query with a conversion error, as DuckDB does, but only in rows that
-are read and not NULL; the result is written as INT64 for every integer type), `floor`, `ceil`/`ceiling`, `sqrt` and
+are read and not NULL; the result is written as INT64 for every integer type), `CAST(t AS DATE)` and
+`CAST(x AS TIMESTAMP)` (also `::` and `DATETIME`) between a DATE and a TIMESTAMP of any unit (a time's day is its floor,
+before 1970 too; a TIMESTAMP_NS reaches microseconds to the nearest, a tie away from zero; a DATE past the TIMESTAMP
+range is a conversion error; a UTC-adjusted value is read in UTC, as the date parts read it, so DuckDB's answer differs
+under another session time zone), `floor`, `ceil`/`ceiling`, `sqrt` and
 `round(x [, n])` of a number (a DECIMAL floors and ceils to DECIMAL(p, 0) and rounds half away from zero, in the
 precision DuckDB gives it; an integer or a DOUBLE floors and ceils to a DOUBLE; `sqrt` is a DOUBLE and NaN below zero;
 `n` is a constant, and an integer is not rounded to tens or up), `least` and `greatest` over numbers (NULLs skipped,
@@ -60,7 +64,11 @@ only on the rows every earlier one left NULL, so a fault where no row needs the 
 The string functions count and cut text in characters (UTF-8 code points, as DuckDB does: a combining mark is a
 character); `upper` and `lower` map one code point to one with DuckDB's own table, so `ß` upper-cases to `ẞ` and
 there is no final-sigma form. Their other arguments are constants (a column there is refused; an empty `lpad`/`rpad`
-pad is an error only where padding is needed, as in DuckDB). Each distinct text is computed once, a dictionary-coded
+pad is an error only where padding is needed, as in DuckDB). `trim`, `ltrim` and `rtrim` strip Unicode's space
+separators (U+0020, U+00A0, U+1680, U+2000 to U+200A, U+202F, U+205F, U+3000), not tabs or line breaks, as DuckDB's do.
+A computed date or time (`make_date`, the casts, `date_trunc`, `epoch_ms`, `coalesce` of timestamps) is the DATE or
+TIMESTAMP a column of it would be, in its unit and time zone, wherever it leaves: a Parquet type, CSV text, a group key,
+a `min` or `max`; JSON and JSONL print the stored integer, as for a column. Each distinct text is computed once, a dictionary-coded
 column once per entry. A DOUBLE column and a DECIMAL default (`coalesce(d, 0.0)`) coalesce to DOUBLE, as in DuckDB.
 
 **Aggregate** with `sum / count / min / max / avg / avg_state`, conditional `agg(...) FILTER (WHERE ...)`, and

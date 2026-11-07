@@ -20,6 +20,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const test_skip = @import("../test_skip.zig");
 const core_memory = @import("../core/memory.zig");
+const clock = @import("../clock.zig");
 const linux = std.os.linux;
 const posix = std.posix;
 
@@ -1391,10 +1392,10 @@ fn preadAll(f: *File, lo: u64, hi: u64) !void {
     }
 }
 
+// Not `linux.clock_gettime`: its vDSO path does not compile for a target that is not Linux, and this file is reached
+// there (the engine plans a reader, then chooses `mmap`).
 fn nowNs() u64 {
-    var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    return @intCast(clock.monoNs());
 }
 
 const testing = std.testing;

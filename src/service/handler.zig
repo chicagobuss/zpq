@@ -231,6 +231,7 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
             return std.json.Stringify.valueAlloc(allocator, .{
                 .structured_plan_versions = .{request.plan_version},
                 .prepare_aggregate_version = request.plan_version,
+                .partial_aggregate_version = request.partial_version,
             }, .{});
 
         const decoded_plan: ?engine.fanout_plan.Query = if (req.plan) |value|
@@ -393,6 +394,26 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
                 .worker_io = pool.worker_io,
             }, qa, result_cap.bytes, request.plan_version) catch |err| return engineError(allocator, err, &diag);
         }
+        if (req.operation == .partial_aggregate) {
+            // The worker prepares the query itself, as `prepare_aggregate` would, and answers its partial with what
+            // the coordinator merges by and checks across workers (`fanout_plan.partialMembers`, the schema
+            // fingerprint), so the coordinator reads no footer and makes no call before the scatter.
+            var arena_state = std.heap.ArenaAllocator.init(allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const merged = engine.fanout_plan.mergeable(arena, req.aggregate.?, req.group_by, req.filter) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return engineError(allocator, err, &Diag{});
+            };
+            var pa = qa;
+            pa.plan_source = engine.syntax_plan.source(&merged.query);
+            pa.aggregate = null;
+            pa.group_by = null;
+            pa.filter = null;
+            const response = try runAggregate(io, allocator, env, pool, pa, result_cap, try engine.fanout_plan.partialMembers(arena, merged));
+            const prof = profiler orelse return response;
+            return attachProfile(io, allocator, env, pool, prof, req.profile_url, budget, response);
+        }
         if (req.sql) |sql| {
             const response = try runSql(io, allocator, env, pool, qa, sql, result_cap);
             const p = profiler orelse return response;
@@ -401,7 +422,7 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
 
         // or group-by wins, then write, then the legacy single-file diagnostics.
         if (qa.kind() != .rows) {
-            const response = try runAggregate(io, allocator, env, pool, qa, result_cap);
+            const response = try runAggregate(io, allocator, env, pool, qa, result_cap, null);
             const p = profiler orelse return response;
             return attachProfile(io, allocator, env, pool, p, req.profile_url, budget, response);
         }
@@ -904,6 +925,8 @@ fn runAggregate(
     pool: *PersistentPool,
     qa: engine.QueryArgs,
     result_cap: ResultCap,
+    /// `partial_aggregate`'s members (`fanout_plan.partialMembers`), added to the answer with its schema fingerprint.
+    partial: ?[]const u8,
 ) ![]u8 {
     // 1-row S3 output not yet supported (Stage 5b); engine.runQuery
     // gives aggregate precedence over output, so qa.output is ignored.
@@ -926,17 +949,18 @@ fn runAggregate(
         writer: *std.Io.Writer,
         started: i64,
         pool: *PersistentPool,
+        partial: ?[]const u8,
         failure: ?anyerror = null,
         fn write(ctx: *anyopaque, ar: engine.AggResult) !void {
             const e: *@This() = @ptrCast(@alignCast(ctx));
             const total_ms = @divTrunc(nowMonoNs() - e.started, std.time.ns_per_ms);
-            aggregateResponse(e.writer, ar, total_ms, e.pool) catch |err| {
+            aggregateResponse(e.writer, ar, total_ms, e.pool, e.partial) catch |err| {
                 e.failure = err;
                 return err;
             };
         }
     };
-    var envelope: Envelope = .{ .writer = &aw.writer, .started = t_start, .pool = pool };
+    var envelope: Envelope = .{ .writer = &aw.writer, .started = t_start, .pool = pool, .partial = partial };
     args.aggregate_sink = .{ .ctx = &envelope, .write_fn = Envelope.write };
     if (pool.per_call_stats) pool.resetStats();
     var result = engine.runQuery(.{
@@ -957,6 +981,7 @@ fn runAggregate(
         result.aggregate,
         @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms),
         pool,
+        partial,
     ) catch |err| {
         if (capped.hit) return resultTooLarge(allocator, result_cap);
         return err;
@@ -988,7 +1013,7 @@ fn writeDecimalList(w: *std.Io.Writer, names: []const []const u8) !void {
 }
 
 /// `runAggregate`'s response for `ar`, onto `w`.
-fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, pool: *PersistentPool) !void {
+fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, pool: *PersistentPool, partial: ?[]const u8) !void {
     if (ar.output.group_cols != null) {
         try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"rows_scanned\":{d},\"rows_matched\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":", .{
             ar.files_in,      ar.rows_in,           ar.rows_scanned,          ar.rows_matched,
@@ -1027,6 +1052,14 @@ fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, poo
     try engine.writeMembershipJson(w, ar.membership);
     try w.writeByte(',');
     try writePoolStats(w, pool.stats());
+    if (partial) |members| {
+        try w.print(",\"partial_version\":{d},", .{request.partial_version});
+        try w.writeAll(members);
+        try w.writeAll(",\"schema_fingerprint\":");
+        if (ar.schema_fingerprint) |fp| {
+            try w.print("\"{s}\"", .{std.fmt.bytesToHex(fp, .lower)});
+        } else try w.writeAll("null");
+    }
     try w.writeByte('}');
 }
 
@@ -1214,7 +1247,7 @@ test "a released grouped Parquet answer has no phantom object in the service env
     };
     var writer: std.Io.Writer.Allocating = .init(a);
     defer writer.deinit();
-    try aggregateResponse(&writer.writer, ar, 0, &pool);
+    try aggregateResponse(&writer.writer, ar, 0, &pool, null);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, writer.written(), .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("agg").?.array.items.len);

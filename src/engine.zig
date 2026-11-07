@@ -61,6 +61,7 @@ pub const AggregateExplanation = types.AggregateExplanation;
 pub const Conjunct = types.Conjunct;
 pub const ResultExplanation = types.ResultExplanation;
 pub const RowGroupTarget = types.RowGroupTarget;
+pub const RowGroupRange = types.RowGroupRange;
 pub const default_row_group_rows = types.default_row_group_rows;
 pub const default_row_group_bytes = types.default_row_group_bytes;
 pub const writeAggregateText = text.writeAggregateText;

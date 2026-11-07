@@ -66,9 +66,29 @@ pub const Error = error{
     BloomFilterUnsupportedColumn,
     /// `--bloom-filter` on a query that writes no rows (an aggregate).
     BloomFilterNeedsRows,
-    /// A `row_groups` range past its input's row groups, or not one range (or null) per input.
+    /// A `row_groups` range past its input's row groups (or a fraction past 1), or not one range (or null) per input.
     RowGroupOutOfRange,
 } || std.mem.Allocator.Error;
+
+/// The row groups of one input a query reads (`QueryArgs.row_groups`).
+pub const RowGroupRange = struct {
+    start: u32,
+    end: u32,
+    /// Null: row groups `start` up to but not including `end`. Set: `start` and `end` are numerators over `of`, read
+    /// against the footer's row group count n as row groups floor(start·n/of) up to floor(end·n/of). Workers handed
+    /// adjacent fractions of one input compute their shared boundary from the same n, so they split it with no gap
+    /// or overlap without the coordinator knowing n.
+    of: ?u32 = null,
+
+    /// The row groups this range keeps of a footer holding `n`; null when it does not fit the footer.
+    pub fn resolve(self: RowGroupRange, n: usize) ?[2]usize {
+        if (self.start > self.end) return null;
+        const of = self.of orelse return if (self.end <= n) .{ self.start, self.end } else null;
+        if (of == 0 or self.end > of) return null;
+        const wide: u64 = n;
+        return .{ @intCast(@as(u64, self.start) * wide / of), @intCast(@as(u64, self.end) * wide / of) };
+    }
+};
 
 /// Typed synchronous handoff. Columns borrow the query; a sink must own anything it retains.
 pub const ColumnarSink = struct {
@@ -170,9 +190,9 @@ pub const QueryArgs = struct {
     /// has; one without is decoded to build one.
     bloom_filters: []const BloomSpec = &.{},
     bloom_filters_enabled: bool = true,
-    /// Per input, parallel to `inputs`: read only row groups `start` up to but not including `end` of its footer; null
-    /// (or a null slice) reads every row group. A coordinator splits one file across workers with it.
-    row_groups: ?[]const ?[2]u32 = null,
+    /// Per input, parallel to `inputs`: read only that input's `RowGroupRange` of its footer; null (or a null slice)
+    /// reads every row group. A coordinator splits one file across workers with it.
+    row_groups: ?[]const ?RowGroupRange = null,
 
     pub fn kind(self: QueryArgs) bound_plan.Kind {
         if (self.plan_source) |source| return source.kind;
@@ -329,6 +349,9 @@ pub const AggResult = struct {
     text_kinds: []const TextKind = &.{},
     /// What each answer column needs to print as CSV (`writeAggregateText`), owned in `Context.gpa`.
     answer_types: []const AnswerType = &.{},
+    /// `metadata.valuesFingerprint` of the first input's schema, when the scan parsed its footers here (always for a
+    /// syntax plan). The scan refuses inputs whose schemas differ under `.values`, so it stands for every input.
+    schema_fingerprint: ?[16]u8 = null,
 
     pub fn deinit(self: *AggResult, gpa: std.mem.Allocator) void {
         self.output.deinit(gpa);

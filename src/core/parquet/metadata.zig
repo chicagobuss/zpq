@@ -412,6 +412,44 @@ pub fn schemaMismatch(
     return null;
 }
 
+/// A digest of `elements` as `schemaMismatch(.., .values)` compares them, so that two inputs' fingerprints are equal
+/// when that check passes between them and differ when it fails (up to a SHA-256 collision, the first 16 bytes kept).
+/// It covers the element count and, per element, its child count and, below the root, its name in lower case and
+/// whether it is a DECIMAL and at what scale. Fan-out workers answer it beside their partials, so a coordinator can
+/// refuse inputs that one worker reading them all would have refused.
+pub fn valuesFingerprint(elements: []const schema.SchemaElement) [16]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    const put = struct {
+        fn word(hash: *std.crypto.hash.sha2.Sha256, v: u64) void {
+            var buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &buf, v, .little);
+            hash.update(&buf);
+        }
+    }.word;
+    put(&h, elements.len);
+    for (elements, 0..) |*e, i| {
+        put(&h, @as(u64, @intCast(@max(e.num_children orelse 0, 0))));
+        if (i == 0) continue;
+        put(&h, e.name.len);
+        var buf: [64]u8 = undefined;
+        var rest = e.name;
+        while (rest.len > 0) {
+            const n = @min(rest.len, buf.len);
+            h.update(std.ascii.lowerString(buf[0..n], rest[0..n]));
+            rest = rest[n..];
+        }
+        if (decimal.kindFromSchema(e)) |k| {
+            put(&h, 1);
+            var scale: [8]u8 = undefined;
+            std.mem.writeInt(i64, &scale, k.scale, .little);
+            h.update(&scale);
+        } else put(&h, 0);
+    }
+    var out: [32]u8 = undefined;
+    h.final(&out);
+    return out[0..16].*;
+}
+
 /// The schema element of the `leaf_idx`-th primitive leaf, as
 /// `resolveColumn` counts them. Null when the schema has fewer leaves.
 pub fn leafSchemaElement(file: *const schema.FileMetaData, leaf_idx: usize) ?schema.SchemaElement {
@@ -1474,6 +1512,54 @@ test "regression: schemas whose roots alone are named apart match" {
     other.name = "b";
     const c = [_]schema.SchemaElement{ spark_root, other };
     try std.testing.expectEqual(@as(?usize, 1), schemaMismatch(&a, &c, .values));
+}
+
+test "valuesFingerprint is equal exactly where schemaMismatch(.values) passes" {
+    const root: schema.SchemaElement = .{ .type = null, .type_length = null, .repetition_type = .REQUIRED, .name = "schema", .num_children = 2, .scale = null, .precision = null, .field_id = null };
+    const a: schema.SchemaElement = .{ .type = .INT64, .type_length = null, .repetition_type = .OPTIONAL, .name = "price", .num_children = null, .scale = null, .precision = null, .field_id = null };
+    var d = a;
+    d.name = "amount";
+    d.logical_type = .{ .DECIMAL = .{ .scale = 2, .precision = 15 } };
+    var spark_root = root;
+    spark_root.name = "spark_schema";
+    var upper = a;
+    upper.name = "PRICE";
+    var double = a;
+    double.type = .DOUBLE;
+    var wider = d;
+    wider.logical_type = .{ .DECIMAL = .{ .scale = 2, .precision = 18 } };
+    var scale3 = d;
+    scale3.logical_type = .{ .DECIMAL = .{ .scale = 3, .precision = 15 } };
+    var legacy = d;
+    legacy.logical_type = null;
+    legacy.converted_type = .DECIMAL;
+    legacy.scale = 2;
+    legacy.precision = 15;
+    var plain = d;
+    plain.logical_type = null;
+    var renamed = a;
+    renamed.name = "cost";
+    var group = root;
+    group.name = "price";
+    group.num_children = 1;
+    var root3 = root;
+    root3.num_children = 3;
+    var root1 = root;
+    root1.num_children = 1;
+    const variants = [_][]const schema.SchemaElement{
+        &.{ root, a, d },       &.{ spark_root, a, d }, &.{ root, upper, d },  &.{ root, double, d },
+        &.{ root, a, wider },   &.{ root, a, scale3 },  &.{ root, a, legacy }, &.{ root, a, plain },
+        &.{ root, renamed, d }, &.{ root3, a, d, a },   &.{ root, group, a },  &.{ root1, a },
+    };
+    var differ: usize = 0;
+    for (variants) |x| for (variants) |y| {
+        const same = schemaMismatch(x, y, .values) == null;
+        try std.testing.expectEqual(same, std.mem.eql(u8, &valuesFingerprint(x), &valuesFingerprint(y)));
+        if (!same) differ += 1;
+    };
+    // The cases mix both outcomes: root name, letter case, physical type and precision match; scale, decimal-ness,
+    // names, counts and nesting do not.
+    try std.testing.expect(differ > 0 and differ < variants.len * variants.len);
 }
 
 test "one output schema cannot describe two different opaque logical types" {

@@ -324,7 +324,7 @@ test "syntax: native fanout preparation and structured workers share exact aggre
     var result = try aggregate.runQuery(ctx, .{
         .inputs = &.{fixture},
         .parallelism = 1,
-        .row_groups = &.{[2]u32{ 0, 8 }},
+        .row_groups = &.{types.RowGroupRange{ .start = 0, .end = 8 }},
         .plan_source = @import("syntax_plan.zig").source(&query),
     });
     defer result.deinit(a);
@@ -410,7 +410,6 @@ test "syntax: unsupported SQL modifiers and casts retain refusal instead of drop
         .plan_source = @import("syntax_plan.zig").source(parsed.syntax.?),
     }));
 }
-
 
 /// `writeAggregateRows`' file of the keys `entries[codes]` and `f`, each row group's key chunk then replaced by one
 /// uncompressed PLAIN dictionary page of every entry and one data page bit-packing its codes. The writer keeps its own
@@ -569,7 +568,6 @@ test "regression: SQL syntax hands a filtered integer COUNT top-H the plan its t
     try std.testing.expectEqualStrings(want.strategyName(), got.strategyName());
     try std.testing.expectEqualDeep(want.record_path, got.record_path);
 }
-
 
 test "regression: a structured fanout plan of a filtered integer COUNT plans as its text fragments do" {
     const a = std.testing.allocator;

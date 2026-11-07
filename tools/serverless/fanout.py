@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """Fan one zpq aggregate out over N zpq-lambda workers and merge their answers.
 
-The coordinator negotiates structured-plan v1 support (on every query, or once per coordinator process for a
-published worker version), then asks the native frontend to prepare the original aggregate request and read input
-row-group counts. When the caller supplies the counts, the plan comes from the first input's footer and the full
-preparation, which validates every footer, runs alongside the scatter. It cuts those row groups into N contiguous runs and forwards
-the prepared syntax and `row_groups` (docs/lambda_requests.md). COUNT and SUM add, MIN and MAX fold, and explicit
-AVG partial states are divided after the merge. With `group_by` the merge is per group. ORDER BY and
-LIMIT apply to the merged rows, never to a worker's. Anything whose parts cannot be merged (COUNT(DISTINCT),
-percentiles and other holistic aggregates, window functions, expressions over aggregates) is refused during native preparation, before any partial-query execution.
+The coordinator makes no call before the scatter. It cuts every input's row groups into N contiguous runs, as
+fractions of each input that the workers resolve against their own footers, and sends each worker a
+`partial_aggregate` request (PLAN-V1.md, docs/lambda_requests.md). Each worker prepares the query itself, reads its
+inputs' footers, and answers its partial with the merge functions, a digest of its plan and a fingerprint of its
+inputs' schema. The coordinator merges only when every worker answered the same of all three, and otherwise refuses
+naming the inputs that differ. Supplied row-group counts only balance the runs: a wrong count moves work between
+workers, never rows out of the answer. COUNT and SUM add, MIN and MAX fold, and explicit AVG partial states are
+divided after the merge. With `group_by` the merge is per group. ORDER BY and LIMIT apply to the merged rows, never
+to a worker's. Anything whose parts cannot be merged (COUNT(DISTINCT), percentiles and other holistic aggregates,
+window functions, expressions over aggregates) each worker refuses while parsing, before it opens an input.
+
+An input that is a `*` pattern is expanded by a worker, so such a query takes the structured plan v1 path instead:
+negotiate (on every query, or once per coordinator process for a published worker version), prepare every input,
+then scatter the prepared plan.
 
     fanout.py --function zpq-worker --workers 32 --input s3://b/lineitem/ --aggregate "sum(x) AS s" ...
 
@@ -20,11 +26,13 @@ import base64
 import concurrent.futures as cf
 import decimal
 import json
+import math
 import re
 import sys
 import time
 
 PLAN_VERSION = 1
+PARTIAL_VERSION = 1
 MERGEABLE = ("count", "sum", "min", "max", "avg")
 REPORT_RE = re.compile(r"Duration: ([\d.]+) ms\s+Billed Duration: (\d+) ms\s+Memory Size: (\d+) MB\s+"
                        r"Max Memory Used: (\d+) MB(?:\s+Init Duration: ([\d.]+) ms)?")
@@ -60,6 +68,15 @@ def split_top(text):
 
 
 # ---- Splitting row groups over workers ----
+
+def partial_runs(counts, workers):
+    """The runs `split` makes of `counts`, as (input index, start, end, of) fractions of each input: `of` is the
+    count the run was cut from, so a worker reads row groups floor(start·n/of) up to floor(end·n/of) of the n its
+    footer holds, and the runs of one input cover it with no gap or overlap whatever n is. A count of 0 is one unit
+    read whole, so every input reaches a worker that opens and checks its footer."""
+    units = [max(1, c) for c in counts]
+    return [[(i, s, e, units[i]) for i, s, e in run] for run in split(units, workers)]
+
 
 def split(counts, workers):
     """Cut the row groups of all inputs, in order, into at most `workers` contiguous runs of near-equal length.
@@ -160,15 +177,44 @@ def pinned_version(function, region=None):
     return account, region, name, qualifier
 
 
+# One Lambda client per (region, pool) for the life of the process, so a warm coordinator keeps its connections.
+_CLIENTS = {}
+_EXECUTOR = None
+_EXECUTOR_N = 0
+
+
+def cached_client(region, pool):
+    key = (region, pool)
+    found = _CLIENTS.get(key)
+    if found is not None:
+        return found
+    import boto3
+    from botocore.config import Config
+    found = boto3.client("lambda", region_name=region, config=Config(
+        read_timeout=900, connect_timeout=10, retries={"total_max_attempts": 1}, max_pool_connections=pool))
+    _CLIENTS[key] = found
+    return found
+
+
+def executor(n):
+    """A thread pool reused across queries, grown when a query needs more workers than the last."""
+    global _EXECUTOR, _EXECUTOR_N
+    if _EXECUTOR is None or n > _EXECUTOR_N:
+        old = _EXECUTOR
+        _EXECUTOR_N = max(n, _EXECUTOR_N, 256)
+        _EXECUTOR = cf.ThreadPoolExecutor(_EXECUTOR_N)
+        if old is not None:
+            old.shutdown(wait=False)
+    return _EXECUTOR
+
+
 def lambda_invoker(function, region=None, pool=256, client=None):
     """invoke(payload) -> (response, stats) through boto3 `lambda.invoke`, every call to exactly `function`
     (qualifier included). When that is a published version, `invoke.capability_key` is its identity for the
-    capability cache; otherwise it is None and every query negotiates. `client` reuses a Lambda client."""
+    capability cache; otherwise it is None and every query negotiates. `client` reuses a Lambda client; with none
+    given, the process-wide client for `(region, pool)` is used."""
     if client is None:
-        import boto3
-        from botocore.config import Config
-        client = boto3.client("lambda", region_name=region, config=Config(
-            read_timeout=900, connect_timeout=10, retries={"total_max_attempts": 1}, max_pool_connections=pool))
+        client = cached_client(region, pool)
 
     def invoke(payload):
         r = client.invoke(FunctionName=function, Payload=json.dumps(payload).encode(), LogType="Tail")
@@ -191,12 +237,82 @@ def loads(raw):
 
 def scatter(invoke, payloads):
     t0 = time.perf_counter()
-    with cf.ThreadPoolExecutor(max(1, len(payloads))) as ex:
-        out = list(ex.map(invoke, payloads))
+    out = list(executor(max(1, len(payloads))).map(invoke, payloads))
     for resp, _ in out:
         if not isinstance(resp, dict) or "agg" not in resp:
             raise WorkerFailed(dumps(resp)[:600])
     return out, (time.perf_counter() - t0) * 1000
+
+
+def _inputs_of(payload):
+    partial = payload.get("partial") if isinstance(payload, dict) else None
+    if isinstance(partial, dict) and isinstance(partial.get("inputs"), list):
+        return partial["inputs"]
+    if isinstance(payload, dict) and isinstance(payload.get("inputs"), list):
+        return payload["inputs"]
+    return []
+
+
+def worker_too_old(resp):
+    """A worker from before `partial_aggregate`: 0.5.1 names the unknown operation, 0.5.0 finds no top-level inputs."""
+    if not isinstance(resp, dict) or resp.get("error") != "bad_json":
+        return False
+    if resp.get("reason") == "MissingField":
+        return True
+    return resp.get("reason") == "BadFieldType" and resp.get("field") == "operation"
+
+
+def check_partial(resp, payload):
+    """`resp` is one worker's partial, or `Refused` naming why it is not. Engine and request errors are refusals;
+    anything else (a crash, a non-object) is `WorkerFailed`."""
+    named = ", ".join(_inputs_of(payload))
+    ok = (isinstance(resp, dict) and resp.get("partial_version") == PARTIAL_VERSION and "agg" in resp
+          and isinstance(resp.get("schema_fingerprint"), str) and isinstance(resp.get("plan_digest"), str)
+          and isinstance(resp.get("aggregates"), list) and isinstance(resp.get("groups"), list))
+    if ok:
+        return
+    if worker_too_old(resp):
+        raise Refused("worker lacks partial_aggregate v1; update the worker before using this coordinator"
+                      + (f": {named}" if named else ""))
+    if isinstance(resp, dict) and resp.get("error") in ("engine", "bad_json", "bad_request"):
+        reason = str(resp.get("reason") or resp.get("error"))
+        raise Refused(f"{reason}: {named}" if named else reason)
+    raise WorkerFailed((named + ": " if named else "") + dumps(resp)[:600])
+
+
+def agree(answers, payloads):
+    """Every answer is a partial, and they planned the same query over compatible schemas. A mismatch names the inputs."""
+    for resp, payload in zip(answers, payloads):
+        check_partial(resp, payload)
+    first = answers[0]
+    for other, payload in zip(answers[1:], payloads[1:]):
+        names = _inputs_of(payloads[0]) + _inputs_of(payload)
+        named = ", ".join(names)
+        for key, what in (("schema_fingerprint", "SchemaMismatch: input schemas differ"),
+                          ("plan_digest", "PlanMismatch: workers planned the query differently")):
+            if other.get(key) != first.get(key):
+                raise Refused(f"{what}: {named}")
+        if other.get("aggregates") != first.get("aggregates") or other.get("groups") != first.get("groups"):
+            raise Refused(f"workers disagree on aggregates or groups: {named}")
+
+
+def partial_payloads(request, runs):
+    inputs = list(request.get("inputs") or [])
+    top = {k: v for k, v in request.items() if k not in
+           ("aggregate", "group_by", "filter", "sql", "operation", "plan_version", "plan", "inputs", "row_groups")}
+    payloads = []
+    for run in runs:
+        partial = {
+            "inputs": [inputs[i] for i, _, _, _ in run],
+            "row_groups": [[s, e, of] for _, s, e, of in run],
+            "aggregate": request["aggregate"],
+        }
+        if request.get("group_by"):
+            partial["group_by"] = request["group_by"]
+        if request.get("filter"):
+            partial["filter"] = request["filter"]
+        payloads.append(dict(top, operation="partial_aggregate", plan_version=PLAN_VERSION, partial=partial))
+    return payloads
 
 
 # Capability acknowledgements by `invoke.capability_key`, for this process. lambda_invoker sets a key only for a
@@ -231,11 +347,53 @@ def prepare(invoke, request, inputs=None):
 
 
 def run(invoke, request, workers, order_by=None, limit=None, counts=None):
-    """Answer `request` (a worker request with `inputs` and `aggregate`, optionally `group_by` and `filter`) over
-    `workers` workers. Optional `counts` (one per input) are trusted for scheduling. With them and no `*` pattern
-    among the inputs, the plan comes from a preparation of the first input alone, and the full preparation of every
-    input (every footer, its schema checks included) runs concurrently with the scatter: the query answers only if
-    both succeed, and a refusal from the full preparation refuses it and discards the partial answers."""
+    """Answer `request` over `workers` workers. Explicit inputs take `partial_aggregate` (no call before the scatter);
+    an input that is a `*` pattern takes the prepared plan v1 path (`run_prepared`)."""
+    inputs = list(request.get("inputs") or [])
+    if any("*" in u for u in inputs):
+        return run_prepared(invoke, request, workers, order_by, limit, counts)
+    t0 = time.perf_counter()
+    if request.get("sql") or request.get("row_groups"):
+        raise Refused("the coordinator takes `aggregate`/`group_by` requests, not `sql` or `row_groups`")
+    if not isinstance(request.get("aggregate"), str) or not request["aggregate"].strip():
+        raise Refused("nothing to merge: the request has no `aggregate`")
+    if not inputs:
+        raise Refused("nothing to merge: the request has no inputs")
+    if counts is None:
+        hinted = [math.ceil(workers / len(inputs))] * len(inputs)
+    else:
+        if len(counts) != len(inputs):
+            raise ValueError(f"{len(counts)} row-group counts for {len(inputs)} inputs")
+        hinted = list(counts)
+    runs = partial_runs(hinted, max(1, workers))
+    payloads = partial_payloads(request, runs)
+    footer_ms = (time.perf_counter() - t0) * 1000
+    out, scatter_ms = scatter_partial(invoke, payloads)
+    answers = [resp for resp, _ in out]
+    agree(answers, payloads)
+    aggs = [(a["function"], None, a["name"]) for a in answers[0]["aggregates"]]
+    if any(fn not in MERGEABLE for fn, _, _ in aggs):
+        raise Refused("worker returned an unsupported merge operation")
+    group = [(None, name) for name in answers[0]["groups"]]
+    merged = merge([a["agg"] for a in answers], aggs, group)
+    rows = order(merged, order_by, limit) if group else merged
+    stats = [dict(s, total_ms=resp.get("total_ms"), rows_in=resp.get("rows_in"), bytes_in=resp.get("bytes_in"))
+             for resp, s in out]
+    return {"agg": rows, "workers": len(payloads), "footer_ms": footer_ms, "scatter_ms": scatter_ms,
+            "check_ms": None, "e2e_ms": (time.perf_counter() - t0) * 1000, "worker_stats": stats,
+            "protocol": "partial"}
+
+
+def scatter_partial(invoke, payloads):
+    t0 = time.perf_counter()
+    out = list(executor(max(1, len(payloads))).map(invoke, payloads))
+    for (resp, _), payload in zip(out, payloads):
+        check_partial(resp, payload)
+    return out, (time.perf_counter() - t0) * 1000
+
+
+def run_prepared(invoke, request, workers, order_by=None, limit=None, counts=None):
+    """The structured-plan v1 path, for inputs that are `*` patterns: negotiate, prepare every input, then scatter."""
     t0 = time.perf_counter()
     if request.get("sql") or request.get("row_groups"):
         raise Refused("the coordinator takes `aggregate`/`group_by` requests, not `sql` or `row_groups`")
@@ -281,7 +439,8 @@ def run(invoke, request, workers, order_by=None, limit=None, counts=None):
     stats = [dict(s, total_ms=resp.get("total_ms"), rows_in=resp.get("rows_in"), bytes_in=resp.get("bytes_in"))
              for resp, s in out]
     return {"agg": rows, "workers": len(payloads), "footer_ms": footer_ms, "scatter_ms": scatter_ms,
-            "check_ms": check_ms, "e2e_ms": (time.perf_counter() - t0) * 1000, "worker_stats": stats}
+            "check_ms": check_ms, "e2e_ms": (time.perf_counter() - t0) * 1000, "worker_stats": stats,
+            "protocol": "plan"}
 
 
 # ---- Output ----

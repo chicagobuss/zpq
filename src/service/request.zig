@@ -4,9 +4,13 @@
 //! such as `mode`. They are skipped by the scanner, never built, so a large one costs no memory.
 
 const std = @import("std");
+const RowGroupRange = @import("zpq").engine.RowGroupRange;
 
 pub const plan_version = 1;
-pub const Operation = enum { query, capabilities, prepare_aggregate };
+/// `partial_aggregate`: the worker prepares the aggregate itself and answers its partial with what the coordinator
+/// merges by and checks (`handler.zig`); its inputs and query ride in the `partial` object.
+pub const partial_version = 1;
+pub const Operation = enum { query, capabilities, prepare_aggregate, partial_aggregate };
 
 pub const Error = error{
     /// A known field holds the wrong JSON type; `Request.parse` names it.
@@ -53,7 +57,12 @@ const Wire = struct {
     row_group_size: ?std.json.Value = null,
     row_group_bytes: ?std.json.Value = null,
     row_groups: ?std.json.Value = null,
+    partial: ?std.json.Value = null,
 };
+
+/// The fields `partial_aggregate` takes inside its `partial` object, and only there. A worker that predates the
+/// operation finds no `inputs`, `s3_url` or `sql` at the top level and refuses the request before opening anything.
+const partial_fields = .{ "inputs", "s3_url", "row_groups", "aggregate", "group_by", "filter" };
 
 pub const Request = struct {
     operation: Operation = .query,
@@ -101,10 +110,10 @@ pub const Request = struct {
     /// `--row-group-size` and `--row-group-bytes`; null for the defaults.
     row_group_size: ?usize = null,
     row_group_bytes: ?MaxMemory = null,
-    /// `row_groups`: one entry per input, `[start, end]` (row groups `start` up to but not including `end`) or null for
-    /// every row group. Lets a coordinator split one file across workers; the engine checks each range against the
-    /// input's footer.
-    row_groups: ?[]const ?[2]u32 = null,
+    /// `row_groups`: one entry per input, `[start, end]` (row groups `start` up to but not including `end`), a fraction
+    /// `[start, end, of]` resolved against the footer, or null for every row group. Lets a coordinator split one file
+    /// across workers; the engine checks each range against the input's footer.
+    row_groups: ?[]const ?RowGroupRange = null,
 
     pub const MaxMemory = union(enum) { bytes: usize, text: []const u8 };
 
@@ -123,7 +132,8 @@ pub const Request = struct {
         const version = if (parsed.value.plan_version) |v| (if (v == .null) null else v) else null;
         if (version) |v| {
             if (v != .integer or v.integer != plan_version) return error.UnsupportedPlanVersion;
-        } else if (req.operation == .prepare_aggregate or has_plan) return error.UnsupportedPlanVersion;
+        } else if (req.operation == .prepare_aggregate or req.operation == .partial_aggregate or has_plan)
+            return error.UnsupportedPlanVersion;
         if (parsed.value.plan) |v| if (v != .null) {
             inline for (.{ "sql", "filter", "select", "aggregate", "group_by", "columns", "column_order" }) |name| {
                 if (@field(parsed.value, name)) |field| if (field != .null) return error.ConflictingPlanFields;
@@ -131,6 +141,35 @@ pub const Request = struct {
             if (req.operation != .query) return error.ConflictingPlanFields;
             req.plan = v;
         };
+        // `partial_aggregate` reads its inputs and query from `partial` (`partial_fields`), which no other request has.
+        var inner: Wire = .{};
+        const src: *const Wire = if (req.operation == .partial_aggregate) blk: {
+            inline for (partial_fields ++ .{ "sql", "plan", "select", "columns", "column_order", "output_url" }) |name| {
+                if (@field(parsed.value, name)) |v| if (v != .null) return error.ConflictingPlanFields;
+            }
+            const value = parsed.value.partial orelse return error.MissingField;
+            if (value != .object) return f.bad("partial");
+            inner = std.json.parseFromValueLeaky(Wire, arena, value, .{ .ignore_unknown_fields = true }) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return f.bad("partial");
+            };
+            inline for (.{
+                "operation",      "plan_version",    "plan",              "sql",
+                "parallelism",    "columns",         "output_url",        "fsync",
+                "output_codec",   "parquet_version", "compress_priority", "select",
+                "column_order",   "scan_all",        "trust_stats",       "cache",
+                "ordered",        "max_memory",      "budget_wait_ms",    "max_result_bytes",
+                "profile",        "profile_url",     "bloom_filters",     "bloom_filters_enabled",
+                "row_group_size", "row_group_bytes", "partial",
+            }) |name| {
+                if (@field(inner, name)) |v| if (v != .null) return error.ConflictingPlanFields;
+            }
+            break :blk &inner;
+        } else blk: {
+            if (parsed.value.partial) |v| if (v != .null) return error.ConflictingPlanFields;
+            break :blk &parsed.value;
+        };
+        const q: Fields = .{ .wire = src, .bad_field = bad_field };
         req.sql = try f.string("sql");
         if (req.sql != null) {
             inline for (.{
@@ -163,9 +202,9 @@ pub const Request = struct {
             .integer => |n| if (n >= 0) @intCast(n) else return f.bad("parallelism"),
             else => return f.bad("parallelism"),
         };
-        if (try f.strings(arena, "inputs", false)) |inputs| {
+        if (try q.strings(arena, "inputs", false)) |inputs| {
             req.inputs = inputs;
-        } else if (try f.string("s3_url")) |url| {
+        } else if (try q.string("s3_url")) |url| {
             const one = try arena.alloc([]const u8, 1);
             one[0] = url;
             req.inputs = one;
@@ -173,7 +212,7 @@ pub const Request = struct {
         if (try f.strings(arena, "columns", true)) |cols| {
             if (cols.len > 0) req.columns = cols;
         }
-        req.filter = try f.string("filter");
+        req.filter = try q.string("filter");
         req.output_url = try f.string("output_url");
         req.fsync = if (parsed.value.fsync) |v| switch (v) {
             .bool => |b| b,
@@ -184,8 +223,8 @@ pub const Request = struct {
         req.parquet_version = try f.string("parquet_version");
         req.compress_priority = try f.string("compress_priority");
         req.select = try f.string("select");
-        req.aggregate = try f.string("aggregate");
-        req.group_by = try f.string("group_by");
+        req.aggregate = try q.string("aggregate");
+        req.group_by = try q.string("group_by");
         req.column_order = try f.string("column_order");
         req.scan_all = try f.boolean("scan_all");
         req.trust_stats = try f.boolean("trust_stats");
@@ -199,7 +238,7 @@ pub const Request = struct {
         req.profile = try f.boolean("profile") or req.profile_url != null;
         // Paths go to system calls as C strings, where a NUL byte would end them early (and std asserts it never
         // does); JSON can carry one, the command line cannot. S3 URLs are checked further by `s3.Url.parse`.
-        const inputs_field = if (parsed.value.inputs != null) "inputs" else "s3_url";
+        const inputs_field = if (src.inputs != null) "inputs" else "s3_url";
         for (req.inputs) |path| if (std.mem.indexOfScalar(u8, path, 0) != null) return f.bad(inputs_field);
         if (req.output_url) |path| if (std.mem.indexOfScalar(u8, path, 0) != null) return f.bad("output_url");
         if (req.profile_url) |path| if (std.mem.indexOfScalar(u8, path, 0) != null) return f.bad("profile_url");
@@ -227,21 +266,31 @@ pub const Request = struct {
             .string => |s| .{ .text = s },
             else => return f.bad("row_group_bytes"),
         };
-        if (parsed.value.row_groups) |v| switch (v) {
+        if (src.row_groups) |v| switch (v) {
             .null => {},
             .array => |list| {
                 if (list.items.len != req.inputs.len) return f.bad("row_groups");
-                const out = try arena.alloc(?[2]u32, list.items.len);
+                const out = try arena.alloc(?RowGroupRange, list.items.len);
                 for (list.items, out) |item, *o| o.* = switch (item) {
                     .null => null,
                     .array => |pair| range: {
-                        if (pair.items.len != 2) return f.bad("row_groups");
-                        var r: [2]u32 = undefined;
-                        for (pair.items, &r) |x, *y| y.* = switch (x) {
+                        if (pair.items.len != 2 and pair.items.len != 3) return f.bad("row_groups");
+                        var r = RowGroupRange{ .start = 0, .end = 0 };
+                        const bounds = pair.items[0..2];
+                        r.start = switch (bounds[0]) {
                             .integer => |n| std.math.cast(u32, n) orelse return f.bad("row_groups"),
                             else => return f.bad("row_groups"),
                         };
-                        if (r[0] > r[1]) return f.bad("row_groups");
+                        r.end = switch (bounds[1]) {
+                            .integer => |n| std.math.cast(u32, n) orelse return f.bad("row_groups"),
+                            else => return f.bad("row_groups"),
+                        };
+                        if (pair.items.len == 3) r.of = switch (pair.items[2]) {
+                            .integer => |n| std.math.cast(u32, n) orelse return f.bad("row_groups"),
+                            else => return f.bad("row_groups"),
+                        };
+                        if (r.resolve(0) == null and r.of != null) return f.bad("row_groups");
+                        if (r.of == null and r.start > r.end) return f.bad("row_groups");
                         break :range r;
                     },
                     else => return f.bad("row_groups"),
@@ -266,6 +315,8 @@ pub const Request = struct {
         }
         if (req.operation == .prepare_aggregate and (req.sql != null or req.select != null or req.columns != null or
             req.column_order != null or req.output_url != null or req.row_groups != null)) return error.ConflictingPlanFields;
+        if (req.operation == .partial_aggregate and (req.aggregate == null or req.aggregate.?.len == 0))
+            return error.MissingField;
         return req;
     }
 
@@ -440,16 +491,24 @@ test "malformed requests are errors, wrong-typed fields named" {
     }
 }
 
-test "request row_groups: one [start, end] range or null per input" {
+test "request row_groups: one [start, end] range, [start, end, of] fraction or null per input" {
     var bad: []const u8 = "";
-    const body = "{\"inputs\":[\"a\",\"b\",\"c\"],\"row_groups\":[[0,3],null,[4,4]]}";
+    const body = "{\"inputs\":[\"a\",\"b\",\"c\",\"d\"],\"row_groups\":[[0,3],null,[4,4],[1,3,4]]}";
     var r = try Request.parse(testing.allocator, body, &bad);
     defer r.deinit();
     const rg = r.row_groups.?;
-    try testing.expectEqual(@as(usize, 3), rg.len);
-    try testing.expectEqual([2]u32{ 0, 3 }, rg[0].?);
+    try testing.expectEqual(@as(usize, 4), rg.len);
+    try testing.expectEqual(RowGroupRange{ .start = 0, .end = 3 }, rg[0].?);
     try testing.expect(rg[1] == null);
-    try testing.expectEqual([2]u32{ 4, 4 }, rg[2].?);
+    try testing.expectEqual(RowGroupRange{ .start = 4, .end = 4 }, rg[2].?);
+    try testing.expectEqual(RowGroupRange{ .start = 1, .end = 3, .of = 4 }, rg[3].?);
+    for ([_][]const u8{ "[[0,1,0]]", "[[0,5,4]]", "[[3,1,4]]", "[[0,1,2,3]]", "[[0,1,-4]]" }) |ranges| {
+        const text = try std.fmt.allocPrint(testing.allocator, "{{\"inputs\":[\"a\"],\"row_groups\":{s}}}", .{ranges});
+        defer testing.allocator.free(text);
+        bad = "";
+        try testing.expectError(error.BadFieldType, Request.parse(testing.allocator, text, &bad));
+        try testing.expectEqualStrings("row_groups", bad);
+    }
 
     var n = try Request.parse(testing.allocator, "{\"inputs\":[\"a\"],\"row_groups\":null}", &bad);
     defer n.deinit();
@@ -631,4 +690,51 @@ test "syntax: worker negotiation and plan version fail closed" {
     try std.testing.expectError(error.UnsupportedPlanVersion, Request.parse(a, "{\"inputs\":[\"x\"],\"plan\":{}}", &field));
     try std.testing.expectError(error.ConflictingPlanFields, Request.parse(a, "{\"inputs\":[\"x\"],\"plan_version\":1,\"plan\":{},\"aggregate\":\"count(*)\"}", &field));
     try std.testing.expectError(error.ConflictingPlanFields, Request.parse(a, "{\"operation\":\"capabilities\",\"inputs\":[\"x\"]}", &field));
+}
+
+test "partial_aggregate: inputs and query only inside `partial`, plan version required" {
+    const a = std.testing.allocator;
+    var field: []const u8 = "";
+    var r = try Request.parse(a,
+        \\{"operation":"partial_aggregate","plan_version":1,"trust_stats":true,
+        \\ "partial":{"inputs":["s3://b/x"],"row_groups":[[1,2,4]],"aggregate":"sum(x) AS s","group_by":"g","filter":"x > 1"}}
+    , &field);
+    defer r.deinit();
+    try std.testing.expectEqual(Operation.partial_aggregate, r.operation);
+    try std.testing.expectEqualStrings("s3://b/x", r.inputs[0]);
+    try std.testing.expectEqual(RowGroupRange{ .start = 1, .end = 2, .of = 4 }, r.row_groups.?[0].?);
+    try std.testing.expectEqualStrings("sum(x) AS s", r.aggregate.?);
+    try std.testing.expectEqualStrings("g", r.group_by.?);
+    try std.testing.expectEqualStrings("x > 1", r.filter.?);
+    try std.testing.expect(r.trust_stats);
+
+    const refused = [_]struct { body: []const u8, err: anyerror }{
+        .{ .body = "{\"operation\":\"partial_aggregate\",\"plan_version\":1,\"inputs\":[\"x\"],\"partial\":{\"inputs\":[\"x\"],\"aggregate\":\"count(*)\"}}", .err = error.ConflictingPlanFields },
+        .{ .body = "{\"operation\":\"partial_aggregate\",\"plan_version\":1,\"aggregate\":\"count(*)\",\"partial\":{\"inputs\":[\"x\"]}}", .err = error.ConflictingPlanFields },
+        .{ .body = "{\"operation\":\"partial_aggregate\",\"plan_version\":1,\"partial\":{\"inputs\":[\"x\"],\"aggregate\":\"count(*)\",\"sql\":\"x\"}}", .err = error.ConflictingPlanFields },
+        .{ .body = "{\"operation\":\"partial_aggregate\",\"plan_version\":1,\"partial\":{\"inputs\":[\"x\"],\"aggregate\":\"count(*)\",\"output_url\":\"y\"}}", .err = error.ConflictingPlanFields },
+        .{ .body = "{\"operation\":\"partial_aggregate\",\"plan_version\":1,\"partial\":{\"inputs\":[\"x\"]}}", .err = error.MissingField },
+        .{ .body = "{\"operation\":\"partial_aggregate\",\"plan_version\":1}", .err = error.MissingField },
+        .{ .body = "{\"operation\":\"partial_aggregate\",\"partial\":{\"inputs\":[\"x\"],\"aggregate\":\"count(*)\"}}", .err = error.UnsupportedPlanVersion },
+        .{ .body = "{\"operation\":\"partial_aggregate\",\"plan_version\":2,\"partial\":{\"inputs\":[\"x\"],\"aggregate\":\"count(*)\"}}", .err = error.UnsupportedPlanVersion },
+        .{ .body = "{\"operation\":\"query\",\"inputs\":[\"x\"],\"partial\":{}}", .err = error.ConflictingPlanFields },
+    };
+    for (refused) |c| {
+        try std.testing.expectError(c.err, Request.parse(a, c.body, &field));
+    }
+}
+
+test "RowGroupRange fractions of one footer share boundaries and cover it" {
+    const n: usize = 8;
+    var prev: usize = 0;
+    for (0..3) |k| {
+        const ku: u32 = @intCast(k);
+        const got = (RowGroupRange{ .start = ku, .end = ku + 1, .of = 3 }).resolve(n).?;
+        try std.testing.expectEqual(prev, got[0]);
+        prev = got[1];
+    }
+    try std.testing.expectEqual(n, prev);
+    // A zero-count input assigned whole ([0, 1, 1]) still opens: the range is empty, not refused.
+    try std.testing.expectEqual([2]usize{ 0, 0 }, (RowGroupRange{ .start = 0, .end = 1, .of = 1 }).resolve(0).?);
+    try std.testing.expectEqual([2]usize{ 0, 5 }, (RowGroupRange{ .start = 0, .end = 1, .of = 1 }).resolve(5).?);
 }

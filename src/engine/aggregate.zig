@@ -502,6 +502,7 @@ fn executeAggregateOver(
         .output = r.output,
         .text_kinds = text_kinds,
         .answer_types = answer_types,
+        .schema_fingerprint = if (metas) |ms| if (ms.len > 0) metadata.valuesFingerprint(ms[0].schema.items) else null else null,
     };
     if (args.output == null) if (args.aggregate_sink) |sink| {
         try sink.write_fn(sink.ctx, answer);

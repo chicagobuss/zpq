@@ -26,6 +26,16 @@
   two row groups, reading every string column takes 0.78× (DuckDB 2.0.0) and 0.56× (Polars 2.1.0) the original file's
   speed with 0.5.1's re-encode and 1.08× and 1.11× now (PyArrow 26: 1.09×); the Title column is 1.7× to 2.9× faster, and
   the file is 98.7 MB where 0.5.1 wrote 116.3 MB and the original is 122.4 MB. Written bytes change; the values don't.
+- **The Lambda fan-out coordinator makes no call before its workers start.** Each worker now prepares the aggregate
+  itself and answers its share with a fingerprint of its inputs' schema and a digest of its plan, through a new
+  worker operation, `partial_aggregate` (docs/lambda_requests.md). The coordinator merges only when every worker
+  agrees on both, and refuses the query naming the inputs that differ; it no longer asks for capabilities or reads
+  any footer first, which took about 90 ms warm and 250 ms cold per query on 0.5.1. Row-group ranges can be
+  fractions of an input that each worker resolves against its own footer (`[start, end, of]`), so row-group counts a
+  caller supplies only balance the work: a wrong count no longer fails the query or loses rows. The coordinator also
+  keeps its Lambda client, and so its connections, across queries in a warm coordinator Lambda, where it used to
+  build a new one per query, and reuses its thread pool. Inputs given as `*` patterns keep the previous protocol.
+  This changes the worker binary: a 0.5.1 or older worker refuses the new requests, and the coordinator says so.
 - **The Lambda fan-out coordinator (`tools/serverless/fanout.py`) is faster.** 0.5.1's coordinator asked the worker for its
   capabilities and prepared the plan from every input's footer, one after the other, before any worker started, which
   added 0.3–0.7 s per query. It now caches the capability answer for a published worker version, prepares the plan

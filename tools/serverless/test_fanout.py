@@ -192,7 +192,8 @@ class Fanout(unittest.TestCase):
             for workers in (1, 3, 8, 64):
                 with self.subTest(inputs=inputs, agg=agg, group=group, filter=flt, workers=workers):
                     got = fanout.run(self.rt.invoke, req, workers)
-                    self.assertEqual(got["workers"], min(workers, 8 * inputs.count(FULL) + 24 * inputs.count(GROUPS)))
+                    self.assertEqual(got["protocol"], "partial")
+                    self.assertEqual(got["workers"], workers)  # without counts, every worker gets a fraction
                     if group:
                         g, o, d = keyed(got["agg"], names), keyed(one["agg"], names), keyed(ref, names)
                         self.assertEqual(g.keys(), o.keys())
@@ -204,29 +205,42 @@ class Fanout(unittest.TestCase):
                         self.assertTrue(same(got["agg"], one["agg"]), (got["agg"], one["agg"]))
                         self.assertTrue(same(got["agg"], ref[0]), (got["agg"], ref[0]))
 
-    def test_supplied_counts_plan_from_one_footer_check_every_footer_and_answer_the_same(self):
-        prepared = []
+    def test_counts_right_wrong_or_absent_answer_the_same_with_no_call_before_the_scatter(self):
+        sent = []
 
         def invoke(payload):
-            if payload.get("operation") == "prepare_aggregate":
-                prepared.append(payload["inputs"])  # each input of a preparation is one footer opened
+            sent.append(payload)
             return self.rt.invoke(payload)
 
         for inputs, agg, group, flt in CASES:
             req = request(inputs, agg, group, flt)
+            right = [ROW_GROUPS[f] for f in inputs]
+            want = fanout.run(self.rt.invoke, req, 1)
             for workers in (1, 3, 8):
-                with self.subTest(inputs=inputs, agg=agg, group=group, filter=flt, workers=workers):
-                    prepared.clear()
-                    got = fanout.run(invoke, req, workers, counts=[ROW_GROUPS[f] for f in inputs])
-                    self.assertEqual(prepared, [inputs[:1], inputs])  # the plan first, then the full check
-                    want = fanout.run(self.rt.invoke, req, workers)
-                    self.assertEqual(got["workers"], want["workers"])
-                    if group:
-                        g, w = keyed(got["agg"], GROUP_NAMES[group]), keyed(want["agg"], GROUP_NAMES[group])
-                        self.assertEqual(g.keys(), w.keys())
-                        self.assertTrue(all(same(g[k], w[k]) for k in g), (g, w))
-                    else:
-                        self.assertTrue(same(got["agg"], want["agg"]), (got["agg"], want["agg"]))
+                for counts in (right, None, [c * 3 for c in right], [1] * len(inputs), [0] * len(inputs)):
+                    with self.subTest(inputs=inputs, agg=agg, group=group, filter=flt, workers=workers, counts=counts):
+                        sent.clear()
+                        got = fanout.run(invoke, req, workers, counts=counts)
+                        self.assertTrue(all(p["operation"] == "partial_aggregate" for p in sent), sent)
+                        self.assertEqual(len(sent), got["workers"])
+                        # Every input reaches a worker, so every footer is opened and its schema checked.
+                        self.assertEqual({u for p in sent for u in p["partial"]["inputs"]}, set(inputs))
+                        if group:
+                            g, w = keyed(got["agg"], GROUP_NAMES[group]), keyed(want["agg"], GROUP_NAMES[group])
+                            self.assertEqual(g.keys(), w.keys())
+                            self.assertTrue(all(same(g[k], w[k]) for k in g), (g, w))
+                        else:
+                            self.assertTrue(same(got["agg"], want["agg"]), (got["agg"], want["agg"]))
+
+    def test_fractions_of_one_input_cover_it_once_whatever_its_row_group_count(self):
+        # FULL holds 8 row groups of 200 rows; thirds of it are row groups [0, 2), [2, 5) and [5, 8).
+        seen = []
+        for k in range(3):
+            resp, _ = self.rt.invoke({"operation": "partial_aggregate", "plan_version": 1, "partial": {
+                "inputs": [FULL], "row_groups": [[k, k + 1, 3]], "aggregate": "count(*) AS c"}})
+            self.assertEqual(resp.get("partial_version"), 1, resp)
+            seen.append((resp["row_groups_in"], resp["agg"]["_a0"]))
+        self.assertEqual(seen, [(2, 400), (3, 600), (3, 600)])
 
     def test_a_glob_input_is_prepared_whole_even_with_counts(self):
         prepared = []
@@ -250,10 +264,11 @@ class Fanout(unittest.TestCase):
 
         invoke.capability_key = ("test", "cached-function")
         fanout.CAPABILITIES.pop(invoke.capability_key, None)
-        req = {"inputs": [FULL], "aggregate": "count(*) AS c, sum(n) AS sn, avg(x) AS ax"}
-        answers = [fanout.run(invoke, req, 4, counts=[8])["agg"] for _ in range(3)]
+        pattern = os.path.join(os.path.dirname(FULL), "full_matc*.parquet")
+        req = {"inputs": [pattern], "aggregate": "count(*) AS c, sum(n) AS sn, avg(x) AS ax"}
+        answers = [fanout.run(invoke, req, 4)["agg"] for _ in range(3)]
         self.assertEqual(operations.count("capabilities"), 1)
-        self.assertEqual(operations.count("prepare_aggregate"), 6)  # per query: the first footer, then every footer
+        self.assertEqual(operations.count("prepare_aggregate"), 3)  # one full prepare per query; the ack is cached
         self.assertTrue(all(same(a, answers[0]) for a in answers))
         self.assertTrue(same(answers[0], fanout.run(self.rt.invoke, req, 4)["agg"]))
 
@@ -263,14 +278,15 @@ class Fanout(unittest.TestCase):
             duckdb(f"COPY (SELECT 1.00::DECIMAL(15,2) AS x) TO '{dec}' (FORMAT parquet)")
             duckdb(f"COPY (SELECT 1::BIGINT AS x) TO '{big}' (FORMAT parquet)")
             req = {"inputs": [dec, big], "aggregate": "count(*) AS c", "group_by": "x"}
-            with self.assertRaisesRegex(fanout.Refused, "SchemaMismatch"):  # the released path: every footer first
-                fanout.run(self.rt.invoke, req, 2)
-            for counts in ([1, 1], [1, 0]):  # each worker binding one file alone; the mismatched input unscanned
-                with self.subTest(counts=counts), self.assertRaisesRegex(fanout.Refused, "SchemaMismatch"):
+            for counts in (None, [1, 1], [1, 0]):
+                with self.subTest(counts=counts), self.assertRaisesRegex(fanout.Refused, "SchemaMismatch") as caught:
                     fanout.run(self.rt.invoke, req, 2, counts=counts)
+                self.assertIn(dec, str(caught.exception))
+                self.assertIn(big, str(caught.exception))
 
     def test_only_a_published_version_caches_the_capability_answer(self):
-        req = {"inputs": [FULL], "aggregate": "count(*) AS c"}
+        pattern = os.path.join(os.path.dirname(FULL), "full_matc*.parquet")
+        req = {"inputs": [pattern], "aggregate": "count(*) AS c"}
         arn = "arn:aws:lambda:us-west-2:123456789012:function:zpq-w"
         for function, key in [("zpq-w", None), ("zpq-w:live", None), ("zpq-w:$LATEST", None), (arn + ":prod", None),
                               ("zpq-w:7", ("lambda", None, "us-west-2", "zpq-w", "7")),
@@ -281,7 +297,7 @@ class Fanout(unittest.TestCase):
                 self.assertEqual(invoke.capability_key, key)
                 fanout.CAPABILITIES.pop(key, None)
                 for _ in range(3):
-                    self.assertEqual(fanout.run(invoke, req, 2, counts=[8])["agg"]["c"], 1600)
+                    self.assertEqual(fanout.run(invoke, req, 2)["agg"]["c"], 1600)
                 self.assertEqual(sum(op == "capabilities" for _, op in client.calls), 3 if key is None else 1)
 
     def test_a_pinned_version_keeps_preparation_and_partials_on_it(self):
@@ -290,9 +306,11 @@ class Fanout(unittest.TestCase):
         fanout.CAPABILITIES.pop(invoke.capability_key, None)
         got = fanout.run(invoke, {"inputs": [FULL, FULL], "aggregate": "count(*) AS c"}, 4, counts=[8, 8])
         self.assertEqual(got["agg"]["c"], 3200)
+        self.assertEqual(got["protocol"], "partial")
         self.assertEqual({f for f, _ in client.calls}, {"zpq-w:7"})
         ops = [op for _, op in client.calls]
-        self.assertEqual((ops.count("capabilities"), ops.count("prepare_aggregate"), ops.count(None)), (1, 2, 4))
+        self.assertTrue(ops and all(op == "partial_aggregate" for op in ops))
+        self.assertEqual(len(ops), got["workers"])
 
     def test_an_empty_range_merges_as_no_rows(self):
         prepared = fanout.prepare(self.rt.invoke, {"inputs": [FULL], "aggregate": UNGROUPED_AGG})
@@ -328,10 +346,12 @@ class Fanout(unittest.TestCase):
         one, _ = self.rt.invoke(req)
         got = fanout.run(invoke, req, 3)
         self.assertTrue(same(keyed(got["agg"], ["group name"]), keyed(one["agg"], ["group name"])))
-        partials = [p for p in requests if p.get("operation") not in ("capabilities", "prepare_aggregate")]
+        partials = [p for p in requests if p.get("operation") == "partial_aggregate"]
         self.assertEqual(len(partials), got["workers"])
-        self.assertTrue(all(p["plan_version"] == 1 and "plan" in p for p in partials))
-        self.assertTrue(all(not any(k in p for k in ("aggregate", "group_by", "filter", "sql")) for p in partials))
+        self.assertTrue(all(p["plan_version"] == 1 and "plan" not in p for p in partials))
+        self.assertTrue(all(p["partial"]["aggregate"] == req["aggregate"] and p["partial"]["group_by"] == req["group_by"]
+                            for p in partials))
+        self.assertTrue(all(not any(k in p for k in ("aggregate", "group_by", "filter", "sql", "inputs")) for p in partials))
 
     def test_worker_rejects_version_conflicts_and_deep_plans_before_input_io(self):
         for payload, reason in [
@@ -353,9 +373,19 @@ class Fanout(unittest.TestCase):
         response, _ = self.rt.invoke({"inputs": ["missing.parquet"], "plan_version": 1, "plan": deep})
         self.assertEqual(response.get("reason"), "PlanTooDeep", response)
 
-    def test_a_range_past_the_footer_fails_the_query(self):
-        with self.assertRaisesRegex(fanout.WorkerFailed, "RowGroupOutOfRange"):
-            fanout.run(self.rt.invoke, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4, counts=[9])
+    def test_an_exact_range_past_the_footer_is_refused(self):
+        payload = {"operation": "partial_aggregate", "plan_version": 1, "partial": {
+            "inputs": [FULL], "row_groups": [[0, 9]], "aggregate": "count(*) AS c"}}
+        resp, _ = self.rt.invoke(payload)
+        with self.assertRaisesRegex(fanout.Refused, "RowGroupOutOfRange"):
+            fanout.check_partial(resp, payload)
+
+    def test_disagreeing_plans_are_refused(self):
+        base = {"partial_version": 1, "agg": {"_a0": 1}, "schema_fingerprint": "aa", "plan_digest": "d1",
+                "aggregates": [{"function": "count", "name": "c"}], "groups": []}
+        payloads = [{"partial": {"inputs": ["a.parquet"]}}, {"partial": {"inputs": ["b.parquet"]}}]
+        with self.assertRaisesRegex(fanout.Refused, "PlanMismatch"):
+            fanout.agree([base, dict(base, plan_digest="d2")], payloads)
 
 
 class Refusals(unittest.TestCase):
@@ -370,9 +400,10 @@ class Refusals(unittest.TestCase):
         try:
             for agg in ["count(DISTINCT s) AS d", "median(x) AS m", "quantile(x, 0.9) AS q",
                         "sum(x) OVER (PARTITION BY b) AS w", "sum(x) / count(*) AS r", "x AS y"]:
-                with self.subTest(agg=agg), self.assertRaises(fanout.Refused):
-                    fanout.run(invoke, {"inputs": [FULL], "aggregate": agg}, 4, counts=[8])
-            self.assertTrue(all(p.get("operation") in ("capabilities", "prepare_aggregate") for p in requests))
+                with self.subTest(agg=agg), self.assertRaises(fanout.Refused) as caught:
+                    fanout.run(invoke, {"inputs": ["missing.parquet"], "aggregate": agg}, 4)
+                self.assertNotIn('"input"', str(caught.exception))  # no answer about an input: none was opened
+            self.assertTrue(all(p.get("operation") == "partial_aggregate" for p in requests))
         finally:
             rt.close()
 
@@ -383,9 +414,11 @@ class Refusals(unittest.TestCase):
             requests.append(payload)
             return {"error": "bad_json", "reason": "MissingField"}, {}
 
-        with self.assertRaisesRegex(fanout.Refused, "structured aggregate plan v1"):
+        with self.assertRaisesRegex(fanout.Refused, "partial_aggregate"):
             fanout.run(old_worker, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4)
-        self.assertEqual(requests, [{"operation": "capabilities"}])
+        self.assertTrue(requests and all(p.get("operation") == "partial_aggregate" for p in requests))
+        self.assertNotIn("inputs", requests[0])
+        self.assertEqual(requests[0]["partial"]["inputs"], [FULL])
 
     def test_capability_versions_require_integers(self):
         for capability in [{"prepare_aggregate_version": True, "structured_plan_versions": [1]},
@@ -397,7 +430,8 @@ class Refusals(unittest.TestCase):
                 return capability, {}
 
             with self.assertRaises(fanout.Refused):
-                fanout.run(invoke, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4)
+                pattern = os.path.join(os.path.dirname(FULL), "full_matc*.parquet")
+                fanout.run(invoke, {"inputs": [pattern], "aggregate": "count(*) AS c"}, 4)
             self.assertEqual(requests, [{"operation": "capabilities"}])
 
     def test_split_is_contiguous_and_even(self):
@@ -405,6 +439,19 @@ class Refusals(unittest.TestCase):
         self.assertEqual(fanout.split([3, 0, 2], 2), [[(0, 0, 2)], [(0, 2, 3), (2, 0, 2)]])
         self.assertEqual(fanout.split([2], 5), [[(0, 0, 1)], [(0, 1, 2)]])
         self.assertEqual(fanout.split([0], 4), [])
+        runs = fanout.partial_runs([3, 0, 2], 2)
+        covered = {}
+        for run in runs:
+            for i, s, e, of in run:
+                covered.setdefault(i, []).append((s, e, of))
+        self.assertEqual(set(covered), {0, 1, 2})
+        for parts in covered.values():
+            parts = sorted(parts)
+            self.assertEqual(parts[0][0], 0)
+            self.assertEqual(parts[-1][1], parts[-1][2])
+            for left, right in zip(parts, parts[1:]):
+                self.assertEqual(left[1], right[0])
+                self.assertEqual(left[2], right[2])
 
 
 def main():

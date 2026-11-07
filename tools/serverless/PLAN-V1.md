@@ -41,3 +41,20 @@ only if both succeed. A refusal from the full preparation refuses the query and 
 partial answers are discarded. Counts remain trusted for scheduling; a range past a
 footer still fails that worker.
 Query output ordering and LIMIT apply after merging.
+
+## Partial aggregate (0.5.2)
+
+For inputs that are not `*` patterns the coordinator makes no call before the scatter. Each worker receives
+`operation: "partial_aggregate"`, `plan_version: 1`, and a `partial` object holding that worker's inputs, fractional
+`row_groups`, and the caller's aggregate, group_by and filter. The worker builds the same mergeable plan
+`prepare_aggregate` builds, reads its own footers, and answers with `partial_version: 1`, `schema_fingerprint`,
+`plan_digest`, `aggregates` and `groups` beside its partial `agg`. The coordinator merges only when every answer
+carries `partial_version: 1` and the same fingerprint, digest, aggregates and groups, and otherwise refuses naming
+the inputs.
+
+A worker that predates `partial_aggregate` receives the envelope but refuses it before it opens an input: 0.5.1
+rejects the unknown `operation` (`stringToEnum` fails) and 0.5.0 finds no top-level `inputs`, `s3_url` or `sql`
+(`MissingField`). The inputs ride only inside `partial`, which those parsers ignore. `*` patterns keep the v1 path
+above, because expanding a pattern still has to list the inputs before they can be split. Supplied row-group counts
+only balance the fractions; a count of 0 is still one whole input, so every footer is checked. An exact range past
+a footer still fails that worker.

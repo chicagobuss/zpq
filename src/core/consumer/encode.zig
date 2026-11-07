@@ -689,10 +689,34 @@ fn aggEncodeCharge(col: expr_agg.OutputCol) u64 {
     const sample: usize = switch (col.col) {
         .i32 => |c| encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i32), encoder.default_page_bytes),
         .i64 => |c| encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i64), encoder.default_page_bytes),
-        .i128 => |c| encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i64), encoder.default_page_bytes),
+        .i128 => |c| switch (aggLeafElem(col).type.?) {
+            .INT32 => encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i32), encoder.default_page_bytes),
+            .INT64 => encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i64), encoder.default_page_bytes),
+            else => 0,
+        },
         else => 0,
     };
     return (bytes *| 3) +| sample;
+}
+
+test "aggregate decimal encode charges follow the physical type" {
+    const a = std.testing.allocator;
+    const values = try a.alloc(i128, answer_rg_rows);
+    defer a.free(values);
+    @memset(values, 0);
+    var col: expr_agg.OutputCol = .{
+        .name = "d",
+        .col = .{ .i128 = .{ .values = values } },
+        .parquet_type = .INT64,
+        .nullable = false,
+        .dec = .{ .precision = 9, .scale = 0 },
+    };
+    const base: u64 = answer_rg_rows * @sizeOf(i128) * 3;
+    try std.testing.expectEqual(base + 512 * 1024, aggEncodeCharge(col));
+    col.dec.?.precision = 18;
+    try std.testing.expectEqual(base + 1024 * 1024, aggEncodeCharge(col));
+    col.dec.?.precision = 38;
+    try std.testing.expectEqual(base, aggEncodeCharge(col));
 }
 
 /// A run of an answer's columns encoded together, one thread a column, each into an arena of its own that holds the

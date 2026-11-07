@@ -542,7 +542,7 @@ fn integerSampleCharge(elems: []const schema.SchemaElement, rows: usize) u64 {
 }
 
 /// The encode estimate charges three times values and levels, plus a bounded integer sample where needed.
-fn encodeCharge(col: filter_eval.Batch.Column) u64 {
+fn encodeCharge(col: filter_eval.Batch.Column, physical: ?schema.Type) u64 {
     const bytes: u64 = switch (col) {
         inline else => |c| blk: {
             const T = @typeInfo(@TypeOf(c.values)).pointer.child;
@@ -558,10 +558,28 @@ fn encodeCharge(col: filter_eval.Batch.Column) u64 {
     const sample: usize = switch (col) {
         .i32 => |c| encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i32), encoder.default_page_bytes),
         .i64 => |c| encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i64), encoder.default_page_bytes),
-        .i128 => |c| encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i64), encoder.default_page_bytes),
+        .i128 => |c| if (physical) |p| switch (p) {
+            .INT32 => encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i32), encoder.default_page_bytes),
+            .INT64 => encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i64), encoder.default_page_bytes),
+            else => 0,
+        } else 0,
         else => 0,
     };
     return (bytes *| 3) +| sample;
+}
+
+test "window decimal encode charges follow the physical type" {
+    const a = std.testing.allocator;
+    const rows = consumer.answer_rg_rows;
+    const values = try a.alloc(i128, rows);
+    defer a.free(values);
+    @memset(values, 0);
+    const col: filter_eval.Batch.Column = .{ .i128 = .{ .values = values } };
+    const base: u64 = rows * @sizeOf(i128) * 3;
+    try std.testing.expectEqual(base + 512 * 1024, encodeCharge(col, .INT32));
+    try std.testing.expectEqual(base + 1024 * 1024, encodeCharge(col, .INT64));
+    try std.testing.expectEqual(base, encodeCharge(col, .FIXED_LEN_BYTE_ARRAY));
+    try std.testing.expectEqual(base, encodeCharge(col, null));
 }
 
 /// An output row group the assembler sealed: its column/page tasks share the executor, then it is placed by
@@ -877,7 +895,10 @@ const EncodeState = struct {
         state.charges = try ja.alloc(u64, n_cols);
         for (state.charges, 0..) |*charge, i| {
             charge.* = 0;
-            for (job.ranges) |r| charge.* +|= encodeCharge(consumer.bufRows(r.piece.agg.cols[i], r.lo, r.hi));
+            for (job.ranges) |r| {
+                const col = consumer.bufRows(r.piece.agg.cols[i], r.lo, r.hi);
+                charge.* +|= encodeCharge(col, w.out_elems[i].type);
+            }
         }
         state.inputs = try ja.alloc(encoder.ColumnInput, n_cols);
         for (state.inputs, 0..) |*in, i| in.* = .{

@@ -15,6 +15,7 @@ pub fn detachOwned(acc: *expr_agg.Accumulator) void {
         .min_bytes => acc.* = .{ .min_bytes = null },
         .max_bytes => acc.* = .{ .max_bytes = null },
         .distinct => acc.* = .{ .distinct = .{} },
+        .blob => |*b| b.bytes = &.{},
         else => {},
     }
 }
@@ -51,6 +52,7 @@ pub fn mergeOwnedAccumulator(
         .max_bytes => src.* = .{ .max_bytes = null },
         .min_arena => src.min_arena.ref = null,
         .max_arena => src.max_arena.ref = null,
+        .blob => |*b| b.bytes = &.{},
         else => {},
     }
 }
@@ -69,6 +71,7 @@ pub fn freeOwnedAccumulatorStrings(
             acc.max_bytes = null;
         },
         .distinct => |*d| d.deinit(allocator),
+        .blob => |*b| b.deinit(allocator),
         else => {},
     };
 }
@@ -110,3 +113,31 @@ test "mergeOwnedAccumulator: distinct sets merge whichever side is larger, own e
     }.run, .{});
 }
 
+
+test "mergeOwnedAccumulator: sketches fold or move whole, the source is left empty, and nothing leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var a: expr_agg.Accumulator = .{ .blob = .{ .kind = .hll } };
+            defer a.blob.deinit(gpa);
+            var b: expr_agg.Accumulator = .{ .blob = .{ .kind = .hll } };
+            defer b.blob.deinit(gpa);
+            var c: expr_agg.Accumulator = .{ .blob = .{ .kind = .hll } };
+            defer c.blob.deinit(gpa);
+            (try a.blob.sketch(gpa, null))[3] = 5;
+            const sb = try b.blob.sketch(gpa, null);
+            sb[3] = 7;
+            sb[4] = 2;
+            try mergeOwnedAccumulator(&a, &b, gpa);
+            try testing.expectEqual(@as(u8, 7), a.blob.bytes[3]);
+            try testing.expectEqual(@as(u8, 2), a.blob.bytes[4]);
+            try testing.expectEqual(@as(usize, 0), b.blob.bytes.len);
+            // Into an empty one the bytes move.
+            try mergeOwnedAccumulator(&c, &a, gpa);
+            try testing.expectEqual(@as(u8, 7), c.blob.bytes[3]);
+            try testing.expectEqual(@as(usize, 0), a.blob.bytes.len);
+            // An empty source changes nothing.
+            try mergeOwnedAccumulator(&c, &b, gpa);
+            try testing.expectEqual(@as(u8, 7), c.blob.bytes[3]);
+        }
+    }.run, .{});
+}

@@ -30,6 +30,11 @@
   expression, and `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `isodow` and
   `dayofyear` of a date or timestamp, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB (a DECIMAL keeps
   DECIMAL(p, 0) after `floor`, an integer floors to a DOUBLE, `least` skips NULLs, `sqrt` of a negative is NaN).
+- **`approx_count_distinct` in SQL.** `approx_count_distinct(col)` over a bare column, scalar or per group, with a FILTER,
+  in a SELECT, HAVING or ORDER BY, answers the number DuckDB does: the same HyperLogLog (1024 registers, DuckDB's hash
+  of each type) and estimator, merged by register maximum, so it does not depend on `-j` (identical to DuckDB on all of
+  ClickBench's hits for eight columns of seven types). An expression argument and TIME, UUID, INTERVAL and INT96 columns
+  are refused by name. A grouped sketch is 1 KB per group and counts against `--max-memory`.
 - **`var_samp`, `var_pop`, `stddev_samp` and their aliases `variance` and `stddev` in SQL.** Over an integer, float or
   DECIMAL column or expression, scalar or per group, with a FILTER, in a SELECT, HAVING or ORDER BY. They fold Welford's
   running mean as DuckDB 2.0 does (bit for bit within a row group) and combine row groups in file order, so the answer

@@ -18,6 +18,7 @@ const testing = std.testing;
 const expr_ast = @import("../ast.zig");
 const schema = @import("../../schema.zig");
 const decimal_mod = @import("../../parquet/decimal.zig");
+const hll = @import("hll.zig");
 const statistics = @import("../../parquet/statistics.zig");
 const AggCall = @import("types.zig").AggCall;
 const Error = @import("types.zig").Error;
@@ -291,7 +292,7 @@ pub fn canStatShortCircuit(call: AggCall, has_outer_filter: bool, trust_stats: b
         // num_rows × min to the sum. updateOneFromStats decides per-RG
         // and falls through to decode for non-constant RGs.
         .sum => true,
-        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop => false,
+        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct => false,
     };
 }
 
@@ -411,7 +412,7 @@ pub fn updateOneFromStats(
             return true;
         },
         // Never short-circuitable: the deviations need every value.
-        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop => return false,
+        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct => return false,
     }
 }
 
@@ -723,6 +724,7 @@ pub fn finalize(
         else
             try emitOneF64(arena, call.alias, avgMean(state.avg)),
         .var_samp, .var_pop, .stddev_samp, .stddev_pop => try emitOneF64(arena, call.alias, state.moments.result(call.func)),
+        .approx_count_distinct => try emitOneI64(arena, call.alias, hll.count(state.blob.bytes), false),
     };
 }
 
@@ -909,7 +911,22 @@ pub fn updateOneWithCharge(
     charge: ?*@import("accumulator.zig").WinnerCharge,
 ) Error!void {
     if (try agg_coded.updateOneCoded(arena, persist, state, call, batch, column_lookup, outer_sel, charge)) return;
-    var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel, true);
+    // The functions only the generic fold runs read values; a column the decoder left as codes and a dictionary is
+    // expanded first (its nulls stay where they were).
+    var flat_batch: filter_eval.Batch = batch.*;
+    var batch_in = batch;
+    if (call.func.extended()) if (call.arg) |arg| if (arg == .col_ref) {
+        const pos = column_lookup[arg.col_ref.col_idx] orelse return error.BadColumn;
+        if (switch (batch.cols[pos]) {
+            inline else => |c| c.codesOnly(),
+        }) {
+            const cols = try arena.dupe(filter_eval.Batch.Column, batch.cols);
+            cols[pos] = try agg_coded.materialize(arena, batch.cols[pos]);
+            flat_batch.cols = cols;
+            batch_in = &flat_batch;
+        }
+    };
+    var input: PreparedAggInput = try .init(arena, call, batch_in, column_lookup, outer_sel, true);
     defer input.deinit(arena);
     const sel = input.selection();
     const values = input.values;
@@ -929,6 +946,7 @@ pub fn updateOneWithCharge(
             foldMax(state, values.?, sel, u64_col),
         .avg => try foldAvg(state, values.?, sel, u64_col, if (input.gathered_from) |*g| g else null),
         .var_samp, .var_pop, .stddev_samp, .stddev_pop => try foldMoments(state, values.?, sel, u64_col, momentScale(call)),
+        .approx_count_distinct => try foldHll(persist, state, call, values.?, sel, charge),
     }
 }
 
@@ -968,7 +986,7 @@ pub fn updateSharedInteger(
             .count => {},
             .count_distinct => unreachable,
             // The shared kernel knows sum, min, max and avg.
-            .var_samp, .var_pop, .stddev_samp, .stddev_pop => return false,
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct => return false,
         }
     }
     if (value_calls < 2) return false;
@@ -1017,7 +1035,7 @@ pub fn updateSharedInteger(
                 state.avg.isum += stats.sum;
                 state.avg.count += stats.count;
             },
-            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop => unreachable,
+            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct => unreachable,
         }
     }
     return true;
@@ -1622,6 +1640,24 @@ pub inline fn momentAt(col: filter_eval.Batch.Column, r: usize, unsigned_64: boo
         .f64 => |c| c.values[r],
         else => null,
     };
+}
+
+/// The selected rows' hashes into the call's sketch, which is made on the first.
+fn foldHll(
+    persist: std.mem.Allocator,
+    state: *Accumulator,
+    call: AggCall,
+    col: filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    charge: ?*accumulator_mod.WinnerCharge,
+) Error!void {
+    if (!sel.any()) return;
+    const kind = hll.kindOfColRef(call.arg.?.col_ref) orelse return error.UnsupportedAggType;
+    const sketch = try state.blob.sketch(persist, charge);
+    var r: usize = 0;
+    while (r < sel.len) : (r += 1) {
+        if (sel.isActive(r)) hll.insert(sketch, hll.hashRow(kind, col, r));
+    }
 }
 
 /// The selected rows in order through the running mean and squared deviations: the order is the answer, so no block

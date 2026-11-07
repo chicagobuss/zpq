@@ -12,6 +12,7 @@ const Accumulator = @import("accumulator.zig").Accumulator;
 const GroupTable = @import("group_table.zig").GroupTable;
 const DistinctSet = @import("distinct.zig").DistinctSet;
 const scalar = @import("scalar.zig");
+const hll = @import("hll.zig");
 const PreparedAggInput = scalar.PreparedAggInput;
 const exactAt = scalar.exactAt;
 const foldExtremeF = scalar.foldExtremeF;
@@ -188,6 +189,10 @@ fn applyGrouped(
         else
             foldMaxGroupedOne(state, values.?, r, u64_col),
         .avg => try foldAvgGroupedOne(state, values.?, r, u64_col),
+        .approx_count_distinct => {
+            const kind = hll.kindOfColRef(call.arg.?.col_ref) orelse return error.UnsupportedAggType;
+            hll.insert(try state.blob.sketch(persist, ctx.winner_charge), hll.hashRow(kind, values.?, r));
+        },
         .var_samp, .var_pop, .stddev_samp, .stddev_pop => state.moments.add(
             scalar.momentAt(values.?, r, u64_col, scalar.momentScale(call)) orelse return error.UnsupportedAggType,
         ),

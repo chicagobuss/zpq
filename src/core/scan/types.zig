@@ -336,7 +336,7 @@ pub const GroupColType = struct {
     pub fn intType(call: expr_agg.AggCall, source: ?schema.SchemaElement) ?expr_ast.IntType {
         if (call.result != .i64) return null;
         return switch (call.func) {
-            .count, .count_distinct => .i64,
+            .count, .count_distinct, .approx_count_distinct => .i64,
             .sum => .i128,
             .min, .max => if (source) |elem| expr_ast.IntType.ofElement(elem) else null,
             else => null,

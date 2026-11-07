@@ -199,6 +199,9 @@ pub fn ownedWinnerBytes(accs: []const expr_agg.Accumulator) usize {
         .min_bytes, .max_bytes => |s| if (s) |v| {
             n += expr_agg.winnerBytes(v.len);
         },
+        .blob => |b| if (b.bytes.len != 0) {
+            n += expr_agg.winnerBytes(b.bytes.len);
+        },
         else => {},
     };
     return n;

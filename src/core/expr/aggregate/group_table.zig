@@ -186,6 +186,7 @@ pub const GroupTable = struct {
                 .min_bytes => |mb| if (mb) |s| self.allocator.free(s),
                 .max_bytes => |mb| if (mb) |s| self.allocator.free(s),
                 .distinct => |*d| d.deinit(self.allocator),
+                .blob => |*b| b.deinit(self.allocator),
                 else => {},
             }
         }
@@ -875,6 +876,7 @@ pub const GroupTable = struct {
         for (self.accumulators.items) |*acc| switch (acc.*) {
             .min_bytes, .max_bytes => |s| if (s) |b| self.allocator.free(b),
             .distinct => |*d| d.deinit(self.allocator),
+            .blob => |*b| b.deinit(self.allocator),
             else => {},
         };
         self.accumulators.clearRetainingCapacity();

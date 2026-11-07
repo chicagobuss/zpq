@@ -788,7 +788,9 @@ pub fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !
     if (target == .scalar) for (target.calls()) |call| {
         if (call.where) |w| markFilterSet(u.hist_ok, w, false);
         if (call.arg) |arg| {
-            if (call.where != null or arg != .col_ref or agg_coded.floatSum(call)) markExprSet(u.hist_ok, arg, false);
+            // The functions only the generic fold runs read values, never a histogram of codes.
+            if (call.where != null or arg != .col_ref or agg_coded.floatSum(call) or call.func.extended())
+                markExprSet(u.hist_ok, arg, false);
         }
     };
     if (in.filter) |f| markFilter(u, f);

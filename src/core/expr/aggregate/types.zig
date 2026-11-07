@@ -19,6 +19,8 @@ pub const AggFunc = enum {
     var_pop,
     stddev_samp,
     stddev_pop,
+    /// `approx_count_distinct(col)`: DuckDB's HyperLogLog (`hll.zig`), a BIGINT, 0 over no values.
+    approx_count_distinct,
 
     /// A function only the generic fold and merge (`foldGroupedOne`, `scalar.zig`) run: the specialized strategies
     /// (dense, coded, owner records, partitioned, sketch) know the original six and decline a query that has one of
@@ -26,7 +28,7 @@ pub const AggFunc = enum {
     pub fn extended(f: AggFunc) bool {
         return switch (f) {
             .count, .count_distinct, .sum, .min, .max, .avg => false,
-            .var_samp, .var_pop, .stddev_samp, .stddev_pop => true,
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct => true,
         };
     }
 };
@@ -370,6 +372,13 @@ pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShap
             const e = arg orelse return error.BadAggArg;
             if (e.temporal() != null or e.isBoolean() or e.typeOf() == .str) return error.UnsupportedAggType;
             break :blk .f64;
+        },
+        // A column only: DuckDB hashes a value at the width its type has there, which an expression's SQL type may not
+        // tell (the parser checks the column's own type against the file).
+        .approx_count_distinct => blk: {
+            const e = arg orelse return error.BadAggArg;
+            if (e != .col_ref) return error.UnsupportedAggType;
+            break :blk .i64;
         },
         .sum => blk: {
             const e = arg orelse return error.BadAggArg;

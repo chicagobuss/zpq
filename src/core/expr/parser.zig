@@ -24,6 +24,7 @@ const filter_ast = @import("../filter/ast.zig");
 const filter_parser = @import("../filter/parser.zig");
 const regex = @import("regex.zig");
 const calendar = @import("calendar.zig");
+const hll = @import("aggregate/hll.zig");
 const Diag = @import("../diag.zig").Diag;
 
 pub const Error = error{
@@ -367,11 +368,19 @@ fn bindNullableSyntax(arena: std.mem.Allocator, node: ?*const syntax.Expr, file:
     return out;
 }
 
+/// `approx_count_distinct` hashes a column's values at the width DuckDB's type for it has, so the column must be one
+/// whose type zpq reproduces (`hll.kindOf`): refused by name otherwise.
+fn checkSketchColumn(func: agg.AggFunc, arg: ?ast.Expr, file: *const schema.FileMetaData) Error!void {
+    if (func != .approx_count_distinct) return;
+    if (hll.kindOf(file, arg orelse return error.BadAggArg) == null) return error.UnsupportedAggType;
+}
+
 pub fn bindAggSyntax(arena: std.mem.Allocator, node: syntax.Aggregate, file: *const schema.FileMetaData, diag: ?*Diag) Error!agg.AggCall {
     const arg = if (node.arg) |arg| try bindSyntax(arena, arg, file, diag) else null;
     const where = if (node.where) |f| try filter_parser.bindSyntax(arena, f, file, diag) else null;
     if (arg == null and node.func != .count) return error.StarOnlyValidInCount;
     if (node.state and node.func != .avg) return error.BadAggArg;
+    try checkSketchColumn(node.func, arg, file);
     return bindAggregate(node.func, arg, where, node.alias, node.default_name, node.state, node.boolean_only);
 }
 
@@ -1223,9 +1232,10 @@ fn parseAggCall(
         default_name = null;
     }
 
-    return if (bound)
-        bindAggregate(func, arg, where, alias, default_name, state, boolean_only)
-    else
+    return if (bound) blk: {
+        try checkSketchColumn(func, arg, file);
+        break :blk bindAggregate(func, arg, where, alias, default_name, state, boolean_only);
+    } else
         .{ .func = func, .arg = arg, .where = where, .alias = alias, .default_name = default_name, .state = state, .boolean_only = boolean_only };
 }
 
@@ -1269,6 +1279,7 @@ pub fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
     if (asciiEqIgnoreCase(name, "var_pop")) return .var_pop;
     if (asciiEqIgnoreCase(name, "stddev_samp") or asciiEqIgnoreCase(name, "stddev")) return .stddev_samp;
     if (asciiEqIgnoreCase(name, "stddev_pop")) return .stddev_pop;
+    if (asciiEqIgnoreCase(name, "approx_count_distinct")) return .approx_count_distinct;
     return null;
 }
 

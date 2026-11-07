@@ -12,6 +12,7 @@ const KeyArena = @import("contracts.zig").KeyArena;
 const keyEql = @import("../../bytes.zig").keyEql;
 const foldExtremeF = @import("contracts.zig").foldExtremeF;
 const foldExtremeI = @import("contracts.zig").foldExtremeI;
+const hll = @import("hll.zig");
 
 /// Accumulator state. One per AggCall, lives across all RGs of all
 /// input files. Tagged union so the dispatcher picks the right
@@ -56,6 +57,47 @@ pub const Accumulator = union(enum) {
     max_d: ?i128,
     /// The variance family's running mean and sum of squared deviations (`types.Moments`).
     moments: types.Moments,
+    /// Heap state of a function whose answer is more than a number (a sketch): bytes the accumulator owns, which
+    /// merge moves or frees and every owner of an accumulator releases.
+    blob: Blob,
+
+    pub const Blob = struct {
+        kind: Kind,
+        bytes: []u8 = &.{},
+
+        pub const Kind = enum { hll };
+
+        pub fn deinit(b: *Blob, allocator: std.mem.Allocator) void {
+            if (b.bytes.len != 0) allocator.free(b.bytes);
+            b.bytes = &.{};
+        }
+
+        /// The sketch of an `approx_count_distinct`, made (zeroed, drawn from the ledger as a string winner is) on first use.
+        pub fn sketch(b: *Blob, persist: std.mem.Allocator, charge: ?*WinnerCharge) Error![]u8 {
+            if (b.bytes.len == 0) {
+                const drawn = winnerBytes(hll.registers);
+                if (charge) |c| try c.adjust(0, drawn);
+                errdefer if (charge) |c| c.adjust(drawn, 0) catch {};
+                const mem = try persist.alloc(u8, hll.registers);
+                @memset(mem, 0);
+                b.bytes = mem;
+            }
+            return b.bytes;
+        }
+
+        /// `src` into `b`, which takes `src`'s bytes (a sketch it has none yet) or folds and frees them.
+        pub fn merge(b: *Blob, src: Blob, allocator: std.mem.Allocator) void {
+            if (src.bytes.len == 0) return;
+            if (b.bytes.len == 0) {
+                b.bytes = src.bytes;
+                return;
+            }
+            switch (b.kind) {
+                .hll => hll.merge(b.bytes, src.bytes),
+            }
+            allocator.free(src.bytes);
+        }
+    };
 
     pub const ArenaBytes = struct {
         store: *KeyArena,
@@ -121,6 +163,7 @@ pub const Accumulator = union(enum) {
             },
             .avg => if (call.result == .avg_dec) .{ .avg_d = .{} } else .{ .avg = .{ .sum = 0, .count = 0 } },
             .var_samp, .var_pop, .stddev_samp, .stddev_pop => .{ .moments = .{} },
+            .approx_count_distinct => .{ .blob = .{ .kind = .hll } },
         };
     }
 
@@ -202,6 +245,7 @@ pub const Accumulator = union(enum) {
             .min_d => |*m| if (src.min_d) |sv| foldExtremeI(true, m, sv),
             .max_d => |*m| if (src.max_d) |sv| foldExtremeI(false, m, sv),
             .moments => |*m| m.combine(src.moments) catch return error.RowCountTooLarge,
+            .blob => |*b| b.merge(src.blob, allocator),
         }
     }
 };
@@ -209,6 +253,7 @@ pub const Accumulator = union(enum) {
 // A group's slot is the largest variant, so a new one must not grow every group.
 comptime {
     std.debug.assert(@sizeOf(types.Moments) <= @sizeOf(AvgState));
+    std.debug.assert(@sizeOf(Accumulator.Blob) <= @sizeOf(AvgState));
 }
 
 pub fn addRowCount(a: u64, b: u64) error{RowCountTooLarge}!u64 {
@@ -243,6 +288,8 @@ pub fn mergePersistent(
                 src.* = if (src.* == .min_arena) .{ .min_bytes = bytes } else .{ .max_bytes = bytes };
             }
             try merge(dst, src, allocator);
+            // Its bytes moved or were freed by the merge, whichever merge it was.
+            if (src.* == .blob) src.blob.bytes = &.{};
         },
     }
 }

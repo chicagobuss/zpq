@@ -647,6 +647,7 @@ const FoldTask = struct {
 fn freeOwned(gpa: std.mem.Allocator, acc: *expr_agg.Accumulator) void {
     switch (acc.*) {
         .min_bytes, .max_bytes => |b| if (b) |s| gpa.free(s),
+        .blob => |*b| b.deinit(gpa),
         else => {},
     }
 }

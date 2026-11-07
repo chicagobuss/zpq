@@ -53,6 +53,8 @@ pub const Error = error{
     IntegerOverflowAbs,
     /// `lpad` / `rpad` with an empty pad of a text that needs padding (DuckDB: "Insufficient padding in LPAD.").
     InsufficientPadding,
+    /// A `CAST` whose value does not fit the type it casts to, or is NaN or infinite (DuckDB: "Conversion Error").
+    ConversionOutOfRange,
     /// A DECIMAL column reached exact evaluation without its unscaled values (see `ColumnT.unscaled`).
     DecimalUnavailable,
     /// A CASE condition over a repeated (nested) column.
@@ -1281,6 +1283,7 @@ fn evalCall(
         .abs => return evalAbs(arena, batch, column_lookup, c),
         .length => return evalLength(arena, batch, column_lookup, c.args[0].*),
         .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => return evalStringFn(arena, batch, column_lookup, c),
+        .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => return evalCast(arena, batch, column_lookup, c),
     }
 }
 
@@ -1565,6 +1568,190 @@ fn evalAbsDecimal(arena: std.mem.Allocator, batch: *const Batch, column_lookup: 
     return .{ .i128 = .{ .values = out, .def_levels = def, .max_def = if (def != null) 1 else 0, .has_nulls = def != null } };
 }
 
+/// 10^n as the doubles DuckDB multiplies and divides by (`NumericHelper::DOUBLE_POWERS_OF_TEN`), parsed, not computed.
+const double_powers_of_ten = [_]f64{
+    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
+    1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26, 1e27, 1e28, 1e29, 1e30, 1e31, 1e32, 1e33, 1e34, 1e35, 1e36, 1e37, 1e38,
+};
+
+/// `x` rounded to a whole number, a tie to the even one: how DuckDB takes a DOUBLE to an integer.
+fn roundHalfEven(x: f64) f64 {
+    const t = @trunc(x);
+    if (@abs(x - t) != 0.5) return @round(x);
+    return if (@mod(t, 2) == 0) t else @round(x);
+}
+
+/// `v / d` rounded half away from zero, d > 0: how DuckDB takes a DECIMAL to an integer or to fewer places.
+fn divRoundHalfAway(v: i128, d: i128) i128 {
+    const q = @divTrunc(v, d);
+    const r = @rem(v, d);
+    if (@as(u128, @abs(r)) * 2 < @as(u128, @intCast(d))) return q;
+    return if (v < 0) q - 1 else q + 1;
+}
+
+/// A DOUBLE as the integer type `t`: NaN, an infinity and what rounds outside the type are conversion errors.
+fn doubleAsInt(t: ast.IntType, x: f64) Error!i64 {
+    if (!std.math.isFinite(x)) return error.ConversionOutOfRange;
+    const r = roundHalfEven(x);
+    // The type's range as doubles: its minimum, and its maximum plus one (a power of two, so exact).
+    const low: f64 = @floatFromInt(t.minValue());
+    const high: f64 = @floatFromInt(t.maxValue() + 1);
+    if (!(r >= low and r < high)) return error.ConversionOutOfRange;
+    return @intFromFloat(r);
+}
+
+/// `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))`, converted as DuckDB does: an
+/// integer to another by range, a DECIMAL to an integer or to fewer places half away from zero, a DOUBLE to an integer
+/// half to even and to a DECIMAL as `round(x * 10^s)` in double. A value that does not
+/// fit is `ConversionOutOfRange`, but only in a row the batch wants and the data does not make NULL.
+fn evalCast(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const arg = c.args[0].*;
+    if (arg.typeOf() == .dec) return evalCastDecimal(arena, batch, column_lookup, c, arg);
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    const target_dec: ast.Dec = c.dec orelse .{ .precision = 38, .scale = 0 };
+    switch (col) {
+        .i64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            const n = in.values.len;
+            switch (c.func) {
+                .cast_i64 => return col,
+                .cast_i8, .cast_i16, .cast_i32 => {
+                    const t = c.int.?;
+                    const out = try arena.alloc(i64, n);
+                    for (in.values, out, 0..) |v, *o, i| {
+                        o.* = v;
+                        if (t.holds(v)) continue;
+                        if (quietRow(batch, col, i)) o.* = 0 else return error.ConversionOutOfRange;
+                    }
+                    return .{ .i64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+                },
+                .cast_double => {
+                    const out = try arena.alloc(f64, n);
+                    for (in.values, out) |v, *o| o.* = @floatFromInt(v);
+                    return .{ .f64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+                },
+                .cast_dec => {
+                    const out = try arena.alloc(i128, n);
+                    const factor = ast.pow10(target_dec.scale);
+                    const bound = ast.pow10(target_dec.precision);
+                    for (in.values, out, 0..) |v, *o, i| {
+                        const scaled = std.math.mul(i128, v, factor) catch null;
+                        if (scaled != null and @abs(scaled.?) < @as(u128, @intCast(bound))) {
+                            o.* = scaled.?;
+                        } else if (quietRow(batch, col, i)) o.* = 0 else return error.ConversionOutOfRange;
+                    }
+                    return .{ .i128 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+                },
+                else => unreachable,
+            }
+        },
+        .f64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            const n = in.values.len;
+            switch (c.func) {
+                .cast_double => return col,
+                .cast_i8, .cast_i16, .cast_i32, .cast_i64 => {
+                    const t = c.int.?;
+                    const out = try arena.alloc(i64, n);
+                    for (in.values, out, 0..) |v, *o, i| {
+                        o.* = doubleAsInt(t, v) catch if (quietRow(batch, col, i)) 0 else return error.ConversionOutOfRange;
+                    }
+                    return .{ .i64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+                },
+                .cast_dec => {
+                    const out = try arena.alloc(i128, n);
+                    const factor = double_powers_of_ten[target_dec.scale];
+                    const bound = ast.pow10(target_dec.precision);
+                    for (in.values, out, 0..) |v, *o, i| {
+                        const scaled = @round(v * factor);
+                        // 2^126 is far above any 38-digit bound and keeps the integer conversion defined.
+                        if (std.math.isFinite(scaled) and @abs(scaled) < 0x1p126 and @abs(@as(i128, @intFromFloat(scaled))) < @as(u128, @intCast(bound))) {
+                            o.* = @intFromFloat(scaled);
+                        } else if (quietRow(batch, col, i)) o.* = 0 else return error.ConversionOutOfRange;
+                    }
+                    return .{ .i128 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+                },
+                else => unreachable,
+            }
+        },
+        else => return error.TypeMismatch,
+    }
+}
+
+/// A row nobody reads: unwanted by the batch's selection, or NULL in the data.
+fn quietRow(batch: *const Batch, col: Batch.Column, i: usize) bool {
+    return rowIsNull(col, i) or (batch.sel != null and !batch.sel.?.isActive(i));
+}
+
+/// `quietRow` for an exact operand, whose NULLs (if it has any) are in `nulls`.
+fn quietDecimalRow(batch: *const Batch, nulls: ?Batch.Column, i: usize) bool {
+    if (nulls) |nc| if (rowIsNull(nc, i)) return true;
+    return batch.sel != null and !batch.sel.?.isActive(i);
+}
+
+/// `evalCast` of an exact DECIMAL argument, read at its own scale.
+fn evalCastDecimal(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call, arg: ast.Expr) Error!Batch.Column {
+    const spec = arg.decSpec().?;
+    const o = try decOperandCached(arena, batch, column_lookup, arg, spec.scale, null);
+    const n = batch.num_rows;
+    const v = try arena.alloc(i128, n);
+    switch (o.op) {
+        .scalar => |x| @memset(v, x),
+        .i64 => |vs| for (vs, v) |x, *r| {
+            r.* = x;
+        },
+        .i64s => |x| for (x.v, v) |y, *r| {
+            r.* = @as(i128, y) * x.factor;
+        },
+        .i128 => |vs| @memcpy(v, vs),
+    }
+    const def: ?[]u32 = if (o.nulls) |nc| blk: {
+        const d = try arena.alloc(u32, n);
+        for (d, 0..) |*dv, i| dv.* = @intFromBool(!rowIsNull(nc, i));
+        break :blk d;
+    } else null;
+    const levels: u32 = if (def != null) 1 else 0;
+    switch (c.func) {
+        .cast_double => {
+            const out = try arena.alloc(f64, n);
+            for (v, out) |x, *r| r.* = ast.decimalToDouble(x, spec.scale);
+            return .{ .f64 = .{ .values = out, .def_levels = def, .max_def = levels, .has_nulls = def != null } };
+        },
+        .cast_i8, .cast_i16, .cast_i32, .cast_i64 => {
+            const t = c.int.?;
+            const out = try arena.alloc(i64, n);
+            const divisor = ast.pow10(spec.scale);
+            for (v, out, 0..) |x, *r, i| {
+                const q = divRoundHalfAway(x, divisor);
+                if (t.holds(q)) {
+                    r.* = @intCast(q);
+                } else if (quietDecimalRow(batch, o.nulls, i)) {
+                    r.* = 0;
+                } else return error.ConversionOutOfRange;
+            }
+            return .{ .i64 = .{ .values = out, .def_levels = def, .max_def = levels, .has_nulls = def != null } };
+        },
+        .cast_dec => {
+            const target = c.dec.?;
+            const bound: u128 = @intCast(ast.pow10(target.precision));
+            const out = try arena.alloc(i128, n);
+            for (v, out, 0..) |x, *r, i| {
+                const scaled: ?i128 = if (target.scale >= spec.scale)
+                    std.math.mul(i128, x, ast.pow10(target.scale - spec.scale)) catch null
+                else
+                    divRoundHalfAway(x, ast.pow10(spec.scale - target.scale));
+                if (scaled != null and @abs(scaled.?) < bound) {
+                    r.* = scaled.?;
+                } else if (quietDecimalRow(batch, o.nulls, i)) {
+                    r.* = 0;
+                } else return error.ConversionOutOfRange;
+            }
+            return .{ .i128 = .{ .values = out, .def_levels = def, .max_def = levels, .has_nulls = def != null } };
+        },
+        else => return error.TypeMismatch,
+    }
+}
+
 /// `CAST(s AS VARCHAR)`: the argument's texts as they are, a bare column read as decoded, codes and all.
 fn evalCastText(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, arg: ast.Expr) Error!Batch.Column {
     const col = if (arg == .col_ref)
@@ -1713,7 +1900,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => unreachable,
     }
     return .{ .i64 = .{
         .values = out,
@@ -2733,6 +2920,49 @@ test "regression: coalesce: col + col (f64) is NULL where both are" {
     try testing.expectEqual(1.5, out.f64.values[0]);
     try testing.expectEqual(3.5, out.f64.values[2]);
     try testing.expectEqualSlices(u32, &.{ 1, 0, 1 }, out.f64.def_levels.?);
+}
+
+test "casts round as DuckDB does: a DOUBLE to the even integer, a DECIMAL half away from zero" {
+    for ([_][2]f64{ .{ 2.5, 2 }, .{ 3.5, 4 }, .{ -2.5, -2 }, .{ -3.5, -4 }, .{ 0.5, 0 }, .{ 2.4999, 2 }, .{ 2.5001, 3 }, .{ -0.5, 0 } }) |c| {
+        try testing.expectEqual(c[1], roundHalfEven(c[0]));
+    }
+    for ([_][3]i128{ .{ 250, 100, 3 }, .{ -250, 100, -3 }, .{ 249, 100, 2 }, .{ 5, 10, 1 }, .{ -5, 10, -1 }, .{ 4, 10, 0 }, .{ 2675, 10, 268 } }) |c| {
+        try testing.expectEqual(c[2], divRoundHalfAway(c[0], c[1]));
+    }
+    // A DOUBLE that rounds outside the type, NaN and the infinities are conversion errors.
+    try testing.expectEqual(@as(i64, 2147483647), try doubleAsInt(.i32, 2147483647.0));
+    try testing.expectEqual(@as(i64, -2147483648), try doubleAsInt(.i32, -2147483648.4));
+    try testing.expectError(error.ConversionOutOfRange, doubleAsInt(.i32, 2147483648.0));
+    try testing.expectError(error.ConversionOutOfRange, doubleAsInt(.i8, 127.5));
+    try testing.expectError(error.ConversionOutOfRange, doubleAsInt(.i64, 0x1p63));
+    try testing.expectEqual(@as(i64, std.math.minInt(i64)), try doubleAsInt(.i64, -0x1p63));
+    try testing.expectError(error.ConversionOutOfRange, doubleAsInt(.i64, std.math.nan(f64)));
+    try testing.expectError(error.ConversionOutOfRange, doubleAsInt(.i16, std.math.inf(f64)));
+}
+
+test "a cast to a narrower integer fails on a value that does not fit, in rows that are read and not NULL" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const vals = [_]i64{ 100, 1000, -128 };
+    const dls = [_]u32{ 1, 0, 1 };
+    const cols = [_]Batch.Column{.{ .i64 = .{ .values = &vals, .def_levels = &dls, .max_def = 1 } }};
+    const batch: Batch = .{ .cols = &cols, .num_rows = 3 };
+    const lookup = [_]?usize{0};
+    var col: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    const args = [_]*ast.Expr{&col};
+    // 1000 is NULL, so 100 and -128 fit a TINYINT; without the NULL it would not.
+    const out = try evalExpr(a, &batch, &lookup, .{ .call = .{ .func = .cast_i8, .args = &args, .result_type = .i64, .depth = 2, .int = .i8 } });
+    try testing.expectEqualSlices(i64, &.{ 100, 0, -128 }, out.i64.values);
+    const dense = [_]Batch.Column{.{ .i64 = .{ .values = &vals } }};
+    const dense_batch: Batch = .{ .cols = &dense, .num_rows = 3 };
+    try testing.expectError(error.ConversionOutOfRange, evalExpr(a, &dense_batch, &lookup, .{ .call = .{
+        .func = .cast_i8,
+        .args = &args,
+        .result_type = .i64,
+        .depth = 2,
+        .int = .i8,
+    } }));
 }
 
 test "coalesce: a DOUBLE column with a DECIMAL literal default is DOUBLE, as DuckDB types it" {

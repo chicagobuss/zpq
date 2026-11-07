@@ -108,7 +108,9 @@ pub const Lower = struct {
             },
             c.LP_EXPR_CAST => if (textType(node.u.cast.type_name)) .{
                 .cast_text = try self.ptr(node.u.cast.expr orelse return error.SqlParseError, depth + 1),
-            } else .{ .call = .{ .name = "CAST", .args = &.{} } },
+            } else if (numericTarget(node.u.cast.type_name)) |target| try self.castCall(node, target, depth) else .{
+                .call = .{ .name = "CAST", .args = &.{} },
+            },
             else => error.UnexpectedChar,
         };
     }
@@ -158,6 +160,60 @@ pub const Lower = struct {
             } else joined = part;
         }
         return joined.?.*;
+    }
+
+    /// What a cast to a number or a DATE is called to the binder, and a DECIMAL's precision and scale.
+    const CastTarget = struct { name: []const u8, precision: u8 = 0, scale: u8 = 0 };
+
+    /// `CAST(x AS type)` for the types zpq casts to: the integers, DOUBLE and DECIMAL(p, s), by every spelling
+    /// DuckDB has for them. Anything else (FLOAT, UBIGINT, DATE, TIMESTAMP, ...) is no cast zpq makes, and refuses: a computed DATE
+    /// would print as its day number, not as the date DuckDB prints.
+    fn numericTarget(type_name: ?[*:0]const u8) ?CastTarget {
+        const t = std.mem.span(type_name orelse return null);
+        const open = std.mem.indexOfScalar(u8, t, '(') orelse t.len;
+        var buf: [32]u8 = undefined;
+        const base = std.mem.trim(u8, t[0..open], " ");
+        if (base.len > buf.len) return null;
+        const upper = std.ascii.upperString(&buf, base);
+        const names = [_]struct { spelling: []const u8, name: []const u8 }{
+            .{ .spelling = "TINYINT", .name = "cast$tinyint" },
+            .{ .spelling = "INT1", .name = "cast$tinyint" },
+            .{ .spelling = "SMALLINT", .name = "cast$smallint" },
+            .{ .spelling = "INT2", .name = "cast$smallint" },
+            .{ .spelling = "SHORT", .name = "cast$smallint" },
+            .{ .spelling = "INTEGER", .name = "cast$integer" },
+            .{ .spelling = "INT", .name = "cast$integer" },
+            .{ .spelling = "INT4", .name = "cast$integer" },
+            .{ .spelling = "SIGNED", .name = "cast$integer" },
+            .{ .spelling = "BIGINT", .name = "cast$bigint" },
+            .{ .spelling = "INT8", .name = "cast$bigint" },
+            .{ .spelling = "LONG", .name = "cast$bigint" },
+            .{ .spelling = "DOUBLE", .name = "cast$double" },
+            .{ .spelling = "DOUBLE PRECISION", .name = "cast$double" },
+            .{ .spelling = "FLOAT8", .name = "cast$double" },
+        };
+        for (names) |n| if (std.mem.eql(u8, upper, n.spelling)) return .{ .name = n.name };
+        if (!std.mem.eql(u8, upper, "DECIMAL") and !std.mem.eql(u8, upper, "NUMERIC")) return null;
+        // DECIMAL alone is DECIMAL(18, 3), DECIMAL(p) is DECIMAL(p, 0).
+        if (open == t.len) return .{ .name = "cast$decimal", .precision = 18, .scale = 3 };
+        const close = std.mem.indexOfScalar(u8, t, ')') orelse return null;
+        var parts = std.mem.splitScalar(u8, t[open + 1 .. close], ',');
+        const p = std.fmt.parseInt(u8, std.mem.trim(u8, parts.next() orelse return null, " "), 10) catch return null;
+        const sc = if (parts.next()) |text| std.fmt.parseInt(u8, std.mem.trim(u8, text, " "), 10) catch return null else 0;
+        if (parts.next() != null) return null;
+        return .{ .name = "cast$decimal", .precision = p, .scale = sc };
+    }
+
+    fn castCall(self: *Lower, node: *const c.LpNode, target: CastTarget, depth: u32) Error!syntax.Expr {
+        const decimal = target.precision != 0;
+        const args = try self.arena.alloc(*const syntax.Expr, if (decimal) 3 else 1);
+        args[0] = try self.ptr(node.u.cast.expr orelse return error.SqlParseError, depth + 1);
+        if (decimal) for ([_]u8{ target.precision, target.scale }, 1..) |v, i| {
+            const digits = try self.arena.create(syntax.Expr);
+            digits.* = .{ .number = .{ .token = try std.fmt.allocPrint(self.arena, "{d}", .{v}), .floating = false } };
+            args[i] = digits;
+        };
+        return .{ .call = .{ .name = target.name, .args = args } };
     }
 
     /// DuckDB's names for its one string type that a cast takes; a length (`VARCHAR(10)`) DuckDB ignores, so zpq does.

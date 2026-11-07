@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Numeric casts in SQL.** `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))` and `x::TYPE`
+  over a number, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB, including its rounding (a DECIMAL
+  half away from zero, a DOUBLE to an integer half to even) and its conversion error for a value that does not fit.
+  `CAST(... AS DATE | TIMESTAMP | FLOAT)` and a text cast to a number are still refused by name.
 - **String functions in SQL.** `length`, `substring` / `substr`, `left`, `right`, `upper` / `lower`, `trim` / `ltrim` /
   `rtrim`, `replace` and `lpad` / `rpad` run over a text column or expression, in a SELECT, an aggregate or a GROUP BY
   key, and match DuckDB (characters are code points; a negative `substring` length reads backwards; `upper` and `lower`

@@ -402,7 +402,7 @@ test "syntax: unsupported SQL modifiers and casts retain refusal instead of drop
     try std.testing.expectError(error.TrailingTokens, sql.parseSqlPlan(a, "SELECT strlen(s) FILTER (WHERE b > 0) AS n FROM 'ci/fixtures/parquet/full_match.parquet'"));
     try std.testing.expectError(error.ExpectedRParen, sql.parseSqlPlan(a, "SELECT sum(n ORDER BY n) AS n FROM 'ci/fixtures/parquet/full_match.parquet'"));
     try std.testing.expectError(error.ModuloNotSupported, sql.parseSqlPlan(a, "SELECT count(*) AS c FROM 'ci/fixtures/parquet/full_match.parquet' WHERE b % 2 = 1"));
-    const parsed = try sql.parseSqlPlan(a, "SELECT sum(CAST(b AS BIGINT)) AS n FROM 'ci/fixtures/parquet/full_match.parquet'");
+    const parsed = try sql.parseSqlPlan(a, "SELECT sum(CAST(b AS FLOAT)) AS n FROM 'ci/fixtures/parquet/full_match.parquet'");
     defer parsed.deinit(a);
     try std.testing.expectError(error.UnknownFunction, aggregate.runQuery(.{ .gpa = a, .io = std.testing.io, .env = .empty }, .{
         .inputs = &.{fixture},

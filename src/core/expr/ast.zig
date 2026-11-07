@@ -146,6 +146,28 @@ pub fn pow10(n: u8) i128 {
     return pow10_table[n];
 }
 
+/// The double nearest `sum / 10^scale`, ties to even: DuckDB's cast of a DECIMAL to DOUBLE, which is exact to the last
+/// bit (0 of 240000 probed casts differ). A quotient of at least 55 bits is cut at 53, the rest deciding the rounding
+/// with the remainder as a sticky bit; a 113-bit quotient would lose a tie plus a digit 19 places below the point.
+pub fn decimalToDouble(sum: i192, scale: u8) f64 {
+    if (sum == 0) return 0;
+    const n: u256 = @abs(sum);
+    const d: u256 = @intCast(pow10(scale));
+    const n_bits: i32 = 256 - @clz(n);
+    const d_bits: i32 = 256 - @clz(d);
+    const shift: u8 = @intCast(@max(0, 55 + d_bits - n_bits));
+    const scaled = n << shift;
+    const q = scaled / d;
+    const sticky = scaled % d != 0;
+    const drop: u8 = @intCast(256 - @clz(q) - 53);
+    const dropped = q & ((@as(u256, 1) << drop) - 1);
+    const half = @as(u256, 1) << (drop - 1);
+    var m: u256 = q >> drop;
+    if (dropped > half or (dropped == half and (sticky or m & 1 == 1))) m += 1;
+    const magnitude = std.math.ldexp(@as(f64, @floatFromInt(@as(u64, @intCast(m)))), @as(i32, drop) - @as(i32, shift));
+    return if (sum < 0) -magnitude else magnitude;
+}
+
 const pow10_table: [Dec.max_precision + 1]i128 = blk: {
     var t: [Dec.max_precision + 1]i128 = undefined;
     t[0] = 1;
@@ -261,6 +283,15 @@ pub const Func = enum {
     /// `lpad(s, n, pad)` / `rpad(s, n, pad)`: `s` cut or padded with `pad` to `n` characters.
     lpad,
     rpad,
+    /// `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))`, one arm per target (a
+    /// DECIMAL's precision and scale are the two literal arguments after the value). The integer ones round a DECIMAL
+    /// half away from zero and a DOUBLE half to even; one that does not fit is a `ConversionOutOfRange`.
+    cast_i8,
+    cast_i16,
+    cast_i32,
+    cast_i64,
+    cast_double,
+    cast_dec,
 };
 
 /// What an integer value stands for in time, so the date/time functions read it in its unit. Output keeps printing
@@ -475,7 +506,7 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => c.args[0].mayBeNull(),
+                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => c.args[0].mayBeNull(),
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
                 .coalesce => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;
@@ -625,7 +656,7 @@ pub const IntType = enum {
                 .{ .i128, .i128, .i128, .i128, .i128, .u64, .u64, .u64, .u64 }, // u64
             };
         };
-        return t[@intFromEnum(a)][@intFromEnum(b)];
+        return t[@backingInt(a)][@backingInt(b)];
     }
 };
 

@@ -741,6 +741,13 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "replace")) return .replace;
     if (asciiEqIgnoreCase(name, "lpad")) return .lpad;
     if (asciiEqIgnoreCase(name, "rpad")) return .rpad;
+    // The names `CAST` lowers to; `$` is no part of a name a query can write unquoted.
+    if (asciiEqIgnoreCase(name, "cast$tinyint")) return .cast_i8;
+    if (asciiEqIgnoreCase(name, "cast$smallint")) return .cast_i16;
+    if (asciiEqIgnoreCase(name, "cast$integer")) return .cast_i32;
+    if (asciiEqIgnoreCase(name, "cast$bigint")) return .cast_i64;
+    if (asciiEqIgnoreCase(name, "cast$double")) return .cast_double;
+    if (asciiEqIgnoreCase(name, "cast$decimal")) return .cast_dec;
     return null;
 }
 
@@ -839,6 +846,23 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             if (args.len != 3) return error.WrongArity;
             if (args[0].typeOf() != .str or !isIntLiteral(args[1].*) or !isStrLiteral(args[2].*)) return error.TypeMismatch;
             return .str;
+        },
+        // A number to a number: the value is the only argument, and a DECIMAL's precision and scale follow it.
+        .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double => {
+            if (args.len != 1) return error.WrongArity;
+            const a = args[0];
+            if (a.typeOf() == .str or a.temporal() != null or a.isBoolean()) return error.TypeMismatch;
+            return if (func == .cast_double) .f64 else .i64;
+        },
+        .cast_dec => {
+            if (args.len != 3) return error.WrongArity;
+            const a = args[0];
+            if (a.typeOf() == .str or a.temporal() != null or a.isBoolean()) return error.TypeMismatch;
+            if (!isIntLiteral(args[1].*) or !isIntLiteral(args[2].*)) return error.TypeMismatch;
+            const p = args[1].literal.i64;
+            const sc = args[2].literal.i64;
+            if (p < 1 or p > ast.Dec.max_precision or sc < 0 or sc > p) return error.TypeMismatch;
+            return .dec;
         },
         // Only text casts to text: zpq has no number, date or bytes-escaping spelling to match DuckDB's.
         .cast_text => {
@@ -1171,7 +1195,9 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
     for (args) |arg| try rejectUnsigned64Operand(arg.*);
     const result_type = try resolveCallType(func, args, file);
     var dec: ?ast.Dec = null;
-    if (result_type == .dec) {
+    if (func == .cast_dec) {
+        dec = .{ .precision = @intCast(args[1].literal.i64), .scale = @intCast(args[2].literal.i64) };
+    } else if (result_type == .dec) {
         dec = args[0].decSpec().?;
         for (args[1..]) |a| dec = ast.Dec.common(dec.?, a.decSpec().?);
     }
@@ -1195,11 +1221,19 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 } else args[0].temporal(),
                 .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,
                 .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
+                .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => null,
             },
-            .int = if (func == .abs and args[0].* == .col_ref) blk: {
-                const elem = metadata.leafSchemaElement(file, args[0].col_ref.col_idx) orelse break :blk null;
-                break :blk ast.IntType.ofElement(elem);
-            } else null,
+            .int = switch (func) {
+                .abs => if (args[0].* == .col_ref) blk: {
+                    const elem = metadata.leafSchemaElement(file, args[0].col_ref.col_idx) orelse break :blk null;
+                    break :blk ast.IntType.ofElement(elem);
+                } else null,
+                .cast_i8 => .i8,
+                .cast_i16 => .i16,
+                .cast_i32 => .i32,
+                .cast_i64 => .i64,
+                else => null,
+            },
             .part = switch (func) {
                 .date_trunc, .date_part => ast.DatePart.parse(args[0].literal.str) orelse unreachable,
                 else => null,

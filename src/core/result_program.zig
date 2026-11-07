@@ -859,25 +859,9 @@ fn hugeintAs(comptime T: type, v: i128) T {
     return @as(T, @floatFromInt(lower)) + @as(T, @floatFromInt(upper)) * (max_word + 1);
 }
 
-/// The double nearest `sum / 10^scale`, ties to even: DuckDB's cast of a DECIMAL to DOUBLE, which is exact to the last
-/// bit. A quotient of at least 55 bits is cut at 53, the rest deciding the rounding with the remainder as a sticky bit.
+/// The double nearest `sum / 10^scale`, ties to even: DuckDB's cast of a DECIMAL to DOUBLE.
 fn decimalAsDouble(sum: i192, scale: u8) f64 {
-    if (sum == 0) return 0;
-    const n: u256 = @abs(sum);
-    const d: u256 = @intCast(expr_ast.pow10(scale));
-    const n_bits: i32 = 256 - @clz(n);
-    const d_bits: i32 = 256 - @clz(d);
-    const shift: u8 = @intCast(@max(0, 55 + d_bits - n_bits));
-    const scaled = n << shift;
-    const q = scaled / d;
-    const sticky = scaled % d != 0;
-    const drop: u8 = @intCast(256 - @clz(q) - 53);
-    const dropped = q & ((@as(u256, 1) << drop) - 1);
-    const half = @as(u256, 1) << (drop - 1);
-    var m: u256 = q >> drop;
-    if (dropped > half or (dropped == half and (sticky or m & 1 == 1))) m += 1;
-    const magnitude = std.math.ldexp(@as(f64, @floatFromInt(@as(u64, @intCast(m)))), @as(i32, drop) - @as(i32, shift));
-    return if (sum < 0) -magnitude else magnitude;
+    return expr_ast.decimalToDouble(sum, scale);
 }
 
 /// A mean of a sum beyond 128 bits, which DuckDB cannot make: the sum over 10^scale over the count in 113 bits.

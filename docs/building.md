@@ -2,7 +2,7 @@
 
 Moved from the README for 0.5.0: toolchain, recipes, release archives and a local Homebrew rehearsal.
 
-Requires Zig 0.17.0 (the release, not master), pinned in `build.zig.zon`. On a fresh machine, `just bootstrap` installs
+Requires a Zig 0.17.x release (not master), with 0.17.0 as the minimum in `build.zig.zon`. On a fresh machine, `just bootstrap` installs
 the pinned toolchain to `~/.zvm/0.17.0` and warms the build. The first build fetches prebuilt BoringSSL artifacts from
 R2 and checks them against the sha256 digests in `vendor/boring_tls/prebuilt.sha256`; `just fetch-deps` stores them in
 `vendor/boring_tls/prebuilt/` for offline builds. No source builds. No system OpenSSL.

@@ -15,8 +15,8 @@ const zon = @import("build.zig.zon");
 /// (`enable_sql`, `version`) resolve at comptime.
 pub fn build(b: *std.Build) void {
     const builtin = @import("builtin");
-    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 17 or builtin.zig_version.patch != 0 or builtin.zig_version.pre != null) {
-        @compileError(std.fmt.comptimePrint("Unsupported Zig version: {}. zpq requires exactly the 0.17.0 release version to prevent standard library drift.", .{builtin.zig_version}));
+    if (builtin.zig_version.major != 0 or builtin.zig_version.minor != 17 or builtin.zig_version.pre != null) {
+        @compileError(std.fmt.comptimePrint("Unsupported Zig version: {}. zpq requires a Zig 0.17.x release to prevent standard library drift.", .{builtin.zig_version}));
     }
 
     const target = b.standardTargetOptions(.{});

@@ -293,7 +293,7 @@ pub fn canStatShortCircuit(call: AggCall, has_outer_filter: bool, trust_stats: b
         // num_rows × min to the sum. updateOneFromStats decides per-RG
         // and falls through to decode for non-constant RGs.
         .sum => true,
-        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont => false,
+        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => false,
     };
 }
 
@@ -413,7 +413,7 @@ pub fn updateOneFromStats(
             return true;
         },
         // Never short-circuitable: the deviations need every value.
-        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont => return false,
+        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => return false,
     }
 }
 
@@ -727,6 +727,7 @@ pub fn finalize(
         .var_samp, .var_pop, .stddev_samp, .stddev_pop => try emitOneF64(arena, call.alias, state.moments.result(call.func)),
         .approx_count_distinct => try emitOneI64(arena, call.alias, hll.count(state.blob.bytes), false),
         .quantile_cont => try emitOneF64(arena, call.alias, quantile.cont(state.blob.f64s(), call.q)),
+        .string_agg => try emitOneString(arena, call.alias, try state.blob.joinText(arena, call.sep)),
     };
 }
 
@@ -950,6 +951,7 @@ pub fn updateOneWithCharge(
         .var_samp, .var_pop, .stddev_samp, .stddev_pop => try foldMoments(state, values.?, sel, u64_col, momentScale(call)),
         .approx_count_distinct => try foldHll(persist, state, call, values.?, sel, charge),
         .quantile_cont => try foldQuantile(persist, state, values.?, sel, u64_col, charge),
+        .string_agg => try foldText(persist, state, values.?, sel, charge),
     }
 }
 
@@ -989,7 +991,7 @@ pub fn updateSharedInteger(
             .count => {},
             .count_distinct => unreachable,
             // The shared kernel knows sum, min, max and avg.
-            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont => return false,
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => return false,
         }
     }
     if (value_calls < 2) return false;
@@ -1038,7 +1040,7 @@ pub fn updateSharedInteger(
                 state.avg.isum += stats.sum;
                 state.avg.count += stats.count;
             },
-            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont => unreachable,
+            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => unreachable,
         }
     }
     return true;
@@ -1643,6 +1645,29 @@ pub inline fn momentAt(col: filter_eval.Batch.Column, r: usize, unsigned_64: boo
         .f64 => |c| c.values[r],
         else => null,
     };
+}
+
+/// Row `r` of a text lane, whether it holds its values or codes into a dictionary.
+pub inline fn textAt(col: filter_eval.Batch.Column, r: usize) ?[]const u8 {
+    return switch (col) {
+        .string => |c| if (c.codes) |codes| c.dict[codes[r]] else c.values[r],
+        else => null,
+    };
+}
+
+/// The selected rows' texts, in row order, onto the call's list.
+fn foldText(
+    persist: std.mem.Allocator,
+    state: *Accumulator,
+    col: filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    charge: ?*accumulator_mod.WinnerCharge,
+) Error!void {
+    var r: usize = 0;
+    while (r < sel.len) : (r += 1) {
+        if (!sel.isActive(r)) continue;
+        try state.blob.appendText(persist, charge, textAt(col, r) orelse return error.UnsupportedAggType);
+    }
 }
 
 /// The selected rows' values, as doubles, onto the call's list.

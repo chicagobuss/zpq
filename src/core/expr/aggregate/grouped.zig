@@ -189,6 +189,11 @@ fn applyGrouped(
         else
             foldMaxGroupedOne(state, values.?, r, u64_col),
         .avg => try foldAvgGroupedOne(state, values.?, r, u64_col),
+        .string_agg => try state.blob.appendText(
+            persist,
+            ctx.winner_charge,
+            scalar.textAt(values.?, r) orelse return error.UnsupportedAggType,
+        ),
         .quantile_cont => try state.blob.appendF64(
             persist,
             ctx.winner_charge,

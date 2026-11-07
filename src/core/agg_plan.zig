@@ -121,7 +121,7 @@ pub const OwnerProgram = struct {
                 .count = p.find(.present_count, col) orelse return null,
             } },
             .count_distinct => if (p.distinct_arg != null and p.distinct_arg.?.col_idx == col) .distinct else null,
-            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont => null,
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => null,
         };
     }
 

@@ -31,7 +31,7 @@ pub const State = struct {
                 .avg => if (c.arg != null and c.arg.?.typeOf() == .i64) .avg else return,
                 .min => if (c.result == .i64) .min else return,
                 .max => if (c.result == .i64) .max else return,
-                .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont => return,
+                .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => return,
             };
             // COUNT may evaluate arbitrary expressions; its state is still only a counter.
             self.fields[i] = .{ .kind = kind, .off = 0, .unsigned = if (c.arg) |a|

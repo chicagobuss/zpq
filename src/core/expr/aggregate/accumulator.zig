@@ -67,7 +67,7 @@ pub const Accumulator = union(enum) {
         bytes: []align(8) u8 = &.{},
         len: usize = 0,
 
-        pub const Kind = enum { hll, quantile };
+        pub const Kind = enum { hll, quantile, text };
 
         pub fn deinit(b: *Blob, allocator: std.mem.Allocator) void {
             if (b.bytes.len != 0) allocator.free(b.bytes);
@@ -100,6 +100,43 @@ pub const Accumulator = union(enum) {
             if (b.bytes.len != 0) persist.free(b.bytes);
             b.bytes = mem;
             if (charge) |c| c.adjust(old + new, new) catch unreachable;
+        }
+
+        /// One text of a `string_agg`: its length (four bytes) and the bytes, after the ones before it.
+        pub fn appendText(b: *Blob, persist: std.mem.Allocator, charge: ?*WinnerCharge, text: []const u8) Error!void {
+            const len = std.math.cast(u32, text.len) orelse return error.OutOfMemory;
+            try b.reserve(persist, charge, 4 + text.len);
+            std.mem.writeInt(u32, b.bytes[b.len..][0..4], len, .little);
+            @memcpy(b.bytes[b.len + 4 ..][0..text.len], text);
+            b.len += 4 + text.len;
+        }
+
+        /// The texts of a `string_agg` joined by `sep`, in `gpa`; null over none.
+        pub fn joinText(b: Blob, gpa: std.mem.Allocator, sep: []const u8) std.mem.Allocator.Error!?[]u8 {
+            if (b.len == 0) return null;
+            var total: usize = 0;
+            var n: usize = 0;
+            var at: usize = 0;
+            while (at < b.len) : (n += 1) {
+                const len = std.mem.readInt(u32, b.bytes[at..][0..4], .little);
+                total += len;
+                at += 4 + len;
+            }
+            const out = try gpa.alloc(u8, total + sep.len * (n - 1));
+            var w: usize = 0;
+            at = 0;
+            var i: usize = 0;
+            while (at < b.len) : (i += 1) {
+                const len = std.mem.readInt(u32, b.bytes[at..][0..4], .little);
+                if (i != 0) {
+                    @memcpy(out[w..][0..sep.len], sep);
+                    w += sep.len;
+                }
+                @memcpy(out[w..][0..len], b.bytes[at + 4 ..][0..len]);
+                w += len;
+                at += 4 + len;
+            }
+            return out;
         }
 
         /// One value of a quantile's list.
@@ -145,6 +182,13 @@ pub const Accumulator = union(enum) {
             switch (b.kind) {
                 .hll => {
                     hll.merge(b.bytes, src.bytes);
+                    allocator.free(src.bytes);
+                },
+                // Texts keep their order: the destination's, then the source's.
+                .text => {
+                    try b.reserve(allocator, null, src.len);
+                    @memcpy(b.bytes[b.len..][0..src.len], src.bytes[0..src.len]);
+                    b.len += src.len;
                     allocator.free(src.bytes);
                 },
                 .quantile => {
@@ -228,6 +272,7 @@ pub const Accumulator = union(enum) {
             .var_samp, .var_pop, .stddev_samp, .stddev_pop => .{ .moments = .{} },
             .approx_count_distinct => .{ .blob = .{ .kind = .hll } },
             .quantile_cont => .{ .blob = .{ .kind = .quantile } },
+            .string_agg => .{ .blob = .{ .kind = .text } },
         };
     }
 
@@ -356,6 +401,30 @@ pub fn mergePersistent(
             if (src.* == .blob) src.blob.release();
         },
     }
+}
+
+test "string_agg texts keep their order through a merge, empty ones count, and nothing leaks" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(a: std.mem.Allocator) !void {
+            var lo: Accumulator.Blob = .{ .kind = .text };
+            defer lo.deinit(a);
+            var hi: Accumulator.Blob = .{ .kind = .text };
+            defer hi.deinit(a);
+            try lo.appendText(a, null, "x");
+            try lo.appendText(a, null, "");
+            try hi.appendText(a, null, "yy");
+            const own = (try lo.joinText(a, "|")).?;
+            defer a.free(own);
+            try testing.expectEqualStrings("x|", own);
+            try lo.merge(hi, a);
+            hi.release();
+            const all = (try lo.joinText(a, ", ")).?;
+            defer a.free(all);
+            try testing.expectEqualStrings("x, , yy", all);
+            var none: Accumulator.Blob = .{ .kind = .text };
+            try testing.expectEqual(@as(?[]u8, null), try none.joinText(a, "|"));
+        }
+    }.run, .{});
 }
 
 test "round 4: copy merge into an empty accumulator keeps the source budget" {

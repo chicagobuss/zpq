@@ -30,6 +30,10 @@
   expression, and `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `isodow` and
   `dayofyear` of a date or timestamp, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB (a DECIMAL keeps
   DECIMAL(p, 0) after `floor`, an integer floors to a DOUBLE, `least` skips NULLs, `sqrt` of a negative is NaN).
+- **`string_agg` in SQL.** `string_agg(text [, sep])` (and `group_concat`, `listagg`) over a text column or expression,
+  scalar or per group, with a FILTER, answers the texts of the group in the order of the file (the same at every `-j`),
+  joined by a constant separator; NULL over none. A non-text argument, a non-constant separator and `DISTINCT` are
+  refused by name.
 - **`median` and `quantile_cont` in SQL.** `median(x)` and `quantile_cont(x, q)` over an integer or DOUBLE column or
   expression, scalar or per group, with a FILTER, in a SELECT, HAVING or ORDER BY, answer the DOUBLE DuckDB does, bit for
   bit (NaN sorts last, infinities interpolate, NULLs are skipped), the same at every `-j`; equal to DuckDB on four

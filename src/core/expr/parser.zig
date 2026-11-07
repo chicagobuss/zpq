@@ -1174,7 +1174,9 @@ fn parseAggCall(
         if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
         arg = try parseExpr(bound, arena, lex, file);
         lex.depth -= 1;
-        if (aggTakesSecond(name_tok.text)) {
+        const takes = aggSecond(name_tok.text);
+        const next = try lex.peek();
+        if (takes == .required or (takes == .optional and next.kind == .comma)) {
             const comma = try lex.next();
             if (comma.kind != .comma) return error.BadAggArg;
             lex.depth += 1;
@@ -1276,9 +1278,17 @@ pub fn isSqlAggName(name: []const u8) bool {
     return !asciiEqIgnoreCase(name, "count_distinct") and (resolveAggFunc(name) != null or asciiEqIgnoreCase(name, "avg_state"));
 }
 
-/// The aggregates that take a constant or a second column after the first argument.
-pub fn aggTakesSecond(name: []const u8) bool {
-    return asciiEqIgnoreCase(name, "quantile_cont");
+/// Whether an aggregate takes a second argument after the first: `quantile_cont` needs it, `string_agg` may.
+pub const Second = enum { none, required, optional };
+
+pub fn aggSecond(name: []const u8) Second {
+    if (asciiEqIgnoreCase(name, "quantile_cont")) return .required;
+    if (isStringAggName(name)) return .optional;
+    return .none;
+}
+
+pub fn isStringAggName(name: []const u8) bool {
+    return asciiEqIgnoreCase(name, "string_agg") or asciiEqIgnoreCase(name, "group_concat") or asciiEqIgnoreCase(name, "listagg");
 }
 
 pub fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
@@ -1296,6 +1306,7 @@ pub fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
     if (asciiEqIgnoreCase(name, "stddev_pop")) return .stddev_pop;
     if (asciiEqIgnoreCase(name, "approx_count_distinct")) return .approx_count_distinct;
     if (asciiEqIgnoreCase(name, "median") or asciiEqIgnoreCase(name, "quantile_cont")) return .quantile_cont;
+    if (isStringAggName(name)) return .string_agg;
     return null;
 }
 
@@ -1667,6 +1678,11 @@ pub fn bindAggregate(
         q = literalNumber(s) orelse return error.UnsupportedAggType;
         if (!(q >= 0 and q <= 1)) return error.UnsupportedAggType;
     };
+    var sep: []const u8 = ",";
+    if (func == .string_agg) if (second) |s| {
+        if (s != .literal or s.literal != .str) return error.UnsupportedAggType;
+        sep = s.literal.str;
+    };
     const shifted = if (func != .sum) null else if (arg) |a| sumOffset(a) else null;
 
     return .{
@@ -1680,6 +1696,7 @@ pub fn bindAggregate(
         .state = state,
         .as_date = as_date,
         .q = q,
+        .sep = sep,
     };
 }
 

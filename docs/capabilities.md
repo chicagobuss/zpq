@@ -117,7 +117,11 @@ of it: true if any, false unless all, NULL over no values), `var_samp` / `varian
 forms are NULL below two values and the population forms 0 for one; Welford's mean and squared deviations as DuckDB
 folds them, so one row group is bit for bit DuckDB's. Row groups combine pairwise in file order, the same at every `-j`;
 DuckDB itself varies in the last digits with its thread count and between runs, and zpq's answer is always one it gives.
-`DISTINCT`, and a date, BOOLEAN or text argument, are refused), `median(x)` and `quantile_cont(x, q)` of an integer or DOUBLE
+`DISTINCT`, and a date, BOOLEAN or text argument, are refused), `string_agg(text [, sep])` (also `group_concat` and
+`listagg`: the non-NULL values in file, row-group and row order, joined by a constant separator, `,` by default; NULL
+over none; empty texts count. The order is the scan order, the same at every `-j` unless `--unordered`; DuckDB's own
+varies with its threads. A text argument only; the other types, a non-constant separator and `DISTINCT` are refused. The
+texts are held in memory, with four bytes each, against `--max-memory`), `median(x)` and `quantile_cont(x, q)` of an integer or DOUBLE
 (a DOUBLE; NULLs skipped, NULL over none; the values sorted with NaN last and the position `(n - 1) * q` interpolated
 exactly as DuckDB's x86-64 build does, so the answer is its own bit for bit and the same at every `-j`; the quantile is
 a constant from 0 to 1. A FLOAT, DECIMAL, date, BOOLEAN or text argument, a negative or non-constant quantile, and

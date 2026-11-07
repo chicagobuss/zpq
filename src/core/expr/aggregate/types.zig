@@ -23,6 +23,9 @@ pub const AggFunc = enum {
     approx_count_distinct,
     /// `median(x)` and `quantile_cont(x, q)`: the interpolated quantile of a number's values, a DOUBLE (`AggCall.q`).
     quantile_cont,
+    /// `string_agg(x, sep)` (also `group_concat`, `listagg`): the non-NULL texts of the group in scan order, joined by
+    /// the constant `AggCall.sep`; NULL over none.
+    string_agg,
 
     /// A function only the generic fold and merge (`foldGroupedOne`, `scalar.zig`) run: the specialized strategies
     /// (dense, coded, owner records, partitioned, sketch) know the original six and decline a query that has one of
@@ -30,7 +33,7 @@ pub const AggFunc = enum {
     pub fn extended(f: AggFunc) bool {
         return switch (f) {
             .count, .count_distinct, .sum, .min, .max, .avg => false,
-            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont => true,
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => true,
         };
     }
 };
@@ -154,6 +157,8 @@ pub const AggCall = struct {
     as_date: bool = false,
     /// The quantile `quantile_cont` takes (`median` is 0.5), a constant in [0, 1].
     q: f64 = 0.5,
+    /// The text `string_agg` puts between values.
+    sep: []const u8 = ",",
 };
 
 /// How an aggregate folds, and what it emits in the final 1-row parquet:
@@ -386,6 +391,12 @@ pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShap
             if (e.temporal() != null or e.isBoolean() or e.typeOf() == .str or e.typeOf() == .dec) return error.UnsupportedAggType;
             if (e == .col_ref and e.col_ref.physical_type == .FLOAT) return error.UnsupportedAggType;
             break :blk .f64;
+        },
+        // Text only: DuckDB casts anything else to text, which zpq has no spelling of that it can match.
+        .string_agg => blk: {
+            const e = arg orelse return error.BadAggArg;
+            if (e.typeOf() != .str) return error.UnsupportedAggType;
+            break :blk .bytes;
         },
         .approx_count_distinct => blk: {
             const e = arg orelse return error.BadAggArg;

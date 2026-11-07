@@ -472,6 +472,8 @@ pub fn partAggSupported(args: MultiAggArgs, calls: []const expr_agg.AggCall, gro
 pub fn orderSensitive(calls: []const expr_agg.AggCall) bool {
     for (calls) |c| {
         if (c.func == .count or c.func == .count_distinct) continue;
+        // The texts of a group join in the order the partials meet.
+        if (c.func == .string_agg) return true;
         if (c.result == .f64) return true;
         // An avg sums integer values exactly (`AvgState.isum`); only a float argument's sum depends on order.
         if (c.result == .avg_f64 and (c.arg == null or c.arg.?.typeOf() != .i64)) return true;

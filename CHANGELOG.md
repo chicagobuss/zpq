@@ -98,6 +98,12 @@
   BOOLEANs, in WHERE too; `dayname`, `monthname`, `last_day`, `weekofyear`, `strpos`, `concat_ws` and `mod`; `ascii`, `chr`,
   `repeat` and `position(needle IN s)`. `ln`, `exp`, `pow`,
   `sin` and their kin stay refused: DuckDB's math library differs from a current one's in the last digit for many inputs.
+- **Unaliased computed columns are named as DuckDB names them.** `SELECT id, id + 1, upper(s) FROM t ORDER BY id` was refused
+  as `missing --output or --aggregate`; its columns are now `id`, `(id + 1)` and `upper(s)`. Names were checked against DuckDB on
+  over 500 generated expressions. What zpq rewrites before it reads, or prints differently from DuckDB (`CASE`, `//`, `EXTRACT`,
+  `POSITION`, `TRY_CAST`, a qualified column), is refused as `SelectAliasRequired` until it has an alias.
+- **`COLUMNS('regex')`, `COLUMNS(*)` and `COLUMNS(* EXCLUDE (...))` in SQL**: `SELECT max(COLUMNS('^l_.*date')) FROM lineitem`
+  runs, each matching column an output named after it, as DuckDB's.
 - **`ROLLUP`, `CUBE`, `GROUPING SETS` and `GROUPING()` in SQL** (`zpq query --query`): `GROUP BY ROLLUP (a, b)`, `CUBE (a, b)`,
   `GROUPING SETS ((a), (b), ())` and their products with plain keys match DuckDB, including the NULL a key takes in a set
   that leaves it out (in the key's own type), `GROUPING` / `GROUPING_ID`, HAVING per set and the grand-total row over no

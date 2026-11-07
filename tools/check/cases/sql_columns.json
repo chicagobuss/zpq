@@ -1,0 +1,642 @@
+{
+ "fixtures": [
+  {
+   "name": "ep",
+   "path": "ci/fixtures/parquet/sql_epoch.parquet"
+  },
+  {
+   "name": "mf",
+   "path": "ci/fixtures/parquet/sql_math.parquet"
+  },
+  {
+   "name": "sf",
+   "path": "ci/fixtures/parquet/sql_strings_pred.parquet"
+  },
+  {
+   "name": "up",
+   "path": "ci/fixtures/parquet/sql_uints.parquet"
+  }
+ ],
+ "cases": [
+  {
+   "id": "sql_columns:max-regex",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS('^t.*')) FROM '{fixture:ep}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT max(COLUMNS('^t.*')) FROM '{fixture:ep}'"
+   }
+  },
+  {
+   "id": "sql_columns:min-count",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT min(COLUMNS('^t[mnz].*')), count(*) AS c FROM '{fixture:ep}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT min(COLUMNS('^t[mnz].*')), count(*) AS c FROM '{fixture:ep}'"
+   }
+  },
+  {
+   "id": "sql_columns:count-partial",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(COLUMNS('d')) FROM '{fixture:ep}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT count(COLUMNS('d')) FROM '{fixture:ep}'"
+   }
+  },
+  {
+   "id": "sql_columns:star",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS(*)) FROM '{fixture:mf}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT max(COLUMNS(*)) FROM '{fixture:mf}'"
+   }
+  },
+  {
+   "id": "sql_columns:star-exclude",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS(* EXCLUDE (id, d))) FROM '{fixture:ep}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT max(COLUMNS(* EXCLUDE (id, d))) FROM '{fixture:ep}'"
+   }
+  },
+  {
+   "id": "sql_columns:star-exclude-one",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT min(COLUMNS(* EXCLUDE id)) FROM '{fixture:ep}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT min(COLUMNS(* EXCLUDE id)) FROM '{fixture:ep}'"
+   }
+  },
+  {
+   "id": "sql_columns:sum-alternation",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(COLUMNS('^(x|y)$')) FROM '{fixture:mf}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT sum(COLUMNS('^(x|y)$')) FROM '{fixture:mf}'"
+   }
+  },
+  {
+   "id": "sql_columns:two-items",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS('^x')), min(COLUMNS('^y')) FROM '{fixture:mf}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT max(COLUMNS('^x')), min(COLUMNS('^y')) FROM '{fixture:mf}'"
+   }
+  },
+  {
+   "id": "sql_columns:arithmetic-after",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT min(COLUMNS('^(x|y)$')) + 1 FROM '{fixture:mf}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT min(COLUMNS('^(x|y)$')) + 1 FROM '{fixture:mf}'"
+   }
+  },
+  {
+   "id": "sql_columns:case-insensitive",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS('(?i)^D$')) FROM '{fixture:ep}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT max(COLUMNS('(?i)^D$')) FROM '{fixture:ep}'"
+   }
+  },
+  {
+   "id": "sql_columns:anchored-group",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS('^(.)n$')) FROM '{fixture:ep}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT max(COLUMNS('^(.)n$')) FROM '{fixture:ep}'"
+   }
+  },
+  {
+   "id": "sql_columns:grouped",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, max(COLUMNS('^d.*')) FROM '{fixture:ep}' GROUP BY id ORDER BY id LIMIT 5",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, max(COLUMNS('^d.*')) FROM '{fixture:ep}' GROUP BY id ORDER BY id LIMIT 5"
+   }
+  },
+  {
+   "id": "sql_columns:rows",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, COLUMNS('^d.*') FROM '{fixture:ep}' ORDER BY id LIMIT 5",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, COLUMNS('^d.*') FROM '{fixture:ep}' ORDER BY id LIMIT 5"
+   }
+  },
+  {
+   "id": "sql_columns:rows-ints",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, COLUMNS('^(n|b)$') FROM '{fixture:mf}' ORDER BY id LIMIT 7",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, COLUMNS('^(n|b)$') FROM '{fixture:mf}' ORDER BY id LIMIT 7"
+   }
+  },
+  {
+   "id": "sql_columns:distinct",
+   "fixture": "sf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT DISTINCT COLUMNS('^s$') FROM '{fixture:sf}' ORDER BY 1",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT DISTINCT COLUMNS('^s$') FROM '{fixture:sf}' ORDER BY 1"
+   }
+  },
+  {
+   "id": "sql_columns:spelling",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "select MAX ( columns ( '^x' ) ), count(*) as n from '{fixture:mf}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "select MAX ( columns ( '^x' ) ), count(*) as n from '{fixture:mf}'"
+   }
+  },
+  {
+   "id": "sql_columns:where",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS('^x')), count(*) AS c FROM '{fixture:mf}' WHERE id > 10",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT max(COLUMNS('^x')), count(*) AS c FROM '{fixture:mf}' WHERE id > 10"
+   }
+  },
+  {
+   "id": "sql_columns:uints",
+   "fixture": "up",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS('^u')) FROM '{fixture:up}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT max(COLUMNS('^u')) FROM '{fixture:up}'"
+   }
+  },
+  {
+   "id": "sql_columns:set-operation",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS('^(x|y)$')) FROM '{fixture:mf}' UNION ALL SELECT min(COLUMNS('^(x|y)$')) FROM '{fixture:mf}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT max(COLUMNS('^(x|y)$')) FROM '{fixture:mf}' UNION ALL SELECT min(COLUMNS('^(x|y)$')) FROM '{fixture:mf}'"
+   }
+  },
+  {
+   "id": "sql_columns:refuse:no-match",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS('zzz')) FROM '{fixture:mf}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "ColumnsNoMatch",
+    "diag": "no column matches",
+    "exit": 2,
+    "binder_sql": "SELECT max(COLUMNS('zzz')) FROM '{fixture:mf}'",
+    "duck_error": "Binder Error:"
+   }
+  },
+  {
+   "id": "sql_columns:refuse:bad-regex",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS('(')) FROM '{fixture:mf}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "InvalidRegex",
+    "diag": "invalid regular expression",
+    "exit": 2,
+    "binder_sql": "SELECT max(COLUMNS('(')) FROM '{fixture:mf}'",
+    "duck_error": "Binder Error:"
+   }
+  },
+  {
+   "id": "sql_columns:refuse:two-in-one-item",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS('^x')) + max(COLUMNS('^x')) FROM '{fixture:mf}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "ColumnsNotSupported",
+    "diag": "COLUMNS(...) is supported",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_columns:refuse:name-list",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS(['x', 'y'])) FROM '{fixture:mf}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "ColumnsNotSupported",
+    "diag": "COLUMNS(...) is supported",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_columns:refuse:in-where",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id FROM '{fixture:mf}' WHERE COLUMNS(*) > 0",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "ColumnsNotSupported",
+    "diag": "COLUMNS(...) is supported",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_columns:refuse:alias-twice",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS('^(x|y)$')) AS m FROM '{fixture:mf}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "DuplicateOutputColumn",
+    "diag": "defined more than once",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_columns:names:aggregate",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT min(COLUMNS('^t[mnz].*')), count(*) AS c FROM '{fixture:ep}'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    }
+   ],
+   "oracle": {
+    "compare": "names",
+    "names": [
+     "tm",
+     "tmn",
+     "tn",
+     "tz",
+     "tzn",
+     "tmz",
+     "c"
+    ]
+   }
+  },
+  {
+   "id": "sql_columns:names:rows",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, COLUMNS('^d.*') FROM '{fixture:ep}' ORDER BY id LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    }
+   ],
+   "oracle": {
+    "compare": "names",
+    "names": [
+     "id",
+     "d",
+     "dn"
+    ]
+   }
+  },
+  {
+   "id": "sql_columns:names:arithmetic",
+   "fixture": "mf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT min(COLUMNS('^(x|y)$')) + 1 FROM '{fixture:mf}'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    }
+   ],
+   "oracle": {
+    "compare": "names",
+    "names": [
+     "x",
+     "y"
+    ]
+   }
+  },
+  {
+   "id": "sql_columns:names:exclude",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT max(COLUMNS(* EXCLUDE (id, d, dn, tu, tun, tm, tmn, tn, tz, tzn))) FROM '{fixture:ep}'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    }
+   ],
+   "oracle": {
+    "compare": "names",
+    "names": [
+     "tmz"
+    ]
+   }
+  }
+ ]
+}

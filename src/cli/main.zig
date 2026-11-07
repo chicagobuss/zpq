@@ -583,6 +583,32 @@ fn runQuery(
     try runParsed(init, &options, diag, arena);
 }
 
+/// The top-level column names of the first file a table path or glob names, for `COLUMNS(...)`.
+const ColumnNames = struct {
+    schemas: *engine.join.LocalSchemas,
+    io: std.Io,
+    env: std.process.Environ,
+
+    fn of(ctx: *anyopaque, arena: std.mem.Allocator, table: []const u8) anyerror![]const []const u8 {
+        const self: *ColumnNames = @ptrCast(@alignCast(ctx));
+        const matches = try expandGlob(arena, self.io, table, self.env);
+        if (matches.len == 0) return error.NoMatches;
+        // A footer is read from a local file only.
+        const meta = engine.join.LocalSchemas.footer(self.schemas, matches[0]) catch |err| return if (err == error.JoinNotLocal) error.ColumnsNotSupported else err;
+        const items = meta.schema.items;
+        var out: std.ArrayList([]const u8) = .empty;
+        var i: usize = 1;
+        while (i < items.len) {
+            try out.append(arena, items[i].name);
+            // A group's descendants are not top-level columns.
+            var pending: usize = @intCast(items[i].num_children orelse 0);
+            i += 1;
+            while (pending > 0 and i < items.len) : (i += 1) pending = pending - 1 + @as(usize, @intCast(items[i].num_children orelse 0));
+        }
+        return out.items;
+    }
+};
+
 /// The query `options` describe. A set operation runs its branches through here too, on copies of the options.
 fn runParsed(
     init: std.process.Init,
@@ -600,7 +626,20 @@ fn runParsed(
     var select = options.select;
     var aggregate = options.aggregate;
     const explain = options.explain;
-    const query = options.query;
+    // `COLUMNS(...)` select items are written out once per column they name, which the footer says.
+    var column_schemas: engine.join.LocalSchemas = .{ .arena = arena };
+    defer column_schemas.deinit();
+    const query: ?[]const u8 = if (comptime build_options.enable_sql) if (options.query) |q| blk: {
+        var names: ColumnNames = .{ .schemas = &column_schemas, .io = io, .env = env };
+        break :blk zpq.core.expr.sql_columns.expand(arena, q, .{ .ctx = &names, .names = ColumnNames.of }) catch |err| {
+            switch (err) {
+                error.ColumnsNotSupported => diagnosticPrint("sql: COLUMNS(...) is supported as select items over one local table, a regular expression or * [EXCLUDE (...)], once in an item\n", .{}),
+                error.ColumnsNoMatch => diagnosticPrint("sql: no column matches COLUMNS(...)\n", .{}),
+                else => {},
+            }
+            return err;
+        };
+    } else null else options.query;
     const fsync = options.fsync;
     const codec = options.codec;
     const parquet_version = options.parquet_version;
@@ -1124,7 +1163,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "UnsupportedStatement",        "SubqueryNotSupported",        "WindowNotSupported",           "ColumnMustBeGrouped",      "BadOutputUrl",         "BadOperator",
         "BadValue",                    "BloomFilterNeedsRows",        "BloomFilterUnsupportedColumn", "Unsigned64Operand",        "NullableNotSupported", "NestedNotSupported",
         "NestedRowOutputNotSupported", "UnbalancedParentheses",       "FilterTooDeep",                "AggregateInGroupBy",       "HavingTypeMismatch",   "UnsupportedCase",
-        "UnsupportedType",             "DecimalScaleTooLarge",        "MissingOutputOrAggregate", "SelectAliasRequired",     "MultipleStatements",       "CteNotSupported",      "AggregateInWhere",
+        "UnsupportedType",             "DecimalScaleTooLarge",        "MissingOutputOrAggregate", "SelectAliasRequired", "ColumnsNotSupported", "ColumnsNoMatch",     "MultipleStatements",       "CteNotSupported",      "AggregateInWhere",
         "MissingFromClause",           "MissingTableName",            "UnsupportedFromClause",        "UnsupportedAggType",       "UnsupportedCoalesce",  "UnsupportedColumnType",
         "UnlabelledColumn",            "INT96ReencodeNotSupported",   "NestedReencodeNotSupported",   "NestedFilterNotSupported", "ModuloNotSupported",   "ExpressionInPredicate",
         "NestedColumnSelected",        "NestedAggregateNotSupported", "NestedGroupKeyNotSupported",   "UnsupportedDatePart",      "InvalidRegex",         "UnsupportedRegex",

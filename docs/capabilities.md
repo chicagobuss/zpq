@@ -95,6 +95,22 @@ INTEGER or narrower, a BIGINT being no function DuckDB has either; an error othe
 argument must be a constant (`contains`, `strpos`, `position`, `repeat`, `regexp_matches`) refuses a column. `reverse` stays
 unknown: DuckDB reverses grapheme clusters, and zpq has no Unicode segmentation table.
 
+A computed column of a row query that has no `AS` is named as DuckDB names it: the expression printed back, every binary
+operation in parentheses (`(n + 1)`, `((n * 2) + 1)`, `(-(n))`), function names in lower case and in double quotes when they
+are keywords (`abs(n)`, `"year"(d)`, `"left"(s, 2)`), `coalesce` and `ifnull` as `COALESCE(...)`, a cast as `CAST(x AS
+BIGINT)` (also for `x::INT`), and literals and names as written. Aggregate and GROUP BY outputs keep their own long-standing names (`sum`,
+`count`, a key's text as written). A row column that DuckDB prints another way, or that zpq rewrites before it reads (`CASE`,
+`//`, `EXTRACT`, `POSITION`, `substring(x FROM ...)`, `TRY_CAST`, typed literals, a qualified column, a DECIMAL or sized cast) is
+refused as `SelectAliasRequired` until it is given an alias.
+
+`COLUMNS('regex')`, `COLUMNS(*)` and `COLUMNS(* EXCLUDE (a, b))` in the SELECT list stand for the columns they name, as in DuckDB:
+the select item that holds one is written once per column (the regular expression matches anywhere in the name, RE2 syntax, and
+is read against the top-level columns of the table's first file), with the column's name as the item's name
+(`max(COLUMNS('^l_.*date'))` is `max(l_shipdate) AS l_shipdate, ...`). One `COLUMNS` per item, in the SELECT list of a query over
+one local file or glob; a pattern that matches nothing is `ColumnsNoMatch`, and a list of names, a lambda, two in one item, one in
+WHERE or HAVING, or a join or S3 table is `ColumnsNotSupported`. A set operation or a grouping-set query expands each of its
+queries on its own.
+
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 
 **Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`), string concat (`||`),

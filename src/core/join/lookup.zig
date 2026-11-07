@@ -423,12 +423,18 @@ const Part = struct {
     local: []Local = &.{},
     lo: i64 = std.math.maxInt(i64),
     hi: i64 = std.math.minInt(i64),
+    /// The survivors as a row mask (a bit per row, not a row list), for the payloads decoded on their own
+    /// (`LateLocal`).
+    kept: []u64 = &.{},
 
-    /// The keys and local codes, which `buildPart` allocates from the build's `gpa` rather than the part's arena.
+    /// The keys, the survivors' mask and the local codes, which the build allocates from its `gpa` rather than an
+    /// arena.
     fn freeLarge(p: *Part, gpa: std.mem.Allocator) void {
         p.keys.free(gpa);
+        gpa.free(p.kept);
         for (p.local) |l| l.codes.free(gpa);
         p.keys = .{ .wide = &.{} };
+        p.kept = &.{};
         p.local = &.{};
     }
 };
@@ -461,14 +467,23 @@ const Local = struct {
     /// Each survivor's local code, at its dictionary's width.
     codes: Codes,
     dict: Dict,
-    /// Local code -> global code, filled when the dictionaries unify.
+    /// Local code -> global code, filled when the dictionaries unify; empty when the local codes are the global ones
+    /// (a build of one part).
     global: []u32 = &.{},
+
+    const empty: Local = .{ .codes = .{ .u32 = &.{} }, .dict = .{ .i64 = &.{} } };
+
+    fn globalOf(l: Local, row: usize) u32 {
+        const code = l.codes.get(@intCast(row));
+        return if (l.global.len == 0) code else l.global[code];
+    }
 };
 
 pub const BuildError = error{ DuplicateBuildKey, JoinKeyType, JoinPayloadType, JoinBuildExceedsBudget, OutOfMemory };
 
 const Ctx = struct {
-    /// One per build row group: its survivors' dictionaries and remaps, until the build is laid out.
+    /// Per build row group, one for the row group and one per payload (`arena`): its survivors' dictionaries and
+    /// remaps until the build is laid out, each written by one task at a time.
     arenas: []std.heap.ArenaAllocator,
     /// The survivors' keys and local codes, each an exact allocation (`Part.freeLarge`): in a row group's arena
     /// alone, a first block half again its first request held SF30 orders' 270 MB of them in ~400 MB.
@@ -480,6 +495,32 @@ const Ctx = struct {
     meta: *const schema.FileMetaData,
     spec: Spec,
     parts: []Part,
+    /// By leaf: what the filter reads, the key among it. These decode first, with the filter (`buildPart`).
+    filter_cols: []const bool,
+    /// The payloads (indices into `spec.payload`) no filter reads: each decodes on its own, per row group
+    /// (`LateLocal`), so a build of few row groups and many payloads still has a task per core.
+    late: []const usize,
+
+    fn arena(c: *const Ctx, rg_index: usize, slot: usize) std.mem.Allocator {
+        return c.arenas[rg_index * (c.spec.payload.len + 1) + slot].allocator();
+    }
+
+    /// `l` (on a task's scratch) kept for the layout: its codes narrowed into `gpa`, its dictionary copied into the
+    /// payload's arena.
+    fn keepLocal(c: *const Ctx, rg_index: usize, pi: usize, l: Local) !Local {
+        const a = c.arena(rg_index, 1 + pi);
+        const codes = try l.codes.narrowed(c.gpa, l.dict.len());
+        errdefer codes.free(c.gpa);
+        const dict: Dict = switch (l.dict) {
+            .string => |d| blk: {
+                const out = try a.alloc([]const u8, d.len);
+                for (d, out) |v, *o| o.* = try a.dupe(u8, v);
+                break :blk .{ .string = out };
+            },
+            inline else => |d, tag| @unionInit(Dict, @tagName(tag), try a.dupe(@TypeOf(d[0]), d)),
+        };
+        return .{ .codes = codes, .dict = dict };
+    }
 };
 
 fn chunkOf(bytes: []const u8, cm: schema.ColumnMetaData) ![]const u8 {
@@ -568,36 +609,43 @@ fn codedLocal(comptime T: type, a: std.mem.Allocator, bytes: []const u8, meta: *
     return .{ .codes = .{ .u32 = codes }, .dict = d };
 }
 
+/// A payload's local dictionary over the `keep` rows: the chunk's own when it is dictionary-coded throughout and no
+/// filter decoded it, else one built from its values (`decoded`, or decoded here).
+fn localOf(c: *const Ctx, sa: std.mem.Allocator, rg: *const schema.RowGroup, p: usize, keep: []const u32, decoded: ?filter_eval.Batch.Column) !Local {
+    if (decoded == null) {
+        const cm = rg.columns.items[p].meta_data orelse return error.ColumnMetaMissing;
+        if (switch (cm.type) {
+            .INT32 => try codedLocal(i32, sa, c.bytes, c.meta, rg, p, keep),
+            .INT64 => try codedLocal(i64, sa, c.bytes, c.meta, rg, p, keep),
+            .DOUBLE => try codedLocal(f64, sa, c.bytes, c.meta, rg, p, keep),
+            .BYTE_ARRAY => try codedLocal([]const u8, sa, c.bytes, c.meta, rg, p, keep),
+            else => null,
+        }) |coded| return coded;
+    }
+    return switch (decoded orelse try decodeValues(sa, c.bytes, c.meta, rg, p)) {
+        .i32 => |pc| try localDict(i32, sa, pc, keep),
+        .i64 => |pc| try localDict(i64, sa, pc, keep),
+        .f64 => |pc| try localDict(f64, sa, pc, keep),
+        .string => |pc| try localDict([]const u8, sa, pc, keep),
+        else => error.JoinPayloadType,
+    };
+}
+
+/// One row group's filter pass: decode what the filter reads, keep the rows it passes with a non-NULL key, and take
+/// the local dictionaries of the payloads it decoded. The other payloads decode after, on their own (`LateLocal`).
 fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
-    const a = c.arenas[rg_index].allocator();
     const scratch = &c.workers[worker];
     defer _ = scratch.reset(.retain_capacity);
     const sa = scratch.allocator();
     const rg = &c.meta.row_groups.items[rg_index];
     const rows: usize = @intCast(rg.num_rows);
-    const n_leaves = rg.columns.items.len;
+    const part = &c.parts[rg_index];
+    part.local = try c.arena(rg_index, 0).alloc(Local, c.spec.payload.len);
+    @memset(part.local, Local.empty);
     var cols: std.ArrayList(filter_eval.Batch.Column) = .empty;
     const lookup = try sa.alloc(?usize, c.meta.schema.items.len);
     @memset(lookup, null);
-    var need = try sa.alloc(bool, n_leaves);
-    @memset(need, false);
-    need[c.spec.key] = true;
-    for (c.spec.payload) |p| need[p] = true;
-    if (c.spec.filter) |f| {
-        var fc: std.ArrayList(usize) = .empty;
-        try f.collectColumns(&fc, sa);
-        for (fc.items) |ci| need[ci] = true;
-    }
-    // Payload columns no filter reads decode after it, and as codes when their chunk allows.
-    const filter_cols = try sa.alloc(bool, n_leaves);
-    @memset(filter_cols, false);
-    filter_cols[c.spec.key] = true;
-    if (c.spec.filter) |f| {
-        var fc: std.ArrayList(usize) = .empty;
-        try f.collectColumns(&fc, sa);
-        for (fc.items) |ci| filter_cols[ci] = true;
-    }
-    for (need, 0..) |n, ci| if (n and filter_cols[ci]) {
+    for (c.filter_cols, 0..) |f, ci| if (f) {
         lookup[ci] = cols.items.len;
         try cols.append(sa, try decodeValues(sa, c.bytes, c.meta, rg, ci));
     };
@@ -610,7 +658,8 @@ fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
     const kept = sel.count();
     var keep: std.ArrayList(u32) = try .initCapacity(sa, kept);
     var keys: std.ArrayList(i64) = try .initCapacity(sa, kept);
-    var part: Part = .{};
+    var lo: i64 = std.math.maxInt(i64);
+    var hi: i64 = std.math.minInt(i64);
     var it = sel.iterator();
     while (it.next()) |r| {
         const k: ?i64 = switch (key_col) {
@@ -621,62 +670,53 @@ fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
         // A NULL build key matches no probe row, NULL ones included.
         const key = k orelse {
             part.null_key = true;
+            sel.mask[r / 64] &= ~(@as(u64, 1) << @intCast(r & 63));
             continue;
         };
         keep.appendAssumeCapacity(@intCast(r));
         keys.appendAssumeCapacity(key);
-        part.lo = @min(part.lo, key);
-        part.hi = @max(part.hi, key);
+        lo = @min(lo, key);
+        hi = @max(hi, key);
     }
-    // Survivors' keys and local dictionaries outlive the scratch.
-    const locals = try sa.alloc(Local, c.spec.payload.len);
-    for (c.spec.payload, locals) |p, *l| {
-        const cm = rg.columns.items[p].meta_data orelse return error.ColumnMetaMissing;
-        if (!filter_cols[p]) if (switch (cm.type) {
-            .INT32 => try codedLocal(i32, sa, c.bytes, c.meta, rg, p, keep.items),
-            .INT64 => try codedLocal(i64, sa, c.bytes, c.meta, rg, p, keep.items),
-            .DOUBLE => try codedLocal(f64, sa, c.bytes, c.meta, rg, p, keep.items),
-            .BYTE_ARRAY => try codedLocal([]const u8, sa, c.bytes, c.meta, rg, p, keep.items),
-            else => null,
-        }) |coded| {
-            l.* = coded;
-            continue;
-        };
-        if (lookup[p] == null) {
-            lookup[p] = cols.items.len;
-            try cols.append(sa, try decodeValues(sa, c.bytes, c.meta, rg, p));
-        }
-        l.* = switch (cols.items[lookup[p].?]) {
-            .i32 => |pc| try localDict(i32, sa, pc, keep.items),
-            .i64 => |pc| try localDict(i64, sa, pc, keep.items),
-            .f64 => |pc| try localDict(f64, sa, pc, keep.items),
-            .string => |pc| try localDict([]const u8, sa, pc, keep.items),
-            else => return error.JoinPayloadType,
-        };
-    }
-    part.keys = if (keys.items.len != 0 and @as(i128, part.hi) - part.lo <= std.math.maxInt(u32)) blk: {
+    for (c.spec.payload, part.local, 0..) |p, *l, pi| if (c.filter_cols[p]) {
+        l.* = try c.keepLocal(rg_index, pi, try localOf(c, sa, rg, p, keep.items, cols.items[lookup[p].?]));
+    };
+    if (c.late.len != 0) part.kept = try c.gpa.dupe(u64, sel.mask);
+    part.keys = if (keys.items.len != 0 and @as(i128, hi) - lo <= std.math.maxInt(u32)) blk: {
         const out = try c.gpa.alloc(u32, keys.items.len);
-        for (keys.items, out) |k, *o| o.* = @intCast(k - part.lo);
+        for (keys.items, out) |k, *o| o.* = @intCast(k - lo);
         break :blk .{ .narrow = out };
     } else .{ .wide = try c.gpa.dupe(i64, keys.items) };
-    errdefer part.keys.free(c.gpa);
-    var narrowed: usize = 0;
-    errdefer for (locals[0..narrowed]) |l| l.codes.free(c.gpa);
-    for (locals) |*l| {
-        l.codes = try l.codes.narrowed(c.gpa, l.dict.len());
-        narrowed += 1;
-        l.dict = switch (l.dict) {
-            .string => |d| blk: {
-                const out = try a.alloc([]const u8, d.len);
-                for (d, out) |s, *o| o.* = try a.dupe(u8, s);
-                break :blk .{ .string = out };
-            },
-            inline else => |d, tag| @unionInit(Dict, @tagName(tag), try a.dupe(@TypeOf(d[0]), d)),
-        };
-    }
-    part.local = try a.dupe(Local, locals);
-    c.parts[rg_index] = part;
+    part.lo = lo;
+    part.hi = hi;
 }
+
+/// One payload no filter reads, over one row group's survivors (`Part.kept`): task `i` is row group `i / late.len`'s
+/// payload `late[i % late.len]`.
+const LateLocal = struct {
+    c: *Ctx,
+
+    fn run(self: @This(), worker: usize, i: usize) !void {
+        const c = self.c;
+        const rg_index = i / c.late.len;
+        const pi = c.late[i % c.late.len];
+        const scratch = &c.workers[worker];
+        defer _ = scratch.reset(.retain_capacity);
+        const sa = scratch.allocator();
+        const part = &c.parts[rg_index];
+        const keep = try sa.alloc(u32, part.keys.len());
+        var n: usize = 0;
+        for (part.kept, 0..) |w, wi| {
+            var bits = w;
+            while (bits != 0) : (bits &= bits - 1) {
+                keep[n] = @intCast(wi * 64 + @ctz(bits));
+                n += 1;
+            }
+        }
+        const rg = &c.meta.row_groups.items[rg_index];
+        part.local[pi] = try c.keepLocal(rg_index, pi, try localOf(c, sa, rg, c.spec.payload[pi], keep, null));
+    }
+};
 
 /// The most workers `parallel` runs.
 const max_workers = 64;
@@ -716,12 +756,74 @@ fn parallel(n: usize, threads: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx)
     for (errs) |e| if (e) |err| return err;
 }
 
-/// Unify payload `p`'s local dictionaries in row-group order: global codes number values by first appearance. The
-/// dictionary goes in `a`, and each part's local-to-global map in that part's arena (`arenas`, freed with the build's
-/// other scratch). The map that dedupes, and the list as it grows, live in `scratch` and go when this returns: in `a`,
-/// an arena held for the query, every table a growing map outgrew would stay charged (171 MB for a 1.08M-entry
-/// dictionary, against its 8.6 MB).
-fn unify(comptime T: type, a: std.mem.Allocator, scratch: std.mem.Allocator, arenas: []std.heap.ArenaAllocator, parts: []Part, p: usize) !Dict {
+/// One payload's dictionaries unified (`Unify.run`): its distinct values in global-code order, borrowed from the parts'
+/// local dictionaries, and their string bytes; then the dictionary in the build's allocator (`Unify.copy`).
+const Unified = struct {
+    values: Dict = .{ .i64 = &.{} },
+    /// Whether `values` is a list of its own (in `gpa`) rather than a part's local dictionary.
+    owned: bool = false,
+    bytes: usize = 0,
+    dict: Dict = .{ .i64 = &.{} },
+    blob: []u8 = &.{},
+
+    fn deinit(u: Unified, gpa: std.mem.Allocator) void {
+        if (u.owned) switch (u.values) {
+            inline else => |v| gpa.free(v),
+        };
+    }
+};
+
+/// Unify payload `p`'s local dictionaries in row-group order: global codes number values by first appearance. Each
+/// part's local-to-global map goes in that part's arena for `p` (freed with the build's other scratch); the map that
+/// dedupes lives in `gpa` and goes when the task ends. One part's local dictionary is already the global one.
+const Unify = struct {
+    c: *Ctx,
+    out: []Unified,
+
+    fn run(self: @This(), _: usize, p: usize) !void {
+        const c = self.c;
+        if (c.parts.len == 0) return;
+        self.out[p] = switch (c.parts[0].local[p].dict) {
+            .i32 => try unify(i32, c, p),
+            .i64 => try unify(i64, c, p),
+            .f64 => try unify(f64, c, p),
+            .string => try unify([]const u8, c, p),
+        };
+    }
+
+    /// The values into the dictionary allocated for them, strings into one blob.
+    fn copy(self: @This(), _: usize, p: usize) !void {
+        const u = self.out[p];
+        switch (u.values) {
+            .string => |v| {
+                var at: usize = 0;
+                for (v, @constCast(u.dict.string)) |x, *o| {
+                    @memcpy(u.blob[at..][0..x.len], x);
+                    o.* = u.blob[at..][0..x.len];
+                    at += x.len;
+                }
+            },
+            inline else => |v, tag| @memcpy(@constCast(@field(u.dict, @tagName(tag))), v),
+        }
+    }
+};
+
+fn unify(comptime T: type, c: *Ctx, p: usize) !Unified {
+    const tag = switch (T) {
+        i32 => "i32",
+        i64 => "i64",
+        f64 => "f64",
+        else => "string",
+    };
+    const gpa = c.gpa;
+    var bytes: usize = 0;
+    if (c.parts.len == 1) {
+        const local = @field(c.parts[0].local[p].dict, tag);
+        if (T == []const u8) for (local) |v| {
+            bytes += v.len;
+        };
+        return .{ .values = @unionInit(Dict, tag, local), .bytes = bytes };
+    }
     const Ctx2 = if (T == []const u8) std.hash_map.StringContext else struct {
         pub fn hash(_: @This(), v: T) u64 {
             return std.hash.Wyhash.hash(0, std.mem.asBytes(&v));
@@ -731,36 +833,24 @@ fn unify(comptime T: type, a: std.mem.Allocator, scratch: std.mem.Allocator, are
         }
     };
     var map: std.HashMapUnmanaged(T, u32, Ctx2, 80) = .empty;
-    defer map.deinit(scratch);
+    defer map.deinit(gpa);
     var dict: std.ArrayList(T) = .empty;
-    defer dict.deinit(scratch);
-    for (parts, arenas) |*part, *arena| {
+    errdefer dict.deinit(gpa);
+    for (c.parts, 0..) |*part, rg_index| {
         const l = &part.local[p];
-        const local = @field(l.dict, switch (T) {
-            i32 => "i32",
-            i64 => "i64",
-            f64 => "f64",
-            else => "string",
-        });
-        l.global = try arena.allocator().alloc(u32, local.len);
+        const local = @field(l.dict, tag);
+        l.global = try c.arena(rg_index, 1 + p).alloc(u32, local.len);
         for (local, l.global) |v, *g| {
-            const gop = try map.getOrPut(scratch, v);
+            const gop = try map.getOrPut(gpa, v);
             if (!gop.found_existing) {
-                const owned = if (T == []const u8) try a.dupe(u8, v) else v;
-                gop.key_ptr.* = owned;
                 gop.value_ptr.* = @intCast(dict.items.len);
-                try dict.append(scratch, owned);
+                try dict.append(gpa, v);
+                if (T == []const u8) bytes += v.len;
             }
             g.* = gop.value_ptr.*;
         }
     }
-    const out = try a.dupe(T, dict.items);
-    return switch (T) {
-        i32 => .{ .i32 = out },
-        i64 => .{ .i64 = out },
-        f64 => .{ .f64 = out },
-        else => .{ .string = out },
-    };
+    return .{ .values = @unionInit(Dict, tag, try dict.toOwnedSlice(gpa)), .owned = true, .bytes = bytes };
 }
 
 /// Each part's keys into the dense map's bits, flagging a key set twice. With `disjoint` (no two parts' key ranges
@@ -819,7 +909,7 @@ const FillCodes = struct {
         switch (part.keys) {
             inline else => |keys| for (keys, 0..) |raw, row| {
                 const s = c.j.slot(Keys.of(raw, part.lo)).?;
-                for (c.codes, part.local) |dst, l| dst.set(s, l.global[l.codes.get(@intCast(row))]);
+                for (c.codes, part.local) |dst, l| dst.set(s, l.globalOf(row));
             },
         }
     }
@@ -842,14 +932,28 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
         return error.JoinKeyType;
     const parts = try a.alloc(Part, meta.row_groups.items.len);
     @memset(parts, .{});
-    const arenas = try a.alloc(std.heap.ArenaAllocator, parts.len);
+    const arenas = try a.alloc(std.heap.ArenaAllocator, parts.len * (spec.payload.len + 1));
     for (arenas) |*ar| ar.* = .init(gpa);
     defer for (arenas) |*ar| ar.deinit();
     var workers: [max_workers]std.heap.ArenaAllocator = undefined;
     for (&workers) |*w| w.* = .init(gpa);
     defer for (&workers) |*w| w.deinit();
     defer for (parts) |*p| p.freeLarge(gpa);
-    var ctx: Ctx = .{ .arenas = arenas, .gpa = gpa, .workers = &workers, .bytes = bytes, .meta = meta, .spec = spec, .parts = parts };
+    const leaves = if (parts.len == 0) 0 else meta.row_groups.items[0].columns.items.len;
+    const filter_cols = try gpa.alloc(bool, leaves);
+    defer gpa.free(filter_cols);
+    @memset(filter_cols, false);
+    if (leaves != 0) filter_cols[spec.key] = true;
+    if (spec.filter) |f| {
+        var fc: std.ArrayList(usize) = .empty;
+        defer fc.deinit(gpa);
+        try f.collectColumns(&fc, gpa);
+        for (fc.items) |ci| filter_cols[ci] = true;
+    }
+    var late: std.ArrayList(usize) = .empty;
+    defer late.deinit(gpa);
+    if (leaves != 0) for (spec.payload, 0..) |leaf, pi| if (!filter_cols[leaf]) try late.append(gpa, pi);
+    var ctx: Ctx = .{ .arenas = arenas, .gpa = gpa, .workers = &workers, .bytes = bytes, .meta = meta, .spec = spec, .parts = parts, .filter_cols = filter_cols, .late = late.items };
     const trace = std.c.getenv("ZPQ_JOIN_TRACE") != null;
     var t = @import("../../clock.zig").monoNs();
     if (trace) t = lap("start", t);
@@ -881,6 +985,8 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     const key_bytes: usize = @intCast(@min(dense_bytes, hash_bytes));
     j.bytes = key_bytes + payload_bytes;
     if (spec.budget) |b| if (j.bytes > b) return error.JoinBuildExceedsBudget;
+    try parallel(parts.len * late.items.len, spec.threads, LateLocal{ .c = &ctx }, LateLocal.run);
+    if (trace) t = lap("payloads' local dictionaries", t);
     if (dense_bytes <= hash_bytes) {
         const words: usize = @intCast(span / 64 + 1);
         const d: Dense = .{ .lo = if (n == 0) 0 else lo, .bits = try a.alloc(u64, words), .rank = try a.alloc(u32, words) };
@@ -922,23 +1028,32 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     }
     const payloads = try a.alloc(Payload, spec.payload.len);
     const codes = try a.alloc(Codes, spec.payload.len);
-    for (spec.payload, payloads, codes, 0..) |leaf, *out, *cs, p| {
+    // Each payload's dictionaries unify on a task of its own (`Unify`); only the copy into `a`, which serves one thread,
+    // is allocated here between the two parallel passes.
+    const unified = try gpa.alloc(Unified, spec.payload.len);
+    defer gpa.free(unified);
+    @memset(unified, .{});
+    defer for (unified) |u| u.deinit(gpa);
+    const un: Unify = .{ .c = &ctx, .out = unified };
+    try parallel(spec.payload.len, spec.threads, un, Unify.run);
+    for (spec.payload, payloads, codes, unified) |leaf, *out, *cs, *u| {
         const element = @import("../parquet/metadata.zig").leafSchemaElement(meta, leaf).?;
         // With no row group the dictionary's type comes from the column's: a LEFT miss still reads it, as NULL.
-        const dict: Dict = if (parts.len == 0) switch (element.type orelse .INT64) {
+        if (parts.len == 0) u.values = switch (element.type orelse .INT64) {
             .INT32 => .{ .i32 = &.{} },
             .DOUBLE => .{ .f64 = &.{} },
             .BYTE_ARRAY => .{ .string = &.{} },
             else => .{ .i64 = &.{} },
-        } else switch (parts[0].local[p].dict) {
-            .i32 => try unify(i32, a, gpa, arenas, parts, p),
-            .i64 => try unify(i64, a, gpa, arenas, parts, p),
-            .f64 => try unify(f64, a, gpa, arenas, parts, p),
-            .string => try unify([]const u8, a, gpa, arenas, parts, p),
         };
-        cs.* = try .init(a, n, dict.len());
-        out.* = .{ .name = element.name, .element = element, .codes = cs.*, .dict = dict };
+        u.dict = switch (u.values) {
+            .string => |v| .{ .string = try a.alloc([]const u8, v.len) },
+            inline else => |v, tag| @unionInit(Dict, @tagName(tag), try a.alloc(@TypeOf(v[0]), v.len)),
+        };
+        if (u.values == .string) u.blob = try a.alloc(u8, u.bytes);
+        cs.* = try .init(a, n, u.values.len());
+        out.* = .{ .name = element.name, .element = element, .codes = cs.*, .dict = u.dict };
     }
+    try parallel(spec.payload.len, spec.threads, un, Unify.copy);
     j.payloads = payloads;
     if (trace) t = lap("unify dictionaries", t);
     try parallel(parts.len, spec.threads, FillCodes{ .j = j, .parts = parts, .codes = codes }, FillCodes.run);

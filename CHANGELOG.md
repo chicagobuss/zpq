@@ -19,6 +19,9 @@
   - Numbers compare exactly unless one side is DOUBLE, strings byte by byte, and times only with times in the same
     unit.
   - A string against a number, or a DATE against a TIMESTAMP, is refused as a type mismatch.
+  - A side of FLOAT arithmetic (`f + i`, `round(f)`) is refused by name: SQL rounds each step to FLOAT, and zpq
+    computes in DOUBLE. A FLOAT column, and abs, coalesce, least, greatest, floor, ceil or CASE of FLOATs alone,
+    compare as FLOAT.
   - Each side is evaluated over the rows earlier conjuncts kept.
   - No statistic prunes such a comparison yet.
   - LIKE, IN and BETWEEN, FILTER clauses and CASE conditions still take literals on their value side.

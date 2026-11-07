@@ -733,7 +733,7 @@ const Side = struct {
     lane: expr_ast.Type,
     /// A bare UINT64 column: its i64 lane holds raw bits, read as u64.
     unsigned: bool,
-    /// FLOAT, not DOUBLE: a FLOAT column, or arithmetic of FLOATs with integers or DECIMALs.
+    /// FLOAT, not DOUBLE: a FLOAT column, or a call or CASE that picks a FLOAT value (`Expr.float32`).
     float32: bool,
     /// Its DECIMAL type in exact arithmetic (an integer's widening; UINT64's is DECIMAL(20, 0)).
     dec: ?expr_ast.Dec,
@@ -748,14 +748,9 @@ const Side = struct {
         };
     }
 
+    /// A FLOAT value as DuckDB has it (`Expr.float32`); FLOAT arithmetic refused when the comparison bound.
     fn isFloat32(e: expr_ast.Expr) bool {
-        return switch (e) {
-            .col_ref => |c| c.expr_type == .f64 and c.physical_type == .FLOAT,
-            // FLOAT with an integer or DECIMAL stays FLOAT in DuckDB; with a DOUBLE it is DOUBLE.
-            .binop => |b| b.result_type == .f64 and (isFloat32(b.left.*) or isFloat32(b.right.*)) and
-                (isFloat32(b.left.*) or b.left.typeOf() != .f64) and (isFloat32(b.right.*) or b.right.typeOf() != .f64),
-            .literal, .call, .case_ => false,
-        };
+        return e.float32() == .exact;
     }
 
     fn int(s: Side, v: Value) i128 {

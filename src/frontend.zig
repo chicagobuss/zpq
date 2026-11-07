@@ -261,6 +261,11 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         error.IntegerOverflowRound => diagnosticPrint("zpq query: integer overflow in round\n", .{}),
         error.IntegerOverflowAbs => diagnosticPrint("zpq query: integer overflow in abs\n", .{}),
         error.ConversionOutOfRange => diagnosticPrint("zpq query: a CAST value does not fit the type it casts to\n", .{}),
+        error.FloatArithmeticComparison => diagnosticPrint(
+            "zpq query: a WHERE comparison of FLOAT arithmetic is not supported in this release: SQL rounds each\n" ++
+                "step to FLOAT, and zpq computes in DOUBLE; CAST the FLOAT column to DOUBLE to compare in DOUBLE\n",
+            .{},
+        ),
         error.ComparisonValueOutOfRange => diagnosticPrint(
             "zpq query: a value in a WHERE comparison does not fit the DECIMAL type both sides convert to\n",
             .{},

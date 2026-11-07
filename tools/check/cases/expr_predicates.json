@@ -1251,6 +1251,312 @@
     "error": "exit 1",
     "diag": "integer overflow in -"
    }
+  },
+  {
+   "id": "expr:review:float-value-abs",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE abs(f) = i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE abs(f) = i"
+   }
+  },
+  {
+   "id": "expr:review:float-value-coalesce",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE coalesce(f, f) = i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE coalesce(f, f) = i"
+   }
+  },
+  {
+   "id": "expr:review:float-value-case",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE CASE WHEN i > 0 THEN f ELSE f END = i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE CASE WHEN i > 0 THEN f ELSE f END = i"
+   }
+  },
+  {
+   "id": "expr:review:float-value-floor",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE floor(f) = i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE floor(f) = i"
+   }
+  },
+  {
+   "id": "expr:review:float-value-abs-constant",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE abs(f) = 16777217"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE abs(f) = 16777217"
+   }
+  },
+  {
+   "id": "expr:review:float-value-coalesce-double",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE coalesce(f, x) = i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE coalesce(f, x) = i"
+   }
+  },
+  {
+   "id": "expr:review:refuse:float-arith-plus-gt",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE g + i > i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a WHERE comparison of FLOAT arithmetic is not supported"
+   }
+  },
+  {
+   "id": "expr:review:refuse:float-arith-plus-eq",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE g + i = i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a WHERE comparison of FLOAT arithmetic is not supported"
+   }
+  },
+  {
+   "id": "expr:review:refuse:float-arith-decimal",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE f + dz > i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a WHERE comparison of FLOAT arithmetic is not supported"
+   }
+  },
+  {
+   "id": "expr:review:refuse:float-arith-round",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE round(f) = i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a WHERE comparison of FLOAT arithmetic is not supported"
+   }
+  },
+  {
+   "id": "expr:review:refuse:float-arith-least-integer",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE least(f, 1) = i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a WHERE comparison of FLOAT arithmetic is not supported"
+   }
+  },
+  {
+   "id": "expr:review:refuse:float-arith-float-float",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE f + g = i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a WHERE comparison of FLOAT arithmetic is not supported"
+   }
   }
  ]
 }

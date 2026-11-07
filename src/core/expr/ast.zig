@@ -414,10 +414,10 @@ pub const DiffPart = enum {
 
     pub fn parse(name: []const u8) ?DiffPart {
         const plural = [_]struct { []const u8, DiffPart }{
-            .{ "years", .year },         .{ "quarters", .quarter },         .{ "months", .month },
-            .{ "weeks", .week },         .{ "days", .day },                 .{ "hours", .hour },
-            .{ "minutes", .minute },     .{ "seconds", .second },           .{ "milliseconds", .millisecond },
-            .{ "microseconds", .microsecond }, .{ "decades", .decade },     .{ "centuries", .century },
+            .{ "years", .year },               .{ "quarters", .quarter }, .{ "months", .month },
+            .{ "weeks", .week },               .{ "days", .day },         .{ "hours", .hour },
+            .{ "minutes", .minute },           .{ "seconds", .second },   .{ "milliseconds", .millisecond },
+            .{ "microseconds", .microsecond }, .{ "decades", .decade },   .{ "centuries", .century },
             .{ "millennia", .millennium },
         };
         for (std.enums.values(DiffPart)) |p| if (std.ascii.eqlIgnoreCase(name, @tagName(p))) return p;
@@ -513,6 +513,74 @@ pub const Expr = union(enum) {
 
     /// The unit an integer expression counts time in: a DATE or TIMESTAMP column, or a date/time function's result.
     /// Arithmetic leaves it, as `ts + 1` is no longer a time zpq could print as one.
+    /// How DuckDB's FLOAT typing of this expression meets zpq's DOUBLE lane, which holds every FLOAT value exactly.
+    /// `exact`: a FLOAT value as DuckDB has it: a FLOAT column, or abs, coalesce, least, greatest, floor, ceil and
+    /// CASE whose value arguments are all such (they pick or round a FLOAT to a FLOAT exactly), compared in FLOAT.
+    /// `computed`: FLOAT arithmetic, which DuckDB rounds to FLOAT at every step and does with an integer or DECIMAL
+    /// rounded to FLOAT first; zpq computes in DOUBLE, so it has other values. `none`: no FLOAT result (a DOUBLE
+    /// operand widens a FLOAT exactly, and a cast or other function reads its exact value).
+    pub const Float32 = enum { none, exact, computed };
+
+    pub fn float32(self: Expr) Float32 {
+        return switch (self) {
+            .literal => .none,
+            .col_ref => |c| if (c.expr_type == .f64 and c.physical_type == .FLOAT) .exact else .none,
+            .binop => |b| switch (picked(&.{ b.left, b.right })) {
+                .computed, .exact => .computed,
+                .none => .none,
+            },
+            .call => |c| switch (c.func) {
+                .abs, .coalesce, .least, .greatest, .floor, .ceil => picked(c.args),
+                .round => switch (picked(c.args)) {
+                    .exact, .computed => .computed,
+                    .none => .none,
+                },
+                else => for (c.args) |arg| {
+                    if (arg.float32() == .computed) break .computed;
+                } else .none,
+            },
+            .case_ => |k| blk: {
+                var mix: Mix = .{};
+                for (k.whens) |w| if (w.then) |t| mix.add(t);
+                if (k.else_) |x| mix.add(x);
+                break :blk mix.result();
+            },
+        };
+    }
+
+    /// Value arguments meeting in one type (arithmetic's operands, coalesce's, CASE's): FLOAT values alone stay
+    /// `exact`; one beside an integer or DECIMAL is `computed` (DuckDB rounds those to FLOAT); beside a DOUBLE, none.
+    const Mix = struct {
+        computed: bool = false,
+        exact: bool = false,
+        other: bool = false,
+        double: bool = false,
+
+        fn add(m: *Mix, e: *const Expr) void {
+            switch (e.float32()) {
+                .computed => m.computed = true,
+                .exact => m.exact = true,
+                .none => if (e.typeOf() == .f64) {
+                    m.double = true;
+                } else {
+                    m.other = true;
+                },
+            }
+        }
+
+        fn result(m: Mix) Float32 {
+            if (m.computed) return .computed;
+            if (!m.exact or m.double) return .none;
+            return if (m.other) .computed else .exact;
+        }
+    };
+
+    fn picked(args: []const *const Expr) Float32 {
+        var mix: Mix = .{};
+        for (args) |arg| mix.add(arg);
+        return mix.result();
+    }
+
     pub fn temporal(self: Expr) ?Temporal {
         return switch (self) {
             .col_ref => |c| c.temporal,
@@ -1107,4 +1175,37 @@ test "Expr.isBoolean: a BOOLEAN column, and CASE or coalesce whose every value i
     const one = [_]*Expr{ &b, &i };
     try std.testing.expect((Expr{ .call = .{ .func = .coalesce, .args = &both, .result_type = .i64, .depth = 1 } }).isBoolean());
     try std.testing.expect(!(Expr{ .call = .{ .func = .coalesce, .args = &one, .result_type = .i64, .depth = 1 } }).isBoolean());
+}
+
+test "an expression's FLOAT typing as DuckDB binds it" {
+    var f: Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .FLOAT, .expr_type = .f64 } };
+    var g: Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .FLOAT, .expr_type = .f64 } };
+    var d: Expr = .{ .col_ref = .{ .col_idx = 2, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var i: Expr = .{ .col_ref = .{ .col_idx = 3, .physical_type = .INT64, .expr_type = .i64 } };
+    const call = struct {
+        fn of(func: Func, args: []const *Expr) Expr {
+            return .{ .call = .{ .func = func, .args = args, .result_type = .f64, .depth = 2 } };
+        }
+        fn bin(l: *Expr, r: *Expr) Expr {
+            return .{ .binop = .{ .op = .add, .left = l, .right = r, .result_type = .f64, .depth = 2 } };
+        }
+    };
+    try std.testing.expectEqual(Expr.Float32.exact, f.float32());
+    try std.testing.expectEqual(Expr.Float32.none, i.float32());
+    // abs, coalesce and CASE of FLOATs keep a FLOAT value; beside a DOUBLE they are DOUBLE.
+    try std.testing.expectEqual(Expr.Float32.exact, call.of(.abs, &.{&f}).float32());
+    try std.testing.expectEqual(Expr.Float32.exact, call.of(.coalesce, &.{ &f, &g }).float32());
+    try std.testing.expectEqual(Expr.Float32.none, call.of(.coalesce, &.{ &f, &d }).float32());
+    const whens = [_]Case.When{.{ .cond = .{ .null_check = .{ .col_idx = 3, .is_not = true } }, .then = &f }};
+    const case: Expr = .{ .case_ = .{ .whens = &whens, .else_ = &g, .result_type = .f64, .depth = 2 } };
+    try std.testing.expectEqual(Expr.Float32.exact, case.float32());
+    // Arithmetic in FLOAT, and a FLOAT beside an integer, are computed; anything under them too.
+    var sum = call.bin(&f, &i);
+    try std.testing.expectEqual(Expr.Float32.computed, sum.float32());
+    try std.testing.expectEqual(Expr.Float32.computed, call.bin(&f, &g).float32());
+    try std.testing.expectEqual(Expr.Float32.computed, call.of(.abs, &.{&sum}).float32());
+    try std.testing.expectEqual(Expr.Float32.computed, call.of(.coalesce, &.{ &f, &i }).float32());
+    try std.testing.expectEqual(Expr.Float32.computed, call.of(.round, &.{&f}).float32());
+    try std.testing.expectEqual(Expr.Float32.none, call.bin(&f, &d).float32());
+    try std.testing.expectEqual(Expr.Float32.none, call.of(.cast_double, &.{&f}).float32());
 }

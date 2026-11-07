@@ -52,6 +52,9 @@ pub const Error = error{
     /// A typed DATE or TIMESTAMP literal that does not convert to the column's timestamp type (a TIMESTAMP past
     /// TIMESTAMP_NS's years, a DATE past TIMESTAMP's): DuckDB's cast fails, so there is no threshold to compare.
     TemporalOutOfRange,
+    /// A side of a comparison of expressions computes in FLOAT (`f + i`, `round(f)`): DuckDB rounds each step to FLOAT,
+    /// and zpq computes in DOUBLE.
+    FloatArithmeticComparison,
     /// The two sides of a comparison of expressions are of kinds that do not compare: a string against a number,
     /// or times in two units (a DATE against a TIMESTAMP, a time against a plain number).
     TypeMismatch,
@@ -84,6 +87,8 @@ fn bindExprCompare(arena: std.mem.Allocator, left: syntax.Expr, op: ast.Operator
     sides[0] = expr_parser.bindSyntax(arena, left, file, diag) catch |err| return intoError(err);
     sides[1] = expr_parser.bindSyntax(arena, right, file, diag) catch |err| return intoError(err);
     if (expr_ast.Type.promote(sides[0].typeOf(), sides[1].typeOf()) == null) return error.TypeMismatch;
+    // DuckDB rounds FLOAT arithmetic to FLOAT at every step; zpq's DOUBLE lane would compare other values.
+    for (sides) |e| if (e.float32() == .computed) return error.FloatArithmeticComparison;
     if (!std.meta.eql(sides[0].temporal(), sides[1].temporal())) return error.TypeMismatch;
     return .{ .expr = .{ .op = op, .left = &sides[0], .right = &sides[1] } };
 }

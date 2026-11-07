@@ -1,5 +1,5 @@
 """The expression predicates review's fixture (zpq-060/REVIEW-joins.md, EP-1..EP-5): one row whose column pairs meet in
-a common type other than either side's (UINT64 magnitudes, FLOAT against BIGINT, DECIMAL against DOUBLE, DECIMALs
+a common type other than either side's (UINT64 magnitudes, FLOAT against BIGINT (and FLOAT arithmetic with it), DECIMAL against DOUBLE, DECIMALs
 whose common type overflows, INTEGER arithmetic at its edge), plain-encoded as the review wrote it; and 1000 rows of
 DECIMALs at scales 2, 9, 18 and 37 beside their correctly rounded DOUBLEs. Arguments: the two output paths.
 """
@@ -19,6 +19,7 @@ def main():
         "v": pa.array([1], type=pa.uint64()),
         "f": pa.array([16777216.0], type=pa.float32()),
         "i": pa.array([16777217], type=pa.int64()),
+        "g": pa.array([1.0], type=pa.float32()),
         "dz": pa.array([decimal.Decimal("16777217")], type=pa.decimal128(12, 0)),
         "p": pa.array([decimal.Decimal("0.1")], type=pa.decimal128(38, 37)),
         "x": pa.array([0.1], type=pa.float64()),

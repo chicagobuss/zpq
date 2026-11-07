@@ -36,7 +36,9 @@ compares with nothing, and a constant nested more deeply than the thread's stack
 the thread, not fixed) is refused (`ConstantTooDeep`).
 In SQL a WHERE comparison may also set two expressions against each other (`l_commitdate < l_receiptdate`,
 `l_extendedprice * (1 - l_discount) > 50000`, `abs(a - 25) < z`). Numbers of any lane compare exactly unless one side is
-DOUBLE, strings byte by byte, and times only with times in the same unit. A row where either side is NULL passes neither
+DOUBLE, strings byte by byte, and times only with times in the same unit. A FLOAT column, or abs, coalesce, least,
+greatest, floor, ceil or CASE of FLOATs alone, compares as FLOAT; FLOAT arithmetic (`f + i`, `round(f)`) is refused,
+since SQL rounds each of its steps to FLOAT and zpq computes in DOUBLE. A row where either side is NULL passes neither
 the comparison nor its NOT. A side is evaluated only over the rows earlier conjuncts kept, so `z > 0 AND b / z > 3`
 divides no zero. No statistic prunes such a comparison yet. LIKE, IN and BETWEEN still take literals on their value
 side, as do FILTER clauses and CASE conditions.

@@ -213,6 +213,18 @@ engine takes a level.
 
 `python -m unittest discover -s bench/tests` checks the rules (the `bench-self` stage of the commit tier).
 
+## Site export
+
+```sh
+python -m bench site-export RUN --run-id ID --out DIR [--lane hot-fresh|cold] [--reps 3]
+```
+
+Writes the files the site's importer reads, from a saved native run (`header.json`, `journal.jsonl` and any
+`rechecks/*/journal.jsonl`): `composite.json` (one entry per case and engine, with a median only when every
+repetition was accepted), `results.jsonl` (one attempt record per journal row), `confirmations.jsonl` and
+`status.json`. It reads saved records only, and the same run exports to the same bytes (except the status heartbeat).
+The candidate and baseline SHAs and each engine's version and digest come from the header.
+
 ## Requests and saved-run exports
 
 Prepare an offline request packet, optionally with a metadata-only input dependency plan:

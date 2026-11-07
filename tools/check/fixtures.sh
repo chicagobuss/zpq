@@ -32,7 +32,9 @@ if [[ $(git -C "$corpus" rev-parse HEAD 2>/dev/null) != "$pin" ]]; then
   git -C "$corpus" checkout --quiet --detach "$pin"
 fi
 [[ $(git -C "$corpus" rev-parse HEAD) == "$pin" ]] || { echo "fixtures: $corpus is not at $pin" >&2; exit 1; }
-stamp=$(cat tools/datagen/*.py | sha256sum | cut -c1-16)
+# macOS ships shasum, not sha256sum; both print the same "HASH  -" for stdin, so a stamp is the same on every host.
+sha256() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
+stamp=$(cat tools/datagen/*.py | sha256 | cut -c1-16)
 for spec in bench:benchmark_100mb.parquet,bench_types.parquet nested:nested_edges.parquet; do
   recipe=${spec%%:*}
   files=${spec#*:}

@@ -98,7 +98,10 @@
   as DuckDB's own formatter does, which settles on non-shortest digits for ties such as `-521345.625`; zpq ports that
   formatter step for step. Checked against DuckDB on 600,000 generated DOUBLEs and FLOATs and 90,000 values of every other
   type. A cast of an expression computed from a FLOAT (DuckDB computes it in single precision) and of an INT96 timestamp
-  is refused by name. It was `type mismatch in expression` for every non-text argument.
+  is refused by name. It was `type mismatch in expression` for every non-text argument. A NaN prints with its sign
+  (`-nan` for `inf - inf`, `sqrt(-1)` and the text `-nan`, as DuckDB does); `-x` of a DOUBLE now gives -0.0 for 0.0 as
+  DuckDB's does (it gave 0.0), while the negation of a NaN keeps the NaN's sign where DuckDB flips it, which only the text
+  shows. A `TRY_CAST` inside another (`TRY_CAST(TRY_CAST(s AS INTEGER) AS DOUBLE)`) was left as an unknown function.
 - **Numeric casts in SQL.** `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))` and `x::TYPE`
   over a number, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB, including its rounding (a DECIMAL
   half away from zero, a DOUBLE to an integer half to even) and its conversion error for a value that does not fit.

@@ -477,5 +477,8 @@ test "text to double is DuckDB 2.0.0's" {
     }
     try T.expect(std.math.isNan(parseDouble(&scratch, a, "NaN").?));
     try T.expect(std.math.isNan(parseDouble(&scratch, a, "  nan  ").?));
+    // DuckDB keeps the sign of a NaN it reads.
+    try T.expect(std.math.signbit(parseDouble(&scratch, a, "-nan").?));
+    try T.expect(!std.math.signbit(parseDouble(&scratch, a, "+nan").?));
     try T.expect(std.math.signbit(parseDouble(&scratch, a, "-0").?));
 }

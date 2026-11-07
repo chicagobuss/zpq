@@ -1408,11 +1408,12 @@ pub fn negate(arena: std.mem.Allocator, inner: ast.Expr) Error!ast.Expr {
         else => {
             try rejectUnsigned64Operand(inner);
             const lp = try arena.create(ast.Expr);
-            lp.* = .{ .literal = .{ .i64 = 0 } };
-            const rp = try arena.create(ast.Expr);
-            rp.* = inner;
             const result_type = ast.Type.promote(.i64, inner.typeOf()) orelse return error.TypeMismatch;
             if (result_type == .str) return error.TypeMismatch;
+            // `-0.0 - x` flips the sign of a zero, which `0 - x` leaves (DuckDB's `-x` of 0.0 is -0.0).
+            lp.* = if (result_type == .f64) .{ .literal = .{ .f64 = -0.0 } } else .{ .literal = .{ .i64 = 0 } };
+            const rp = try arena.create(ast.Expr);
+            rp.* = inner;
             const depth = 1 + inner.depth();
             if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
             // Negation can't grow a value, so a DECIMAL keeps its operand's type (as SQL engines type `-x`).

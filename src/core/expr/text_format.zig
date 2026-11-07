@@ -35,7 +35,8 @@ pub fn writeDecimal(out: *std.ArrayList(u8), gpa: std.mem.Allocator, unscaled: i
 /// DOUBLE (`T = f64`) or FLOAT (`T = f32`): the shortest digits that read back the same, fixed notation for a decimal exponent from -4
 /// to 15 (`1e15` is `1000000000000000.0`, `0.0001` is `0.0001`), else `d.ddde+XX` with an exponent of at least two digits.
 pub fn writeFloat(out: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime T: type, x: T) std.mem.Allocator.Error!void {
-    if (std.math.isNan(x)) return out.appendSlice(gpa, "nan");
+    // fmt prints the sign of a NaN too: `-nan` for `inf - inf`, `sqrt(-1)` and the text `-nan`.
+    if (std.math.isNan(x)) return out.appendSlice(gpa, if (std.math.signbit(x)) "-nan" else "nan");
     if (std.math.isInf(x)) return out.appendSlice(gpa, if (x < 0) "-inf" else "inf");
     if (std.math.signbit(x)) try out.append(gpa, '-');
     var digits_buf: [32]u8 = undefined;
@@ -176,6 +177,8 @@ test "DOUBLE and FLOAT text is DuckDB 2.0.0's" {
     try expectFloat(f64, std.math.inf(f64), "inf");
     try expectFloat(f64, -std.math.inf(f64), "-inf");
     try expectFloat(f64, std.math.nan(f64), "nan");
+    try expectFloat(f64, -std.math.nan(f64), "-nan");
+    try expectFloat(f32, -std.math.nan(f32), "-nan");
     try expectFloat(f32, 1.5, "1.5");
     try expectFloat(f32, 1e10, "10000000000.0");
     try expectFloat(f32, 1e16, "1e+16");
@@ -184,8 +187,10 @@ test "DOUBLE and FLOAT text is DuckDB 2.0.0's" {
     try expectFloat(f32, 1e-5, "1e-05");
     try expectFloat(f32, 16777216.0, "16777216.0");
     try expectFloat(f32, -0.0, "-0.0");
-    try expectFloat(f32, -521345.625, "-521345.62");
-    try expectFloat(f32, 2215130.75, "2215130.8");
+    // Where Grisu3 declines (a tie between two shortest candidates) DuckDB prints the widened double's digits.
+    try expectFloat(f32, -521345.625, "-521345.625");
+    try expectFloat(f32, 2215130.75, "2215130.75");
+    try expectFloat(f32, -1564322.25, "-1564322.25");
     try expectFloat(f32, 1234567.9, "1234567.9");
 }
 

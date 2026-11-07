@@ -775,7 +775,10 @@ fn tryCasts(allocator: std.mem.Allocator, sql: []const u8) ![:0]u8 {
             if (open < sql.len and sql[open] == '(') {
                 if (castAs(sql, open)) |as_end| {
                     try out.appendSlice(allocator, "CAST");
-                    try out.appendSlice(allocator, sql[i + word.len .. as_end]);
+                    // The operand is rewritten too: it may hold a `TRY_CAST` of its own.
+                    const operand = try tryCasts(allocator, sql[i + word.len .. as_end]);
+                    defer allocator.free(operand);
+                    try out.appendSlice(allocator, operand);
                     try out.appendSlice(allocator, " zpq_try_");
                     i = as_end;
                     while (i < sql.len and std.ascii.isWhitespace(sql[i])) i += 1;

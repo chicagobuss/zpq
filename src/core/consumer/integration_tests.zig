@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const test_skip = @import("../../test_skip.zig");
 const owner_groups = @import("../owner_groups.zig");
 const msd_groups = @import("../msd_groups.zig");
 const retained_pages = @import("../retained_pages.zig");
@@ -569,6 +570,8 @@ test "a required row gate skips an unread page and defaults the unselected slots
 }
 
 test "advice for a gated chunk follows its gate: the decode reads the same, and records whether every page was kept" {
+    // `adviseGated` walks nothing off Linux, so no page is ever recorded as kept.
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "page-cache advice (madvise, mincore)");
     const testing = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

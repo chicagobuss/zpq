@@ -9,6 +9,7 @@ const expr_ast = @import("../expr/ast.zig");
 const expr_parser = @import("../expr/parser.zig");
 const expr_agg = @import("../expr/agg.zig");
 const core_memory = @import("../memory.zig");
+const test_skip = @import("../../test_skip.zig");
 const owner_groups = @import("../owner_groups.zig");
 const worker_contracts = @import("worker_contracts.zig");
 const FailureProbe = worker_contracts.FailureProbe;
@@ -1023,7 +1024,7 @@ test "phase-four replay policies decline releasing gates before certificate resi
 
 test "windowed S3 merge refusal never retries consumed non-rescannable inputs" {
     const s3_window = @import("../../io/s3_window.zig");
-    if (!s3_window.supported) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the S3 fetch window (epoll loop)");
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

@@ -307,6 +307,52 @@ test "windowed re-encode writes the same bytes at every parallelism" {
     }
 }
 
+test "a single-turn re-encode keeps its output window within max-memory" {
+    const fixture = "ci/fixtures/parquet/repeat_keys.parquet";
+    const gpa = std.heap.smp_allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var input_buf: [96]u8 = undefined;
+    const delta = try std.fmt.bufPrint(&input_buf, ".zig-cache/tmp/{s}/delta.parquet", .{tmp.sub_path});
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var prepared = try runQuery(ctx, .{
+        .inputs = &.{fixture},
+        .output = delta,
+        .select = "k+0 AS t0,k+1 AS t1,k+2 AS t2,k+3 AS t3,k+4 AS t4,k+5 AS t5,k+6 AS t6,k+7 AS t7," ++
+            "k+8 AS t8,k+9 AS t9,k+10 AS t10,k+11 AS t11,k+12 AS t12,k+13 AS t13,k+14 AS t14,k+15 AS t15",
+        .row_group = .{ .rows = 8000 },
+        .parallelism = 1,
+    });
+    prepared.deinit(gpa);
+    // DELTA-coded input is small on wire; its expanded output fills the window while the only CPU turn decodes.
+    // Reserving an encoding beside later pieces used the lone-job allowance although the encoding itself fits.
+    for ([_]usize{ 7 << 20, 16 << 20 }) |limit| {
+        const opts = profile.Options.forBudget(limit);
+        const p = try profile.Profiler.create(gpa, opts, .{});
+        defer p.destroy();
+        var r = try runQuery(ctx, .{
+            .inputs = &.{delta},
+            .output = out,
+            .filter = "t0 >= 0",
+            .select = "t0,t1,t2,t3,t4,t5,t6,t7,t8,t9,t10,t11,t12,t13,t14,t15",
+            .codec = .ZSTD,
+            .parallelism = 1,
+            .max_memory = limit -| opts.reservedBytes(),
+            .max_memory_explicit = limit,
+            .row_group = .{ .rows = 2000 },
+            .profiler = p,
+        });
+        defer r.deinit(gpa);
+        try std.testing.expect(r.write.row_groups_kept > 0);
+        try std.testing.expect(p.ledger_limit > 0);
+        if (p.ledger_peak > p.ledger_limit)
+            std.debug.print("re-encode ledger peak {d} exceeds {d}\n", .{ p.ledger_peak, p.ledger_limit });
+        try std.testing.expect(p.ledger_peak <= p.ledger_limit);
+    }
+}
+
 test "a row query prints the same bytes at every parallelism, in every text format, failing where -j1 fails" {
     const full = "ci/fixtures/parquet/full_match.parquet"; // 8 row groups
     const tiny = "ci/fixtures/parquet/many_tiny.parquet"; // 512 row groups, ZSTD, a FLBA decimal

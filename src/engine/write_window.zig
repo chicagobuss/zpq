@@ -1394,9 +1394,14 @@ fn winWriter(w: *WinCtx) void {
     const prof = profile.threadOf(w.profiler, .writer);
     var asm_ = Assembler.init(w);
     defer asm_.deinit();
+    const serial = w.memory != null and w.cpu_budget == 1;
     var next: usize = 0;
     while (next < w.slots.len) : (next += 1) {
         while (!w.slots[next].done.load(.acquire)) w.completions.waitUncancelable(w.io);
+        // Publication precedes the producer's final region release. Wait for that release before a lone encode
+        // trims idle pages and reserves its credit; the next input is still held behind this slot's window permit.
+        if (serial) w.cpu.waitUncancelable(w.io);
+        defer if (serial) w.cpu.post(w.io);
         const enc = w.slots[next].enc;
         w.core.decode_ns += enc.timings.decode_ns;
         w.core.eval_ns += enc.timings.eval_ns;
@@ -1432,8 +1437,9 @@ fn winWriter(w: *WinCtx) void {
             // finish and none starts, and their regions give their pages back, before it slices. Not over fetched
             // inputs: a producer may be waiting for fetch room this row group holds until the writer is done with it.
             const turns = if (w.memory != null and w.jobs[next].gate == null) w.producers else 0;
-            for (0..turns) |_| w.cpu.waitUncancelable(w.io);
-            defer for (0..turns) |_| w.cpu.post(w.io);
+            const extra_turns = turns -| @intFromBool(serial);
+            for (0..extra_turns) |_| w.cpu.waitUncancelable(w.io);
+            defer for (0..extra_turns) |_| w.cpu.post(w.io);
             w.writer_turns = turns;
             defer w.writer_turns = 0;
             // Encode jobs may still hold regions: only idle ones are trimmed.
@@ -1478,6 +1484,11 @@ fn winWriter(w: *WinCtx) void {
                 }
             }
         }
+        // With one ready CPU turn, a producer cannot overlap useful work with an encode. Finish the sealed
+        // groups before returning its input-window credit, rather than fill the ledger with later pieces.
+        if (serial and w.first_err == null) asm_.writeReady(true) catch |e| {
+            w.first_err = e;
+        };
         if (enc.bytes.len > 0) w.outAlloc().free(enc.bytes);
         profile.gauge(prof, .buffered_bytes, -@as(i64, @intCast(held)));
         _ = w.inflight.fetchSub(held, .acq_rel);
@@ -1488,11 +1499,17 @@ fn winWriter(w: *WinCtx) void {
     };
 }
 
-pub fn runWindowedReencode(w: *WinCtx, async_budget: usize) !void {
+pub fn runWindowedReencode(w: *WinCtx, async_budget: usize, env: ?std.process.Environ) !void {
     // SMT siblings share the private caches and execution resources this pipeline saturates. Use independent
     // affinity domains where topology proves them, with one combined ready-work budget for decode and encode.
-    const visible = std.Thread.getCpuCount() catch 1;
-    w.cpu_budget = hw.independentOwnerWorkers(@max(1, @min(w.cpu_budget, visible)));
+    const available = system.discoverAvailableParallelism(env);
+    w.cpu_budget = hw.independentOwnerWorkers(@max(1, @min(w.cpu_budget, available)));
+    if (w.memory != null and w.cpu_budget == 1) {
+        // No next producer before the writer has admitted and placed this input's sealed groups. Otherwise its
+        // pieces can consume the room for the lone encode reservation while that encode waits for the same turn.
+        w.win_units = 1;
+        w.window.* = .{ .permits = 1 };
+    }
     return runWindowed(WinCtx, w, w.jobs.len, @min(async_budget, w.cpu_budget));
 }
 
@@ -2424,6 +2441,8 @@ test "a byte-copy sink error wins over later allocation and producer errors" {
     w.encode_scratch = null;
     w.gpa = gpa;
     w.io = std.testing.io;
+    w.memory = null;
+    w.cpu_budget = 1;
     w.rg_target = .{};
     w.core = .{};
     w.slots = &slots;

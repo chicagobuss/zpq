@@ -2233,6 +2233,21 @@ test "filter-only and hash-only strings stream a cache-sized window, other strin
     try std.testing.expect(!streamByteArray(in, scalar_filter, 0));
     try std.testing.expectEqual(std.math.maxInt(usize), streamWindowRows(in, scalar_filter, 100_000));
     columns[0].meta_data.?.encodings = .{ .items = &enc_plain, .capacity = enc_plain.len, .pointer_stability = .{} };
+    // Polars (q12's l_shipmode): a dictionary page, RLE_DICTIONARY and PLAIN, no encoding stats. The pages tell a
+    // coded decode whether the dictionary covers them, so the string keeps it. Stats that show a PLAIN data page say
+    // it does not, and the string streams.
+    columns[0].meta_data.?.dictionary_page_offset = 4;
+    columns[0].meta_data.?.data_page_offset = 64;
+    try std.testing.expect(!streamByteArray(in, scalar_filter, 0));
+    var stats = [_]schema.PageEncodingStats{
+        .{ .page_type = @backingInt(schema.PageType.DICTIONARY_PAGE), .encoding = @backingInt(schema.Encoding.PLAIN), .count = 1 },
+        .{ .page_type = @backingInt(schema.PageType.DATA_PAGE), .encoding = @backingInt(schema.Encoding.PLAIN), .count = 1 },
+    };
+    columns[0].meta_data.?.encoding_stats = .{ .items = &stats, .capacity = stats.len, .pointer_stability = .{} };
+    try std.testing.expect(streamByteArray(in, scalar_filter, 0));
+    columns[0].meta_data.?.encoding_stats = null;
+    columns[0].meta_data.?.dictionary_page_offset = null;
+    columns[0].meta_data.?.data_page_offset = 0;
 
     const distinct: expr_agg.AggCall = .{
         .func = .count_distinct,

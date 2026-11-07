@@ -1375,6 +1375,79 @@
    }
   },
   {
+   "id": "join:names:key-through-the-chain",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g.gk, r.rk, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:snow_region}' r WHERE f.fk = d.pk AND d.grp = g.gk AND g.grk = r.rk GROUP BY g.gk, r.rk ORDER BY g.gk, r.rk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "names",
+    "names": [
+     "gk",
+     "rk",
+     "n"
+    ]
+   }
+  },
+  {
+   "id": "join:names:direct-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.pk, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk GROUP BY d.pk ORDER BY d.pk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "names",
+    "names": [
+     "pk",
+     "n"
+    ]
+   }
+  },
+  {
+   "id": "join:names:aliased-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.pk AS key, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk GROUP BY d.pk ORDER BY key"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "names",
+    "names": [
+     "key",
+     "n"
+    ]
+   }
+  },
+  {
    "id": "join:plain:group-by-repeated-strings",
    "fixture": "fact",
    "cli": [

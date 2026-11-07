@@ -495,6 +495,14 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
     // not, so it reads as a build column.
     const columns = try a.alloc(std.ArrayList([]const u8), n);
     @memset(columns, .empty);
+    // A selected key keeps its own name, as DuckDB names it, though it reads as the FK: an unaliased result column
+    // that is one column reference, with the name it had.
+    const named = try a.alloc(?[]const u8, @intCast(sel.result_columns.count));
+    for (named, 0..) |*nm, i| {
+        const rc = sel.result_columns.items[i];
+        const e = rc.*.u.result_column.expr;
+        nm.* = if (rc.*.u.result_column.alias == null and e != null and e.*.kind == c.LP_EXPR_COLUMN_REF) span(e.*.u.column_ref.column) else null;
+    }
     for (try columnRefs(p.root, a)) |ref| {
         const side = try sides.of(ref);
         ref.*.u.column_ref.table = null;
@@ -507,6 +515,11 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         if (name.ptr != span(ref.*.u.column_ref.column).ptr) ref.*.u.column_ref.column = (try a.dupeSentinel(u8, name, 0)).ptr;
         if (d != probe) try addName(a, &columns[d], name);
     }
+    for (named, 0..) |nm, i| if (nm) |name| {
+        const rc = sel.result_columns.items[i];
+        if (span(rc.*.u.result_column.expr.*.u.column_ref.column).ptr != name.ptr)
+            rc.*.u.result_column.alias = (try a.dupeSentinel(u8, name, 0)).ptr;
+    };
     // A snowflake's table reads its FK off its parent's build: the parent publishes it.
     for (0..n) |d| if (d != probe and parent[d] != probe) try addName(a, &columns[parent[d]], fks[d].?);
     const probe_from = list.items[live.items[probe]];

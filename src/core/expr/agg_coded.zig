@@ -848,15 +848,35 @@ pub fn foldDenseCallsWithContext(
 /// and few enough to check. Two composites of one group (a float key's 0.0 and -0.0 entries) would each start from
 /// the same sum and the second write back would drop the first's rows.
 fn seedable(ra: std.mem.Allocator, gid_of: []const u32) !bool {
-    var gids: std.ArrayList(u32) = .empty;
-    defer gids.deinit(ra);
+    // One pass for the count and the largest id, a second through a bit per id: this runs once per batch, and a sort
+    // of a few thousand ids per row group was 5% of a two-key star query.
+    var n: usize = 0;
+    var top: u32 = 0;
     for (gid_of) |g| if (g != unresolved) {
-        if (gids.items.len == 4096) return false;
-        try gids.append(ra, g);
+        n += 1;
+        if (n > 4096) return false;
+        top = @max(top, g);
     };
-    if (gids.items.len < 2) return true;
-    std.mem.sortUnstable(u32, gids.items, {}, std.sort.asc(u32));
-    for (gids.items[1..], gids.items[0 .. gids.items.len - 1]) |a, b| if (a == b) return false;
+    if (n < 2) return true;
+    // Ids far past the count (a large table's late groups): a sort of the few ids beats a bitset of all of them.
+    if (top >= 64 * 4096) {
+        const gids = try ra.alloc(u32, n);
+        defer ra.free(gids);
+        var i: usize = 0;
+        for (gid_of) |g| if (g != unresolved) {
+            gids[i] = g;
+            i += 1;
+        };
+        std.mem.sortUnstable(u32, gids, {}, std.sort.asc(u32));
+        for (gids[1..], gids[0 .. gids.len - 1]) |a, b| if (a == b) return false;
+        return true;
+    }
+    var seen = try std.DynamicBitSetUnmanaged.initEmpty(ra, @as(usize, top) + 1);
+    defer seen.deinit(ra);
+    for (gid_of) |g| if (g != unresolved) {
+        if (seen.isSet(g)) return false;
+        seen.set(g);
+    };
     return true;
 }
 
@@ -3389,4 +3409,14 @@ fn distinctCodesTrial(a: std.mem.Allocator, active_pairs: bool) !void {
             try testing.expectEqualDeep(expected, found);
         }
     }
+}
+
+test "seedable: distinct resolved group ids, through a bitset or, past it, a sort" {
+    const a = std.testing.allocator;
+    const u = unresolved;
+    try std.testing.expect(try seedable(a, &.{ 3, u, 7, 1 }));
+    try std.testing.expect(!try seedable(a, &.{ 3, u, 7, 3 }));
+    try std.testing.expect(try seedable(a, &.{ u, 5 }));
+    try std.testing.expect(try seedable(a, &.{ 64 * 4096 + 9, 2, 64 * 4096 }));
+    try std.testing.expect(!try seedable(a, &.{ 64 * 4096 + 9, 2, 64 * 4096 + 9 }));
 }

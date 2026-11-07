@@ -631,10 +631,13 @@ fn runParsed(
     defer column_schemas.deinit();
     const query: ?[]const u8 = if (comptime build_options.enable_sql) if (options.query) |q| blk: {
         var names: ColumnNames = .{ .schemas = &column_schemas, .io = io, .env = env };
-        break :blk zpq.core.expr.sql_columns.expand(arena, q, .{ .ctx = &names, .names = ColumnNames.of }) catch |err| {
+        // Comments are gone first: a COLUMNS( in one is no call.
+        const clean = try zpq.core.expr.sql_parser.stripComments(arena, q);
+        break :blk zpq.core.expr.sql_columns.expand(arena, clean, .{ .ctx = &names, .names = ColumnNames.of }) catch |err| {
             switch (err) {
-                error.ColumnsNotSupported => diagnosticPrint("sql: COLUMNS(...) is supported as select items over one local table, a regular expression or * [EXCLUDE (...)], once in an item\n", .{}),
+                error.ColumnsNotSupported => diagnosticPrint("sql: COLUMNS(...) is supported as select items over one local table, a regular expression or * [EXCLUDE (...)] (not REPLACE or RENAME), once in an item\n", .{}),
                 error.ColumnsNoMatch => diagnosticPrint("sql: no column matches COLUMNS(...)\n", .{}),
+                error.ColumnsExcludeMissing => diagnosticPrint("sql: a column in the EXCLUDE list of COLUMNS(...) is not found\n", .{}),
                 else => {},
             }
             return err;
@@ -1163,7 +1166,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "UnsupportedStatement",        "SubqueryNotSupported",        "WindowNotSupported",           "ColumnMustBeGrouped",      "BadOutputUrl",         "BadOperator",
         "BadValue",                    "BloomFilterNeedsRows",        "BloomFilterUnsupportedColumn", "Unsigned64Operand",        "NullableNotSupported", "NestedNotSupported",
         "NestedRowOutputNotSupported", "UnbalancedParentheses",       "FilterTooDeep",                "AggregateInGroupBy",       "HavingTypeMismatch",   "UnsupportedCase",
-        "UnsupportedType",             "DecimalScaleTooLarge",        "MissingOutputOrAggregate", "SelectAliasRequired", "ColumnsNotSupported", "ColumnsNoMatch",     "MultipleStatements",       "CteNotSupported",      "AggregateInWhere",
+        "UnsupportedType",             "DecimalScaleTooLarge",        "MissingOutputOrAggregate", "SelectAliasRequired", "ColumnsNotSupported", "ColumnsNoMatch", "ColumnsExcludeMissing",     "MultipleStatements",       "CteNotSupported",      "AggregateInWhere",
         "MissingFromClause",           "MissingTableName",            "UnsupportedFromClause",        "UnsupportedAggType",       "UnsupportedCoalesce",  "UnsupportedColumnType",
         "UnlabelledColumn",            "INT96ReencodeNotSupported",   "NestedReencodeNotSupported",   "NestedFilterNotSupported", "ModuloNotSupported",   "ExpressionInPredicate",
         "NestedColumnSelected",        "NestedAggregateNotSupported", "NestedGroupKeyNotSupported",   "UnsupportedDatePart",      "InvalidRegex",         "UnsupportedRegex",

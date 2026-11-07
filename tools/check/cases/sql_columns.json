@@ -15,6 +15,10 @@
   {
    "name": "up",
    "path": "ci/fixtures/parquet/sql_uints.parquet"
+  },
+  {
+   "name": "cn",
+   "path": "ci/fixtures/parquet/sql_columns_names.parquet"
   }
  ],
  "cases": [
@@ -635,6 +639,266 @@
     "compare": "names",
     "names": [
      "tmz"
+    ]
+   }
+  },
+  {
+   "id": "sql_columns:comment-line",
+   "fixture": "cn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id FROM '{fixture:cn}' ORDER BY id LIMIT 3 -- COLUMNS('x')\n",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id FROM '{fixture:cn}' ORDER BY id LIMIT 3 -- COLUMNS('x')\n"
+   }
+  },
+  {
+   "id": "sql_columns:comment-block",
+   "fixture": "cn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id /* COLUMNS(*) */ FROM '{fixture:cn}' /* COLUMNS('^n') */ ORDER BY id LIMIT 3",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id /* COLUMNS(*) */ FROM '{fixture:cn}' /* COLUMNS('^n') */ ORDER BY id LIMIT 3"
+   }
+  },
+  {
+   "id": "sql_columns:keyword-named-columns",
+   "fixture": "cn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT COLUMNS(*) FROM '{fixture:cn}' WHERE cube = 1 AND rollup >= 0 AND \"union\" >= 0 AND \"intersect\" >= 0 AND \"except\" >= 0 AND \"grouping\" >= 0 ORDER BY id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT COLUMNS(*) FROM '{fixture:cn}' WHERE cube = 1 AND rollup >= 0 AND \"union\" >= 0 AND \"intersect\" >= 0 AND \"except\" >= 0 AND \"grouping\" >= 0 ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_columns:exclude-doubled-quote",
+   "fixture": "cn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT COLUMNS(* EXCLUDE (\"a\"\"b\")) FROM '{fixture:cn}' ORDER BY id LIMIT 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT COLUMNS(* EXCLUDE (\"a\"\"b\")) FROM '{fixture:cn}' ORDER BY id LIMIT 3"
+   }
+  },
+  {
+   "id": "sql_columns:exclude-trailing-comma",
+   "fixture": "cn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT COLUMNS(* EXCLUDE (cube, rollup, \"grouping\", \"union\", \"intersect\", \"except\", \"a\"\"b\",)) FROM '{fixture:cn}' ORDER BY id LIMIT 3",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT COLUMNS(* EXCLUDE (cube, rollup, \"grouping\", \"union\", \"intersect\", \"except\", \"a\"\"b\",)) FROM '{fixture:cn}' ORDER BY id LIMIT 3"
+   }
+  },
+  {
+   "id": "sql_columns:alias-with-space",
+   "fixture": "cn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT (COLUMNS('^n$') + 1) AS \"my col\" FROM '{fixture:cn}' ORDER BY 1 LIMIT 3",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT (COLUMNS('^n$') + 1) AS \"my col\" FROM '{fixture:cn}' ORDER BY 1 LIMIT 3"
+   }
+  },
+  {
+   "id": "sql_columns:refuse:exclude-missing",
+   "fixture": "cn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT COLUMNS(* EXCLUDE (nope)) FROM '{fixture:cn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "ColumnsExcludeMissing",
+    "diag": "not found",
+    "exit": 2,
+    "binder_sql": "SELECT COLUMNS(* EXCLUDE (nope)) FROM '{fixture:cn}'",
+    "duck_error": "Binder Error:"
+   }
+  },
+  {
+   "id": "sql_columns:refuse:exclude-rename",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT COLUMNS(* EXCLUDE (id) RENAME (d AS x)) FROM '{fixture:ep}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "ColumnsNotSupported",
+    "diag": "COLUMNS(...) is supported",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_columns:refuse:exclude-replace",
+   "fixture": "ep",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT COLUMNS(* EXCLUDE (id) REPLACE (id + 1 AS id)) FROM '{fixture:ep}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "ColumnsNotSupported",
+    "diag": "COLUMNS(...) is supported",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_columns:refuse:alias-twice-spaced",
+   "fixture": "cn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT (COLUMNS('^(id|n)$') + 1) AS \"my col\" FROM '{fixture:cn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "DuplicateOutputColumn",
+    "diag": "defined more than once",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_columns:refuse:unicode-class",
+   "fixture": "cn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT COLUMNS('\\pL') FROM '{fixture:cn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "UnsupportedRegex",
+    "diag": "regular expression",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_columns:names:alias-with-space",
+   "fixture": "cn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT (COLUMNS('^n$') + 1) AS \"my col\" FROM '{fixture:cn}' ORDER BY 1 LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    }
+   ],
+   "oracle": {
+    "compare": "names",
+    "names": [
+     "my col"
+    ]
+   }
+  },
+  {
+   "id": "sql_columns:names:keyword-named-columns",
+   "fixture": "cn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT COLUMNS(*) FROM '{fixture:cn}' WHERE cube = 1 ORDER BY id LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    }
+   ],
+   "oracle": {
+    "compare": "names",
+    "names": [
+     "id",
+     "a",
+     "a\"b",
+     "cube",
+     "rollup",
+     "grouping",
+     "union",
+     "intersect",
+     "except",
+     "n"
     ]
    }
   }

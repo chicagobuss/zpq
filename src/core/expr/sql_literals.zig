@@ -21,6 +21,27 @@ pub const Markers = struct {
     ilike_len: usize = 0,
     /// `rewrite` changed more than a `x::TYPE` to the `CAST(x AS TYPE)` it means: a folded literal, an ILIKE, GROUP BY ALL.
     rewrote: bool = false,
+    /// Where in its output (`start..end`) it did, up to `spans.len` places; past that `spans_lost` says the list is short.
+    spans: [8][2]u32 = undefined,
+    span_count: u8 = 0,
+    spans_lost: bool = false,
+
+    fn note(self: *Markers, start: usize, end: usize) void {
+        self.rewrote = true;
+        if (self.span_count == self.spans.len) {
+            self.spans_lost = true;
+            return;
+        }
+        self.spans[self.span_count] = .{ @intCast(start), @intCast(end) };
+        self.span_count += 1;
+    }
+
+    /// Whether a rewrite of that kind touched `start..end` of the output.
+    pub fn touches(self: *const Markers, start: usize, end: usize) bool {
+        if (self.spans_lost) return true;
+        for (self.spans[0..self.span_count]) |s| if (s[0] < end and start < s[1]) return true;
+        return false;
+    }
 
     pub fn choose(sql: []const u8) error{BadValue}!Markers {
         var m: Markers = .{};
@@ -627,8 +648,9 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) E
                 if (is_text and kind != null) {
                     const body = operand[1 .. operand.len - 1];
                     const typed: Typed = .{ .kind = kind.?, .at = try moment(body, kind.?, report), .end = te };
+                    const folded_at = out.items.len;
                     next = try foldTyped(allocator, &out, sql, typed, report);
-                    report.markers.rewrote = true;
+                    report.markers.note(folded_at, out.items.len);
                 } else {
                     try out.print(allocator, "CAST({s} AS {s})", .{ operand, type_text });
                 }
@@ -678,7 +700,7 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) E
             if (!cast_form or chained) {
                 const start = out.items.len;
                 i = try foldTyped(allocator, &out, sql, typed, report);
-                report.markers.rewrote = true;
+                report.markers.note(start, out.items.len);
                 atom = .{ .have = true, .start = start, .end = out.items.len };
                 continue;
             }
@@ -690,12 +712,13 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) E
                 report.set("ILIKE takes a string literal pattern", .{});
                 return error.BadValue;
             };
+            const like_at = out.items.len;
             try out.appendSlice(allocator, "like ");
             try out.appendSlice(allocator, sql[lit..stop]);
             try out.appendSlice(allocator, " escape '");
             try out.appendSlice(allocator, report.markers.ilikeEscape());
             try out.append(allocator, '\'');
-            report.markers.rewrote = true;
+            report.markers.note(like_at, out.items.len);
             atom.have = false;
             i = stop;
             continue;
@@ -703,7 +726,7 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) E
         if (wordIs(sql, i, "group")) if (groupByAllAt(sql, i)) |stop| {
             try out.appendSlice(allocator, "group by ");
             const name = report.markers.groupAll();
-            report.markers.rewrote = true;
+            report.markers.note(out.items.len - "group by ".len, out.items.len + name.len);
             try out.appendSlice(allocator, name);
             atom = .{ .have = true, .start = out.items.len - name.len, .end = out.items.len };
             i = stop;

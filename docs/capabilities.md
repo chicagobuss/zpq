@@ -101,14 +101,18 @@ are keywords (`abs(n)`, `"year"(d)`, `"left"(s, 2)`), `coalesce` and `ifnull` as
 BIGINT)` (also for `x::INT`), and literals and names as written. Aggregate and GROUP BY outputs keep their own long-standing names (`sum`,
 `count`, a key's text as written). A row column that DuckDB prints another way, or that zpq rewrites before it reads (`CASE`,
 `//`, `EXTRACT`, `POSITION`, `substring(x FROM ...)`, `TRY_CAST`, typed literals, a qualified column, a DECIMAL or sized cast) is
-refused as `SelectAliasRequired` until it is given an alias.
+refused as `SelectAliasRequired` until it is given an alias. That is decided item by item: a rewrite in the WHERE (an ILIKE, a
+`position(..)`, a `DATE '..'`) or another item's qualifier does not stop `n + 1` being named `(n + 1)`.
 
 `COLUMNS('regex')`, `COLUMNS(*)` and `COLUMNS(* EXCLUDE (a, b))` in the SELECT list stand for the columns they name, as in DuckDB:
 the select item that holds one is written once per column (the regular expression matches anywhere in the name, RE2 syntax, and
 is read against the top-level columns of the table's first file), with the column's name as the item's name
 (`max(COLUMNS('^l_.*date'))` is `max(l_shipdate) AS l_shipdate, ...`). One `COLUMNS` per item, in the SELECT list of a query over
-one local file or glob; a pattern that matches nothing is `ColumnsNoMatch`, and a list of names, a lambda, two in one item, one in
-WHERE or HAVING, or a join or S3 table is `ColumnsNotSupported`. A set operation or a grouping-set query expands each of its
+one local file or glob; a pattern that matches nothing is `ColumnsNoMatch`, an EXCLUDE of a column the table lacks
+`ColumnsExcludeMissing` (a trailing comma and quoted names are allowed), and a list of names, a lambda, `REPLACE` or `RENAME`,
+two in one item, one in WHERE or HAVING, or a join or S3 table is `ColumnsNotSupported`; an RE2 pattern zpq does not have
+(`\pL`) is `UnsupportedRegex`. An alias on the item, quoted or not, is the name of every column it expands to. A `COLUMNS(` in
+a comment is no call. A set operation or a grouping-set query expands each of its
 queries on its own.
 
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.

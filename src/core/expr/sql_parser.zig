@@ -1462,6 +1462,66 @@ fn fold(allocator: std.mem.Allocator, raw: []const u8, report: *literals.Report)
     };
 }
 
+/// The SELECT list of the statement `sql` (after `SELECT` and a DISTINCT, up to its FROM), by byte range.
+fn selectRegion(sql: []const u8) ?struct { start: usize, end: usize } {
+    var i: usize = 0;
+    while (i < sql.len and std.ascii.isWhitespace(sql[i])) i += 1;
+    const first = sql_setops.nextWord(sql, i);
+    if (!sql_setops.eql(first.word, "select")) return null;
+    var start = first.end;
+    const second = sql_setops.nextWord(sql, start);
+    if (sql_setops.eql(second.word, "distinct") or sql_setops.eql(second.word, "all")) start = second.end;
+    var depth: usize = 0;
+    var k = start;
+    while (k < sql.len) {
+        const ch = sql[k];
+        if (ch == '\'' or ch == '"') {
+            k = sql_setops.quotedEnd(sql, k);
+            continue;
+        }
+        if (ch == '(') depth += 1;
+        if (ch == ')' and depth > 0) depth -= 1;
+        if (depth == 0 and sql_setops.startsWord(sql, k)) {
+            const word = sql_setops.wordAt(sql, k);
+            if (sql_setops.eql(word, "from")) return .{ .start = start, .end = k };
+            k += word.len;
+            continue;
+        }
+        k += 1;
+    }
+    return .{ .start = start, .end = sql.len };
+}
+
+/// Per select item of `root`: whether DuckDB's name for it can be made from its text. Not where a rewrite changed the
+/// SELECT list (`folded_sql` to `sql_c`, or the literal fold's own, which `markers` placed), nor where the item reads a
+/// column through a table qualifier, which is dropped from the tree.
+fn namableItems(allocator: std.mem.Allocator, root: *c.LpNode, folded_sql: []const u8, sql_c: []const u8, markers: literals.Markers) ![]bool {
+    const sel = root.*.u.select;
+    const out = try allocator.alloc(bool, @intCast(sel.result_columns.count));
+    errdefer allocator.free(out);
+    var clean = false;
+    if (selectRegion(folded_sql)) |before| if (selectRegion(sql_c)) |after| {
+        clean = std.mem.eql(u8, folded_sql[before.start..before.end], sql_c[after.start..after.end]) and
+            !markers.touches(before.start, before.end);
+    };
+    const Visit = struct {
+        fn enter(data: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
+            const flag: *bool = @ptrCast(@alignCast(data.*.user_data));
+            if (node.*.kind == c.LP_EXPR_COLUMN_REF and (node.*.u.column_ref.table != null or node.*.u.column_ref.schema != null)) flag.* = true;
+            return 0;
+        }
+    };
+    for (out, 0..) |*ok, i| {
+        var qualified = false;
+        if (sel.result_columns.items[i]) |item| {
+            var visitor: c.LpVisitor = .{ .user_data = &qualified, .enter = Visit.enter, .leave = null };
+            c.lp_ast_walk(item, &visitor);
+        }
+        ok.* = clean and !qualified;
+    }
+    return out;
+}
+
 /// A query `fold` rewrote, read with the markers it chose: a join's probe and build queries are its pieces.
 fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_sql: []const u8, markers: literals.Markers) !ParsedQuery {
     const lp_arena = c.arena_create(64 * 1024) orelse return error.OutOfMemory;
@@ -1499,12 +1559,13 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
         diagnosticPrint("sql: only SELECT is supported (no UNION/INSERT/DDL)\n", .{});
         return error.UnsupportedStatement;
     }
-    // What DuckDB would name an unaliased select item from is the text as written: any rewrite of it, here or before the
-    // parse, leaves the items to be named by an alias.
-    var as_written = std.mem.eql(u8, folded_sql, sql_c) and !markers.rewrote;
+    // What DuckDB would name an unaliased select item from is the text as written: an item that a rewrite touched, here or
+    // before the parse, or that reads a column through a table qualifier, is left to be named by an alias.
+    const namable = try namableItems(allocator, root, folded_sql, sql_c, markers);
+    defer allocator.free(namable);
     if (root.*.u.select.from) |from| if (from.*.kind == c.LP_FROM_TABLE and from.*.u.from_table.name != null) {
         const alias: ?[]const u8 = if (from.*.u.from_table.alias) |a| std.mem.span(a) else null;
-        if (dropTableQualifier(root, tableQualifier(stripQuotes(std.mem.span(from.*.u.from_table.name)), alias))) as_written = false;
+        _ = dropTableQualifier(root, tableQualifier(stripQuotes(std.mem.span(from.*.u.from_table.name)), alias));
     };
     try distinctAsGroupBy(root, lp_arena);
     try groupByAll(root, lp_arena, markers.groupAll());
@@ -1646,7 +1707,7 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
 
     if (structured) {
         const owned = try lower.arena.create(syntax.Query);
-        owned.* = try lowerQuery(&lower, root, select_cols, result_order, is_aggregate, has_group_by, as_written);
+        owned.* = try lowerQuery(&lower, root, select_cols, result_order, is_aggregate, has_group_by, namable);
         return .{
             .syntax = owned,
             .syntax_arena = syntax_owner,
@@ -1802,7 +1863,7 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
     };
 }
 
-fn lowerQuery(lower: *Lower, root: *const c.LpNode, cols: []const ast.SelectColumn, order: ast.ResultOrder, aggregate: bool, grouped: bool, as_written: bool) !syntax.Query {
+fn lowerQuery(lower: *Lower, root: *const c.LpNode, cols: []const ast.SelectColumn, order: ast.ResultOrder, aggregate: bool, grouped: bool, namable: []const bool) !syntax.Query {
     const a = lower.arena;
     const sel = root.u.select;
     const columns = try a.alloc(syntax.Column, cols.len);
@@ -1821,7 +1882,7 @@ fn lowerQuery(lower: *Lower, root: *const c.LpNode, cols: []const ast.SelectColu
         } else {
             out.expr = try lower.expression(node, 0);
             // A computed row column with no alias is named as DuckDB names it, where that is exact.
-            if (!aggregate and out.alias == null and as_written and out.expr.? != .column) {
+            if (!aggregate and out.alias == null and namable[i] and out.expr.? != .column) {
                 if (sql_names.of(a, node)) |name| {
                     out.alias = name;
                 } else |err| switch (err) {

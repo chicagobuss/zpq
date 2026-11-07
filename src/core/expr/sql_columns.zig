@@ -5,8 +5,9 @@
 const std = @import("std");
 const regex = @import("regex.zig");
 const sql_setops = @import("sql_setops.zig");
+const sql_grouping = @import("sql_grouping.zig");
 
-pub const Error = error{ OutOfMemory, ColumnsNotSupported, ColumnsNoMatch, InvalidRegex };
+pub const Error = error{ OutOfMemory, ColumnsNotSupported, ColumnsNoMatch, ColumnsExcludeMissing, InvalidRegex, UnsupportedRegex, RegexTooBig };
 
 /// How the expansion learns the top-level column names of the table a query reads, in schema order.
 pub const Schema = struct {
@@ -14,7 +15,8 @@ pub const Schema = struct {
     names: *const fn (ctx: *anyopaque, arena: std.mem.Allocator, table: []const u8) anyerror![]const []const u8,
 };
 
-/// `sql` with each select item that holds `COLUMNS(...)` written once per column it names; `sql` itself where it holds none.
+/// `sql` (comments already gone) with each select item that holds `COLUMNS(...)` written once per column it names; `sql`
+/// itself where it holds none.
 /// What is not exact is refused: `COLUMNS` outside the SELECT list, two in one item, a lambda or a list of names, a table
 /// that is not one file or glob.
 pub fn expand(arena: std.mem.Allocator, sql: []const u8, schema: Schema) anyerror![]const u8 {
@@ -56,8 +58,10 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8, schema: Schema) anyerro
     }
     const from_at = from orelse return error.ColumnsNotSupported;
     try items.append(arena, sql[item_start..from_at]);
-    // A set operation or a grouping-set query is run as the queries it is made of, each of which comes back here.
-    if (splits(sql[from_at..])) return sql;
+    // A set operation or a grouping-set query is run as the queries it is made of, each of which comes back here. (A
+    // query neither of those reads as one: the caller reports what is wrong with it.)
+    if (sql_setops.split(arena, sql) catch return sql) |_| return sql;
+    if (sql_grouping.expand(arena, sql) catch return sql) |_| return sql;
     // The rest of the query reads the columns by name; COLUMNS there is a different feature.
     if (mentions(sql[from_at..])) return error.ColumnsNotSupported;
 
@@ -103,27 +107,6 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8, schema: Schema) anyerro
 /// Whether `sql` has the word `columns` followed by an open parenthesis, outside quoted text.
 fn mentions(sql: []const u8) bool {
     return find(sql) != null;
-}
-
-/// Whether `sql` has a set operator or a grouping-set clause outside quoted text.
-fn splits(sql: []const u8) bool {
-    var i: usize = 0;
-    while (i < sql.len) {
-        if (sql[i] == '\'' or sql[i] == '"') {
-            i = sql_setops.quotedEnd(sql, i);
-            continue;
-        }
-        if (sql_setops.startsWord(sql, i)) {
-            const word = sql_setops.wordAt(sql, i);
-            for ([_][]const u8{ "union", "intersect", "except", "rollup", "cube", "grouping" }) |w| {
-                if (std.ascii.eqlIgnoreCase(word, w)) return true;
-            }
-            i += word.len;
-            continue;
-        }
-        i += 1;
-    }
-    return false;
 }
 
 const Call = struct { start: usize, end: usize, args_start: usize, args_end: usize };
@@ -228,30 +211,23 @@ fn select(arena: std.mem.Allocator, args: []const u8, names: []const []const u8)
     if (text.len > 0 and text[0] == '\'') {
         if (sql_setops.quotedEnd(text, 0) != text.len) return error.ColumnsNotSupported;
         const pattern = try std.mem.replaceOwned(u8, arena, text[1 .. text.len - 1], "''", "'");
-        const m = regex.Match.compile(arena, pattern, "") catch return error.InvalidRegex;
+        const m = regex.Match.compile(arena, pattern, "") catch |err| return regexError(err);
         var scratch: regex.Scratch = .init(arena);
-        for (names) |name| if (m.apply(&scratch, name) catch return error.InvalidRegex) try picked.append(arena, name);
+        for (names) |name| if (m.apply(&scratch, name) catch |err| return regexError(err)) try picked.append(arena, name);
         return picked.items;
     }
     if (text.len > 0 and text[0] == '*') {
         const rest = std.mem.trim(u8, text[1..], " \t\r\n");
-        var excluded: std.ArrayList([]const u8) = .empty;
-        if (rest.len > 0) {
-            const word = sql_setops.nextWord(rest, 0);
-            if (!sql_setops.eql(word.word, "exclude")) return error.ColumnsNotSupported;
-            var list = std.mem.trim(u8, rest[word.end..], " \t\r\n");
-            if (list.len > 1 and list[0] == '(' and list[list.len - 1] == ')') list = list[1 .. list.len - 1];
-            var parts = std.mem.splitScalar(u8, list, ',');
-            while (parts.next()) |part| {
-                var id = std.mem.trim(u8, part, " \t\r\n");
-                if (id.len >= 2 and id[0] == '"' and id[id.len - 1] == '"') id = id[1 .. id.len - 1];
-                if (id.len == 0) return error.ColumnsNotSupported;
-                try excluded.append(arena, id);
-            }
+        const excluded = try excludeList(arena, rest);
+        // DuckDB refuses to exclude a column the table does not have.
+        for (excluded) |e| {
+            var found = false;
+            for (names) |name| found = found or std.ascii.eqlIgnoreCase(e, name);
+            if (!found) return error.ColumnsExcludeMissing;
         }
         for (names) |name| {
             var skip = false;
-            for (excluded.items) |e| if (std.ascii.eqlIgnoreCase(e, name)) {
+            for (excluded) |e| if (std.ascii.eqlIgnoreCase(e, name)) {
                 skip = true;
             };
             if (!skip) try picked.append(arena, name);
@@ -261,7 +237,68 @@ fn select(arena: std.mem.Allocator, args: []const u8, names: []const []const u8)
     return error.ColumnsNotSupported;
 }
 
-/// Whether the item ends in `AS name`: the last `AS` outside parentheses and quotes, with one name after it.
+fn regexError(err: anyerror) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnsupportedRegex => error.UnsupportedRegex,
+        error.RegexTooBig => error.RegexTooBig,
+        else => error.InvalidRegex,
+    };
+}
+
+/// The names of `EXCLUDE (a, "b""c", ...)` or `EXCLUDE a` after the star (`rest`), unquoted; empty for no EXCLUDE. A trailing
+/// comma is allowed, as DuckDB allows one. REPLACE and RENAME after it are refused by name.
+fn excludeList(arena: std.mem.Allocator, rest: []const u8) Error![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    if (rest.len == 0) return names.items;
+    const word = sql_setops.nextWord(rest, 0);
+    if (!sql_setops.eql(word.word, "exclude")) return error.ColumnsNotSupported;
+    const after = std.mem.trim(u8, rest[word.end..], " \t\r\n");
+    if (after.len == 0) return error.ColumnsNotSupported;
+    var list: []const u8 = undefined;
+    var tail: []const u8 = undefined;
+    if (after[0] == '(') {
+        // The matching parenthesis, past quoted names.
+        var k: usize = 1;
+        while (k < after.len and after[k] != ')') k = if (after[k] == '"') sql_setops.quotedEnd(after, k) else k + 1;
+        if (k >= after.len) return error.ColumnsNotSupported;
+        list = after[1..k];
+        tail = std.mem.trim(u8, after[k + 1 ..], " \t\r\n");
+    } else {
+        const end = if (after[0] == '"') sql_setops.quotedEnd(after, 0) else sql_setops.wordAt(after, 0).len;
+        if (end == 0) return error.ColumnsNotSupported;
+        list = after[0..end];
+        tail = std.mem.trim(u8, after[end..], " \t\r\n");
+    }
+    // REPLACE (...) and RENAME (...) change the columns' names or values; they are not followed.
+    if (tail.len > 0) return error.ColumnsNotSupported;
+    var at: usize = 0;
+    while (true) {
+        while (at < list.len and std.ascii.isWhitespace(list[at])) at += 1;
+        if (at >= list.len) break;
+        var id: []const u8 = undefined;
+        if (list[at] == '"') {
+            const end = sql_setops.quotedEnd(list, at);
+            if (end > list.len or list[end - 1] != '"' or end - at < 2) return error.ColumnsNotSupported;
+            id = try std.mem.replaceOwned(u8, arena, list[at + 1 .. end - 1], "\"\"", "\"");
+            at = end;
+        } else {
+            id = sql_setops.wordAt(list, at);
+            if (id.len == 0) return error.ColumnsNotSupported;
+            at += id.len;
+        }
+        try names.append(arena, id);
+        while (at < list.len and std.ascii.isWhitespace(list[at])) at += 1;
+        if (at >= list.len) break;
+        if (list[at] != ',') return error.ColumnsNotSupported;
+        at += 1;
+    }
+    if (names.items.len == 0) return error.ColumnsNotSupported;
+    return names.items;
+}
+
+/// Whether the item ends in `AS name`: the last `AS` outside parentheses and quotes, with one name after it (a bare word or
+/// a double-quoted name, spaces and doubled quotes allowed).
 fn hasAlias(item: []const u8) bool {
     var depth: usize = 0;
     var i: usize = 0;
@@ -284,7 +321,9 @@ fn hasAlias(item: []const u8) bool {
     }
     const at = last_as orelse return false;
     const name = std.mem.trim(u8, item[at..], " \t\r\n");
-    return name.len > 0 and std.mem.indexOfAny(u8, name, " \t\r\n,()") == null;
+    if (name.len == 0) return false;
+    if (name[0] == '"') return sql_setops.quotedEnd(name, 0) == name.len;
+    return sql_setops.wordAt(name, 0).len == name.len;
 }
 
 fn quoted(arena: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8) !void {
@@ -329,4 +368,38 @@ test "COLUMNS(regex) expands to the columns it matches anywhere in their names, 
     try std.testing.expectError(error.ColumnsNotSupported, expand(a, "SELECT max(COLUMNS(['d'])) FROM f", schema));
     try std.testing.expectError(error.ColumnsNotSupported, expand(a, "SELECT max(COLUMNS('^t')) FROM f JOIN g ON f.a = g.a", schema));
     try std.testing.expectError(error.InvalidRegex, expand(a, "SELECT max(COLUMNS('(')) FROM f", schema));
+}
+
+fn quirkyNames(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror![]const []const u8 {
+    const names = [_][]const u8{ "id", "a\"b", "cube", "union", "rollup" };
+    return &names;
+}
+
+test "COLUMNS: a name that looks like a keyword, an EXCLUDE, an alias with a space" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var dummy: u8 = 0;
+    const schema: Schema = .{ .ctx = &dummy, .names = testNames };
+    const quirky: Schema = .{ .ctx = &dummy, .names = quirkyNames };
+    // A column called like a set operator or a grouping clause is no such clause.
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM f WHERE cube = 1 AND \"union\" > 0", try expand(a, "SELECT COLUMNS('^id$') FROM f WHERE cube = 1 AND \"union\" > 0", quirky));
+    try std.testing.expectEqualStrings("SELECT \"id\", \"a\"\"b\", \"cube\", \"union\", \"rollup\" FROM f WHERE rollup = 1", try expand(a, "SELECT COLUMNS(*) FROM f WHERE rollup = 1", quirky));
+    // EXCLUDE names are unquoted, a doubled quote one quote, case and a trailing comma do not matter.
+    try std.testing.expectEqualStrings("SELECT \"id\", \"cube\", \"union\", \"rollup\" FROM f", try expand(a, "SELECT COLUMNS(* EXCLUDE (\"a\"\"b\")) FROM f", quirky));
+    try std.testing.expectEqualStrings("SELECT \"id\" FROM f", try expand(a, "SELECT COLUMNS(* EXCLUDE (CUBE, \"union\", \"a\"\"b\", rollup,)) FROM f", quirky));
+    try std.testing.expectEqualStrings("SELECT \"d\", \"dn\", \"tu\", \"tm\", \"tz\" FROM f", try expand(a, "SELECT COLUMNS(* EXCLUDE id) FROM f", schema));
+    try std.testing.expectError(error.ColumnsExcludeMissing, expand(a, "SELECT COLUMNS(* EXCLUDE (nope)) FROM f", schema));
+    try std.testing.expectError(error.ColumnsExcludeMissing, expand(a, "SELECT COLUMNS(* EXCLUDE (id, \"a\"\"b\")) FROM f", schema));
+    // RENAME and REPLACE are refused; so is an empty list or a doubled comma.
+    try std.testing.expectError(error.ColumnsNotSupported, expand(a, "SELECT COLUMNS(* EXCLUDE (id) RENAME (d AS x)) FROM f", schema));
+    try std.testing.expectError(error.ColumnsNotSupported, expand(a, "SELECT COLUMNS(* EXCLUDE (id) REPLACE (d + 1 AS d)) FROM f", schema));
+    try std.testing.expectError(error.ColumnsNotSupported, expand(a, "SELECT COLUMNS(* EXCLUDE ()) FROM f", schema));
+    try std.testing.expectError(error.ColumnsNotSupported, expand(a, "SELECT COLUMNS(* EXCLUDE (id,,d)) FROM f", schema));
+    // An alias, quoted with spaces or not, is the name of every expansion, and is not given twice.
+    try std.testing.expectEqualStrings("SELECT (\"d\" + 1) AS \"my col\" FROM f", try expand(a, "SELECT (COLUMNS('^d$') + 1) AS \"my col\" FROM f", schema));
+    try std.testing.expectEqualStrings("SELECT max(\"d\") AS \"a\"\"b\" FROM f", try expand(a, "SELECT max(COLUMNS('^d$')) AS \"a\"\"b\" FROM f", schema));
+    try std.testing.expectEqualStrings("SELECT max(\"d\") AS m FROM f", try expand(a, "SELECT max(COLUMNS('^d$')) AS m FROM f", schema));
+    // A pattern RE2 has and zpq does not is refused as such.
+    try std.testing.expectError(error.UnsupportedRegex, expand(a, "SELECT COLUMNS('\\pL') FROM f", schema));
 }

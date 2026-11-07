@@ -411,8 +411,9 @@ pub const BuildError = error{ DuplicateBuildKey, JoinKeyType, JoinPayloadType, J
 const Ctx = struct {
     /// One per build row group: its survivors, until the build is laid out.
     arenas: []std.heap.ArenaAllocator,
-    /// What each row group's decode scratch draws from.
-    scratch: std.mem.Allocator,
+    /// One scratch arena per worker (`parallel`), reset between its row groups but kept: a row group's scratch
+    /// mapped afresh and unmapped again faulted SF30 orders' 45M rows in at ~3.6 GB of new pages.
+    workers: []std.heap.ArenaAllocator,
     bytes: []const u8,
     meta: *const schema.FileMetaData,
     spec: Spec,
@@ -505,10 +506,10 @@ fn codedLocal(comptime T: type, a: std.mem.Allocator, bytes: []const u8, meta: *
     return .{ .codes = codes, .dict = d };
 }
 
-fn buildPart(c: *Ctx, rg_index: usize) !void {
+fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
     const a = c.arenas[rg_index].allocator();
-    var scratch = std.heap.ArenaAllocator.init(c.scratch);
-    defer scratch.deinit();
+    const scratch = &c.workers[worker];
+    defer _ = scratch.reset(.retain_capacity);
     const sa = scratch.allocator();
     const rg = &c.meta.row_groups.items[rg_index];
     const rows: usize = @intCast(rg.num_rows);
@@ -544,8 +545,9 @@ fn buildPart(c: *Ctx, rg_index: usize) !void {
         try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
     }
     const key_col = cols.items[lookup[c.spec.key].?];
-    var keep: std.ArrayList(u32) = .empty;
-    var keys: std.ArrayList(i64) = .empty;
+    const kept = sel.count();
+    var keep: std.ArrayList(u32) = try .initCapacity(sa, kept);
+    var keys: std.ArrayList(i64) = try .initCapacity(sa, kept);
     var part: Part = .{};
     var it = sel.iterator();
     while (it.next()) |r| {
@@ -559,8 +561,8 @@ fn buildPart(c: *Ctx, rg_index: usize) !void {
             part.null_key = true;
             continue;
         };
-        try keep.append(sa, @intCast(r));
-        try keys.append(sa, key);
+        keep.appendAssumeCapacity(@intCast(r));
+        keys.appendAssumeCapacity(key);
         part.lo = @min(part.lo, key);
         part.hi = @max(part.hi, key);
     }
@@ -606,14 +608,18 @@ fn buildPart(c: *Ctx, rg_index: usize) !void {
     c.parts[rg_index] = part;
 }
 
-fn parallel(n: usize, threads: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize) anyerror!void) !void {
+/// The most workers `parallel` runs.
+const max_workers = 64;
+
+/// `f(ctx, worker, i)` for every `i` below `n`, on up to `threads` workers numbered from 0.
+fn parallel(n: usize, threads: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize, usize) anyerror!void) !void {
     const C = @TypeOf(ctx);
     const W = struct {
-        fn run(c: C, cursor: *std.atomic.Value(usize), total: usize, errs: []?anyerror) void {
+        fn run(c: C, worker: usize, cursor: *std.atomic.Value(usize), total: usize, errs: []?anyerror) void {
             while (true) {
                 const i = cursor.fetchAdd(1, .monotonic);
                 if (i >= total) return;
-                f(c, i) catch |e| {
+                f(c, worker, i) catch |e| {
                     errs[i] = e;
                     cursor.store(total, .monotonic);
                     return;
@@ -625,11 +631,11 @@ fn parallel(n: usize, threads: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx)
     const errs = try std.heap.page_allocator.alloc(?anyerror, n);
     defer std.heap.page_allocator.free(errs);
     @memset(errs, null);
-    var pool: [64]std.Thread = undefined;
+    var pool: [max_workers]std.Thread = undefined;
     const t = @max(1, @min(threads, pool.len, n));
     var started: usize = 0;
     while (started < t) : (started += 1) {
-        pool[started] = std.Thread.spawn(.{}, W.run, .{ ctx, &cursor, n, errs }) catch |e| {
+        pool[started] = std.Thread.spawn(.{}, W.run, .{ ctx, started, &cursor, n, errs }) catch |e| {
             cursor.store(n, .monotonic);
             for (pool[0..started]) |th| th.join();
             return e;
@@ -642,9 +648,9 @@ fn parallel(n: usize, threads: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx)
 
 /// Unify payload `p`'s local dictionaries in row-group order: global codes number values by first appearance. The
 /// dictionary goes in `a`, and each part's local-to-global map in that part's arena (`arenas`, freed with the build's
-/// other scratch). The map that dedupes, and the list as it grows, live in
-/// `scratch` and go when this returns: in `a`, an arena held for the query, every table a growing map outgrew would
-/// stay charged (171 MB for a 1.08M-entry dictionary, against its 8.6 MB).
+/// other scratch). The map that dedupes, and the list as it grows, live in `scratch` and go when this returns: in `a`,
+/// an arena held for the query, every table a growing map outgrew would stay charged (171 MB for a 1.08M-entry
+/// dictionary, against its 8.6 MB).
 fn unify(comptime T: type, a: std.mem.Allocator, scratch: std.mem.Allocator, arenas: []std.heap.ArenaAllocator, parts: []Part, p: usize) !Dict {
     const Ctx2 = if (T == []const u8) std.hash_map.StringContext else struct {
         pub fn hash(_: @This(), v: T) u64 {
@@ -691,7 +697,7 @@ const SetBits = struct {
     parts: []const Part,
     d: *const Dense,
     dup: *std.atomic.Value(bool),
-    fn run(c: @This(), i: usize) !void {
+    fn run(c: @This(), _: usize, i: usize) !void {
         for (c.parts[i].keys) |k| {
             const at: u64 = @bitCast(k -% c.d.lo);
             const bit = @as(u64, 1) << @intCast(at & 63);
@@ -705,7 +711,7 @@ const FillCodes = struct {
     j: *const Join,
     parts: []const Part,
     codes: []const Codes,
-    fn run(c: @This(), i: usize) !void {
+    fn run(c: @This(), _: usize, i: usize) !void {
         const part = c.parts[i];
         for (part.keys, 0..) |k, row| {
             const s = c.j.slot(k).?;
@@ -718,7 +724,8 @@ const FillCodes = struct {
 /// survivors, pick the key structure from their verified domain, and lay every payload out by slot.
 fn lap(what: []const u8, since: i64) i64 {
     const now = @import("../../clock.zig").monoNs();
-    std.debug.print("join build: {s} {d:.1} ms\n", .{ what, @as(f64, @floatFromInt(now - since)) / 1e6 });
+    const ru = std.posix.getrusage(0);
+    std.debug.print("join build: {s} {d:.1} ms (minor faults so far {d})\n", .{ what, @as(f64, @floatFromInt(now - since)) / 1e6, ru.minflt });
     return now;
 }
 
@@ -733,12 +740,16 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     const arenas = try a.alloc(std.heap.ArenaAllocator, parts.len);
     for (arenas) |*ar| ar.* = .init(gpa);
     defer for (arenas) |*ar| ar.deinit();
-    var ctx: Ctx = .{ .arenas = arenas, .scratch = gpa, .bytes = bytes, .meta = meta, .spec = spec, .parts = parts };
+    var workers: [max_workers]std.heap.ArenaAllocator = undefined;
+    for (&workers) |*w| w.* = .init(gpa);
+    defer for (&workers) |*w| w.deinit();
+    var ctx: Ctx = .{ .arenas = arenas, .workers = &workers, .bytes = bytes, .meta = meta, .spec = spec, .parts = parts };
     const trace = std.c.getenv("ZPQ_JOIN_TRACE") != null;
     var t = @import("../../clock.zig").monoNs();
+    if (trace) t = lap("start", t);
     try parallel(parts.len, spec.threads, &ctx, struct {
-        fn f(c: *Ctx, i: usize) anyerror!void {
-            return buildPart(c, i);
+        fn f(c: *Ctx, worker: usize, i: usize) anyerror!void {
+            return buildPart(c, worker, i);
         }
     }.f);
     if (trace) t = lap("decode+local dictionaries", t);

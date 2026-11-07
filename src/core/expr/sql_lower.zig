@@ -113,6 +113,14 @@ pub const Lower = struct {
                         .left = try self.ptr(f.args.items[0] orelse return error.SqlParseError, depth + 1),
                         .right = try self.ptr(f.args.items[1] orelse return error.SqlParseError, depth + 1),
                     } };
+                // `mod(a, b)` is `a % b`.
+                if (std.ascii.eqlIgnoreCase(name_, "mod") and f.args.count == 2 and f.over == null and f.distinct == 0 and
+                    f.filter == null and f.order_by.count == 0)
+                    break :blk .{ .binary = .{
+                        .op = .mod,
+                        .left = try self.ptr(f.args.items[0] orelse return error.SqlParseError, depth + 1),
+                        .right = try self.ptr(f.args.items[1] orelse return error.SqlParseError, depth + 1),
+                    } };
                 if (try self.sugarCall(f, name_, depth)) |rewritten| break :blk rewritten;
                 if (parser.resolveFunc(name_) != null) {
                     if (f.order_by.count != 0) return error.ExpectedRParen;
@@ -192,6 +200,7 @@ pub const Lower = struct {
             .{ .name = "quarter", .part = "quarter" },
             .{ .name = "month", .part = "month" },
             .{ .name = "week", .part = "week" },
+            .{ .name = "weekofyear", .part = "week" },
             .{ .name = "day", .part = "day" },
             .{ .name = "dayofmonth", .part = "day" },
             .{ .name = "hour", .part = "hour" },

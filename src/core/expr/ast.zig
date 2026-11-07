@@ -409,6 +409,16 @@ pub const Func = enum {
     str_test,
     /// `regexp_matches(s, 'pattern' [, 'options'])`: whether the pattern matches anywhere in the text, a BOOLEAN.
     regexp_matches,
+    /// `dayname(t)` and `monthname(t)` (`Call.part` is `dow` or `month`): the English name of a DATE's or TIMESTAMP's day of
+    /// the week or month; NULL for an infinite time.
+    date_name,
+    /// `last_day(t)`: the last day of the month of a DATE or TIMESTAMP, a DATE; NULL for an infinite time, an error past
+    /// DuckDB's last DATE.
+    last_day,
+    /// `strpos(s, 'x')` / `instr`: the 1-based character position of the first `x` in `s`, 0 where there is none, a BIGINT.
+    strpos,
+    /// `concat_ws('sep', a, b, ...)`: the non-NULL texts joined by the constant separator; empty where all are NULL.
+    concat_ws,
 };
 
 /// The string tests `Func.str_test` stands for.
@@ -869,7 +879,10 @@ pub const Expr = union(enum) {
                 .math => for (c.args) |a| {
                     if (a.mayBeNull()) break true;
                 } else false,
-                .str_test, .regexp_matches => c.args[0].mayBeNull(),
+                .str_test, .regexp_matches, .strpos => c.args[0].mayBeNull(),
+                // Infinite times give NULL whatever the columns say.
+                .date_name, .last_day => true,
+                .concat_ws => false,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp => c.lenient or c.args[0].mayBeNull(),
                 // Any of the three can be NULL (a literal year over a nullable month).
                 .make_date => for (c.args) |a| {
@@ -1328,4 +1341,19 @@ test "an expression's FLOAT typing as DuckDB binds it" {
     try std.testing.expectEqual(Expr.Float32.computed, call.of(.round, &.{&f}).float32());
     try std.testing.expectEqual(Expr.Float32.none, call.bin(&f, &d).float32());
     try std.testing.expectEqual(Expr.Float32.none, call.of(.cast_double, &.{&f}).float32());
+}
+
+test "the math functions offered are the ones DuckDB's results agree with, and the string tests hold as it does" {
+    const T = std.testing;
+    try T.expectEqual(MathFn.atan2, MathFn.parse("ATAN2").?);
+    try T.expectEqual(@as(usize, 2), MathFn.atan2.arity());
+    for ([_][]const u8{ "ln", "log", "log2", "log10", "exp", "sin", "cos", "tan", "pow", "power" }) |name|
+        try T.expect(MathFn.parse(name) == null);
+    try T.expectEqual(StrTest.starts_with, StrTest.parse("PREFIX").?);
+    try T.expectEqual(StrTest.ends_with, StrTest.parse("suffix").?);
+    try T.expect(StrTest.contains.holds("abc", ""));
+    try T.expect(StrTest.starts_with.holds("", ""));
+    try T.expect(!StrTest.ends_with.holds("abc", "abcd"));
+    try T.expect(!StrTest.contains.holds("ABC", "b"));
+    try T.expect(StrTest.contains.holds("aéb", "é"));
 }

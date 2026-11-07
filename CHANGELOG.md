@@ -91,6 +91,12 @@
   and `1e3` as integers rounded half away from zero, `inf`/`nan`), checked against DuckDB on 64,000 generated strings;
   a text that is no number is a `ConversionInvalid` error for `CAST`. A text to DECIMAL, DATE or TIMESTAMP is still
   refused by name.
+- **More scalar functions in SQL.** `t.g` for the query's one table (it failed as an unknown column); `epoch`, `epoch_ms`,
+  `epoch_us`, `epoch_ns` and `EXTRACT(epoch FROM ...)` of a DATE or TIMESTAMP (the TIMESTAMP WITH TIME ZONE double differs
+  from a TIMESTAMP's, as DuckDB's does); `cbrt`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `degrees`, `radians`, `atan2`, `sign`
+  and `trunc` (fuzzed against DuckDB on 140,000 rows each); `starts_with`, `ends_with`, `contains` and `regexp_matches` as
+  BOOLEANs, in WHERE too; `dayname`, `monthname`, `last_day`, `weekofyear`, `strpos`, `concat_ws` and `mod`. `ln`, `exp`, `pow`,
+  `sin` and their kin stay refused: DuckDB's math library differs from a current one's in the last digit for many inputs.
 - **`ROLLUP`, `CUBE`, `GROUPING SETS` and `GROUPING()` in SQL** (`zpq query --query`): `GROUP BY ROLLUP (a, b)`, `CUBE (a, b)`,
   `GROUPING SETS ((a), (b), ())` and their products with plain keys match DuckDB, including the NULL a key takes in a set
   that leaves it out (in the key's own type), `GROUPING` / `GROUPING_ID`, HAVING per set and the grand-total row over no

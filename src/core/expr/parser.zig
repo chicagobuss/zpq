@@ -784,6 +784,10 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "sqrt")) return .sqrt;
     if (ast.StrTest.parse(name) != null) return .str_test;
     if (asciiEqIgnoreCase(name, "regexp_matches")) return .regexp_matches;
+    if (asciiEqIgnoreCase(name, "dayname") or asciiEqIgnoreCase(name, "monthname")) return .date_name;
+    if (asciiEqIgnoreCase(name, "last_day")) return .last_day;
+    if (asciiEqIgnoreCase(name, "strpos") or asciiEqIgnoreCase(name, "instr")) return .strpos;
+    if (asciiEqIgnoreCase(name, "concat_ws")) return .concat_ws;
     if (asciiEqIgnoreCase(name, "sign")) return .sign;
     if (asciiEqIgnoreCase(name, "trunc")) return .trunc;
     if (ast.MathFn.parse(name) != null) return .math;
@@ -983,6 +987,23 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             if (args.len == 0) return error.WrongArity;
             for (args) |a| if (!plainNumber(a.*)) return error.TypeMismatch;
             return .f64;
+        },
+        .date_name, .last_day => {
+            if (args.len != 1) return error.WrongArity;
+            const t = args[0].temporal() orelse return error.TypeMismatch;
+            if (t == .ts_ns and args[0].isUtc()) return error.TypeMismatch;
+            return if (func == .date_name) .str else .i64;
+        },
+        .strpos => {
+            if (args.len != 2) return error.WrongArity;
+            if (args[0].typeOf() != .str or !isStrLiteral(args[1].*)) return error.TypeMismatch;
+            return .i64;
+        },
+        .concat_ws => {
+            if (args.len < 2) return error.WrongArity;
+            if (!isStrLiteral(args[0].*)) return error.TypeMismatch;
+            for (args[1..]) |a| if (a.typeOf() != .str) return error.TypeMismatch;
+            return .str;
         },
         .str_test => {
             if (args.len != 2) return error.WrongArity;
@@ -1566,7 +1587,7 @@ fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
         .call => |c| switch (c.func) {
             .abs, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .sign => return c.int,
             .trunc => return intTypeOf(file, c.args[0].*),
-            .strlen, .length, .date_part, .date_diff, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => return .i64,
+            .strlen, .length, .date_part, .date_diff, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .strpos => return .i64,
             .round => return intTypeOf(file, c.args[0].*),
             .coalesce, .least, .greatest => {
                 var br: IntBranches = .{ .file = file };
@@ -1603,6 +1624,7 @@ fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, nam
     if (isTryCast(name)) e.call.lenient = true;
     e.call.math = math;
     if (func == .str_test) e.call.str_test = ast.StrTest.parse(name);
+    if (func == .date_name) e.call.part = if (asciiEqIgnoreCase(name, "dayname")) .dow else .month;
     return e;
 }
 
@@ -1641,7 +1663,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
             .depth = depth,
             .dec = dec,
             .temporal = switch (func) {
-                .make_date, .cast_date => .date,
+                .make_date, .cast_date, .last_day => .date,
                 .epoch_ms, .date_trunc, .cast_timestamp => .ts_us,
                 // Values of one unit (and one time zone) keep it; `resolveCallType` refuses a mix.
                 .coalesce => args[0].temporal(),
@@ -1651,6 +1673,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 .split_part, .regexp_extract, .date_diff, .strftime => null,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => null,
                 .floor, .ceil, .sqrt, .round, .least, .greatest, .math, .sign, .trunc, .str_test, .regexp_matches => null,
+                .date_name, .strpos, .concat_ws => null,
             },
             // A truncated or coalesced TIMESTAMP is as UTC-adjusted as its argument, DuckDB's TIMESTAMP WITH TIME ZONE;
             // every cast and `epoch_ms` give a plain TIMESTAMP.
@@ -2564,9 +2587,17 @@ test "parse: date/time functions bind DuckDB's argument types and carry their un
     _ = try parseExprOnly(a, "make_date(coalesce(-i * 2 + 1, 0))", &file, null);
     for ([_][]const u8{
         "make_date(b)",                      "make_date(2147483648)", "make_date(make_date(i))", "make_date(i + b)",
-        "make_date(date_part('year', tms))", "epoch_ms(tms)",         "date_trunc('minute', b)", "date_part(s, tms)",
+        "make_date(date_part('year', tms))", "epoch(b)",              "date_trunc('minute', b)", "date_part(s, tms)",
     }) |src|
         try testing.expectError(error.TypeMismatch, parseExprOnly(a, src, &file, null));
+    // `epoch_ms` of a time counts milliseconds, a BIGINT; of an integer it makes the TIMESTAMP.
+    const counted = try parseExprOnly(a, "epoch_ms(tms)", &file, null);
+    try testing.expectEqual(ast.Func.to_epoch_ms, counted.call.func);
+    try testing.expectEqual(ast.Type.i64, counted.typeOf());
+    try testing.expect(counted.temporal() == null);
+    try testing.expectEqual(ast.Func.epoch_ms, (try parseExprOnly(a, "epoch_ms(b)", &file, null)).call.func);
+    try testing.expectEqual(ast.Type.f64, (try parseExprOnly(a, "epoch(tms)", &file, null)).typeOf());
+    try testing.expectEqual(ast.Func.epoch, (try parseExprOnly(a, "date_part('epoch', tms)", &file, null)).call.func);
     try testing.expectError(error.UnsupportedDatePart, parseExprOnly(a, "date_trunc('dow', tms)", &file, null));
     try testing.expectError(error.UnsupportedDatePart, parseExprOnly(a, "date_part('fortnight', tms)", &file, null));
     try testing.expectError(error.WrongArity, parseExprOnly(a, "date_part('minute')", &file, null));

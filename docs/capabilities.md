@@ -76,6 +76,21 @@ other empty entry and an empty `ROLLUP ()`, `CUBE ()` or `GROUPING SETS ()` are 
 grand total. A HAVING that names a key a set leaves out reads it as NULL there (`HAVING a IS NOT NULL` drops the grand-total
 row); `count(a)` and the like keep reading the column.
 
+**More scalar functions.** A column of the query's one table may be written `t.g` (its alias, else the file's own name).
+`epoch(t)` (also `date_part('epoch', t)` and `EXTRACT(epoch FROM t)`) is a DATE's or TIMESTAMP's seconds since the epoch as a
+DOUBLE, `epoch_ms`, `epoch_us` and `epoch_ns` of one count that unit as a BIGINT (milliseconds rounded half away from zero), all
+NULL for an infinite time and an error where DuckDB's overflow; a TIMESTAMP WITH TIME ZONE is computed as DuckDB does, which is
+not the same double as a TIMESTAMP's. `cbrt`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `degrees`, `radians` and `atan2` of
+numbers are DOUBLEs through the C library, `sign(x)` is -1, 0 or 1, and `trunc(x)` rounds toward zero (a DECIMAL(p, s) to
+DECIMAL(p, 0)). `ln`, `log2`, `log10`, `exp`, `sin`, `cos`, `tan` and `pow` are not offered: DuckDB's binary carries an older math
+library whose results differ from a current one's in the last digit for 1 to 50 percent of inputs (and in the sign of a NaN),
+so they stay unknown functions. `starts_with` (`prefix`), `ends_with` (`suffix`), `contains` and `regexp_matches(s, 'pattern'
+[, 'options'])` of a text against a constant are BOOLEANs in a SELECT, an aggregate argument (`bool_or`, `count`), a GROUP BY
+key, under `coalesce` and `CASE`, and in WHERE (alone, under NOT, AND, OR, and in an aggregate's FILTER). `dayname`,
+`monthname` (English names), `last_day` (a DATE; an error past DuckDB's last DATE), `weekofyear`, `strpos` / `instr` (the 1-based
+character position of a constant text, 0 for none), `concat_ws('sep', a, b, ...)` (NULLs skipped; texts only) and `mod(a, b)` (`a % b`)
+match DuckDB too. A function whose second argument must be a constant (`contains`, `strpos`, `regexp_matches`) refuses a column.
+
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 
 **Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`), string concat (`||`),

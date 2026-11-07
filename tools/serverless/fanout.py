@@ -464,7 +464,10 @@ class SignedInvoke:
         body = dumps(payload).encode()
         creds = self.credentials or _credentials()
         frozen = creds.get_frozen_credentials() if hasattr(creds, "get_frozen_credentials") else creds
-        req = self._request(method="POST", url=self.url, data=body, headers={"Content-Type": "application/json"})
+        # Host has to be on the request before it is signed. Without it the front end answers 400 and never checks
+        # the signature.
+        req = self._request(method="POST", url=self.url, data=body, headers={
+            "Host": self._pool.host, "Content-Type": "application/json"})
         self._sign(frozen, "lambda", self.region).add_auth(req)
         status, headers, data = self._pool.post(self._path, list(req.headers.items()), body)
         return _read_invoke(status, headers, data)

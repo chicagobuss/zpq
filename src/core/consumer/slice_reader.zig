@@ -4,6 +4,7 @@ const metadata = @import("../parquet/metadata.zig");
 const schema = @import("../schema.zig");
 const column_mod = @import("../parquet/column.zig");
 const filter_eval = @import("../filter/eval.zig");
+const filter_ast = @import("../filter/ast.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
 const int96_mod = @import("../parquet/int96.zig");
 const core_memory = @import("../memory.zig");
@@ -64,6 +65,11 @@ pub const SliceReader = struct {
     levels_only: bool = false,
     /// The chunk it reads, re-marked as each slice starts (`enterChunk`).
     site: DecodeSite,
+    /// A byte-array reader's LIKE that every row the filter keeps satisfies (`plan.prefilterLike`): a page's values
+    /// are checked while the page is in cache, and only the values that match are copied out of it.
+    prefilter: ?Prefilter = null,
+
+    pub const Prefilter = struct { kind: filter_ast.LikeKind, operand: []const u8 };
 
     const Raw = union(enum) {
         i32: column_mod.ColumnChunkReader(i32),
@@ -629,6 +635,8 @@ pub const SliceReader = struct {
                     // misreporting its ownership limit as corrupt input; the rescannable scan retries normally.
                     return error.RetainedEncodingUnsupported;
                 };
+            } else if (self.prefilter) |pf| {
+                _ = try copyMatching(a, dst, if (def) |d| d[got..][0..want] else null, @intCast(self.levels.max_def), pf);
             } else _ = try copyBytes(a, dst);
             got += k;
         }
@@ -739,6 +747,24 @@ pub const SliceReader = struct {
     fn copyBytes(a: std.mem.Allocator, vals: [][]const u8) ![][]const u8 {
         var total: usize = 0;
         for (vals) |v| total += v.len;
+        const buf = try a.alloc(u8, total);
+        var off: usize = 0;
+        for (vals) |*v| {
+            @memcpy(buf[off..][0..v.len], v.*);
+            v.* = buf[off..][0..v.len];
+            off += v.len;
+        }
+        return vals;
+    }
+
+    /// `copyBytes` of the values that match `pf`; every other value, and every null, becomes an empty string. The
+    /// filter rejects those rows as it rejects the strings, and nothing else reads a row it rejected.
+    fn copyMatching(a: std.mem.Allocator, vals: [][]const u8, def: ?[]const u32, max_def: u32, pf: Prefilter) ![][]const u8 {
+        var total: usize = 0;
+        for (vals, 0..) |*v, i| {
+            const present = if (def) |d| d[i] >= max_def else true;
+            if (present and filter_ast.likeMatches(pf.kind, pf.operand, v.*)) total += v.len else v.* = "";
+        }
         const buf = try a.alloc(u8, total);
         var off: usize = 0;
         for (vals) |*v| {
@@ -973,3 +999,21 @@ test "chunkDictionary gives a string chunk's dictionary only when every data pag
         }
     }
 }
+
+test "copyMatching keeps the values that match and blanks every other row, nulls included" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var vals = [_][]const u8{ "xgooglex", "abc", "", "google", "zzz", "GOOGLE", "google" };
+    const def = [_]u32{ 1, 1, 1, 0, 1, 1, 1 }; // row 3 is null
+    const out = try SliceReader.copyMatching(a, &vals, &def, 1, .{ .kind = .contains, .operand = "google" });
+    const want = [_][]const u8{ "xgooglex", "", "", "", "", "", "google" };
+    for (want, out) |w, o| try std.testing.expectEqualStrings(w, o);
+    // The copies are the arena's, not the page's: the source bytes may be freed or overwritten.
+    var page = "xgooglex".*;
+    var one = [_][]const u8{page[0..]};
+    const kept = try SliceReader.copyMatching(a, &one, null, 0, .{ .kind = .prefix, .operand = "xg" });
+    @memset(&page, 0);
+    try std.testing.expectEqualStrings("xgooglex", kept[0]);
+}
+

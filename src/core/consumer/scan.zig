@@ -63,6 +63,7 @@ const plainValueEncodings = scan_plan.plainValueEncodings;
 const hashOnlyByteArray = scan_plan.hashOnlyByteArray;
 const streamByteArray = scan_plan.streamByteArray;
 const streamWindowRows = scan_plan.streamWindowRows;
+const prefilterLike = scan_plan.prefilterLike;
 const GatedFilter = scan_plan.GatedFilter;
 const foldWantsCodes = scan_plan.foldWantsCodes;
 const flatGroupKey = scan_plan.flatGroupKey;
@@ -1328,10 +1329,17 @@ fn filterNames(f: filter_ast.Filter, ci: usize) bool {
 }
 
 /// The rows of a row group its filter keeps, reading only the columns before the payload a slice at a time.
+/// The LIKE a byte-array reader of `ci` checks as its pages decode (`plan.prefilterLike`).
+fn prefilterOf(in: AggRowGroup, target: AggTarget, ci: usize) ?SliceReader.Prefilter {
+    const like = prefilterLike(in, target, ci) orelse return null;
+    return .{ .kind = like.kind, .operand = like.operand };
+}
+
 fn filterSurvivors(
     a: std.mem.Allocator,
     side: std.mem.Allocator,
     in: AggRowGroup,
+    target: AggTarget,
     decode_options: DecodeOptions,
     payload: []const bool,
     num_rows: usize,
@@ -1353,10 +1361,10 @@ fn filterSurvivors(
         if (gated) |g| if (g.deferred[ci]) continue;
         try first.append(a, ci);
     }
-    if (try filterPhase(a, side, in, decode_options, first.items, &survivors, false, lookup, ws, stream_rows, codes, gated) == null)
+    if (try filterPhase(a, side, in, target, decode_options, first.items, &survivors, false, lookup, ws, stream_rows, codes, gated) == null)
         return null;
     if (gated) |g| for (g.order) |ci| if (g.deferred[ci]) {
-        if (try filterPhase(a, side, in, decode_options, &.{ci}, &survivors, true, lookup, ws, stream_rows, false, g) == null)
+        if (try filterPhase(a, side, in, target, decode_options, &.{ci}, &survivors, true, lookup, ws, stream_rows, false, g) == null)
             return null;
     };
     return survivors;
@@ -1368,6 +1376,7 @@ fn filterPhase(
     a: std.mem.Allocator,
     side: std.mem.Allocator,
     in: AggRowGroup,
+    target: AggTarget,
     decode_options: DecodeOptions,
     columns: []const usize,
     survivors: *filter_selection.SelectionVector,
@@ -1398,6 +1407,7 @@ fn filterPhase(
         var r = try SliceReader.initPooled(a, side, in.rg, in.meta, in.src, ci, options, pool) orelse
             return null;
         if (coded) r.exact_codes = true;
+        r.prefilter = prefilterOf(in, target, ci);
         if (in.subgroup) |subgroup| try r.seekSubgroup(a, subgroup);
         lookup[ci] = readers.items.len;
         try readers.append(a, r);
@@ -1474,11 +1484,13 @@ fn openSlicedPayload(
         options.decimal_exact_only = target.exactInputs();
         const late = if (payload) |p| p[ci] else false;
         const held = if (deferred) |d| d[ci] else false;
+        const prefilter = prefilterOf(in, target, ci);
         if (late or held) if (survivors) |sv| {
             options.row_gate = sv;
             adviseGated(in, ci, sv, ws);
         };
         var r = try SliceReader.initPooled(pages, side, in.rg, in.meta, in.src, ci, options, pool) orelse return null;
+        r.prefilter = prefilter;
         // The exact tiles read a dictionary DECIMAL through its codes, and every DECIMAL as its exact integers: a
         // scalar target's readers would otherwise scale each value to its f64 view too.
         if (exact) |x| {
@@ -1941,6 +1953,7 @@ fn scanRGSlicedExact(
         pages.allocator(),
         side,
         in,
+        target,
         decode_options,
         p,
         num_rows,
@@ -2047,6 +2060,9 @@ fn scanRGSlicedExact(
             try filter_selection.SelectionVector.init(sa, n);
         if (payload == null) if (in.filter) |f| try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
         matched += if (in.filter != null) sel.count() else n;
+        // A window the filter emptied folds nothing: no group, no accumulator and no error comes of it. A sparse filter
+        // would otherwise pay each fold's per-window setup (a coded key copies its dictionary) once per window.
+        if (in.filter != null and exact == null and !discovering and sel.count() == 0) continue;
         const input_base = std.math.add(u64, in.row_base, done) catch return error.BadColumn;
         const window = try selectedWindow(&batch, &sel, input_base, null, n);
         if (exact) |*x| {

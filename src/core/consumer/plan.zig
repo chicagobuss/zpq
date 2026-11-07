@@ -270,6 +270,37 @@ pub fn hashOnlyByteArray(target: AggTarget, ci: usize) bool {
     }
 }
 
+/// The LIKE that every surviving row must satisfy on `ci`: the filter itself, or a conjunct of its top-level AND.
+fn mandatoryLike(f: filter_ast.Filter, ci: usize) ?filter_ast.LikeMatch {
+    switch (f) {
+        .like => |l| return if (l.col_idx == ci and !l.negate) l else null,
+        .and_filter => |c| {
+            if (c.in_set != null or c.null_member) return null;
+            for (c.children) |child| if (mandatoryLike(child, ci)) |l| return l;
+            return null;
+        },
+        else => return null,
+    }
+}
+
+/// The LIKE a filter-only flat BYTE_ARRAY chunk is checked against while its pages decode, so the bytes of a row it
+/// fails are never copied out of the page. The row stays in the batch as an empty string, which the filter then rejects
+/// as it would the string; no fold reads the column, so no one sees the difference. Null when the chunk's dictionary
+/// covers it (the predicate is already one compare per entry), when the fold reads the column, or when the LIKE is not
+/// one every kept row satisfies.
+pub fn prefilterLike(in: AggRowGroup, target: AggTarget, ci: usize) ?filter_ast.LikeMatch {
+    const filter = in.filter orelse return null;
+    if (ci >= in.read.len or !in.read[ci] or ci >= in.rg.columns.items.len) return null;
+    const cm = in.rg.columns.items[ci].meta_data orelse return null;
+    if (cm.type != .BYTE_ARRAY) return null;
+    if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) return null;
+    if (!reusableByteEncodings(cm.encodings.items)) return null;
+    if (columnFeedsFold(target, ci)) return null;
+    const like = mandatoryLike(filter, ci) orelse return null;
+    if (@import("../filter/membership.zig").dictionaryCoversChunk(&cm)) return null;
+    return like;
+}
+
 /// Filter-only or hash-only flat BYTE_ARRAY: the scan reads it a cache-sized window at a time instead of
 /// decompressing the chunk into the row-group region.
 pub fn streamByteArray(in: AggRowGroup, target: AggTarget, ci: usize) bool {

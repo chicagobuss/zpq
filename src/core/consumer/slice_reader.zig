@@ -4,6 +4,8 @@ const metadata = @import("../parquet/metadata.zig");
 const schema = @import("../schema.zig");
 const column_mod = @import("../parquet/column.zig");
 const filter_eval = @import("../filter/eval.zig");
+const filter_ast = @import("../filter/ast.zig");
+const filter_selection = @import("../filter/selection.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
 const int96_mod = @import("../parquet/int96.zig");
 const core_memory = @import("../memory.zig");
@@ -20,6 +22,30 @@ const flbaWidth = @import("column.zig").flbaWidth;
 const valuesCol = @import("column.zig").valuesCol;
 const codedCol = @import("column.zig").codedCol;
 const chunkDictionary = @import("column.zig").chunkDictionary;
+
+/// The values a first pass copied out of a byte-array chunk's pages for the rows that can still reach the fold: the rows
+/// the filter had not rejected when the pages were read, that satisfy a LIKE every kept row satisfies. The second pass
+/// replays them (`SliceReader.replay`) instead of decompressing the chunk again. Rows ascend. A row that is alive but
+/// NULL, with no LIKE to reject it, is kept as a NULL (`nulls`): the replay gives it back as one. Every other row is
+/// an empty string in the replay, and no fold reads one. Bounded by `cap`, which counts what the lists hold too: a
+/// pass that would pass it stops keeping, sets `overflow`, and the second pass reads the pages as before.
+pub const Kept = struct {
+    rows: std.ArrayList(u32) = .empty,
+    vals: std.ArrayList([]const u8) = .empty,
+    nulls: std.ArrayList(u32) = .empty,
+    bytes: usize = 0,
+    cap: usize,
+    overflow: bool = false,
+    /// Row-group lifetime: the values outlive the first pass's windows.
+    arena: std.mem.Allocator,
+    /// The next entries of `rows` and `nulls` the replay has not yet handed out.
+    cursor: usize = 0,
+    null_cursor: usize = 0,
+};
+
+/// Windows served from a first pass's `Kept`, and first passes that outgrew their cap (for tests).
+pub var test_replays: std.atomic.Value(usize) = .init(0);
+pub var test_overflows: std.atomic.Value(usize) = .init(0);
 
 /// One flat column chunk decoded a slice of rows at a time, into the lane `decodeWriteColumn` gives the whole chunk:
 /// for a row group too big to hold decoded at once. Each reader keeps its own page buffers, so the memory held is a
@@ -64,6 +90,27 @@ pub const SliceReader = struct {
     levels_only: bool = false,
     /// The chunk it reads, re-marked as each slice starts (`enterChunk`).
     site: DecodeSite,
+    /// How a streamed byte-array column is copied out of its pages (`plan.fusion`); null reads it as it always was.
+    fused: ?*Fused = null,
+    /// Rows of this reader's sequence delivered so far.
+    taken: usize = 0,
+
+    pub const Prefilter = struct { kind: filter_ast.LikeKind, operand: []const u8 };
+
+    pub const Fused = struct {
+        /// A LIKE that every row the filter keeps satisfies: a page's values are checked while the page is in cache,
+        /// and only the values that match are copied out of it.
+        prefilter: ?Prefilter = null,
+        /// Rows the filter has not rejected: the others are not copied (they are empty strings in the batch, and
+        /// nothing reads them). Only with `keep`.
+        active: ?*const filter_selection.SelectionVector = null,
+        /// Keep what is copied for a later pass (`Kept`).
+        keep: ?*Kept = null,
+        /// Serve the rows from what an earlier pass kept; no page is read.
+        replay: ?*Kept = null,
+        /// The first row of the window being read.
+        row0: usize = 0,
+    };
 
     const Raw = union(enum) {
         i32: column_mod.ColumnChunkReader(i32),
@@ -320,6 +367,14 @@ pub const SliceReader = struct {
         const n = @min(n_want, self.left);
         self.left -= n;
         self.stream_left = 0;
+        if (self.fused) |f| {
+            f.row0 = self.taken;
+            if (f.replay) |kept| {
+                self.taken += n;
+                return self.replayWindow(f, kept, a, n);
+            }
+        }
+        self.taken += n;
         if (n != 0 and !self.levels_only and self.dec == null and !self.float16 and !self.int96) {
             switch (self.raw.*) {
                 inline .i32, .i64, .bytes => |*r| if (r.options.any_dictionary and r.options.encoded)
@@ -629,6 +684,8 @@ pub const SliceReader = struct {
                     // misreporting its ownership limit as corrupt input; the rescannable scan retries normally.
                     return error.RetainedEncodingUnsupported;
                 };
+            } else if (self.fused) |f| {
+                try self.copyWanted(a, f, dst, if (def) |d| d[got..][0..want] else null, f.row0 + got);
             } else _ = try copyBytes(a, dst);
             got += k;
         }
@@ -694,6 +751,7 @@ pub const SliceReader = struct {
     pub fn skip(self: *SliceReader, a: std.mem.Allocator, n_want: usize) !void {
         const n = @min(n_want, self.left);
         self.left -= n;
+        self.taken += n;
         switch (self.raw.*) {
             inline else => |*r| {
                 const T = @TypeOf(r.*).Value;
@@ -747,6 +805,84 @@ pub const SliceReader = struct {
             off += v.len;
         }
         return vals;
+    }
+
+    /// `copyBytes` of the values this reader may be asked for: not a null, not a row `active` has rejected, and a match
+    /// of `prefilter`. Every other value becomes an empty string; the filter rejects those rows as it rejects the
+    /// strings, and nothing else reads a row it rejected. With `keep`, the copies go to the row-group arena and are
+    /// recorded for the replay; past the cap they go to `a` as before and `keep` stops.
+    fn copyWanted(self: *SliceReader, a: std.mem.Allocator, f: *Fused, vals: [][]const u8, def: ?[]const u32, row0: usize) !void {
+        const max_def: u32 = @intCast(self.levels.max_def);
+        // Without a predicate nothing rejects a NULL, so one that is still alive may survive and has to come back NULL.
+        const track_nulls = f.keep != null and f.prefilter == null;
+        var total: usize = 0;
+        var entries: usize = 0;
+        var null_rows: usize = 0;
+        for (vals, 0..) |*v, i| {
+            const present = if (def) |d| d[i] >= max_def else true;
+            const alive = if (f.active) |s| row0 + i < s.len and s.isActive(row0 + i) else true;
+            if (track_nulls and !present and alive) null_rows += 1;
+            const wanted = present and alive and (if (f.prefilter) |pf| filter_ast.likeMatches(pf.kind, pf.operand, v.*) else true);
+            if (wanted) {
+                total += v.len;
+                entries += @intFromBool(v.len != 0);
+            } else v.* = "";
+        }
+        var into = a;
+        const keep: ?*Kept = if (f.keep) |k| if (k.overflow) null else k else null;
+        if (keep) |k| {
+            const cost = total +| entries *| (@sizeOf(u32) + @sizeOf([]const u8)) +| null_rows *| @sizeOf(u32);
+            if (k.bytes +| cost > k.cap) {
+                k.overflow = true;
+                _ = test_overflows.fetchAdd(1, .monotonic);
+            } else {
+                k.bytes += cost;
+                into = k.arena;
+            }
+        }
+        const recording = if (keep) |k| !k.overflow else false;
+        const buf = try into.alloc(u8, total);
+        var off: usize = 0;
+        for (vals, 0..) |*v, i| {
+            if (v.len == 0) {
+                if (recording and null_rows != 0 and (if (def) |d| d[i] < max_def else false) and
+                    (if (f.active) |s| row0 + i < s.len and s.isActive(row0 + i) else true))
+                    try keep.?.nulls.append(keep.?.arena, @intCast(row0 + i));
+                continue;
+            }
+            @memcpy(buf[off..][0..v.len], v.*);
+            v.* = buf[off..][0..v.len];
+            off += v.len;
+            if (recording) {
+                try keep.?.rows.append(keep.?.arena, @intCast(row0 + i));
+                try keep.?.vals.append(keep.?.arena, v.*);
+            }
+        }
+    }
+
+    /// The next `n` rows of what a first pass kept: those rows' values, a NULL for each NULL it kept, an empty string
+    /// for every other.
+    fn replayWindow(self: *SliceReader, f: *Fused, kept: *Kept, a: std.mem.Allocator, n: usize) !filter_eval.Batch.Column {
+        _ = test_replays.fetchAdd(1, .monotonic);
+        const lo = f.row0;
+        const values = try a.alloc([]const u8, n);
+        @memset(values, "");
+        while (kept.cursor < kept.rows.items.len and kept.rows.items[kept.cursor] < lo + n) : (kept.cursor += 1) {
+            const row = kept.rows.items[kept.cursor];
+            if (row >= lo) values[row - lo] = kept.vals.items[kept.cursor];
+        }
+        const max_def: u32 = @intCast(self.levels.max_def);
+        const def: ?[]u32 = if (max_def > 0) try a.alloc(u32, n) else null;
+        if (def) |d| @memset(d, max_def);
+        var has_nulls = false;
+        while (kept.null_cursor < kept.nulls.items.len and kept.nulls.items[kept.null_cursor] < lo + n) : (kept.null_cursor += 1) {
+            const row = kept.nulls.items[kept.null_cursor];
+            if (row >= lo) if (def) |d| {
+                d[row - lo] = 0;
+                has_nulls = true;
+            };
+        }
+        return .{ .string = .{ .values = values, .def_levels = def, .max_def = max_def, .has_nulls = has_nulls } };
     }
 
     /// A DECIMAL slice as `decimal_mod.decodeColumnExact` gives a chunk: the f64 view with the exact integers beside.

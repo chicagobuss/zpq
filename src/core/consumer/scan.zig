@@ -51,6 +51,7 @@ const DecodeBudget = budget_module.DecodeBudget;
 const decodeEstimate = budget_module.decodeEstimate;
 const DecodeOptions = column_mod.DecodeOptions;
 const SliceReader = @import("slice_reader.zig").SliceReader;
+const Kept = @import("slice_reader.zig").Kept;
 const poolOn = @import("pool.zig").poolOn;
 const gatherRows = @import("output.zig").gatherRows;
 const pruning = @import("pruning.zig");
@@ -64,6 +65,7 @@ const plainValueEncodings = scan_plan.plainValueEncodings;
 const hashOnlyByteArray = scan_plan.hashOnlyByteArray;
 const streamByteArray = scan_plan.streamByteArray;
 const streamWindowRows = scan_plan.streamWindowRows;
+const fusion = scan_plan.fusion;
 const GatedFilter = scan_plan.GatedFilter;
 const foldWantsCodes = scan_plan.foldWantsCodes;
 const flatGroupKey = scan_plan.flatGroupKey;
@@ -469,12 +471,14 @@ fn foldGroupedWindows(
 /// Returns the rows the outer filter kept (every row without one), for the summary's `rows_matched`.
 pub fn scanRGForAgg(
     gpa: std.mem.Allocator,
-    in: AggRowGroup,
+    in_group: AggRowGroup,
     stats: agg_plan.StatsUse,
     decode_options: DecodeOptions,
     target: AggTarget,
     ws: AggWorkspace,
 ) !u64 {
+    var in = in_group;
+    in.fuse = !(if (ws.scratch.slice) |pool| pool.fusion_declined else false);
     var execution = ws;
     // A join's build columns have no chunk to cost a cache window by: its row groups slice when memory asks (or a
     // batch size is set), and one the slices cannot take publishes on the whole-row-group decode alone.
@@ -1356,11 +1360,19 @@ fn filterNames(f: filter_ast.Filter, ci: usize) bool {
     return filter_ast.reads(f, ci);
 }
 
+/// The LIKE a byte-array reader of `ci` checks as its pages decode (`plan.fusion`).
+fn prefilterOf(in: AggRowGroup, target: AggTarget, ci: usize) ?SliceReader.Prefilter {
+    const like = (fusion(in, target, ci) orelse return null).like orelse return null;
+    return .{ .kind = like.kind, .operand = like.operand };
+}
+
 /// The rows of a row group its filter keeps, reading only the columns before the payload a slice at a time.
+/// `kept`: what the streamed strings the fold also reads keep for the payload pass (`Kept`).
 fn filterSurvivors(
     a: std.mem.Allocator,
     side: std.mem.Allocator,
     in: AggRowGroup,
+    target: AggTarget,
     decode_options: DecodeOptions,
     payload: []const bool,
     num_rows: usize,
@@ -1369,6 +1381,7 @@ fn filterSurvivors(
     /// Read dictionary-encoded fixed-width filter columns as codes, as a whole coded chunk is filtered.
     codes: bool,
     gated: ?*GatedFilter,
+    kept: []?Kept,
 ) !?filter_selection.SelectionVector {
     const pool = try poolOn(&ws.scratch.slice, side);
     const words = try pool.survivorWords(num_rows);
@@ -1382,10 +1395,10 @@ fn filterSurvivors(
         if (gated) |g| if (g.deferred[ci]) continue;
         try first.append(a, ci);
     }
-    if (try filterPhase(a, side, in, decode_options, first.items, &survivors, false, lookup, ws, stream_rows, codes, gated) == null)
+    if (try filterPhase(a, side, in, target, decode_options, first.items, &survivors, false, lookup, ws, stream_rows, codes, gated, kept) == null)
         return null;
     if (gated) |g| for (g.order) |ci| if (g.deferred[ci]) {
-        if (try filterPhase(a, side, in, decode_options, &.{ci}, &survivors, true, lookup, ws, stream_rows, false, g) == null)
+        if (try filterPhase(a, side, in, target, decode_options, &.{ci}, &survivors, true, lookup, ws, stream_rows, false, g, kept) == null)
             return null;
     };
     return survivors;
@@ -1397,6 +1410,7 @@ fn filterPhase(
     a: std.mem.Allocator,
     side: std.mem.Allocator,
     in: AggRowGroup,
+    target: AggTarget,
     decode_options: DecodeOptions,
     columns: []const usize,
     survivors: *filter_selection.SelectionVector,
@@ -1406,6 +1420,7 @@ fn filterPhase(
     stream_rows: usize,
     codes: bool,
     gated: ?*GatedFilter,
+    kept: []?Kept,
 ) !?void {
     const num_rows = survivors.len;
     const pool = try poolOn(&ws.scratch.slice, side);
@@ -1427,6 +1442,19 @@ fn filterPhase(
         var r = try SliceReader.initPooled(a, side, in.rg, in.meta, in.src, ci, options, pool) orelse
             return null;
         if (coded) r.exact_codes = true;
+        if (fusion(in, target, ci)) |f| {
+            const fused = try a.create(SliceReader.Fused);
+            fused.* = .{ .prefilter = prefilterOf(in, target, ci) };
+            r.fused = fused;
+            if (f.shared) {
+                // The payload pass replays what this one copies, for the rows still alive when the pages are read.
+                // More than a quarter of the chunk's bytes is more than the second read costs.
+                const cap: usize = @intCast(@max(0, cm.?.total_uncompressed_size) / 4);
+                kept[ci] = .{ .cap = cap, .arena = a };
+                fused.keep = &kept[ci].?;
+                if (gate) fused.active = survivors;
+            }
+        }
         if (in.subgroup) |subgroup| try r.seekSubgroup(a, subgroup);
         lookup[ci] = readers.items.len;
         try readers.append(a, r);
@@ -1480,6 +1508,7 @@ fn openSlicedPayload(
     deferred: ?[]const bool,
     ws: AggWorkspace,
     exact: ?*const exact_tiles.ExactTiles,
+    kept: []?Kept,
 ) !?void {
     @memset(lookup, null);
     var n_readers: usize = 0;
@@ -1503,11 +1532,22 @@ fn openSlicedPayload(
         options.decimal_exact_only = target.exactInputs();
         const late = if (payload) |p| p[ci] else false;
         const held = if (deferred) |d| d[ci] else false;
+        const fused = fusion(in, target, ci);
         if (late or held) if (survivors) |sv| {
             options.row_gate = sv;
             adviseGated(in, ci, sv, ws);
         };
         var r = try SliceReader.initPooled(pages, side, in.rg, in.meta, in.src, ci, options, pool) orelse return null;
+        if (fused) |f| {
+            // A string only the filter reads copies just its matches. One the first pass kept is served from that.
+            const state = try pages.create(SliceReader.Fused);
+            state.* = .{};
+            if (!f.shared) state.prefilter = prefilterOf(in, target, ci);
+            if (ci < kept.len) if (kept[ci]) |*k| if (!k.overflow) {
+                state.replay = k;
+            };
+            if (state.prefilter != null or state.replay != null) r.fused = state;
+        }
         // The exact tiles read a dictionary DECIMAL through its codes, and every DECIMAL as its exact integers: a
         // scalar target's readers would otherwise scale each value to its f64 view too.
         if (exact) |x| {
@@ -2050,11 +2090,15 @@ fn scanRGSlicedExact(
         @memset(none, false);
         break :blk none;
     } else null;
+    // What each streamed string the fold also reads keeps of its first pass for the second (`plan.fusion`).
+    const carried = try pages.allocator().alloc(?Kept, in.rg.columns.items.len);
+    @memset(carried, null);
     var survivors: filter_selection.SelectionVector = undefined;
     if (payload) |p| survivors = (try filterSurvivors(
         pages.allocator(),
         side,
         in,
+        target,
         decode_options,
         p,
         num_rows,
@@ -2063,8 +2107,14 @@ fn scanRGSlicedExact(
         if (exact != null and ws.decode_batch_rows != 0) @min(stream_rows, ws.decode_batch_rows) else stream_rows,
         exact != null,
         if (gated) |*g| g else null,
+        carried,
     )) orelse
         return null;
+    // A cap that was hit says the filter keeps too many rows for the second pass to be saved: this worker's later
+    // row groups read the string whole, as they did before.
+    for (carried) |k| if (k) |keep| if (keep.overflow) {
+        pool.fusion_declined = true;
+    };
     // The filter pass has released its readers. The same slots decode the payload.
     try openSlicedPayload(
         pages.allocator(),
@@ -2081,6 +2131,7 @@ fn scanRGSlicedExact(
         if (gated) |g| g.deferred else null,
         ws,
         if (exact) |*x| x else null,
+        carried,
     ) orelse return null;
     // Each slice's build columns follow its readers' columns.
     for (pubs) |j| for (j.payloads, 0..) |_, p| {
@@ -2179,6 +2230,10 @@ fn scanRGSlicedExact(
                 continue;
             }
         }
+        // A window the filter emptied folds nothing: no group, no accumulator and no error comes of it. A sparse filter
+        // would otherwise pay each fold's per-window setup (a coded key copies its dictionary) once per window. After
+        // the join's slice: a build side publishes and folds per slice whatever the window holds.
+        if (in.filter != null and exact == null and !discovering and sel.count() == 0) continue;
         const input_base = std.math.add(u64, in.row_base, done) catch return error.BadColumn;
         const window = try selectedWindow(&batch, &sel, input_base, null, n);
         if (exact) |*x| {

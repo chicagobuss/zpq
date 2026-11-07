@@ -1936,3 +1936,196 @@ test "a group-join whose scan fails leaks nothing, request after request" {
         } else |_| {}
     }
 }
+
+test "a streamed string the fold also reads is kept by the first pass and replayed by the second, the answer unchanged" {
+    const fixture = "ci/fixtures/parquet/count_certificate_plain.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const slice_reader = @import("../core/consumer/slice_reader.zig");
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // `v > ...` completes first, so `s` is deferred and read only at its survivors; min(s) and max(s) read it bare, so
+    // the plan reads it in a first pass and a second. With strlen(s) the use is not bare, and the string reads whole.
+    const Case = struct { like: []const u8, replays: bool, overflows: bool };
+    for ([_]Case{
+        .{ .like = "%7777%", .replays = true, .overflows = false }, // a few rows: kept, replayed
+        .{ .like = "%1%", .replays = false, .overflows = true }, // a third of them: over the cap, read again
+    }) |case| {
+        var filter_buf: [96]u8 = undefined;
+        const filter = try std.fmt.bufPrint(&filter_buf, "v > -100000 AND s LIKE '{s}'", .{case.like});
+        const replays_before = slice_reader.test_replays.load(.monotonic);
+        const overflows_before = slice_reader.test_overflows.load(.monotonic);
+        const fused = try sortedGroupText(gpa, ctx, .{
+            .inputs = &.{fixture},
+            .filter = filter,
+            .aggregate = "min(s) AS lo, max(s) AS hi, count(*) AS c",
+            .group_by = "f",
+            .parallelism = 1,
+        });
+        defer gpa.free(fused);
+        try std.testing.expectEqual(case.replays, slice_reader.test_replays.load(.monotonic) != replays_before);
+        // One worker: its first row group hits the cap, and its later groups read the string whole.
+        try std.testing.expectEqual(
+            @as(usize, @intFromBool(case.overflows)),
+            slice_reader.test_overflows.load(.monotonic) - overflows_before,
+        );
+        const replays_mid = slice_reader.test_replays.load(.monotonic);
+        const overflows_mid = slice_reader.test_overflows.load(.monotonic);
+        const whole = try sortedGroupText(gpa, ctx, .{
+            .inputs = &.{fixture},
+            .filter = filter,
+            .aggregate = "min(s) AS lo, max(s) AS hi, count(*) AS c, sum(strlen(s)) AS l",
+            .group_by = "f",
+            .parallelism = 1,
+        });
+        defer gpa.free(whole);
+        // A use that is not the bare value leaves the string to the whole-row-group decode: nothing kept, nothing replayed.
+        try std.testing.expectEqual(replays_mid, slice_reader.test_replays.load(.monotonic));
+        try std.testing.expectEqual(overflows_mid, slice_reader.test_overflows.load(.monotonic));
+        // Each group row of `whole` is `lo,hi,c,l,`: without its last field it is a row of `fused`.
+        var want: std.ArrayList(u8) = .empty;
+        defer want.deinit(gpa);
+        var rows = std.mem.splitScalar(u8, whole, ';');
+        while (rows.next()) |row| {
+            if (row.len == 0) continue;
+            const body = row[0 .. row.len - 1];
+            try want.appendSlice(gpa, body[0 .. std.mem.lastIndexOfScalar(u8, body, ',').? + 1]);
+            try want.append(gpa, ';');
+        }
+        try std.testing.expect(fused.len > 0);
+        try std.testing.expectEqualStrings(want.items, fused);
+    }
+}
+
+test "a LIKE the empty string satisfies does not blank the rows it rejects" {
+    const fixture = "ci/fixtures/parquet/count_certificate_plain.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // `s` holds no empty string. A rejected value left as "" would be accepted again by `LIKE ''`, which the filter
+    // re-evaluates; the filter-only string and the one min(s) also reads must both answer no rows.
+    for ([_][]const u8{ "count(*) AS c", "min(s) AS lo, count(*) AS c" }) |aggregate| {
+        const got = try sortedGroupText(gpa, ctx, .{
+            .inputs = &.{fixture},
+            .filter = "f >= 0 AND s LIKE ''",
+            .aggregate = aggregate,
+            .group_by = "f",
+            .parallelism = 1,
+        });
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings("", got);
+    }
+}
+
+test "a NULL that survives the filter comes back NULL from the replay, whatever the parallelism" {
+    const slice_reader = @import("../core/consumer/slice_reader.zig");
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // pyarrow 26, PLAIN optional strings, no page index: `fusion_null_survivor` is three rows (v = 0, 1, 1; s = NULL,
+    // 100 a's, 100 b's); the other two have 6000 rows in six row groups with v = k % 11 and s NULL on every 29th row,
+    // `fusion_null_mixed` with dictionary pages that fall back to PLAIN. `v = 0 AND s IS NULL` keeps only NULLs, so
+    // every MIN, MAX and DISTINCT over s is empty. A NULL the replay returned as "" made them "" and 1 (PF-1).
+    const Fixture = struct { name: []const u8, rows: []const u8 };
+    const aggregate = "min(s) AS lo, max(s) AS hi, count(*) AS n, count(s) AS nn, count(DISTINCT s) AS d";
+    for ([_]Fixture{
+        .{ .name = "fusion_null_survivor", .rows = "0,null,null,1,0,0,;" },
+        .{ .name = "fusion_null_sparse", .rows = "0,null,null,19,0,0,;" },
+        .{ .name = "fusion_null_mixed", .rows = "0,null,null,19,0,0,;" },
+    }) |fixture| {
+        var path_buf: [96]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "ci/fixtures/parquet/{s}.parquet", .{fixture.name});
+        std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
+        for ([_]usize{ 1, 4 }) |jobs| {
+            const replays_before = slice_reader.test_replays.load(.monotonic);
+            const got = try sortedGroupText(gpa, ctx, .{
+                .inputs = &.{path},
+                .filter = "v = 0 AND s IS NULL",
+                .aggregate = aggregate,
+                .group_by = "v",
+                .parallelism = jobs,
+            });
+            defer gpa.free(got);
+            try std.testing.expectEqualStrings(fixture.rows, got);
+            // The first pass kept the NULLs and the second replayed them, so the replay is what this proves.
+            if (jobs == 1) try std.testing.expect(slice_reader.test_replays.load(.monotonic) != replays_before);
+        }
+    }
+    // A dense earlier conjunct keeps enough strings to overflow the first pass, so the replay is bypassed in that row
+    // group and, for that worker, in the later ones. Which worker that is must not change an answer (PF-1 depended on it).
+    for ([_]usize{ 1, 4 }) |jobs| {
+        const overflows_before = slice_reader.test_overflows.load(.monotonic);
+        const got = try sortedGroupText(gpa, ctx, .{
+            .inputs = &.{"ci/fixtures/parquet/fusion_null_sparse.parquet"},
+            .filter = "v > 0 AND s IS NULL",
+            .aggregate = aggregate,
+            .group_by = "v",
+            .parallelism = jobs,
+        });
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings("1,null,null,19,0,0,;10,null,null,19,0,0,;2,null,null,19,0,0,;" ++
+            "3,null,null,19,0,0,;4,null,null,18,0,0,;5,null,null,19,0,0,;6,null,null,19,0,0,;7,null,null,19,0,0,;" ++
+            "8,null,null,18,0,0,;9,null,null,19,0,0,;", got);
+        if (jobs == 1) try std.testing.expect(slice_reader.test_overflows.load(.monotonic) != overflows_before);
+    }
+    // The NULLs the first pass also kept are not the rows that survive here: the non-NULL ones are, unchanged.
+    for ([_]usize{ 1, 4 }) |jobs| {
+        const got = try sortedGroupText(gpa, ctx, .{
+            .inputs = &.{"ci/fixtures/parquet/fusion_null_sparse.parquet"},
+            .filter = "v = 0 AND s IS NOT NULL",
+            .aggregate = "min(s) AS lo, count(*) AS n",
+            .group_by = "v",
+            .parallelism = jobs,
+        });
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings("0,\"hay-1001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",527,;", got);
+    }
+}
+
+test "a row group with a join in its filter is not fused, and answers as the same query without the join" {
+    const fixture = "ci/fixtures/parquet/count_certificate_plain.parquet"; // PLAIN string `s`, `k` from -32767 to 102
+    const build = "ci/fixtures/parquet/full_match.parquet"; // `ts` unique, 0 to 1599
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(std.testing.io, build, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const slice_reader = @import("../core/consumer/slice_reader.zig");
+    const sql_parser = @import("../core/expr/sql_parser.zig");
+    const engine_join = @import("join.zig");
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // The join keeps the probe rows with 0 <= k < 1600. Without it, the same filter keeps `s` from the first pass and
+    // replays it; with it, the join's slices publish and fold, and `s` reads as it did before fusion.
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(gpa);
+    try sql.print(gpa, "SELECT f.v, min(f.s) AS lo, count(*) AS c FROM '{s}' f JOIN '{s}' d ON f.k = d.ts " ++
+        "WHERE f.v > -100000 AND f.s LIKE '%1%' GROUP BY f.v", .{ fixture, build });
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var schemas: engine_join.LocalSchemas = .{ .arena = arena };
+    defer schemas.deinit();
+    const pq = (try sql_parser.parseSqlJoinPlan(arena, sql.items, .{ .ctx = &schemas, .footer = engine_join.LocalSchemas.footer })).?;
+    const replays_before = slice_reader.test_replays.load(.monotonic);
+    const overflows_before = slice_reader.test_overflows.load(.monotonic);
+    const joined = try sortedGroupText(gpa, ctx, .{
+        .inputs = &.{fixture},
+        .plan_source = @import("syntax_plan.zig").source(pq.syntax.?),
+        .aggregate = pq.aggregate_str,
+        .filter = pq.filter_str,
+        .group_by = pq.group_by_str,
+        .select = pq.select_str,
+        .select_cols = pq.select_cols,
+        .result_order = pq.result_order,
+        .parallelism = 1,
+    });
+    defer gpa.free(joined);
+    try std.testing.expect(joined.len > 0);
+    try std.testing.expectEqual(replays_before, slice_reader.test_replays.load(.monotonic));
+    try std.testing.expectEqual(overflows_before, slice_reader.test_overflows.load(.monotonic));
+    const plain = try sortedGroupText(gpa, ctx, .{
+        .inputs = &.{fixture},
+        .filter = "k >= 0 AND k < 1600 AND v > -100000 AND s LIKE '%1%'",
+        .aggregate = "min(s) AS lo, count(*) AS c",
+        .group_by = "v",
+        .parallelism = 1,
+    });
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings(plain, joined);
+}

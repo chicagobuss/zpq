@@ -154,6 +154,9 @@ pub const SliceScratch = struct {
     /// Next slot `checkout` hands out. `rewind` at the start of a pass, while no reader still holds a slot.
     next: usize = 0,
     survivors: []u64 = &.{},
+    /// A row group of this worker kept more of a streamed string than its cap allows (`slice_reader.Kept`): the
+    /// filter keeps too many rows for the second pass to be saved, and the worker's later groups read it whole.
+    fusion_declined: bool = false,
     /// Filter slices and payload slices stay apart: each pass sizes itself from its own high water.
     /// `ArenaAllocator.init` allocates no backing.
     values: std.heap.ArenaAllocator,

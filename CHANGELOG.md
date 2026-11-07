@@ -12,7 +12,7 @@
   often went to DELTA_BYTE_ARRAY, which the readers we measured decode slower than PLAIN (Polars 2.1.0 about twice as
   slow). A dictionary may now hold up to a quarter of the values' bytes (still 1 MiB at least, and still a quarter or
   fewer distinct values), and the other strings are PLAIN unless DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY saves the
-  bytes after the codec (half, or a tenth), judged on the chunk's first page. On the ClickBench `hits_0` shard at its
+  bytes after the codec (half for DELTA_BYTE_ARRAY, any for DELTA_LENGTH_BYTE_ARRAY), judged on the chunk's first page. On the ClickBench `hits_0` shard at its
   two row groups, reading every string column takes 0.78× (DuckDB 2.0.0) and 0.56× (Polars 2.1.0) the original file's
   speed with 0.5.1's re-encode and 1.08× and 1.11× now (PyArrow 26: 1.09×); the Title column is 1.7× to 2.9× faster, and
   the file is 98.7 MB where 0.5.1 wrote 116.3 MB and the original is 122.4 MB. Written bytes change; the values don't.

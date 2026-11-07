@@ -116,7 +116,7 @@ pages and encodings, regardless of the requested footer version. JSON requests u
 to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte
 arrays (a quarter or fewer distinct, and a dictionary within a quarter of the values' bytes, at least 1 MiB); DELTA_BINARY_PACKED
 for INT32 / INT64; other strings PLAIN, unless a sample of the chunk's first page, compressed with the chosen codec, shows
-DELTA_BYTE_ARRAY at half PLAIN's size or less, or DELTA_LENGTH_BYTE_ARRAY a tenth smaller (FIXED_LEN_BYTE_ARRAY has no
+DELTA_BYTE_ARRAY at half PLAIN's size or less, or DELTA_LENGTH_BYTE_ARRAY smaller at all (FIXED_LEN_BYTE_ARRAY has no
 DELTA_LENGTH_BYTE_ARRAY).
 DECIMAL columns re-encode losslessly: INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled integer, never
 a DOUBLE. Direct projection copies preserve page indexes; re-encoded chunks get their own.

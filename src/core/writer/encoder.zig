@@ -1685,13 +1685,14 @@ const StringValues = struct { bytes: []const u8, encoding: schema.Encoding };
 ///   shared with the previous present value, suffix[i] the rest): sorted keys, paths;
 /// - DELTA_LENGTH_BYTE_ARRAY, `DBP(lengths) ++ concat(values)`: short values of varying length, where PLAIN's four
 ///   length bytes are a large share.
-/// Readers decode PLAIN fastest or equal-fastest, and DELTA_BYTE_ARRAY several times slower in Polars, 20% slower in
-/// DuckDB, so a delta layout is kept only for the bytes it saves *after the chunk's codec*, which already finds most
-/// of what a prefix or a length column repeats: the first page is encoded each way and compressed, and DELTA_BYTE_ARRAY
-/// must at least halve PLAIN's size, DELTA_LENGTH_BYTE_ARRAY save a tenth. The sample is a function of the values and
-/// the codec alone, so the choice is the same on every thread and run. One layout for the whole chunk, so every page
-/// has the same one. A FIXED_LEN_BYTE_ARRAY column takes DELTA_BYTE_ARRAY or PLAIN: DELTA_LENGTH_BYTE_ARRAY is defined
-/// for BYTE_ARRAY only, and strict readers reject it on FLBA.
+/// Readers decode PLAIN fastest or equal-fastest on long values, and DELTA_BYTE_ARRAY several times slower in Polars
+/// and 20% slower in DuckDB, so a delta layout is kept only for the bytes it saves *after the chunk's codec*, which
+/// already finds most of what a prefix or a length column repeats: the first page is encoded each way and compressed,
+/// and DELTA_BYTE_ARRAY must at least halve PLAIN's size (it costs readers the most), DELTA_LENGTH_BYTE_ARRAY be
+/// smaller at all (long values, where it is not, are PLAIN; short ones, where it is, read faster as well). The sample
+/// is a function of the values and the codec alone, so the choice is the same on every thread and run. One layout for
+/// the whole chunk, so every page has the same one. A FIXED_LEN_BYTE_ARRAY column takes DELTA_BYTE_ARRAY or PLAIN:
+/// DELTA_LENGTH_BYTE_ARRAY is defined for BYTE_ARRAY only, and strict readers reject it on FLBA.
 fn stringsEncoding(
     arena: std.mem.Allocator,
     in: ColumnInput,
@@ -1725,7 +1726,7 @@ fn stringsEncoding(
     if (fixed) return null;
     const bytes = try encodeStringsAs(arena, sample, sample_defs, max_def, .DELTA_LENGTH_BYTE_ARRAY);
     const delta_length = (try compression.compress(arena, bytes, in.codec)).len;
-    return if (delta_length * 10 <= plain * 9) .DELTA_LENGTH_BYTE_ARRAY else null;
+    return if (delta_length < plain) .DELTA_LENGTH_BYTE_ARRAY else null;
 }
 
 /// The present `values` in `encoding` (DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY), the first one's prefix empty.

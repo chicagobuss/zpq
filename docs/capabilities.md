@@ -34,6 +34,12 @@ within year 294247 (a DATE plus an INTERVAL included), a decimal stays within 38
 literal that does not convert to a column's timestamp type (`TemporalOutOfRange`: TIMESTAMP_NS stops at year 2262)
 compares with nothing, and a constant nested more deeply than the thread's stack allows folding (the budget is read from
 the thread, not fixed) is refused (`ConstantTooDeep`).
+In SQL a WHERE comparison may also set two expressions against each other (`l_commitdate < l_receiptdate`,
+`l_extendedprice * (1 - l_discount) > 50000`, `abs(a - 25) < z`). Numbers of any lane compare exactly unless one side is
+DOUBLE, strings byte by byte, and times only with times in the same unit. A row where either side is NULL passes neither
+the comparison nor its NOT. A side is evaluated only over the rows earlier conjuncts kept, so `z > 0 AND x / z > 3`
+divides no zero. No statistic prunes such a comparison yet. LIKE, IN and BETWEEN still take literals on their value
+side, as do FILTER clauses and CASE conditions.
 
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 

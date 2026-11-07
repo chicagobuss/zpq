@@ -13,6 +13,15 @@
   does not have): `coalesce` of times of different kinds, `date_trunc`, `date_part`, `date_diff` and a cast to TIMESTAMP
   of a UTC-adjusted TIMESTAMP_NS, and `date_diff` between UTC-adjusted microseconds, nanoseconds and UTC-adjusted
   nanoseconds. Nested block comments are read whole, and an unterminated one is a parse error.
+- **WHERE compares two expressions in SQL.** `l_commitdate < l_receiptdate`, `l_extendedprice * (1 - l_discount) >
+  50000`, `abs(a - 25) < z`, `30 < a + b`, and the same under AND, OR and NOT, in a single-table query, a join's probe
+  or build side, a LEFT JOIN's ON and an `IN (SELECT ...)`, now run and match DuckDB (PDS-H q12 among them).
+  - Numbers compare exactly unless one side is DOUBLE, strings byte by byte, and times only with times in the same
+    unit.
+  - A string against a number, or a DATE against a TIMESTAMP, is refused as a type mismatch.
+  - Each side is evaluated over the rows earlier conjuncts kept.
+  - No statistic prunes such a comparison yet.
+  - LIKE, IN and BETWEEN, FILTER clauses and CASE conditions still take literals on their value side.
 
 - **Row-level math and date parts in SQL.** `floor`, `ceil`, `sqrt`, `round(x, n)`, `least` and `greatest` over a column or
   expression, and `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `isodow` and

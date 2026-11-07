@@ -1353,12 +1353,7 @@ fn reportGated(ws: AggWorkspace, in: AggRowGroup, payload: ?[]const bool, deferr
 }
 
 fn filterNames(f: filter_ast.Filter, ci: usize) bool {
-    return switch (f) {
-        .and_filter, .or_filter => |c| for (c.children) |child| {
-            if (filterNames(child, ci)) break true;
-        } else false,
-        inline else => |l| l.col_idx == ci,
-    };
+    return filter_ast.reads(f, ci);
 }
 
 /// The rows of a row group its filter keeps, reading only the columns before the payload a slice at a time.

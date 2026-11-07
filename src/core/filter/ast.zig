@@ -93,6 +93,105 @@ pub const Composite = struct {
 };
 
 const in_set_mod = @import("in_set.zig");
+const expr_ast = @import("../expr/ast.zig");
+
+/// `left op right` over two expressions of comparable types (`filter/parser.zig` checks them): numbers of any lane,
+/// exactly when neither is DOUBLE; strings byte by byte; a row where either side is NULL is not kept.
+pub const ExprCompare = struct {
+    op: Operator,
+    left: *const expr_ast.Expr,
+    right: *const expr_ast.Expr,
+
+    pub fn readsColumn(e: ExprCompare, ci: usize) bool {
+        return exprReads(e.left.*, ci) or exprReads(e.right.*, ci);
+    }
+
+    /// Set every column either side reads to `v` in `set`.
+    pub fn setColumns(e: ExprCompare, set: []bool, v: bool) void {
+        setExprColumns(e.left.*, set, v);
+        setExprColumns(e.right.*, set, v);
+    }
+};
+
+/// Whether some leaf of `f` reads column `ci`.
+pub fn reads(f: Filter, ci: usize) bool {
+    return switch (f) {
+        .and_filter, .or_filter => |c| for (c.children) |child| {
+            if (reads(child, ci)) break true;
+        } else false,
+        .expr => |e| e.readsColumn(ci),
+        inline else => |l| l.col_idx == ci,
+    };
+}
+
+fn exprReads(e: expr_ast.Expr, ci: usize) bool {
+    return switch (e) {
+        .literal => false,
+        .col_ref => |c| c.col_idx == ci,
+        .binop => |b| exprReads(b.left.*, ci) or exprReads(b.right.*, ci),
+        .call => |c| for (c.args) |arg| {
+            if (exprReads(arg.*, ci)) break true;
+        } else false,
+        .case_ => |c| blk: {
+            for (c.whens) |w| {
+                if (reads(w.cond, ci)) break :blk true;
+                if (w.then) |t| if (exprReads(t.*, ci)) break :blk true;
+            }
+            break :blk if (c.else_) |x| exprReads(x.*, ci) else false;
+        },
+    };
+}
+
+fn appendExprColumns(e: expr_ast.Expr, list: *std.ArrayList(usize), allocator: std.mem.Allocator) std.mem.Allocator.Error!void {
+    switch (e) {
+        .literal => {},
+        .col_ref => |c| try list.append(allocator, c.col_idx),
+        .binop => |b| {
+            try appendExprColumns(b.left.*, list, allocator);
+            try appendExprColumns(b.right.*, list, allocator);
+        },
+        .call => |c| for (c.args) |arg| try appendExprColumns(arg.*, list, allocator),
+        .case_ => |c| {
+            for (c.whens) |w| {
+                try w.cond.collectColumns(list, allocator);
+                if (w.then) |t| try appendExprColumns(t.*, list, allocator);
+            }
+            if (c.else_) |x| try appendExprColumns(x.*, list, allocator);
+        },
+    }
+}
+
+fn setExprColumns(e: expr_ast.Expr, set: []bool, v: bool) void {
+    switch (e) {
+        .literal => {},
+        .col_ref => |c| if (c.col_idx < set.len) {
+            set[c.col_idx] = v;
+        },
+        .binop => |b| {
+            setExprColumns(b.left.*, set, v);
+            setExprColumns(b.right.*, set, v);
+        },
+        .call => |c| for (c.args) |arg| setExprColumns(arg.*, set, v),
+        .case_ => |c| {
+            for (c.whens) |w| {
+                setFilterColumns(w.cond, set, v);
+                if (w.then) |t| setExprColumns(t.*, set, v);
+            }
+            if (c.else_) |x| setExprColumns(x.*, set, v);
+        },
+    }
+}
+
+/// Set every column a leaf of `f` reads to `v` in `set`.
+pub fn setFilterColumns(f: Filter, set: []bool, v: bool) void {
+    switch (f) {
+        .and_filter, .or_filter => |c| for (c.children) |child| setFilterColumns(child, set, v),
+        .expr => |e| e.setColumns(set, v),
+        inline else => |l| if (l.col_idx < set.len) {
+            set[l.col_idx] = v;
+        },
+    }
+}
 
 pub fn Leaf(comptime T: type) type {
     return struct {
@@ -356,6 +455,8 @@ pub const Filter = union(enum) {
     /// A join's foreign key: keeps the rows whose key has a build match (`join/lookup.zig`). Only a join binder makes
     /// one, as a top-level AND conjunct.
     lookup: Lookup,
+    /// Two expressions compared (`ExprCompare`): the one leaf that reads more than one column. No statistic prunes it.
+    expr: ExprCompare,
 
     /// Walk the AST collecting every leaf's column index.
     /// Useful for the "fetch only filter columns first" pattern.
@@ -372,6 +473,10 @@ pub const Filter = union(enum) {
             .null_check => |f| try list.append(allocator, f.col_idx),
             .like => |f| try list.append(allocator, f.col_idx),
             .lookup => |f| try list.append(allocator, f.col_idx),
+            .expr => |e| {
+                try appendExprColumns(e.left.*, list, allocator);
+                try appendExprColumns(e.right.*, list, allocator);
+            },
             .and_filter, .or_filter => |c| for (c.children) |child| try child.collectColumns(list, allocator),
         }
     }
@@ -385,7 +490,7 @@ pub const Lookup = struct {
 /// The column a leaf reads; null for a composite.
 pub fn leafColumn(f: Filter) ?usize {
     return switch (f) {
-        .and_filter, .or_filter => null,
+        .and_filter, .or_filter, .expr => null,
         inline else => |leaf| leaf.col_idx,
     };
 }
@@ -429,6 +534,8 @@ pub fn eql(a: Filter, b: Filter) bool {
         .null_check => |n| n.col_idx == b.null_check.col_idx and n.is_not == b.null_check.is_not and
             n.trust_stats == b.null_check.trust_stats,
         .lookup => |l| l.col_idx == b.lookup.col_idx and l.join == b.lookup.join,
+        // The same bound sides only: two spellings of one comparison are not recognized as one.
+        .expr => |e| e.op == b.expr.op and e.left == b.expr.left and e.right == b.expr.right,
         .like => |m| m.col_idx == b.like.col_idx and m.kind == b.like.kind and m.negate == b.like.negate and
             m.fold == b.like.fold and std.mem.eql(u8, m.operand, b.like.operand),
         inline .int32, .int64, .uint64, .decimal, .boolean => |l, tag| blk: {
@@ -492,7 +599,7 @@ fn withTrust(arena: std.mem.Allocator, f: Filter, plausible: bool) std.mem.Alloc
             if (plausible) out.trust_stats = true;
             break :blk .{ .null_check = out };
         },
-        .lookup => f,
+        .lookup, .expr => f,
         .and_filter, .or_filter => |c| blk: {
             const children = try arena.alloc(Filter, c.children.len);
             for (c.children, children) |child, *n| n.* = try withTrust(arena, child, plausible);
@@ -507,6 +614,10 @@ fn withTrust(arena: std.mem.Allocator, f: Filter, plausible: bool) std.mem.Alloc
 fn markAllColumns(f: Filter, cols: []bool) void {
     switch (f) {
         .and_filter, .or_filter => |c| for (c.children) |child| markAllColumns(child, cols),
+        .expr => |e| {
+            e.left.collectColumns(cols);
+            e.right.collectColumns(cols);
+        },
         else => if (leafColumn(f)) |ci| if (ci < cols.len) {
             cols[ci] = true;
         },
@@ -550,6 +661,8 @@ pub fn cost(f: Filter) Cost {
         .string => |l| if (l.value.len == 0 and (l.op == .Eq or l.op == .NotEq)) .fixed else .string,
         // A probe of a build structure per row: dearer than a compare, so it runs on what the cheap leaves left.
         .lookup => .string,
+        // Two expressions evaluated per row before they compare: after the leaves that test one column.
+        .expr => .like_search,
         .like => |m| if (m.fold) .like_search else switch (m.kind) {
             .exact, .prefix, .suffix => .like_anchored,
             .contains, .general => .like_search,

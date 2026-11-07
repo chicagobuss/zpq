@@ -52,7 +52,41 @@ pub const Error = error{
     /// A typed DATE or TIMESTAMP literal that does not convert to the column's timestamp type (a TIMESTAMP past
     /// TIMESTAMP_NS's years, a DATE past TIMESTAMP's): DuckDB's cast fails, so there is no threshold to compare.
     TemporalOutOfRange,
+    /// The two sides of a comparison of expressions are of kinds that do not compare: a string against a number,
+    /// or times in two units (a DATE against a TIMESTAMP, a time against a plain number).
+    TypeMismatch,
+    // What binding a comparison's expressions can refuse (`expr/parser.zig`, whose own set includes this one).
+    UnknownFunction,
+    WrongArity,
+    UnsupportedColumnType,
+    ExpressionTooDeep,
+    Unsigned,
+    DecimalScaleTooLarge,
+    InvalidDecimalType,
+    UnsupportedCase,
+    UnsupportedDatePart,
+    BadNumber,
+    NestedColumnSelected,
 } || std.mem.Allocator.Error;
+
+/// `err` from binding an expression, as this set has it; one it does not name refuses as an unsupported type.
+fn intoError(err: anyerror) Error {
+    inline for (@typeInfo(Error).error_set.error_names.?) |name| if (err == @field(anyerror, name)) return @field(Error, name);
+    return error.UnsupportedType;
+}
+
+/// `left op right`, each side bound as an expression: kinds that compare (`ast.ExprCompare`), and times only against
+/// times in the same unit.
+fn bindExprCompare(arena: std.mem.Allocator, left: syntax.Expr, op: ast.Operator, right: syntax.Expr, file: *const schema.FileMetaData, diag: ?*Diag) Error!ast.Filter {
+    const expr_parser = @import("../expr/parser.zig");
+    const expr_ast = @import("../expr/ast.zig");
+    const sides = try arena.alloc(expr_ast.Expr, 2);
+    sides[0] = expr_parser.bindSyntax(arena, left, file, diag) catch |err| return intoError(err);
+    sides[1] = expr_parser.bindSyntax(arena, right, file, diag) catch |err| return intoError(err);
+    if (expr_ast.Type.promote(sides[0].typeOf(), sides[1].typeOf()) == null) return error.TypeMismatch;
+    if (!std.meta.eql(sides[0].temporal(), sides[1].temporal())) return error.TypeMismatch;
+    return .{ .expr = .{ .op = op, .left = &sides[0], .right = &sides[1] } };
+}
 
 /// How deep grouping parentheses may nest. Each level adds at most an OR and an AND node, and evaluation clones the
 /// row selection once per OR level, so this caps the tree height every walker (evaluation, pruning, negation,
@@ -138,6 +172,7 @@ fn bindSyntaxAt(arena: std.mem.Allocator, node: syntax.Predicate, file: *const s
             }
             break :blk bindIn(arena, operand.col_idx, list.negate, leaves.items, has_null);
         },
+        .expr_compare => |x| bindExprCompare(arena, x.left.*, x.op, x.right.*, file, diag),
         .between => |b| blk: {
             const operand = try bindOperand(file, b.operand.column, b.operand.make_date, diag);
             const inner = try ast.join(arena, true, &.{
@@ -687,6 +722,8 @@ pub fn negateFilter(arena: std.mem.Allocator, f: ast.Filter) Error!ast.Filter {
         .like => |m| .{ .like = .{ .col_idx = m.col_idx, .kind = m.kind, .operand = m.operand, .negate = !m.negate, .fold = m.fold } },
         // An anti join is not a negated lookup's rows (NULL keys): no binder negates one.
         .lookup => error.UnsupportedType,
+        // NULL on either side keeps the row out both ways, as for a leaf.
+        .expr => |e| .{ .expr = .{ .op = e.op.negate(), .left = e.left, .right = e.right } },
         // De Morgan, a node at a time: the tree is at most a few levels deep (see `ast.Composite`).
         .and_filter, .or_filter => |c| blk: {
             const children = try arena.alloc(ast.Filter, c.children.len);

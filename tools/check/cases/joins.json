@@ -2699,6 +2699,123 @@
      }
     }
    }
+  },
+  {
+   "id": "join:expr:probe-columns",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, count(*) AS n, sum(f.amt) AS s FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.amt > f.q * 1000 GROUP BY d.grp ORDER BY d.grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, count(*) AS n, sum(f.amt) AS s FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.amt > f.q * 1000 GROUP BY d.grp ORDER BY d.grp"
+   }
+  },
+  {
+   "id": "join:expr:build-columns",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.kind, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE d.w > d.grp * 1500 GROUP BY d.kind ORDER BY d.kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.kind, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE d.w > d.grp * 1500 GROUP BY d.kind ORDER BY d.kind"
+   }
+  },
+  {
+   "id": "join:expr:left-on-build",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, count(*) AS n FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk AND d.w < d.grp * 2000 GROUP BY d.grp ORDER BY d.grp NULLS FIRST"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, count(*) AS n FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk AND d.w < d.grp * 2000 GROUP BY d.grp ORDER BY d.grp NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:expr:in-subquery",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' WHERE fk IN (SELECT pk FROM '{fixture:dim}' WHERE w > grp * 1000) AND amt < q * 3000"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' WHERE fk IN (SELECT pk FROM '{fixture:dim}' WHERE w > grp * 1000) AND amt < q * 3000"
+   }
+  },
+  {
+   "id": "join:refuse:expr-across-tables",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.amt > d.w"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a join condition reads both tables beyond its one key equality"
+   }
   }
  ]
 }

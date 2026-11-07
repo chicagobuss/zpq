@@ -28,6 +28,9 @@ pub const Predicate = union(enum) {
     in_list: struct { operand: Operand, values: []const []const u8, negate: bool },
     between: struct { operand: Operand, low: []const u8, high: []const u8, negate: bool },
     boolean: []const u8,
+    /// A comparison of two expressions (`l_commitdate < l_receiptdate`, `price * (1 - discount) > 500`): WHERE's
+    /// comparisons that are not a column against a literal.
+    expr_compare: struct { left: *const Expr, op: filter.Operator, right: *const Expr },
 };
 
 pub const Aggregate = struct {

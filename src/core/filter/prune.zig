@@ -69,6 +69,8 @@ pub fn pruneRowGroup(
         .like => .unknown,
         // The build's verified key range could prune row groups; the prototype keeps them.
         .lookup => .unknown,
+        // Two columns' ranges could prove `a < b` for a whole row group; not yet.
+        .expr => .unknown,
         .and_filter, .or_filter => |c| blk: {
             if (c.neverTrue(filter == .and_filter)) break :blk .skip;
             var d = pruneRowGroup(rg, c.children[0], file_meta);
@@ -945,6 +947,7 @@ pub fn prunePage(
     // Callers may supply an index directly; writer suppression also covers null-only predicates.
     switch (filter) {
         .and_filter, .or_filter => {},
+        .expr => return .unknown,
         inline else => |leaf| {
             const col = leaf.col_idx;
             if (col >= col_indexes.len or col >= rg.columns.items.len) return .unknown;
@@ -956,7 +959,7 @@ pub fn prunePage(
         },
     }
     switch (filter) {
-        .null_check, .like, .lookup, .and_filter, .or_filter => {},
+        .null_check, .like, .lookup, .and_filter, .or_filter, .expr => {},
         inline else => |leaf| if (!statistics.boundsReadable(rg, leaf.col_idx, file_meta)) return .unknown,
     }
     return switch (filter) {
@@ -969,7 +972,7 @@ pub fn prunePage(
         .string => |leaf| prunePageBytes(page_idx, leaf.col_idx, leaf.op, leaf.value, .BYTE_ARRAY, col_indexes),
         .boolean => |leaf| prunePageBoolean(page_idx, leaf.col_idx, leaf.op, leaf.value, col_indexes),
         .null_check => |nc| prunePageNullCheck(page_idx, nc.col_idx, nc.is_not, col_indexes),
-        .like, .lookup => .unknown,
+        .like, .lookup, .expr => .unknown,
         .and_filter, .or_filter => |c| blk: {
             if (c.neverTrue(filter == .and_filter)) break :blk .skip;
             var d = prunePage(rg, page_idx, c.children[0], col_indexes, file_meta, trust_stats);

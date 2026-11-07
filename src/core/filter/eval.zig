@@ -26,7 +26,10 @@ pub const Error = error{
     NestedFilterNotSupported,
     /// A DECIMAL leaf met a column decoded without its exact integers (see `ColumnT.unscaled`).
     DecimalUnavailable,
-} || std.mem.Allocator.Error;
+} || std.mem.Allocator.Error || expr_eval.Error;
+
+const expr_eval = @import("../expr/eval.zig");
+const expr_ast = @import("../expr/ast.zig");
 
 inline fn rejectIfNested(col: anytype) Error!void {
     if (col.max_rep > 0) return error.NestedFilterNotSupported;
@@ -523,6 +526,7 @@ pub fn evaluate(
             const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
             try @import("../join/lookup.zig").narrow(leaf.join, batch.cols[col_pos], sel, arena, null);
         },
+        .expr => |x| try evalExprCompare(x, batch, sel, column_lookup, arena),
         .int32 => |leaf| {
             const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
             const col = batch.cols[col_pos];
@@ -704,6 +708,71 @@ fn UnsignedLane(comptime L: type) type {
     };
 }
 
+/// One row's value of an evaluated side, by lane; null for a NULL. A coded column reads through its dictionary.
+const Value = union(enum) { int: i64, float: f64, dec: i128, str: []const u8 };
+
+fn valueAt(col: Batch.Column, r: usize) ?Value {
+    const info = col.nullInfo();
+    if (info.def_levels) |dl| if (dl[r] < info.max_def) return null;
+    return switch (col) {
+        inline else => |c, tag| blk: {
+            const v = if (c.codes) |cs| c.dict[cs[r]] else c.values[r];
+            break :blk switch (tag) {
+                .i32, .i64 => .{ .int = v },
+                .f32, .f64 => .{ .float = v },
+                .i128 => .{ .dec = v },
+                .string => .{ .str = v },
+                .boolean => .{ .int = @intFromBool(v) },
+            };
+        },
+    };
+}
+
+fn asFloat(v: Value, scale: u8) f64 {
+    return switch (v) {
+        .int => |i| @floatFromInt(i),
+        .float => |f| f,
+        .dec => |d| @as(f64, @floatFromInt(d)) / std.math.pow(f64, 10, @floatFromInt(scale)),
+        .str => unreachable,
+    };
+}
+
+/// `v` as an unscaled integer at `to` places, from `from` places; wide enough that no DECIMAL(38) overflows.
+fn asScaled(v: Value, from: u8, to: u8) i256 {
+    const raw: i256 = switch (v) {
+        .int => |i| i,
+        .dec => |d| d,
+        .float, .str => unreachable,
+    };
+    return raw * std.math.pow(i256, 10, to - from);
+}
+
+/// `x.left op x.right` over the selected rows (`ast.ExprCompare`), both sides evaluated over those rows only, so a
+/// fault (`1 / 0`) in a row an earlier conjunct dropped is none. A NULL on either side drops the row.
+fn evalExprCompare(x: ast.ExprCompare, batch: *const Batch, sel: *selection.SelectionVector, column_lookup: []const ?usize, arena: std.mem.Allocator) Error!void {
+    const wanted = batch.restrictedTo(sel);
+    const l = try expr_eval.evalGroupKeyExpr(arena, &wanted, column_lookup, x.left.*);
+    const r = try expr_eval.evalGroupKeyExpr(arena, &wanted, column_lookup, x.right.*);
+    const lt = x.left.typeOf();
+    const rt = x.right.typeOf();
+    const lane = expr_ast.Type.promote(lt, rt) orelse return error.TypeMismatch;
+    const ls: u8 = if (x.left.decSpec()) |d| d.scale else 0;
+    const rs: u8 = if (x.right.decSpec()) |d| d.scale else 0;
+    const scale = @max(ls, rs);
+    var it = sel.iterator();
+    while (it.next()) |row| {
+        const a = valueAt(l, row);
+        const b = valueAt(r, row);
+        const keep = if (a == null or b == null) false else switch (lane) {
+            .str => ast.applyOpStr(a.?.str, x.op, b.?.str),
+            .f64 => ast.applyOp(f64, asFloat(a.?, ls), x.op, asFloat(b.?, rs)),
+            .dec => ast.applyOp(i256, asScaled(a.?, if (lt == .dec) ls else 0, scale), x.op, asScaled(b.?, if (rt == .dec) rs else 0, scale)),
+            .i64 => ast.applyOp(i64, a.?.int, x.op, b.?.int),
+        };
+        if (!keep) sel.set(row, false);
+    }
+}
+
 /// The column a value leaf tests; null for AND/OR and IS [NOT] NULL (which reads levels only).
 fn leafColumn(f: ast.Filter) ?usize {
     return switch (f) {
@@ -717,7 +786,7 @@ fn leafColumn(f: ast.Filter) ?usize {
         .boolean => |l| l.col_idx,
         .like => |l| l.col_idx,
         // A lookup reads its key's codes or values itself (dictionary-direct).
-        .null_check, .and_filter, .or_filter, .lookup => null,
+        .null_check, .and_filter, .or_filter, .lookup, .expr => null,
     };
 }
 

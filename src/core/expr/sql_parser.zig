@@ -346,12 +346,15 @@ fn boolLiterals(root: *c.LpNode) void {
     c.lp_ast_walk(root, &visitor);
 }
 
-/// Refuse a predicate in WHERE, a FILTER or a CASE condition whose value side reads a column (`s = t`,
-/// `s IN ('a', t)`, `x BETWEEN 1 AND y`): the filter grammar compares a column with literals only, and before this a
-/// value-side identifier, a column or a misspelt one, could bind as literal text and match incorrect rows.
-fn rejectColumnComparisons(root: *c.LpNode) error{BadValue}!void {
+/// Refuse a predicate in a FILTER or a CASE condition whose value side reads a column (`s = t`, `s IN ('a', t)`,
+/// `x BETWEEN 1 AND y`), and in WHERE such a LIKE, IN or BETWEEN: the filter grammar compares a column with literals
+/// only, and before this a value-side identifier, a column or a misspelt one, could bind as literal text and match
+/// incorrect rows. WHERE's own comparisons of two expressions lower as such (`syntax.Predicate.expr_compare`).
+fn rejectColumnComparisons(root: *c.LpNode, where_expressions: bool) error{BadValue}!void {
     const Visit = struct {
         found: ?*c.LpNode = null,
+        /// Walking WHERE: a comparison (=, <>, <, <=, >, >=) may read columns on both sides.
+        where: bool = false,
 
         fn readsColumn(node: ?*c.LpNode) bool {
             const n = node orelse return false;
@@ -380,6 +383,7 @@ fn rejectColumnComparisons(root: *c.LpNode) error{BadValue}!void {
                     c.LP_OP_LE,
                     c.LP_OP_GT,
                     c.LP_OP_GE,
+                    => !self.where and readsColumn(node.*.u.binary.right),
                     c.LP_OP_LIKE,
                     c.LP_OP_GLOB,
                     c.LP_OP_IS,
@@ -398,9 +402,10 @@ fn rejectColumnComparisons(root: *c.LpNode) error{BadValue}!void {
             return 2;
         }
     };
-    var state: Visit = .{};
+    var state: Visit = .{ .where = where_expressions };
     var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = null };
     if (root.u.select.where) |w| c.lp_ast_walk(w, &visitor);
+    state.where = false;
     var i: usize = 0;
     while (state.found == null and i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
         if (root.u.select.result_columns.items[i]) |rc| c.lp_ast_walk(rc, &visitor);
@@ -1224,7 +1229,9 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
     boolLiterals(root);
     quoteWholePaths(root);
     try pushNotsDown(root, lp_arena);
-    try rejectColumnComparisons(root);
+    // Only the structured plan carries WHERE's comparisons of two expressions; the fragment strings would read a
+    // value-side column as literal text.
+    try rejectColumnComparisons(root, structured);
     if (root.*.u.select.where) |w| {
         const wi = analyzeExpr(w);
         if (wi.has_window) {
@@ -1548,7 +1555,11 @@ fn lowerQuery(lower: *Lower, root: *const c.LpNode, cols: []const ast.SelectColu
         .aggregate = aggregate,
         .calls = calls.items,
         .keys = keys,
-        .filter = if (sel.where) |node| try lower.predicate(node, 0) else null,
+        .filter = if (sel.where) |node| blk: {
+            lower.compare_expressions = true;
+            defer lower.compare_expressions = false;
+            break :blk try lower.predicate(node, 0);
+        } else null,
         .select = if (aggregate or star) null else selected.items,
         .columns = if (star) &.{} else columns,
         .hidden = hidden,
@@ -2411,6 +2422,34 @@ test "regression: sql_parser refuses a comparison that reads a column on its val
         var q = try parseSqlQuery(a, sql);
         q.deinit(a);
     }
+}
+
+test "sql_parser: WHERE compares two expressions in the plan; FILTER and CASE conditions keep the literal grammar" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT count(*) AS n FROM 't' WHERE s = t",
+        "SELECT count(*) AS n FROM 't' WHERE n + 1 > m * 2 AND s = 'x'",
+        "SELECT count(*) AS n FROM 't' WHERE 3 < n",
+    }) |sql| {
+        var q = try parseSqlPlan(a, sql);
+        defer q.deinit(a);
+        const f = q.syntax.?.filter.?;
+        const compare = switch (f) {
+            .expr_compare => f,
+            .and_ => |terms| terms[0],
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expect(compare == .expr_compare);
+    }
+    // A column against a literal stays the leaf statistics prune, a constant side folded first.
+    var plain = try parseSqlPlan(a, "SELECT count(*) AS n FROM 't' WHERE n > 1 + 1");
+    defer plain.deinit(a);
+    try std.testing.expectEqualStrings("2", plain.syntax.?.filter.?.comparison.value);
+    for ([_][]const u8{
+        "SELECT count(*) FILTER (WHERE s <> t) AS n FROM 't'",
+        "SELECT CASE WHEN s = t THEN 1 ELSE 0 END AS k FROM 't'",
+        "SELECT id FROM 't' WHERE s LIKE t",
+    }) |sql| try std.testing.expectError(error.BadValue, parseSqlPlan(a, sql));
 }
 
 test "regression: a HAVING literal operand is a value, not a SELECT position" {

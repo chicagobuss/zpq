@@ -23,6 +23,9 @@ pub const Lower = struct {
     ilike_escape: []const u8 = "",
     hidden: std.ArrayList(*const c.LpNode) = .empty,
     rows: std.ArrayList(syntax.RowKey) = .empty,
+    /// Set while WHERE lowers: a comparison that is not a column against a literal lowers as two expressions
+    /// (`expr_compare`). A FILTER or CASE condition, and anything inside an expression, keeps the literal grammar.
+    compare_expressions: bool = false,
 
     fn copy(self: *Lower, text: []const u8) ![]const u8 {
         return self.arena.dupe(u8, text);
@@ -47,6 +50,13 @@ pub const Lower = struct {
     }
 
     pub fn expression(self: *Lower, node: *const c.LpNode, depth: u32) Error!syntax.Expr {
+        const compare = self.compare_expressions;
+        self.compare_expressions = false;
+        defer self.compare_expressions = compare;
+        return self.expressionAt(node, depth);
+    }
+
+    fn expressionAt(self: *Lower, node: *const c.LpNode, depth: u32) Error!syntax.Expr {
         if (depth > parser.MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
         return switch (node.kind) {
             c.LP_RESULT_COLUMN => self.expression(node.u.result_column.expr orelse return error.SqlParseError, depth),
@@ -500,7 +510,18 @@ pub const Lower = struct {
                     c.LP_OP_GE => .GtEq,
                     else => return error.BadOperator,
                 };
-                break :blk .{ .comparison = .{ .operand = try self.operand(left), .op = op, .value = try self.literal(right) } };
+                if (!self.compare_expressions)
+                    break :blk .{ .comparison = .{ .operand = try self.operand(left), .op = op, .value = try self.literal(right) } };
+                // A column against a literal (a constant folds to one) keeps the leaf whose statistics prune.
+                plain: {
+                    const column = self.operand(left) catch break :plain;
+                    const value = self.literal(right) catch break :plain;
+                    break :blk .{ .comparison = .{ .operand = column, .op = op, .value = value } };
+                }
+                const sides = try self.arena.alloc(syntax.Expr, 2);
+                sides[0] = try self.expression(left, depth + 1);
+                sides[1] = try self.expression(right, depth + 1);
+                break :blk .{ .expr_compare = .{ .left = &sides[0], .op = op, .right = &sides[1] } };
             },
             c.LP_EXPR_IN => blk: {
                 const list = node.u.in;

@@ -483,7 +483,7 @@ fn skipReason(f: filter_ast.Filter, rg: *const schema.RowGroup, meta: *const sch
             }
             return 0;
         },
-        .or_filter => return 0,
+        .or_filter, .expr => return 0,
         inline else => |leaf| {
             if (filter_prune.pruneRowGroup(rg, f, meta) != .skip) return 0;
             return leaf.col_idx + 1;

@@ -1,0 +1,574 @@
+{
+ "fixtures": [
+  {
+   "name": "exprfix",
+   "copy": "COPY (SELECT i AS id, (CASE WHEN i % 13 = 0 THEN NULL ELSE i % 50 END)::INTEGER AS a, (CASE WHEN i % 17 = 0 THEN NULL ELSE (i * 7) % 60 END)::BIGINT AS b, ((i % 97) * 0.5)::DOUBLE AS x, ((i % 1000) * 0.01)::DECIMAL(12, 2) AS p, ((i % 37) * 0.1)::DECIMAL(9, 1) AS q, (CASE WHEN i % 19 = 0 THEN NULL ELSE 'k' || (i % 23) END) AS s, 'k' || (i % 29) AS t, (DATE '1995-01-01' + (i % 400)::INTEGER) AS d1, (DATE '1995-01-01' + (i % 333)::INTEGER) AS d2, (TIMESTAMP '1995-01-01' + to_seconds(i)) AS ts, (i % 5)::BIGINT AS z FROM range(0, 20000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 4096)"
+  }
+ ],
+ "cases": [
+  {
+   "id": "expr:int-columns-with-nulls",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE a < b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE a < b"
+   }
+  },
+  {
+   "id": "expr:arithmetic-both-sides",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(x) AS sx FROM '{fixture:exprfix}' WHERE a + 1 > b * 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(x) AS sx FROM '{fixture:exprfix}' WHERE a + 1 > b * 2"
+   }
+  },
+  {
+   "id": "expr:double-against-int",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE x * 2 >= a"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE x * 2 >= a"
+   }
+  },
+  {
+   "id": "expr:decimals-of-two-scales",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(p) AS sp FROM '{fixture:exprfix}' WHERE p > q"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(p) AS sp FROM '{fixture:exprfix}' WHERE p > q"
+   }
+  },
+  {
+   "id": "expr:decimal-exact-equality",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE p * 2 = q + p"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE p * 2 = q + p"
+   }
+  },
+  {
+   "id": "expr:decimal-against-double",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE p < x"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE p < x"
+   }
+  },
+  {
+   "id": "expr:strings",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE s <> t"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE s <> t"
+   }
+  },
+  {
+   "id": "expr:string-equality",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE s = t"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE s = t"
+   }
+  },
+  {
+   "id": "expr:dates",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE d1 < d2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE d1 < d2"
+   }
+  },
+  {
+   "id": "expr:or-with-a-leaf",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE d1 = d2 OR a > 40"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE d1 = d2 OR a > 40"
+   }
+  },
+  {
+   "id": "expr:not",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE NOT (a < b)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE NOT (a < b)"
+   }
+  },
+  {
+   "id": "expr:function-of-a-column",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(b) AS sb FROM '{fixture:exprfix}' WHERE abs(a - 25) < z"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(b) AS sb FROM '{fixture:exprfix}' WHERE abs(a - 25) < z"
+   }
+  },
+  {
+   "id": "expr:literal-on-the-left",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE 30 < a + b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE 30 < a + b"
+   }
+  },
+  {
+   "id": "expr:division-guarded-by-an-earlier-conjunct",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE z > 0 AND x / z > 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE z > 0 AND x / z > 3"
+   }
+  },
+  {
+   "id": "expr:grouped",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT z, count(*) AS n, sum(x) AS sx FROM '{fixture:exprfix}' WHERE a < b AND s IS NOT NULL GROUP BY z ORDER BY z"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT z, count(*) AS n, sum(x) AS sx FROM '{fixture:exprfix}' WHERE a < b AND s IS NOT NULL GROUP BY z ORDER BY z"
+   }
+  },
+  {
+   "id": "expr:grouped-by-string-top",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT s, count(*) AS n FROM '{fixture:exprfix}' WHERE d1 > d2 GROUP BY s ORDER BY n DESC, s LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT s, count(*) AS n FROM '{fixture:exprfix}' WHERE d1 > d2 GROUP BY s ORDER BY n DESC, s LIMIT 5"
+   }
+  },
+  {
+   "id": "expr:refuse:date-against-timestamp",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE d1 < ts"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "type mismatch in expression"
+   }
+  },
+  {
+   "id": "expr:refuse:string-against-number",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE s < a"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "type mismatch in expression"
+   }
+  },
+  {
+   "id": "expr:refuse:like-against-a-column",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE s LIKE t"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "a comparison takes a literal on its right"
+   }
+  },
+  {
+   "id": "expr:refuse:in-a-filter-clause",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) FILTER (WHERE a < b) AS n FROM '{fixture:exprfix}'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "a comparison takes a literal on its right"
+   }
+  }
+ ]
+}

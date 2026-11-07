@@ -411,7 +411,6 @@ test "syntax: unsupported SQL modifiers and casts retain refusal instead of drop
     }));
 }
 
-
 /// `writeAggregateRows`' file of the keys `entries[codes]` and `f`, each row group's key chunk then replaced by one
 /// uncompressed PLAIN dictionary page of every entry and one data page bit-packing its codes. The writer keeps its own
 /// dictionaries to a tenth of a chunk; other writers' are often far denser, and footer cost gates weigh exactly that.
@@ -570,7 +569,6 @@ test "regression: SQL syntax hands a filtered integer COUNT top-H the plan its t
     try std.testing.expectEqualDeep(want.record_path, got.record_path);
 }
 
-
 test "regression: a structured fanout plan of a filtered integer COUNT plans as its text fragments do" {
     const a = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);
@@ -687,4 +685,25 @@ test "bound frontend: a resolved join travels with the worker plan" {
     try std.testing.expectEqualStrings("'BUILDING'", j.build.semis[0].build.filter.?.comparison.value);
     // The bound source carries it to the engine, which reads the builds before anything binds.
     try std.testing.expect(@import("syntax_plan.zig").source(&back).join != null);
+}
+
+test "bound frontend: a comparison of two expressions travels with the worker plan" {
+    const syntax = @import("../core/expr/syntax.zig");
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const one: syntax.Expr = .{ .number = .{ .token = "1", .floating = false } };
+    const sum: syntax.Expr = .{ .binary = .{ .op = .add, .left = &.{ .column = "l_quantity" }, .right = &one } };
+    const query: syntax.Query = .{
+        .aggregate = true,
+        .filter = .{ .expr_compare = .{ .left = &.{ .column = "l_commitdate" }, .op = .Lt, .right = &sum } },
+    };
+    const json = try std.json.Stringify.valueAlloc(a, query, .{});
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+    const back = try @import("fanout_plan.zig").decode(a, value);
+    const x = back.filter.?.expr_compare;
+    try std.testing.expectEqual(.Lt, x.op);
+    try std.testing.expectEqualStrings("l_commitdate", x.left.column);
+    try std.testing.expectEqualStrings("l_quantity", x.right.binary.left.column);
+    try std.testing.expectEqualStrings("1", x.right.binary.right.number.token);
 }

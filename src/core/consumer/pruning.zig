@@ -24,7 +24,7 @@ fn collectConjunctiveLeaves(f: filter_ast.Filter, list: *std.ArrayList(Conjuncti
         // A NULL-member AND passes no row; what its leaves prove of pages says nothing of that.
         .and_filter => |c| if (!c.null_member) for (c.children) |child| try collectConjunctiveLeaves(child, list, allocator),
         // A lookup proves nothing of a page's statistics.
-        .or_filter, .lookup => {},
+        .or_filter, .lookup, .expr => {},
         else => {
             const col_idx = switch (f) {
                 .int32 => |l| l.col_idx,
@@ -253,4 +253,3 @@ pub fn compactRows(
     if (control) |c| _ = c.row_groups.fetchAdd(1, .monotonic);
     return ranges.items;
 }
-

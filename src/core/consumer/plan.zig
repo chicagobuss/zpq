@@ -173,6 +173,7 @@ fn emptinessWant(f: filter_ast.Filter, ci: usize) ?EmptyWant {
         },
         .like => |l| return if (l.col_idx == ci) null else .absent,
         .null_check => |l| return if (l.col_idx == ci) null else .absent,
+        .expr => |e| return if (e.readsColumn(ci)) null else .absent,
         inline else => |l| return if (l.col_idx == ci) null else .absent,
     }
 }
@@ -207,12 +208,7 @@ fn exprMentions(e: expr_ast.Expr, ci: usize) bool {
 }
 
 fn filterMentions(f: filter_ast.Filter, ci: usize) bool {
-    return switch (f) {
-        .and_filter, .or_filter => |c| for (c.children) |child| {
-            if (filterMentions(child, ci)) break true;
-        } else false,
-        inline else => |l| l.col_idx == ci,
-    };
+    return filter_ast.reads(f, ci);
 }
 
 /// PLAIN and dictionary data pages only. Delta byte arrays expand into the arena, so they stay on the
@@ -821,12 +817,7 @@ pub fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !
 }
 
 fn markFilterSet(set: []bool, f: filter_ast.Filter, v: bool) void {
-    switch (f) {
-        .and_filter, .or_filter => |c| for (c.children) |child| markFilterSet(set, child, v),
-        inline else => |l| if (l.col_idx < set.len) {
-            set[l.col_idx] = v;
-        },
-    }
+    filter_ast.setFilterColumns(f, set, v);
 }
 
 fn markExprSet(set: []bool, e: expr_ast.Expr, v: bool) void {
@@ -869,6 +860,10 @@ fn markFilter(u: CodeUses, f: filter_ast.Filter) void {
         .like => |l| mark(u.code, l.col_idx),
         // A coded foreign key is looked up once per dictionary entry (`join.lookup.narrow`).
         .lookup => |l| mark(u.code, l.col_idx),
+        .expr => |e| {
+            markExprValues(u, e.left.*);
+            markExprValues(u, e.right.*);
+        },
     }
 }
 

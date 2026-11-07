@@ -76,11 +76,24 @@
   INTERVAL anywhere else and a fraction of a whole-number unit are refused by name, never answered. Constants keep DuckDB's
   types and ranges: an integer takes the narrowest type that holds it after its sign, an INTERVAL component its field's width,
   a TIMESTAMP its year-294247 limit, a decimal its 38 digits, and what DuckDB refuses is refused, never wrapped or aborted on.
+- **Re-encoded string columns read faster in other engines.** The v2 writer now keeps a string column's dictionary
+  while it stays within a quarter of the chunk's bytes (and within one dictionary page), and otherwise writes PLAIN unless
+  a delta layout compresses smaller. Before, wide columns such as ClickBench's URL and Title fell to DELTA_BYTE_ARRAY,
+  which PyArrow, DuckDB and Polars read 10–50% slower than the original file. Values don't change; file bytes do.
 - **String filters read dictionaries, not rows.** A filter on a dictionary-encoded string column (`=`, `<>`, `IN`) now
   compares each dictionary entry once and selects rows by code, whether or not the file has a page index. On a Ryzen 9
   9950X, PDS-H-shaped filters such as `l_shipmode IN ('MAIL', 'SHIP')` with a date range are 1.8–6.3× faster.
 - **`LIKE '%text%'` is faster.** The substring search's tail now runs in vectors too: ClickBench Q20 is 11% faster.
 - **zpq builds with any Zig 0.17.x patch release,** not only 0.17.0, so 0.17.1 can be adopted when it ships.
+- **Re-encoded wide string columns read as fast as the original, or faster, in other engines.** zpq sent a string column
+  to a dictionary only while the dictionary stayed within 1 MiB, so wide values (titles, URLs) that repeat just as
+  often went to DELTA_BYTE_ARRAY, which the readers we measured decode slower than PLAIN (Polars 2.1.0 about twice as
+  slow). A dictionary may now hold up to a quarter of the values' bytes (still 1 MiB at least, never more than one dictionary
+  page holds, and still a quarter or fewer distinct values), and the other strings are PLAIN unless DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY saves the
+  bytes after the codec (half for DELTA_BYTE_ARRAY, any for DELTA_LENGTH_BYTE_ARRAY), judged on the chunk's first page. On the ClickBench `hits_0` shard at its
+  two row groups, reading every string column takes 0.78× (DuckDB 2.0.0) and 0.56× (Polars 2.1.0) the original file's
+  speed with 0.5.1's re-encode and 1.08× and 1.11× now (PyArrow 26: 1.09×); the Title column is 1.7× to 2.9× faster, and
+  the file is 98.7 MB where 0.5.1 wrote 116.3 MB and the original is 122.4 MB. Written bytes change; the values don't.
 - **The Lambda fan-out coordinator (`tools/serverless/fanout.py`) is faster.** 0.5.1's coordinator asked the worker for its
   capabilities and prepared the plan from every input's footer, one after the other, before any worker started, which
   added 0.3–0.7 s per query. It now caches the capability answer for a published worker version, prepares the plan

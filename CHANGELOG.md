@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **`LIKE` filters with a `MIN`, `MAX` or `COUNT(DISTINCT)` of the same string column read it once.** When a cheaper
+  condition runs first, zpq now keeps the strings it already decoded for the rows that pass and replays them for the
+  aggregate instead of reading those pages again. On a Ryzen 9 9950X, ClickBench Q21 is 64% faster and Q22 70% faster
+  (Q21 584 ms to 209 ms), and a filter-only `LIKE` (Q20) is 13% faster.
 - **Re-encoded files read faster than the original.** Dictionary data pages are sized by their packed index bytes
   rather than a fixed row count, and integer pages choose PLAIN or DELTA_BINARY_PACKED by compressing a sample of the
   first page both ways. A Snappy re-encode of the 14.8 GB ClickBench file is 13% smaller than the original and reads

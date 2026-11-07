@@ -693,10 +693,7 @@ fn compile(
             // hundreds... one more digit (`round(95::DECIMAL(2,0), -1)` is DECIMAL(3,0)), up to 38: only there can the
             // rounded value leave the type.
             const ty: PostType = switch (v.ty) {
-                .dec => |d| if (r.digits >= d.scale) v.ty else .{ .dec = .{
-                    .precision = if (d.scale == 0) @min(expr_ast.Dec.max_precision, d.precision + 1) else d.precision,
-                    .scale = @intCast(@max(0, r.digits)),
-                } },
+                .dec => |d| .{ .dec = expr_ast.roundedDec(d, r.digits) },
                 else => v.ty,
             };
             break :blk .{ .ty = ty, .node = .{ .round = .{ .value = v, .digits = r.digits } } };
@@ -881,33 +878,12 @@ fn rawOrder(lt: PostType, l: Raw, rt: PostType, r: Raw) std.math.Order {
     return std.math.order(x, y);
 }
 
-/// `round(x, digits)` of a double as DuckDB computes it: scale, round half away from zero, scale back. A non-finite
-/// input stays as it is, and so does a finite one whose scaling overflows to a non-finite value for positive digits;
-/// for negative digits that overflow is 0.
 fn roundDouble(x: f64, digits: i32) f64 {
-    if (!std.math.isFinite(x)) return x;
-    if (digits < 0) {
-        const m = std.math.pow(f64, 10, @floatFromInt(-digits));
-        const r = @round(x / m) * m;
-        return if (std.math.isFinite(r)) r else 0;
-    }
-    const m = std.math.pow(f64, 10, @floatFromInt(digits));
-    const r = @round(x * m) / m;
-    return if (std.math.isFinite(r)) r else x;
+    return expr_ast.roundDouble(x, digits);
 }
 
-/// `round(v, digits)` of an exact decimal at `scale`, half away from zero, as the unscaled value of the type
-/// `compile` gave it: scale `digits` when that is fewer than `scale` (0 when negative), else `v` itself.
 fn roundDecimal(v: i128, scale: u8, digits: i32) error{DecimalOverflow}!i128 {
-    if (digits >= scale) return v;
-    const drop: i32 = scale - digits;
-    // A divisor past 10^38 is past twice any value a DECIMAL holds: everything rounds to zero.
-    if (drop > expr_ast.Dec.max_precision) return 0;
-    const divisor = expr_ast.pow10(@intCast(drop));
-    var q = @divTrunc(v, divisor);
-    if (@as(u128, @abs(@rem(v, divisor))) * 2 >= @as(u128, @intCast(divisor))) q += if (v < 0) -1 else 1;
-    if (digits >= 0) return q;
-    return std.math.mul(i128, q, expr_ast.pow10(@intCast(-digits))) catch error.DecimalOverflow;
+    return expr_ast.roundDecimal(v, scale, digits);
 }
 
 fn postCell(ty: PostType, v: ?Raw) scan.AggValue {

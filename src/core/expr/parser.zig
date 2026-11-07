@@ -741,6 +741,12 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "replace")) return .replace;
     if (asciiEqIgnoreCase(name, "lpad")) return .lpad;
     if (asciiEqIgnoreCase(name, "rpad")) return .rpad;
+    if (asciiEqIgnoreCase(name, "floor")) return .floor;
+    if (asciiEqIgnoreCase(name, "ceil") or asciiEqIgnoreCase(name, "ceiling")) return .ceil;
+    if (asciiEqIgnoreCase(name, "sqrt")) return .sqrt;
+    if (asciiEqIgnoreCase(name, "round")) return .round;
+    if (asciiEqIgnoreCase(name, "least")) return .least;
+    if (asciiEqIgnoreCase(name, "greatest")) return .greatest;
     // The names `CAST` lowers to; `$` is no part of a name a query can write unquoted.
     if (asciiEqIgnoreCase(name, "cast$tinyint")) return .cast_i8;
     if (asciiEqIgnoreCase(name, "cast$smallint")) return .cast_i16;
@@ -755,6 +761,11 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
 /// type. coalesce requires ≥2 args, all promotable to a common type.
 fn isIntLiteral(e: ast.Expr) bool {
     return e == .literal and e.literal == .i64;
+}
+
+/// A number a function may take: not text, not a date or time, not a BOOLEAN.
+fn plainNumber(e: ast.Expr) bool {
+    return e.typeOf() != .str and e.temporal() == null and !e.isBoolean();
 }
 
 fn isStrLiteral(e: ast.Expr) bool {
@@ -846,6 +857,38 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             if (args.len != 3) return error.WrongArity;
             if (args[0].typeOf() != .str or !isIntLiteral(args[1].*) or !isStrLiteral(args[2].*)) return error.TypeMismatch;
             return .str;
+        },
+        .floor, .ceil => {
+            if (args.len != 1) return error.WrongArity;
+            if (!plainNumber(args[0].*)) return error.TypeMismatch;
+            return if (args[0].typeOf() == .dec) .dec else .f64;
+        },
+        .sqrt => {
+            if (args.len != 1) return error.WrongArity;
+            if (!plainNumber(args[0].*)) return error.TypeMismatch;
+            return .f64;
+        },
+        // The digits are a constant, as DuckDB's DECIMAL form needs; an integer rounds to tens and up only in its own
+        // type, which zpq does not resolve for an expression, so it is refused there.
+        .round => {
+            if (args.len != 1 and args.len != 2) return error.WrongArity;
+            if (!plainNumber(args[0].*)) return error.TypeMismatch;
+            if (args.len == 2) {
+                if (!isIntLiteral(args[1].*)) return error.TypeMismatch;
+                const d = args[1].literal.i64;
+                if (d < std.math.minInt(i32) or d > std.math.maxInt(i32)) return error.TypeMismatch;
+                if (args[0].typeOf() == .i64 and d < 0) return error.TypeMismatch;
+            }
+            return args[0].typeOf();
+        },
+        .least, .greatest => {
+            if (args.len < 2) return error.WrongArity;
+            var t = args[0].typeOf();
+            for (args) |a| {
+                if (!plainNumber(a.*)) return error.TypeMismatch;
+                t = ast.Type.promote(t, a.typeOf()) orelse return error.TypeMismatch;
+            }
+            return t;
         },
         // A number to a number: the value is the only argument, and a DECIMAL's precision and scale follow it.
         .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double => {
@@ -1197,6 +1240,10 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
     var dec: ?ast.Dec = null;
     if (func == .cast_dec) {
         dec = .{ .precision = @intCast(args[1].literal.i64), .scale = @intCast(args[2].literal.i64) };
+    } else if ((func == .floor or func == .ceil) and result_type == .dec) {
+        dec = .{ .precision = args[0].decSpec().?.precision, .scale = 0 };
+    } else if (func == .round and result_type == .dec) {
+        dec = ast.roundedDec(args[0].decSpec().?, if (args.len == 2) @intCast(args[1].literal.i64) else 0);
     } else if (result_type == .dec) {
         dec = args[0].decSpec().?;
         for (args[1..]) |a| dec = ast.Dec.common(dec.?, a.decSpec().?);
@@ -1222,6 +1269,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,
                 .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => null,
+                .floor, .ceil, .sqrt, .round, .least, .greatest => null,
             },
             .int = switch (func) {
                 .abs => if (args[0].* == .col_ref) blk: {
@@ -1603,7 +1651,35 @@ test "parse: unknown function errors" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"x"}, &.{.INT64});
-    try testing.expectError(error.UnknownFunction, parseExprOnly(a, "sqrt(x)", &file, null));
+    try testing.expectError(error.UnknownFunction, parseExprOnly(a, "median(x)", &file, null));
+}
+
+test "parse: floor, ceil, sqrt, round, least and greatest type their results as DuckDB does" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{ "i", "f", "s" }, &.{ .INT64, .DOUBLE, .BYTE_ARRAY });
+    // An integer floors and ceils to a DOUBLE, sqrt is a DOUBLE, round keeps the type, least takes the common one.
+    for ([_]struct { src: []const u8, t: ast.Type }{
+        .{ .src = "floor(i)", .t = .f64 },
+        .{ .src = "ceiling(f)", .t = .f64 },
+        .{ .src = "sqrt(i)", .t = .f64 },
+        .{ .src = "round(f, 2)", .t = .f64 },
+        .{ .src = "round(i)", .t = .i64 },
+        .{ .src = "round(i, 3)", .t = .i64 },
+        .{ .src = "least(i, 3)", .t = .i64 },
+        .{ .src = "greatest(i, f)", .t = .f64 },
+        .{ .src = "least(i, f, 2.5)", .t = .f64 },
+    }) |c| {
+        const e = try parseExprOnly(a, c.src, &file, null);
+        try testing.expectEqual(c.t, e.typeOf());
+    }
+    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "floor(s)", &file, null));
+    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "least(s, s)", &file, null));
+    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "round(i, -1)", &file, null));
+    try testing.expectError(error.TypeMismatch, parseExprOnly(a, "round(f, i)", &file, null));
+    try testing.expectError(error.WrongArity, parseExprOnly(a, "least(i)", &file, null));
+    try testing.expectError(error.WrongArity, parseExprOnly(a, "sqrt(i, f)", &file, null));
 }
 
 test "parse: abs keeps its argument's type and refuses text and the wrong arity" {

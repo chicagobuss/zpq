@@ -44,8 +44,13 @@ the minimum of an integer column's SQL type, `abs(-2147483648)` of an INTEGER, i
 `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))` and `x::TYPE` of a number (a DECIMAL
 rounds half away from zero to an integer or to fewer places, a DOUBLE half to even to an integer and as `round(x * 10^s)`
 to a DECIMAL; a value that does not fit stops the query with a conversion error, as DuckDB does, but only in rows that
-are read and not NULL; the result is written as INT64 for every integer type), `ifnull(a, b)` (a two-argument
-`coalesce`), `strlen(s)` (bytes; NULL for NULL), the string functions `length`,
+are read and not NULL; the result is written as INT64 for every integer type), `floor`, `ceil`/`ceiling`, `sqrt` and
+`round(x [, n])` of a number (a DECIMAL floors and ceils to DECIMAL(p, 0) and rounds half away from zero, in the
+precision DuckDB gives it; an integer or a DOUBLE floors and ceils to a DOUBLE; `sqrt` is a DOUBLE and NaN below zero;
+`n` is a constant, and an integer is not rounded to tens or up), `least` and `greatest` over numbers (NULLs skipped,
+NULL where all are, NaN above every number), `year`, `quarter`, `month`, `week`, `day`/`dayofmonth`, `hour`, `minute`,
+`second`, `dayofweek`, `isodow` and `dayofyear` of a date or timestamp (spellings of `date_part`), `ifnull(a, b)` (a
+two-argument `coalesce`), `strlen(s)` (bytes; NULL for NULL), the string functions `length`,
 `substring`/`substr` (also `substring(x FROM a [FOR b])`), `left`, `right`, `upper`/`lower`, `trim`/`ltrim`/`rtrim`
 (spaces), `replace`, `lpad`/`rpad` and `concat(a, b, ...)` (a NULL is the empty text, unlike `||`; the arguments must be
 text), and searched `CASE WHEN cond THEN v ...

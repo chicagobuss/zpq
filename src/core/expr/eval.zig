@@ -1284,6 +1284,8 @@ fn evalCall(
         .length => return evalLength(arena, batch, column_lookup, c.args[0].*),
         .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => return evalStringFn(arena, batch, column_lookup, c),
         .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => return evalCast(arena, batch, column_lookup, c),
+        .floor, .ceil, .sqrt, .round => return evalMath(arena, batch, column_lookup, c),
+        .least, .greatest => return evalLeastGreatest(arena, batch, column_lookup, c),
     }
 }
 
@@ -1600,6 +1602,179 @@ fn doubleAsInt(t: ast.IntType, x: f64) Error!i64 {
     return @intFromFloat(r);
 }
 
+/// An exact operand's unscaled rows at `scale` (at least its own; an integer expression counts as scale 0), its
+/// definition levels, and the column its NULLs are read from.
+const DecRows = struct { v: []i128, def: ?[]u32, nulls: ?Batch.Column };
+
+fn decRows(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, arg: ast.Expr, scale: u8) Error!DecRows {
+    const o = try decOperandCached(arena, batch, column_lookup, arg, scale, null);
+    const n = batch.num_rows;
+    const v = try arena.alloc(i128, n);
+    switch (o.op) {
+        .scalar => |x| @memset(v, x),
+        .i64 => |vs| for (vs, v) |x, *r| {
+            r.* = x;
+        },
+        .i64s => |x| for (x.v, v) |y, *r| {
+            r.* = @as(i128, y) * x.factor;
+        },
+        .i128 => |vs| @memcpy(v, vs),
+    }
+    const def: ?[]u32 = if (o.nulls) |nc| blk: {
+        const d = try arena.alloc(u32, n);
+        for (d, 0..) |*dv, i| dv.* = @intFromBool(!rowIsNull(nc, i));
+        break :blk d;
+    } else null;
+    return .{ .v = v, .def = def, .nulls = o.nulls };
+}
+
+fn decColumn(rows: DecRows, v: []i128) Batch.Column {
+    return .{ .i128 = .{ .values = v, .def_levels = rows.def, .max_def = if (rows.def != null) 1 else 0, .has_nulls = rows.def != null } };
+}
+
+fn f64Column(v: []f64, def: ?[]const u32, max_def: u32, has_nulls: bool) Batch.Column {
+    return .{ .f64 = .{ .values = v, .def_levels = def, .max_def = max_def, .has_nulls = has_nulls } };
+}
+
+/// `floor`, `ceil`, `sqrt` and `round` of a number, row by row as DuckDB does. A DECIMAL floors and ceils to DECIMAL(p, 0)
+/// and rounds half away from zero (past its precision is `DecimalOverflow`, in a row that is read); an integer or a DOUBLE
+/// floors and ceils to a DOUBLE, `sqrt` is a DOUBLE and NaN below zero.
+fn evalMath(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const arg = c.args[0].*;
+    const n = batch.num_rows;
+    const digits: i32 = if (c.args.len == 2) @intCast(c.args[1].literal.i64) else 0;
+    if (arg.typeOf() == .dec) {
+        const spec = arg.decSpec().?;
+        const rows = try decRows(arena, batch, column_lookup, arg, spec.scale);
+        if (c.func == .sqrt) {
+            const out = try arena.alloc(f64, n);
+            for (rows.v, out) |x, *r| r.* = @sqrt(ast.decimalToDouble(x, spec.scale));
+            return f64Column(out, rows.def, if (rows.def != null) 1 else 0, rows.def != null);
+        }
+        const out = try arena.alloc(i128, n);
+        const divisor = ast.pow10(spec.scale);
+        for (rows.v, out, 0..) |x, *r, i| {
+            r.* = switch (c.func) {
+                .floor => @divFloor(x, divisor),
+                .ceil => -@divFloor(-x, divisor),
+                else => ast.roundDecimal(x, spec.scale, digits) catch {
+                    if (quietDecimalRow(batch, rows.nulls, i)) {
+                        r.* = 0;
+                        continue;
+                    }
+                    return error.DecimalOverflow;
+                },
+            };
+            if (@abs(r.*) >= @as(u128, @intCast(ast.pow10(c.dec.?.precision)))) {
+                if (quietDecimalRow(batch, rows.nulls, i)) r.* = 0 else return error.DecimalOverflow;
+            }
+        }
+        return decColumn(rows, out);
+    }
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    switch (col) {
+        .i64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            if (c.func == .round) return col;
+            const out = try arena.alloc(f64, n);
+            for (in.values, out) |v, *r| {
+                const x: f64 = @floatFromInt(v);
+                r.* = if (c.func == .sqrt) @sqrt(x) else x;
+            }
+            return f64Column(out, in.def_levels, in.max_def, in.has_nulls);
+        },
+        .f64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            const out = try arena.alloc(f64, n);
+            for (in.values, out) |v, *r| r.* = switch (c.func) {
+                .sqrt => @sqrt(v),
+                .floor => @floor(v),
+                .ceil => @ceil(v),
+                else => ast.roundDouble(v, digits),
+            };
+            return f64Column(out, in.def_levels, in.max_def, in.has_nulls);
+        },
+        else => return error.TypeMismatch,
+    }
+}
+
+/// NaN above every number, as DuckDB orders it: `a` is below `b`.
+fn belowNanLast(a: f64, b: f64) bool {
+    if (std.math.isNan(a)) return false;
+    return std.math.isNan(b) or a < b;
+}
+
+/// `least` / `greatest`: per row the smallest or largest argument that is not NULL, NULL where all are. The arguments are
+/// read in the result's lane: integers as they are, a DOUBLE result converts integers and DECIMALs, a DECIMAL result
+/// reads every argument at its scale.
+fn evalLeastGreatest(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const n = batch.num_rows;
+    const largest = c.func == .greatest;
+    const def = try arena.alloc(u32, n);
+    @memset(def, 0);
+    switch (c.result_type) {
+        .i64 => {
+            const out = try arena.alloc(i64, n);
+            @memset(out, 0);
+            for (c.args) |a| {
+                const col = try evalGroupKeyExpr(arena, batch, column_lookup, a.*);
+                if (col != .i64 or col.i64.max_rep > 0) return error.TypeMismatch;
+                for (col.i64.values, out, def, 0..) |v, *o, *d, i| {
+                    if (rowIsNull(col, i)) continue;
+                    if (d.* == 0 or (if (largest) v > o.* else v < o.*)) o.* = v;
+                    d.* = 1;
+                }
+            }
+            return .{ .i64 = .{ .values = out, .def_levels = def, .max_def = 1, .has_nulls = std.mem.indexOfScalar(u32, def, 0) != null } };
+        },
+        .f64 => {
+            const out = try arena.alloc(f64, n);
+            @memset(out, 0);
+            for (c.args) |a| {
+                const vals = try arena.alloc(f64, n);
+                var nulls: ?Batch.Column = null;
+                if (a.typeOf() == .dec) {
+                    const spec = a.decSpec().?;
+                    const rows = try decRows(arena, batch, column_lookup, a.*, spec.scale);
+                    for (rows.v, vals) |x, *r| r.* = ast.decimalToDouble(x, spec.scale);
+                    nulls = rows.nulls;
+                } else {
+                    const col = try evalGroupKeyExpr(arena, batch, column_lookup, a.*);
+                    nulls = col;
+                    switch (col) {
+                        .i64 => |in| for (in.values, vals) |v, *r| {
+                            r.* = @floatFromInt(v);
+                        },
+                        .f64 => |in| @memcpy(vals, in.values),
+                        else => return error.TypeMismatch,
+                    }
+                }
+                for (vals, out, def, 0..) |v, *o, *d, i| {
+                    if (nulls) |nc| if (rowIsNull(nc, i)) continue;
+                    if (d.* == 0 or (if (largest) belowNanLast(o.*, v) else belowNanLast(v, o.*))) o.* = v;
+                    d.* = 1;
+                }
+            }
+            return f64Column(out, def, 1, std.mem.indexOfScalar(u32, def, 0) != null);
+        },
+        .dec => {
+            const scale = c.dec.?.scale;
+            const out = try arena.alloc(i128, n);
+            @memset(out, 0);
+            for (c.args) |a| {
+                const rows = try decRows(arena, batch, column_lookup, a.*, scale);
+                for (rows.v, out, def, 0..) |v, *o, *d, i| {
+                    if (rows.nulls) |nc| if (rowIsNull(nc, i)) continue;
+                    if (d.* == 0 or (if (largest) v > o.* else v < o.*)) o.* = v;
+                    d.* = 1;
+                }
+            }
+            return .{ .i128 = .{ .values = out, .def_levels = def, .max_def = 1, .has_nulls = std.mem.indexOfScalar(u32, def, 0) != null } };
+        },
+        .str => return error.TypeMismatch,
+    }
+}
+
 /// `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))`, converted as DuckDB does: an
 /// integer to another by range, a DECIMAL to an integer or to fewer places half away from zero, a DOUBLE to an integer
 /// half to even and to a DECIMAL as `round(x * 10^s)` in double. A value that does not
@@ -1692,24 +1867,10 @@ fn quietDecimalRow(batch: *const Batch, nulls: ?Batch.Column, i: usize) bool {
 /// `evalCast` of an exact DECIMAL argument, read at its own scale.
 fn evalCastDecimal(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call, arg: ast.Expr) Error!Batch.Column {
     const spec = arg.decSpec().?;
-    const o = try decOperandCached(arena, batch, column_lookup, arg, spec.scale, null);
+    const rows = try decRows(arena, batch, column_lookup, arg, spec.scale);
     const n = batch.num_rows;
-    const v = try arena.alloc(i128, n);
-    switch (o.op) {
-        .scalar => |x| @memset(v, x),
-        .i64 => |vs| for (vs, v) |x, *r| {
-            r.* = x;
-        },
-        .i64s => |x| for (x.v, v) |y, *r| {
-            r.* = @as(i128, y) * x.factor;
-        },
-        .i128 => |vs| @memcpy(v, vs),
-    }
-    const def: ?[]u32 = if (o.nulls) |nc| blk: {
-        const d = try arena.alloc(u32, n);
-        for (d, 0..) |*dv, i| dv.* = @intFromBool(!rowIsNull(nc, i));
-        break :blk d;
-    } else null;
+    const v = rows.v;
+    const def = rows.def;
     const levels: u32 = if (def != null) 1 else 0;
     switch (c.func) {
         .cast_double => {
@@ -1725,7 +1886,7 @@ fn evalCastDecimal(arena: std.mem.Allocator, batch: *const Batch, column_lookup:
                 const q = divRoundHalfAway(x, divisor);
                 if (t.holds(q)) {
                     r.* = @intCast(q);
-                } else if (quietDecimalRow(batch, o.nulls, i)) {
+                } else if (quietDecimalRow(batch, rows.nulls, i)) {
                     r.* = 0;
                 } else return error.ConversionOutOfRange;
             }
@@ -1742,7 +1903,7 @@ fn evalCastDecimal(arena: std.mem.Allocator, batch: *const Batch, column_lookup:
                     divRoundHalfAway(x, ast.pow10(spec.scale - target.scale));
                 if (scaled != null and @abs(scaled.?) < bound) {
                     r.* = scaled.?;
-                } else if (quietDecimalRow(batch, o.nulls, i)) {
+                } else if (quietDecimalRow(batch, rows.nulls, i)) {
                     r.* = 0;
                 } else return error.ConversionOutOfRange;
             }
@@ -1900,7 +2061,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .floor, .ceil, .sqrt, .round, .least, .greatest => unreachable,
     }
     return .{ .i64 = .{
         .values = out,
@@ -2920,6 +3081,58 @@ test "regression: coalesce: col + col (f64) is NULL where both are" {
     try testing.expectEqual(1.5, out.f64.values[0]);
     try testing.expectEqual(3.5, out.f64.values[2]);
     try testing.expectEqualSlices(u32, &.{ 1, 0, 1 }, out.f64.def_levels.?);
+}
+
+test "least and greatest skip NULLs, are NULL only where every argument is, and put NaN above every number" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const xs = [_]i64{ 1, 0, 3, 0 };
+    const xd = [_]u32{ 1, 0, 1, 0 };
+    const ys = [_]i64{ 2, 0, 0, 5 };
+    const yd = [_]u32{ 1, 0, 0, 1 };
+    const cols = [_]Batch.Column{
+        .{ .i64 = .{ .values = &xs, .def_levels = &xd, .max_def = 1 } },
+        .{ .i64 = .{ .values = &ys, .def_levels = &yd, .max_def = 1 } },
+    };
+    const batch: Batch = .{ .cols = &cols, .num_rows = 4 };
+    const lookup = [_]?usize{ 0, 1 };
+    var x: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
+    var y: ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
+    const args = [_]*ast.Expr{ &x, &y };
+    const least = try evalExpr(a, &batch, &lookup, .{ .call = .{ .func = .least, .args = &args, .result_type = .i64, .depth = 2 } });
+    try testing.expectEqualSlices(u32, &.{ 1, 0, 1, 1 }, least.i64.def_levels.?);
+    try testing.expectEqual(@as(i64, 1), least.i64.values[0]);
+    try testing.expectEqual(@as(i64, 3), least.i64.values[2]);
+    try testing.expectEqual(@as(i64, 5), least.i64.values[3]);
+    const most = try evalExpr(a, &batch, &lookup, .{ .call = .{ .func = .greatest, .args = &args, .result_type = .i64, .depth = 2 } });
+    try testing.expectEqual(@as(i64, 2), most.i64.values[0]);
+    // NaN is above every number: it wins greatest and loses least.
+    const nan = std.math.nan(f64);
+    try testing.expect(belowNanLast(1, nan) and !belowNanLast(nan, 1) and !belowNanLast(nan, nan));
+}
+
+test "floor, ceil, sqrt and round of a DOUBLE column, and NaN below zero" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const vals = [_]f64{ 2.5, -2.5, 2.675, -1 };
+    const cols = [_]Batch.Column{.{ .f64 = .{ .values = &vals } }};
+    const batch: Batch = .{ .cols = &cols, .num_rows = 4 };
+    const lookup = [_]?usize{0};
+    var col: ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .DOUBLE, .expr_type = .f64 } };
+    var two: ast.Expr = .{ .literal = .{ .i64 = 2 } };
+    const one_arg = [_]*ast.Expr{&col};
+    const two_args = [_]*ast.Expr{ &col, &two };
+    const floor = try evalExpr(a, &batch, &lookup, .{ .call = .{ .func = .floor, .args = &one_arg, .result_type = .f64, .depth = 2 } });
+    try testing.expectEqualSlices(f64, &.{ 2, -3, 2, -1 }, floor.f64.values);
+    const ceil = try evalExpr(a, &batch, &lookup, .{ .call = .{ .func = .ceil, .args = &one_arg, .result_type = .f64, .depth = 2 } });
+    try testing.expectEqualSlices(f64, &.{ 3, -2, 3, -1 }, ceil.f64.values);
+    const rounded = try evalExpr(a, &batch, &lookup, .{ .call = .{ .func = .round, .args = &two_args, .result_type = .f64, .depth = 3 } });
+    try testing.expectEqualSlices(f64, &.{ 2.5, -2.5, 2.68, -1 }, rounded.f64.values);
+    const root = try evalExpr(a, &batch, &lookup, .{ .call = .{ .func = .sqrt, .args = &one_arg, .result_type = .f64, .depth = 2 } });
+    try testing.expect(std.math.isNan(root.f64.values[3]));
+    try testing.expectEqual(@sqrt(@as(f64, 2.5)), root.f64.values[0]);
 }
 
 test "casts round as DuckDB does: a DOUBLE to the even integer, a DECIMAL half away from zero" {

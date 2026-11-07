@@ -168,6 +168,46 @@ pub fn decimalToDouble(sum: i192, scale: u8) f64 {
     return if (sum < 0) -magnitude else magnitude;
 }
 
+/// `round(x, digits)` of a double as DuckDB computes it: scale, round half away from zero, scale back. A non-finite
+/// input stays as it is, and so does a finite one whose scaling overflows to a non-finite value for positive digits;
+/// for negative digits that overflow is 0.
+pub fn roundDouble(x: f64, digits: i32) f64 {
+    if (!std.math.isFinite(x)) return x;
+    if (digits < 0) {
+        const m = std.math.pow(f64, 10, @floatFromInt(-digits));
+        const r = @round(x / m) * m;
+        return if (std.math.isFinite(r)) r else 0;
+    }
+    const m = std.math.pow(f64, 10, @floatFromInt(digits));
+    const r = @round(x * m) / m;
+    return if (std.math.isFinite(r)) r else x;
+}
+
+/// `round(v, digits)` of an exact decimal at `scale`, half away from zero, as the unscaled value of the type DuckDB
+/// gives the result: scale `digits` when that is fewer than `scale` (0 when negative), else `v` itself.
+pub fn roundDecimal(v: i128, scale: u8, digits: i32) error{DecimalOverflow}!i128 {
+    if (digits >= scale) return v;
+    const drop: i32 = scale - digits;
+    // A divisor past 10^38 is past twice any value a DECIMAL holds: everything rounds to zero.
+    if (drop > Dec.max_precision) return 0;
+    const divisor = pow10(@intCast(drop));
+    var q = @divTrunc(v, divisor);
+    if (@as(u128, @abs(@rem(v, divisor))) * 2 >= @as(u128, @intCast(divisor))) q += if (v < 0) -1 else 1;
+    if (digits >= 0) return q;
+    return std.math.mul(i128, q, pow10(@intCast(-digits))) catch error.DecimalOverflow;
+}
+
+/// The DECIMAL type DuckDB 2.0 gives `round(x, digits)` of a DECIMAL `d`: the same precision at the digits' scale (none
+/// below the point for a negative count), one digit wider for a whole number rounded to tens and up (to 38), and `d`
+/// itself where rounding changes nothing.
+pub fn roundedDec(d: Dec, digits: i32) Dec {
+    if (digits >= d.scale) return d;
+    return .{
+        .precision = if (d.scale == 0) @min(Dec.max_precision, d.precision + 1) else d.precision,
+        .scale = @intCast(@max(0, digits)),
+    };
+}
+
 const pow10_table: [Dec.max_precision + 1]i128 = blk: {
     var t: [Dec.max_precision + 1]i128 = undefined;
     t[0] = 1;
@@ -292,6 +332,17 @@ pub const Func = enum {
     cast_i64,
     cast_double,
     cast_dec,
+    /// `floor(x)`, `ceil(x)` / `ceiling(x)`: a DECIMAL(p, s) gives DECIMAL(p, 0), an integer or a DOUBLE a DOUBLE.
+    floor,
+    ceil,
+    /// `sqrt(x)`: a DOUBLE; a negative argument is NaN, as in DuckDB.
+    sqrt,
+    /// `round(x [, digits])`: digits a constant; a DECIMAL as the post-aggregate stage rounds it, a DOUBLE half away.
+    round,
+    /// `least(a, b, ...)`, `greatest(a, b, ...)`: the smallest or largest of the non-NULL arguments (NULL where all
+    /// are), numbers only; NaN is above every number.
+    least,
+    greatest,
 };
 
 /// What an integer value stands for in time, so the date/time functions read it in its unit. Output keeps printing
@@ -506,9 +557,9 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => c.args[0].mayBeNull(),
+                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
-                .coalesce => for (c.args) |a| {
+                .coalesce, .least, .greatest => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;
                 } else true,
             },

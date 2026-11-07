@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Row-level math and date parts in SQL.** `floor`, `ceil`, `sqrt`, `round(x, n)`, `least` and `greatest` over a column or
+  expression, and `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `isodow` and
+  `dayofyear` of a date or timestamp, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB (a DECIMAL keeps
+  DECIMAL(p, 0) after `floor`, an integer floors to a DOUBLE, `least` skips NULLs, `sqrt` of a negative is NaN).
 - **Numeric casts in SQL.** `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))` and `x::TYPE`
   over a number, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB, including its rounding (a DECIMAL
   half away from zero, a DOUBLE to an integer half to even) and its conversion error for a value that does not fit.

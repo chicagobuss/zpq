@@ -121,8 +121,18 @@ pub const Lower = struct {
     fn sugarCall(self: *Lower, f: anytype, func: []const u8, depth: u32) Error!?syntax.Expr {
         const is_concat = std.ascii.eqlIgnoreCase(func, "concat");
         const is_ifnull = std.ascii.eqlIgnoreCase(func, "ifnull");
-        if (!is_concat and !is_ifnull and !std.ascii.eqlIgnoreCase(func, "nullif")) return null;
+        const part = datePartAlias(func);
+        if (!is_concat and !is_ifnull and part == null and !std.ascii.eqlIgnoreCase(func, "nullif")) return null;
         if (f.over != null or f.distinct != 0 or f.filter != null or f.order_by.count != 0) return error.ExpectedRParen;
+        if (part) |part_name| {
+            if (f.args.count != 1) return error.WrongArity;
+            const args = try self.arena.alloc(*const syntax.Expr, 2);
+            const text = try self.arena.create(syntax.Expr);
+            text.* = .{ .string = part_name };
+            args[0] = text;
+            args[1] = try self.ptr(f.args.items[0] orelse return error.SqlParseError, depth + 1);
+            return .{ .call = .{ .name = "date_part", .args = args } };
+        }
         if (is_concat) return try self.concatCall(f, depth);
         if (f.args.count != 2) return error.WrongArity;
         if (is_ifnull) {
@@ -138,6 +148,26 @@ pub const Lower = struct {
         const whens = try self.arena.alloc(syntax.Expr.When, 1);
         whens[0] = .{ .cond = .{ .comparison = .{ .operand = column, .op = .Eq, .value = try self.literal(other) } }, .then = null };
         return .{ .case_ = .{ .whens = whens, .else_ = value } };
+    }
+
+    /// The part `year(x)`, `month(x)`, ... name: each is `date_part('<part>', x)`, which DuckDB answers as a BIGINT too.
+    fn datePartAlias(func: []const u8) ?[]const u8 {
+        const aliases = [_]struct { name: []const u8, part: []const u8 }{
+            .{ .name = "year", .part = "year" },
+            .{ .name = "quarter", .part = "quarter" },
+            .{ .name = "month", .part = "month" },
+            .{ .name = "week", .part = "week" },
+            .{ .name = "day", .part = "day" },
+            .{ .name = "dayofmonth", .part = "day" },
+            .{ .name = "hour", .part = "hour" },
+            .{ .name = "minute", .part = "minute" },
+            .{ .name = "second", .part = "second" },
+            .{ .name = "dayofweek", .part = "dow" },
+            .{ .name = "isodow", .part = "isodow" },
+            .{ .name = "dayofyear", .part = "doy" },
+        };
+        for (aliases) |a| if (std.ascii.eqlIgnoreCase(func, a.name)) return a.part;
+        return null;
     }
 
     /// `concat(a, b, ...)` joins its arguments and reads a NULL as the empty text (unlike `||`, where it makes the result

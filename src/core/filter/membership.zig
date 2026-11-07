@@ -1035,6 +1035,19 @@ fn waveEnd(ts: []const *Target, n: usize) usize {
 /// page dictionary-encoded (the rule Hardwood applies). Without them, only parquet-java's v1 signature tells:
 /// PLAIN_DICTIONARY with nothing but level encodings beside it; a v2 RLE_DICTIONARY chunk could have fallen back to
 /// PLAIN without saying so.
+/// Whether a chunk says it has a dictionary its data pages use: a dictionary page, and a dictionary encoding among its
+/// encodings. Weaker than `dictionaryCoversChunk`: without encoding stats, the PLAIN its dictionary page is written in
+/// cannot be told from a PLAIN data page a writer fell back to. A reader that learns which from the pages themselves
+/// (`ColumnChunkReader.readAllCodes`, codes or values) may try the dictionary on this.
+pub fn dictionaryLikely(cm: *const schema.ColumnMetaData) bool {
+    if (cm.dictionary_page_offset == null) return false;
+    for (cm.encodings.items) |e| switch (e) {
+        .PLAIN_DICTIONARY, .RLE_DICTIONARY => return true,
+        else => {},
+    };
+    return false;
+}
+
 pub fn dictionaryCoversChunk(cm: *const schema.ColumnMetaData) bool {
     const DICTIONARY_PAGE = @backingInt(schema.PageType.DICTIONARY_PAGE);
     const plain_dictionary = @backingInt(schema.Encoding.PLAIN_DICTIONARY);

@@ -279,10 +279,12 @@ pub fn streamByteArray(in: AggRowGroup, target: AggTarget, ci: usize) bool {
     if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) return false;
     if (!reusableByteEncodings(cm.encodings.items)) return false;
     const filtered = if (in.filter) |f| filterMentions(f, ci) else false;
-    // A filter-only string its dictionary covers is compared once per dictionary entry from its codes, a few bytes a
-    // row: streaming it reads every value instead, and saves no faulted string bytes.
+    // A filter-only string with a dictionary is compared once per dictionary entry from its codes, a few bytes a row:
+    // streaming it reads every value instead, and saves no faulted string bytes. Its pages say whether the dictionary
+    // covers the chunk (a coded decode falls back to values on a page that is not), so a chunk need only say it has one:
+    // Polars writes no encoding stats, and its dictionary page's PLAIN reads as a possible fallback.
     if (filtered and !columnFeedsFold(target, ci))
-        return !@import("../filter/membership.zig").dictionaryCoversChunk(&cm);
+        return !@import("../filter/membership.zig").dictionaryLikely(&cm);
     // DISTINCT sets and string winners reuse a whole batch's prepared values. Streaming a key forces their
     // payloads into repeated decoder/fold setup too; ordinary memory admission still slices a batch that cannot fit.
     if (target == .grouped) for (target.grouped.calls) |call| {
@@ -655,7 +657,11 @@ pub const ChunkDecoder = struct {
         // pruned replay remains authoritative for failures on pages the query does not need.
         const keyed_whole = decode_options.any_dictionary and self.keep == null and
             (!pruned_pages or packed_codes);
-        const encoded = decode_options.encoded and (prune_info == null or keyed_whole) and ci < uses.code.len and
+        // A page index that skips no page and stands in for none (no always-match page) reads every page, as the chunk
+        // read whole does: codes serve a filter as they do without one, and a corrupt page fails either way.
+        const every_page = if (prune_info) |p| self.keep == null and !pruned_pages and
+            std.mem.indexOfScalar(bool, p.page_is_always_match, true) == null else true;
+        const encoded = decode_options.encoded and (every_page or keyed_whole) and ci < uses.code.len and
             decode_options.row_gate == null;
         const levels_only = encoded and uses.levels[ci] and !uses.code[ci] and !uses.value[ci] and
             self.target == .scalar;

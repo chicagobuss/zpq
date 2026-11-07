@@ -15,6 +15,8 @@ pub const OutputPublication = struct {
     target_buffer: [std.fs.max_path_bytes]u8 = undefined,
     buffer: [std.fs.max_path_bytes]u8 = undefined,
     len: usize = 0,
+    /// Tests only: runs between the sync and the rename of `commitReplacing`, to change the target in that window.
+    before_rename: ?*const fn ([]const u8) void = null,
 
     pub fn path(self: *const OutputPublication) []const u8 {
         return self.buffer[0..self.len];
@@ -59,6 +61,44 @@ pub const OutputPublication = struct {
 
     pub fn commit(self: *OutputPublication, io: std.Io) !void {
         const target = self.target orelse return;
+        try self.seal(io);
+        try local_fs.rename(self.path(), target);
+        self.target = null;
+    }
+
+    /// `commit`, for a result that replaces the very file it was made from (`expected`, as it was read): published only
+    /// if the target is still that file at the rename, after the sync. The staged file and the target are exchanged
+    /// atomically and the file exchanged out is checked; another one (a file renamed over the target meanwhile, or the
+    /// same one rewritten) is exchanged back and `error.InputChanged` returned, and a removed target is not recreated.
+    /// Where the filesystem cannot exchange, the target is checked just before a plain rename instead.
+    pub fn commitReplacing(self: *OutputPublication, io: std.Io, expected: local_fs.Stamp) !void {
+        const target = self.target orelse return;
+        try self.seal(io);
+        if (@import("builtin").is_test) if (self.before_rename) |hook| hook(target);
+        local_fs.exchange(self.path(), target) catch |err| switch (err) {
+            error.NotFound => return error.InputChanged,
+            error.Unsupported => {
+                const now = local_fs.pathStamp(target) catch return error.InputChanged;
+                if (!std.meta.eql(now, expected)) return error.InputChanged;
+                try local_fs.rename(self.path(), target);
+                self.target = null;
+                return;
+            },
+            else => return err,
+        };
+        // The staging name now holds what the target was.
+        const out = local_fs.pathStamp(self.path()) catch null;
+        if (out == null or !std.meta.eql(out.?, expected)) {
+            // Put the other file back; the staged result stays at the staging name for `abort` to remove.
+            local_fs.exchange(self.path(), target) catch return error.RenameFailed;
+            return error.InputChanged;
+        }
+        local_fs.removeFile(self.path());
+        self.target = null;
+    }
+
+    /// Mode, sync and close: the staged file is complete and durable.
+    fn seal(self: *OutputPublication, io: std.Io) !void {
         const fd = self.fd orelse unreachable;
         if (self.permissions) |permissions| {
             const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
@@ -68,8 +108,6 @@ pub const OutputPublication = struct {
         if (self.fsync) try local_fs.syncData(fd);
         self.fd = null;
         try local_fs.closeChecked(fd);
-        try local_fs.rename(self.path(), target);
-        self.target = null;
     }
 
     pub fn abort(self: *OutputPublication) void {

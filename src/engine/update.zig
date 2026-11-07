@@ -297,13 +297,13 @@ fn runCharged(footers: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, re
 
     // The file must be what was read, and still the file its path names: a write under it, or another file renamed
     // over it or its removal since, would be lost to the rename.
-    if (@import("builtin").is_test) if (before_publish) |hook| hook(req.target);
+    // The file must still be what was read: a write under it shows in the mapping and its stamp, and another file
+    // renamed over its path, or its removal, in the exchange that publishes over it (`commitReplacing`).
     try map.intact(req.target);
     if (in_place) {
-        const now = local_fs.pathStamp(req.target) catch return error.InputChanged;
-        if (!std.meta.eql(now, map.stamp)) return error.InputChanged;
-    }
-    try publication.commit(io);
+        if (@import("builtin").is_test) publication.before_rename = before_publish;
+        try publication.commitReplacing(io, map.stamp);
+    } else try publication.commit(io);
     return summary;
 }
 
@@ -1214,14 +1214,15 @@ test "UPDATE rewrites only the pages it changes, keeps every other byte at its o
 
 const fastpath_block = @import("../core/writer/fastpath.zig").share_block;
 
-/// Tests only: runs just before an UPDATE checks its target and publishes, to change the target under it.
+/// Tests only: runs after an UPDATE's result is synced and before it is renamed over its target, to change the target in
+/// that window.
 var before_publish: ?*const fn ([]const u8) void = null;
 
 fn footerLen(bytes: []const u8) usize {
     return std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
 }
 
-test "UPDATE refuses a target replaced or removed while it ran, and a second UPDATE of the same file" {
+test "UPDATE refuses a target replaced or removed while it ran, even after its sync, and a second UPDATE of the same file" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const fixture = "ci/fixtures/parquet/filtered_records_ordered.parquet";
@@ -1262,6 +1263,9 @@ test "UPDATE refuses a target replaced or removed while it ran, and a second UPD
         if (hook == Hooks.replace) {
             try std.testing.expectEqualStrings(Hooks.replacement, try local_fs.readFile(a, target));
         } else try std.testing.expectError(error.FileNotFound, local_fs.openRead(target));
+        // Nor is the staged result left behind.
+        const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        for (try local_fs.listFiles(a, io, dir)) |name| try std.testing.expect(std.mem.indexOf(u8, name, "zpq-tmp") == null);
     }
     before_publish = null;
 

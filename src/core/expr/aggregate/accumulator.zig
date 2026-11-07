@@ -54,6 +54,8 @@ pub const Accumulator = union(enum) {
     avg_d: DecSum,
     min_d: ?i128,
     max_d: ?i128,
+    /// The variance family's running mean and sum of squared deviations (`types.Moments`).
+    moments: types.Moments,
 
     pub const ArenaBytes = struct {
         store: *KeyArena,
@@ -118,6 +120,7 @@ pub const Accumulator = union(enum) {
                 .avg_f64, .avg_dec => unreachable,
             },
             .avg => if (call.result == .avg_dec) .{ .avg_d = .{} } else .{ .avg = .{ .sum = 0, .count = 0 } },
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop => .{ .moments = .{} },
         };
     }
 
@@ -198,9 +201,15 @@ pub const Accumulator = union(enum) {
             .avg_d => |*d| d.add(src.avg_d.get(), src.avg_d.n),
             .min_d => |*m| if (src.min_d) |sv| foldExtremeI(true, m, sv),
             .max_d => |*m| if (src.max_d) |sv| foldExtremeI(false, m, sv),
+            .moments => |*m| m.combine(src.moments) catch return error.RowCountTooLarge,
         }
     }
 };
+
+// A group's slot is the largest variant, so a new one must not grow every group.
+comptime {
+    std.debug.assert(@sizeOf(types.Moments) <= @sizeOf(AvgState));
+}
 
 pub fn addRowCount(a: u64, b: u64) error{RowCountTooLarge}!u64 {
     const sum = std.math.add(u64, a, b) catch return error.RowCountTooLarge;

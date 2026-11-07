@@ -32,6 +32,8 @@ fn foldsToItself(acc: expr_agg.Accumulator) bool {
         .sum_f => |x| if (x) |v| plainFloat(v) else true,
         .avg => |a| plainFloat(a.sum),
         .sum_i, .min_i, .min_f, .max_i, .max_f, .min_bytes, .max_bytes, .min_arena, .max_arena, .sum_d, .avg_d, .min_d, .max_d => true,
+        // A fresh state takes the source whole.
+        .moments => true,
     };
 }
 
@@ -65,6 +67,7 @@ pub fn sameAccBits(a: expr_agg.Accumulator, b: expr_agg.Accumulator) bool {
         .avg => |v| F.f(v.sum, b.avg.sum) and v.count == b.avg.count and v.isum == b.avg.isum,
         .sum_d => |v| v.lo == b.sum_d.lo and v.hi == b.sum_d.hi and v.n == b.sum_d.n,
         .avg_d => |v| v.lo == b.avg_d.lo and v.hi == b.avg_d.hi and v.n == b.avg_d.n,
+        .moments => |v| v.count == b.moments.count and F.f(v.mean, b.moments.mean) and F.f(v.dsquared, b.moments.dsquared),
     };
 }
 

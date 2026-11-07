@@ -32,7 +32,7 @@ pub const OwnerProgram = struct {
     pub fn init(calls: []const expr_agg.AggCall) ?OwnerProgram {
         var p: OwnerProgram = .{};
         for (calls) |call| {
-            if (call.where != null or call.offset != 0 or call.state) return null;
+            if (call.where != null or call.offset != 0 or call.state or call.func.extended()) return null;
             if (call.arg == null) {
                 if (call.func != .count or call.result != .i64) return null;
                 continue;
@@ -121,6 +121,7 @@ pub const OwnerProgram = struct {
                 .count = p.find(.present_count, col) orelse return null,
             } },
             .count_distinct => if (p.distinct_arg != null and p.distinct_arg.?.col_idx == col) .distinct else null,
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop => null,
         };
     }
 

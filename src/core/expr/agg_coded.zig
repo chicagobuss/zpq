@@ -133,6 +133,8 @@ pub fn updateOneCoded(
     outer_sel: *const Sel,
     charge: ?*agg.WinnerCharge,
 ) Error!bool {
+    // The coded folds are written for the original six functions; the rest take the row fold.
+    if (call.func.extended()) return false;
     if (call.func == .count) if (call.arg) |arg| if (arg == .col_ref) {
         const pos = lookup[arg.col_ref.col_idx] orelse return error.BadColumn;
         const lcol = batch.cols[pos];
@@ -371,6 +373,8 @@ fn foldHist(
         },
         .count => unreachable,
         .distinct => unreachable,
+        // Welford's mean and deviations depend on the row order a count-times-entry fold does not have.
+        .moments => return error.UnsupportedAggType,
     }
 }
 
@@ -2119,8 +2123,8 @@ fn foldGroupedValue(
             return;
         }
     }
-    if (call.arg.? == .col_ref and arg_col.?.codes() != null and space * arg_col.?.dictLen() <= MAX_HIST and
-        !float_sum and !to_pairs)
+    if (!call.func.extended() and call.arg.? == .col_ref and arg_col.?.codes() != null and
+        space * arg_col.?.dictLen() <= MAX_HIST and !float_sum and !to_pairs)
     {
         // (composite, code) histogram, then fold each entry once per group.
         const col = arg_col.?;
@@ -2172,7 +2176,7 @@ fn foldGroupedValue(
         else => |e| vals_col = computed orelse try expr_eval.evalExpr(ra, &batch.restrictedTo(sel), lookup, e),
     }
     // Strings and anything unusual: the row fold, with group ids expanded from composites.
-    const is_numeric_sum_like = call.func != .count_distinct and (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes and
+    const is_numeric_sum_like = call.func != .count_distinct and !call.func.extended() and (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes and
         (!float_sum or try seedable(ra, gid_of));
     if (!is_numeric_sum_like) {
         const gids = try ra.alloc(u32, comp.len);
@@ -2221,7 +2225,7 @@ fn foldGroupedNumeric(
                 // Each order's identity (`agg.minTotal`/`maxTotal`): NaN for min, -inf for max.
                 .min => @memset(part, std.math.nan(f64)),
                 .max => @memset(part, -std.math.inf(f64)),
-                .count, .count_distinct => unreachable,
+                .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop => unreachable,
             }
             switch (call.func) {
                 .sum, .avg => forEachActive(sel, comp.len, struct {
@@ -2240,7 +2244,7 @@ fn foldGroupedNumeric(
                         part[cp] = if (is_min) agg.minTotal(part[cp], v[r]) else agg.maxTotal(part[cp], v[r]);
                     }
                 },
-                .count, .count_distinct => unreachable,
+                .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop => unreachable,
             }
             for (0..space) |cp| {
                 if (seen[cp] == 0) continue;
@@ -2266,7 +2270,7 @@ fn foldGroupedNumeric(
                 .sum, .avg => @memset(part, 0),
                 .min => @memset(part, std.math.maxInt(i128)),
                 .max => @memset(part, std.math.minInt(i128)),
-                .count, .count_distinct => unreachable,
+                .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop => unreachable,
             }
             var r: usize = 0;
             while (r < comp.len) : (r += 1) {
@@ -2279,7 +2283,7 @@ fn foldGroupedNumeric(
                     .avg => part[cp] += x,
                     .min => part[cp] = @min(part[cp], x),
                     .max => part[cp] = @max(part[cp], x),
-                    .count, .count_distinct => unreachable,
+                    .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop => unreachable,
                 }
             }
             for (0..space) |cp| {
@@ -2313,7 +2317,7 @@ fn foldGroupedNumeric(
                 .sum, .avg => {},
                 .min => @memset(ext, std.math.maxInt(i128)),
                 .max => @memset(ext, std.math.minInt(i128)),
-                .count, .count_distinct => unreachable,
+                .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop => unreachable,
             }
             var r: usize = 0;
             while (r < comp.len) : (r += 1) {
@@ -2324,7 +2328,7 @@ fn foldGroupedNumeric(
                     .sum, .avg => sums[cp] += v[r],
                     .min => ext[cp] = @min(ext[cp], v[r]),
                     .max => ext[cp] = @max(ext[cp], v[r]),
-                    .count, .count_distinct => unreachable,
+                    .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop => unreachable,
                 }
             }
             for (0..space) |cp| {

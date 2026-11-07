@@ -1265,6 +1265,10 @@ pub fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
     if (asciiEqIgnoreCase(name, "min")) return .min;
     if (asciiEqIgnoreCase(name, "max")) return .max;
     if (asciiEqIgnoreCase(name, "avg")) return .avg;
+    if (asciiEqIgnoreCase(name, "var_samp") or asciiEqIgnoreCase(name, "variance")) return .var_samp;
+    if (asciiEqIgnoreCase(name, "var_pop")) return .var_pop;
+    if (asciiEqIgnoreCase(name, "stddev_samp") or asciiEqIgnoreCase(name, "stddev")) return .stddev_samp;
+    if (asciiEqIgnoreCase(name, "stddev_pop")) return .stddev_pop;
     return null;
 }
 

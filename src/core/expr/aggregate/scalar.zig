@@ -291,7 +291,7 @@ pub fn canStatShortCircuit(call: AggCall, has_outer_filter: bool, trust_stats: b
         // num_rows × min to the sum. updateOneFromStats decides per-RG
         // and falls through to decode for non-constant RGs.
         .sum => true,
-        .avg => false,
+        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop => false,
     };
 }
 
@@ -410,7 +410,8 @@ pub fn updateOneFromStats(
             }
             return true;
         },
-        .avg => return false, // never short-circuitable
+        // Never short-circuitable: the deviations need every value.
+        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop => return false,
     }
 }
 
@@ -721,6 +722,7 @@ pub fn finalize(
             try emitOneDec(arena, call.alias, try avgDecMean(call, state.avg_d), resultDec(call))
         else
             try emitOneF64(arena, call.alias, avgMean(state.avg)),
+        .var_samp, .var_pop, .stddev_samp, .stddev_pop => try emitOneF64(arena, call.alias, state.moments.result(call.func)),
     };
 }
 
@@ -926,6 +928,7 @@ pub fn updateOneWithCharge(
         else
             foldMax(state, values.?, sel, u64_col),
         .avg => try foldAvg(state, values.?, sel, u64_col, if (input.gathered_from) |*g| g else null),
+        .var_samp, .var_pop, .stddev_samp, .stddev_pop => try foldMoments(state, values.?, sel, u64_col, momentScale(call)),
     }
 }
 
@@ -964,6 +967,8 @@ pub fn updateSharedInteger(
             .max => ops |= 4,
             .count => {},
             .count_distinct => unreachable,
+            // The shared kernel knows sum, min, max and avg.
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop => return false,
         }
     }
     if (value_calls < 2) return false;
@@ -1012,7 +1017,7 @@ pub fn updateSharedInteger(
                 state.avg.isum += stats.sum;
                 state.avg.count += stats.count;
             },
-            .count_distinct => unreachable,
+            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop => unreachable,
         }
     }
     return true;
@@ -1594,6 +1599,45 @@ fn extremeExact(
         .i128 => |c| extremeI128(is_min, c.values, sel),
         else => unreachable,
     };
+}
+
+/// The scale of a DECIMAL argument, which the variance family reads as the DOUBLE DuckDB casts it to; null for an
+/// integer or float one.
+pub fn momentScale(call: AggCall) ?u8 {
+    const arg = call.arg orelse return null;
+    return if (arg.typeOf() == .dec) arg.decSpec().?.scale else null;
+}
+
+/// Row `r` of the variance family's argument as the DOUBLE it folds: a float lane, an integer lane widened (a UInt64
+/// column keeps its bits in the i64 lane), or a DECIMAL's unscaled value at `scale`. Null for any other lane.
+pub inline fn momentAt(col: filter_eval.Batch.Column, r: usize, unsigned_64: bool, scale: ?u8) ?f64 {
+    if (scale) |s| return switch (col) {
+        .i32, .i64, .i128 => expr_ast.decimalToDouble(exactAt(col, r), s),
+        else => null,
+    };
+    return switch (col) {
+        .i32 => |c| @floatFromInt(c.values[r]),
+        .i64 => |c| if (unsigned_64) @floatFromInt(@as(u64, @bitCast(c.values[r]))) else @floatFromInt(c.values[r]),
+        .f32 => |c| c.values[r],
+        .f64 => |c| c.values[r],
+        else => null,
+    };
+}
+
+/// The selected rows in order through the running mean and squared deviations: the order is the answer, so no block
+/// or SIMD reordering.
+fn foldMoments(
+    state: *Accumulator,
+    col: filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    unsigned_64: bool,
+    scale: ?u8,
+) Error!void {
+    const m = &state.moments;
+    var r: usize = 0;
+    while (r < sel.len) : (r += 1) {
+        if (sel.isActive(r)) m.add(momentAt(col, r, unsigned_64, scale) orelse return error.UnsupportedAggType);
+    }
 }
 
 /// Row `r` of an exact column (any of its lanes) as an unscaled i128.

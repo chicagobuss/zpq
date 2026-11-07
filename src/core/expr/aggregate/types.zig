@@ -13,7 +13,115 @@ pub const AggFunc = enum {
     min,
     max,
     avg,
+    /// `var_samp`, `var_pop`, `stddev_samp`, `stddev_pop` (`variance` and `stddev` are the sample forms): a DOUBLE
+    /// from the running mean and sum of squared deviations (`Moments`), NULL where the form has too few values.
+    var_samp,
+    var_pop,
+    stddev_samp,
+    stddev_pop,
+
+    /// A function only the generic fold and merge (`foldGroupedOne`, `scalar.zig`) run: the specialized strategies
+    /// (dense, coded, owner records, partitioned, sketch) know the original six and decline a query that has one of
+    /// these, so none can reach an arm it was not written for.
+    pub fn extended(f: AggFunc) bool {
+        return switch (f) {
+            .count, .count_distinct, .sum, .min, .max, .avg => false,
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop => true,
+        };
+    }
 };
+
+/// The running state of the variance family: Welford's streaming mean and sum of squared deviations (DOI
+/// 10.2307/1266577) as DuckDB 2.0 folds them, so a row group folds in row order and the row groups combine in input
+/// order (the ordered-block mode every `f64` result is already in) to the same bits at every `-j`.
+pub const Moments = struct {
+    count: u64 = 0,
+    mean: f64 = 0,
+    dsquared: f64 = 0,
+
+    pub fn add(self: *Moments, x: f64) void {
+        self.count += 1;
+        const mean_differential = (x - self.mean) / @as(f64, @floatFromInt(self.count));
+        const new_mean = self.mean + mean_differential;
+        const dsquared_increment = (x - new_mean) * (x - self.mean);
+        self.dsquared += dsquared_increment;
+        self.mean = new_mean;
+    }
+
+    /// Chan et al.'s pairwise combine, with DuckDB's fused multiply-add for the mean.
+    pub fn combine(target: *Moments, source: Moments) error{Overflow}!void {
+        if (target.count == 0) {
+            target.* = source;
+        } else if (source.count > 0) {
+            const count = std.math.add(u64, target.count, source.count) catch return error.Overflow;
+            const target_count: f64 = @floatFromInt(target.count);
+            const source_count: f64 = @floatFromInt(source.count);
+            const total_count: f64 = @floatFromInt(count);
+            const delta = source.mean - target.mean;
+            const mean = @mulAdd(f64, source_count / total_count, delta, target.mean);
+            target.dsquared = source.dsquared + target.dsquared + delta * delta * source_count * target_count / total_count;
+            target.mean = mean;
+            target.count = count;
+        }
+    }
+
+    /// The answer of `func`, null where the form has too few values: the sample forms need two, the population forms one
+    /// (and give 0 for one).
+    pub fn result(self: Moments, func: AggFunc) ?f64 {
+        const n: f64 = @floatFromInt(self.count);
+        return switch (func) {
+            .var_samp => if (self.count <= 1) null else self.dsquared / (n - 1),
+            .var_pop => if (self.count == 0) null else if (self.count > 1) self.dsquared / n else 0,
+            .stddev_samp => if (self.count <= 1) null else @sqrt(self.dsquared / (n - 1)),
+            .stddev_pop => if (self.count == 0) null else if (self.count > 1) @sqrt(self.dsquared / n) else 0,
+            else => unreachable,
+        };
+    }
+};
+
+test "Moments: DuckDB 2.0.0's Welford fold, its NULLs, and a combine of two halves" {
+    const T = std.testing;
+    var m: Moments = .{};
+    // Values from DuckDB: `var_samp`, `var_pop`, `stddev_pop` over (2, 4, 4, 4, 5, 5, 7, 9).
+    for ([_]f64{ 2, 4, 4, 4, 5, 5, 7, 9 }) |x| m.add(x);
+    try T.expectEqual(@as(?f64, 4.571428571428571), m.result(.var_samp));
+    try T.expectEqual(@as(?f64, 4.0), m.result(.var_pop));
+    try T.expectEqual(@as(?f64, 2.0), m.result(.stddev_pop));
+    // Ill-conditioned: three values about 10^9 apart by tenths, bit for bit what DuckDB answers.
+    var near: Moments = .{};
+    for ([_]f64{ 1e9 + 0.1, 1e9 + 0.2, 1e9 + 0.4 }) |x| near.add(x);
+    try T.expectEqual(@as(?f64, 0.023333316644034596), near.result(.var_samp));
+    try T.expectEqual(@as(?f64, 0.015555544429356397), near.result(.var_pop));
+    try T.expectEqual(@as(?f64, 0.1527524685366315), near.result(.stddev_samp));
+    try T.expectEqual(@as(?f64, 0.12472186828842967), near.result(.stddev_pop));
+    // One value: the sample forms are NULL, the population forms 0. None: all NULL.
+    var one: Moments = .{};
+    one.add(42.5);
+    try T.expectEqual(@as(?f64, null), one.result(.var_samp));
+    try T.expectEqual(@as(?f64, null), one.result(.stddev_samp));
+    try T.expectEqual(@as(?f64, 0.0), one.result(.var_pop));
+    try T.expectEqual(@as(?f64, 0.0), one.result(.stddev_pop));
+    const none: Moments = .{};
+    inline for (.{ .var_samp, .var_pop, .stddev_samp, .stddev_pop }) |f| try T.expectEqual(@as(?f64, null), none.result(f));
+    // Infinity and NaN poison the result, as in DuckDB.
+    var bad: Moments = .{};
+    for ([_]f64{ 1, std.math.inf(f64), 3 }) |x| bad.add(x);
+    try T.expect(std.math.isNan(bad.result(.var_pop).?));
+    // Two halves combine to the whole within rounding, and an empty side is the identity.
+    var lo: Moments = .{};
+    var hi: Moments = .{};
+    for ([_]f64{ 2, 4, 4, 4 }) |x| lo.add(x);
+    for ([_]f64{ 5, 5, 7, 9 }) |x| hi.add(x);
+    try lo.combine(hi);
+    try T.expectApproxEqRel(@as(f64, 4.571428571428571), lo.result(.var_samp).?, 1e-15);
+    var empty: Moments = .{};
+    try empty.combine(hi);
+    try T.expectEqual(hi, empty);
+    try lo.combine(.{});
+    try T.expectEqual(@as(u64, 8), lo.count);
+    var full: Moments = .{ .count = std.math.maxInt(u64), .mean = 1, .dsquared = 1 };
+    try T.expectError(error.Overflow, full.combine(hi));
+}
 
 /// One aggregate call. `arg` is null only for `count(*)`. `where` is
 /// null when there's no FILTER clause (apply to all surviving rows).
@@ -256,6 +364,13 @@ pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShap
             break :blk .i64;
         },
         .avg => if (arg != null and arg.?.typeOf() == .dec) .avg_dec else .avg_f64,
+        // A DOUBLE whatever the numeric argument (a DECIMAL or an integer is read as one); dates, booleans and text
+        // are DuckDB's binder errors.
+        .var_samp, .var_pop, .stddev_samp, .stddev_pop => blk: {
+            const e = arg orelse return error.BadAggArg;
+            if (e.temporal() != null or e.isBoolean() or e.typeOf() == .str) return error.UnsupportedAggType;
+            break :blk .f64;
+        },
         .sum => blk: {
             const e = arg orelse return error.BadAggArg;
             break :blk switch (e.typeOf()) {

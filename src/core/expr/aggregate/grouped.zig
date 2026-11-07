@@ -188,6 +188,9 @@ fn applyGrouped(
         else
             foldMaxGroupedOne(state, values.?, r, u64_col),
         .avg => try foldAvgGroupedOne(state, values.?, r, u64_col),
+        .var_samp, .var_pop, .stddev_samp, .stddev_pop => state.moments.add(
+            scalar.momentAt(values.?, r, u64_col, scalar.momentScale(call)) orelse return error.UnsupportedAggType,
+        ),
     }
 }
 

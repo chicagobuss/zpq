@@ -44,6 +44,7 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
         else if (call.result == .avg_dec)
             decValue(try expr_agg.avgDecMean(call, state.avg_d), expr_agg.resultDec(call))
         else if (expr_agg.avgMean(state.avg)) |m| .{ .f = m } else .null_val,
+        .var_samp, .var_pop, .stddev_samp, .stddev_pop => if (state.moments.result(call.func)) |v| .{ .f = v } else .null_val,
     };
 }
 

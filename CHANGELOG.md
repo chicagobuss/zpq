@@ -30,6 +30,11 @@
   expression, and `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `isodow` and
   `dayofyear` of a date or timestamp, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB (a DECIMAL keeps
   DECIMAL(p, 0) after `floor`, an integer floors to a DOUBLE, `least` skips NULLs, `sqrt` of a negative is NaN).
+- **`var_samp`, `var_pop`, `stddev_samp` and their aliases `variance` and `stddev` in SQL.** Over an integer, float or
+  DECIMAL column or expression, scalar or per group, with a FILTER, in a SELECT, HAVING or ORDER BY. They fold Welford's
+  running mean as DuckDB 2.0 does (bit for bit within a row group) and combine row groups in file order, so the answer
+  is the same at every `-j`; across row groups DuckDB's own digits vary with its threads. `DISTINCT` and date, BOOLEAN
+  and text arguments are refused by name.
 - **`bool_or` and `bool_and` in SQL.** Over a BOOLEAN column, in a SELECT, with a FILTER or per group, they match DuckDB
   (NULL over no values); any other argument is refused by name.
 - **`strftime` in SQL.** `strftime(t, format)` of a DATE or TIMESTAMP (a constant format of DuckDB's specifiers) runs in a

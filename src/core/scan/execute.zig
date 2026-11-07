@@ -526,6 +526,20 @@ const WorkPhase = struct {
     workers: usize,
 };
 
+// Large private dense lanes compete for the same L2 on SMT siblings and each adds another full merge pass.
+// Unknown cache topology must leave the caller's parallelism alone.
+fn denseCacheWorkers(workers: usize, independent: usize, l2_share: usize, lane_bytes: usize) usize {
+    if (l2_share == 0 or lane_bytes <= l2_share) return workers;
+    return @min(workers, @max(1, independent));
+}
+
+test "dense cache workers retain unknown and fitting lanes and cap large sibling lanes" {
+    try testing.expectEqual(@as(usize, 32), denseCacheWorkers(32, 16, 0, 1024));
+    try testing.expectEqual(@as(usize, 32), denseCacheWorkers(32, 16, 1024, 1024));
+    try testing.expectEqual(@as(usize, 16), denseCacheWorkers(32, 16, 1024, 1025));
+    try testing.expectEqual(@as(usize, 8), denseCacheWorkers(8, 16, 1024, 1025));
+}
+
 fn buildWorkPhase(
     comptime explain: bool,
     gpa: std.mem.Allocator,
@@ -1043,6 +1057,35 @@ fn prepareAggregateWithMetas(
             (!agg_dense.orderSensitive(agg_calls) and agg_dense.numericFits(d.ids(), agg_calls))
     else
         false;
+    // Consider the smaller worker set before dense admission: too many lanes can reject the dense plan entirely.
+    // Restrict the choice to exact composite folds without a cut or filter; ordered/float and selected plans retain
+    // their established partitioning and cost decisions. An explicit thread count always wins.
+    if (args.parallelism == 0 and args.encoded and dense_supported and filter_opt == null and
+        args.result_order.limit == null and allRescannable(args.inputs)) if (domain) |*d|
+    {
+        const product_sum = d.axes.len > 1 and agg_dense.sumCall(agg_calls) != null;
+        if (d.axes.len > 1 and (product_sum or agg_dense.countOnly(agg_calls))) {
+            const hw = @import("../hw.zig");
+            const rows = ndv_stat.?.rows;
+            const lane = agg_dense.laneBytes(d.ids(), agg_calls, rows, product_sum) +|
+                if (product_sum) agg_dense.partialBytes(d.ids(), rows) else 0;
+            const capped = denseCacheWorkers(n_workers, hw.independentOwnerWorkers(n_workers), hw.l2BytesPerWorker(), lane);
+            if (capped < n_workers and d.globalFits(capped)) {
+                var candidate = plan_inputs;
+                candidate.workers = capped;
+                const initial = planAggregate(candidate).dispatch;
+                const stride = expr_agg.fixedGroupStride(group_by_keys.?) orelse 0;
+                const quote = agg_dense.charge(d, capped, agg_calls, rows, stride, null).total;
+                candidate.dense_bytes = quote;
+                const proposed = planAggregate(candidate).dispatch;
+                const available = if (args.ledger) |ledger| ledger.available() else args.max_memory;
+                if (!initial.use_blocks and !proposed.use_blocks and proposed.strategy == .plain_hash and quote <= available) {
+                    n_workers = capped;
+                    plan_inputs.workers = capped;
+                }
+            }
+        }
+    };
     var dense_profitable = true;
     if (args.encoded and dense_supported) if (domain) |*d| {
         const initial = planAggregate(plan_inputs).dispatch;

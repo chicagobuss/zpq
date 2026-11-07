@@ -206,7 +206,7 @@ pub fn planProjection(arena: std.mem.Allocator, args: QueryArgs, meta0: *const s
                     if (c.col_idx < num_leaves) fetch[c.col_idx] = true;
                 },
                 else => {
-                    const alias = item.alias orelse return error.MissingOutputOrAggregate; // alias required
+                    const alias = item.alias orelse return error.SelectAliasRequired;
                     try output_specs.append(arena, .{ .computed = .{ .expr = item.expr, .alias = alias } });
                     any_computed = true;
                     item.expr.collectColumns(fetch);

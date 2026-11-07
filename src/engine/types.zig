@@ -36,6 +36,7 @@ pub const Error = error{
     EmptyAggregate,
     AggregateMutexWithSelect,
     MissingOutputOrAggregate,
+    SelectAliasRequired,
     SchemaMismatch,
     NestedReencodeNotSupported,
     INT96ReencodeNotSupported,

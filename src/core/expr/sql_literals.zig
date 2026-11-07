@@ -19,6 +19,8 @@ pub const Markers = struct {
     group_len: usize = 0,
     ilike: [48]u8 = undefined,
     ilike_len: usize = 0,
+    /// `rewrite` changed more than a `x::TYPE` to the `CAST(x AS TYPE)` it means: a folded literal, an ILIKE, GROUP BY ALL.
+    rewrote: bool = false,
 
     pub fn choose(sql: []const u8) error{BadValue}!Markers {
         var m: Markers = .{};
@@ -626,6 +628,7 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) E
                     const body = operand[1 .. operand.len - 1];
                     const typed: Typed = .{ .kind = kind.?, .at = try moment(body, kind.?, report), .end = te };
                     next = try foldTyped(allocator, &out, sql, typed, report);
+                    report.markers.rewrote = true;
                 } else {
                     try out.print(allocator, "CAST({s} AS {s})", .{ operand, type_text });
                 }
@@ -675,6 +678,7 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) E
             if (!cast_form or chained) {
                 const start = out.items.len;
                 i = try foldTyped(allocator, &out, sql, typed, report);
+                report.markers.rewrote = true;
                 atom = .{ .have = true, .start = start, .end = out.items.len };
                 continue;
             }
@@ -691,6 +695,7 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) E
             try out.appendSlice(allocator, " escape '");
             try out.appendSlice(allocator, report.markers.ilikeEscape());
             try out.append(allocator, '\'');
+            report.markers.rewrote = true;
             atom.have = false;
             i = stop;
             continue;
@@ -698,6 +703,7 @@ pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) E
         if (wordIs(sql, i, "group")) if (groupByAllAt(sql, i)) |stop| {
             try out.appendSlice(allocator, "group by ");
             const name = report.markers.groupAll();
+            report.markers.rewrote = true;
             try out.appendSlice(allocator, name);
             atom = .{ .have = true, .start = out.items.len - name.len, .end = out.items.len };
             i = stop;

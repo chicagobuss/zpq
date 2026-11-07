@@ -7,6 +7,7 @@ const parser = @import("parser.zig");
 const literals = @import("sql_literals.zig");
 const sql_join = @import("sql_join.zig");
 const sql_setops = @import("sql_setops.zig");
+const sql_names = @import("sql_names.zig");
 const schema = @import("../schema.zig");
 const metadata = @import("../parquet/metadata.zig");
 
@@ -329,29 +330,35 @@ fn tableQualifier(path: []const u8, alias: ?[]const u8) []const u8 {
 
 /// A column written `t.g` where `t` names the query's one table is the column `g`: drop the qualifier everywhere, so the
 /// rest of the frontend sees what it always has. A qualifier that names nothing here stays (a nested column's path), as
-/// does a schema-qualified name.
-fn dropTableQualifier(root: *c.LpNode, qualifier: []const u8) void {
+/// does a schema-qualified name. Whether it dropped any.
+fn dropTableQualifier(root: *c.LpNode, qualifier: []const u8) bool {
+    const State = struct { qualifier: []const u8, dropped: bool = false };
     const Visit = struct {
         fn enter(data: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
-            const q: *const []const u8 = @ptrCast(@alignCast(data.*.user_data));
+            const state: *State = @ptrCast(@alignCast(data.*.user_data));
             if (node.*.kind == c.LP_EXPR_COLUMN_REF) {
                 const ref = &node.*.u.column_ref;
                 const table = ref.table orelse return 0;
                 if (ref.schema != null or ref.column == null) return 0;
-                if (!std.ascii.eqlIgnoreCase(std.mem.span(table), q.*)) return 0;
+                if (!std.ascii.eqlIgnoreCase(std.mem.span(table), state.qualifier)) return 0;
                 ref.table = null;
                 ref.quoted &= ~@as(@TypeOf(ref.quoted), c.LP_QUOTED_TABLE);
+                state.dropped = true;
             } else if (node.*.kind == c.LP_EXPR_STAR) {
                 const star = &node.*.u.star;
                 const table = star.table orelse return 0;
-                if (std.ascii.eqlIgnoreCase(std.mem.span(table), q.*)) star.table = null;
+                if (std.ascii.eqlIgnoreCase(std.mem.span(table), state.qualifier)) {
+                    star.table = null;
+                    state.dropped = true;
+                }
             }
             return 0;
         }
     };
-    var qualifier_copy = qualifier;
-    var visitor: c.LpVisitor = .{ .user_data = @ptrCast(&qualifier_copy), .enter = Visit.enter, .leave = null };
+    var state: State = .{ .qualifier = qualifier };
+    var visitor: c.LpVisitor = .{ .user_data = @ptrCast(&state), .enter = Visit.enter, .leave = null };
     c.lp_ast_walk(root, &visitor);
+    return state.dropped;
 }
 
 /// The grammar reads an unquoted `true` / `false` as a column name, which the unparser then quotes (`"true"`), and
@@ -1492,9 +1499,12 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
         diagnosticPrint("sql: only SELECT is supported (no UNION/INSERT/DDL)\n", .{});
         return error.UnsupportedStatement;
     }
+    // What DuckDB would name an unaliased select item from is the text as written: any rewrite of it, here or before the
+    // parse, leaves the items to be named by an alias.
+    var as_written = std.mem.eql(u8, folded_sql, sql_c) and !markers.rewrote;
     if (root.*.u.select.from) |from| if (from.*.kind == c.LP_FROM_TABLE and from.*.u.from_table.name != null) {
         const alias: ?[]const u8 = if (from.*.u.from_table.alias) |a| std.mem.span(a) else null;
-        dropTableQualifier(root, tableQualifier(stripQuotes(std.mem.span(from.*.u.from_table.name)), alias));
+        if (dropTableQualifier(root, tableQualifier(stripQuotes(std.mem.span(from.*.u.from_table.name)), alias))) as_written = false;
     };
     try distinctAsGroupBy(root, lp_arena);
     try groupByAll(root, lp_arena, markers.groupAll());
@@ -1636,7 +1646,7 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
 
     if (structured) {
         const owned = try lower.arena.create(syntax.Query);
-        owned.* = try lowerQuery(&lower, root, select_cols, result_order, is_aggregate, has_group_by);
+        owned.* = try lowerQuery(&lower, root, select_cols, result_order, is_aggregate, has_group_by, as_written);
         return .{
             .syntax = owned,
             .syntax_arena = syntax_owner,
@@ -1792,7 +1802,7 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
     };
 }
 
-fn lowerQuery(lower: *Lower, root: *const c.LpNode, cols: []const ast.SelectColumn, order: ast.ResultOrder, aggregate: bool, grouped: bool) !syntax.Query {
+fn lowerQuery(lower: *Lower, root: *const c.LpNode, cols: []const ast.SelectColumn, order: ast.ResultOrder, aggregate: bool, grouped: bool, as_written: bool) !syntax.Query {
     const a = lower.arena;
     const sel = root.u.select;
     const columns = try a.alloc(syntax.Column, cols.len);
@@ -1810,6 +1820,15 @@ fn lowerQuery(lower: *Lower, root: *const c.LpNode, cols: []const ast.SelectColu
             star = true;
         } else {
             out.expr = try lower.expression(node, 0);
+            // A computed row column with no alias is named as DuckDB names it, where that is exact.
+            if (!aggregate and out.alias == null and as_written and out.expr.? != .column) {
+                if (sql_names.of(a, node)) |name| {
+                    out.alias = name;
+                } else |err| switch (err) {
+                    error.Unnameable => {},
+                    error.OutOfMemory => return error.OutOfMemory,
+                }
+            }
             if (!aggregate) try selected.append(a, .{ .expr = out.expr.?, .alias = out.alias });
         }
     }
@@ -3138,6 +3157,84 @@ test "sql_parser reads EXTRACT(part FROM x) as date_part('part', x), quoted text
     const q = try parseSqlQuery(a, "SELECT extract(minute FROM t) AS m, count(*) FROM f GROUP BY m");
     defer q.deinit(a);
     try std.testing.expectEqualStrings("date_part('minute', t)", q.select_cols[0].expr);
+}
+
+test "sql_parser names an unaliased computed row column as DuckDB does, and leaves what it cannot for an alias" {
+    const a = std.testing.allocator;
+    const named = [_][2][]const u8{
+        .{ "n + 1", "(n + 1)" },
+        .{ "N+1", "(N + 1)" },
+        .{ "n * 2 + 1", "((n * 2) + 1)" },
+        .{ "(n) + (1)", "(n + 1)" },
+        .{ "-n", "(-(n))" },
+        .{ "-5 + n", "(-5 + n)" },
+        .{ "n + -1", "(n + -1)" },
+        .{ "n % 3", "(n % 3)" },
+        .{ "n / 2", "(n / 2)" },
+        .{ "s || s2", "(s || s2)" },
+        .{ "'it''s' || s", "('it''s' || s)" },
+        .{ "1.50 + n", "(1.50 + n)" },
+        .{ "1E3 * n", "(1E3 * n)" },
+        .{ "abs(n)", "abs(n)" },
+        .{ "ABS( n )", "abs(n)" },
+        .{ "round(x,2)", "round(x, 2)" },
+        .{ "length(s) * 2", "(length(s) * 2)" },
+        .{ "mod(n, 3)", "mod(n, 3)" },
+        .{ "coalesce(x, y)", "COALESCE(x, y)" },
+        .{ "ifnull(x, y)", "COALESCE(x, y)" },
+        .{ "year(d)", "\"year\"(d)" },
+        .{ "substring(s, 2, 3)", "\"substring\"(s, 2, 3)" },
+        .{ "left(s, 2)", "\"left\"(s, 2)" },
+        .{ "\"name\" + 1", "(\"name\" + 1)" },
+        .{ "\"Mixed Case\" + 1", "(\"Mixed Case\" + 1)" },
+        .{ "CAST(n AS BIGINT)", "CAST(n AS BIGINT)" },
+        .{ "cast(n as int)", "CAST(n AS INTEGER)" },
+        .{ "n::real", "CAST(n AS FLOAT)" },
+        .{ "x::double", "CAST(x AS double)" },
+        .{ "x::DOUBLE", "CAST(x AS DOUBLE)" },
+        .{ "d::date", "CAST(d AS date)" },
+        .{ "date_trunc('month', d)::date", "CAST(date_trunc('month', d) AS date)" },
+        .{ "n::INT + n::BIGINT", "(CAST(n AS INTEGER) + CAST(n AS BIGINT))" },
+    };
+    for (named) |case| {
+        const sql = try std.fmt.allocPrint(a, "SELECT {s} FROM 'f.parquet'", .{case[0]});
+        defer a.free(sql);
+        const q = try parseSqlPlan(a, sql);
+        defer q.deinit(a);
+        const items = q.syntax.?.select.?;
+        try std.testing.expectEqual(@as(usize, 1), items.len);
+        try std.testing.expectEqualStrings(case[1], items[0].alias orelse "<none>");
+    }
+    // Rewritten before the parse, or printed by DuckDB in a form not followed: the alias stays for the user to give.
+    const left = [_][]const u8{
+        "n // 2",
+        "- -5",
+        "extract(year FROM d)",
+        "position('a' IN s)",
+        "substring(s FROM 2)",
+        "TRY_CAST(n AS SMALLINT)",
+        "n::tinyint2",
+        "n::decimal(10,2)",
+        "n::varchar(10)",
+        "CASE WHEN n > 1 THEN 1 ELSE 0 END",
+        "DATE '2020-01-01' + n",
+        "unknown_fn(n)",
+    };
+    for (left) |item| {
+        const sql = try std.fmt.allocPrint(a, "SELECT {s} FROM 'f.parquet'", .{item});
+        defer a.free(sql);
+        const q = parseSqlPlan(a, sql) catch continue;
+        defer q.deinit(a);
+        const items = q.syntax.?.select orelse continue;
+        try std.testing.expect(items[0].alias == null);
+    }
+    // A qualifier dropped from a column is a rewrite too; an alias the user gave is theirs.
+    const qualified = try parseSqlPlan(a, "SELECT t.n + 1 FROM 'f.parquet' t");
+    defer qualified.deinit(a);
+    try std.testing.expect(qualified.syntax.?.select.?[0].alias == null);
+    const given = try parseSqlPlan(a, "SELECT n + 1 AS z, n FROM 'f.parquet'");
+    defer given.deinit(a);
+    try std.testing.expectEqualStrings("z", given.syntax.?.select.?[0].alias.?);
 }
 
 test "sql_parser reads position(a IN b) as strpos(b, a), quoted text and other calls left alone" {

@@ -373,6 +373,7 @@ fn querySetupError(err: anyerror, diag: *const Diag) bool {
             .{},
         ),
         error.MissingOutputOrAggregate => diagnosticPrint("zpq query: missing --output or --aggregate\n", .{}),
+        error.SelectAliasRequired => diagnosticPrint("zpq query: a computed select item needs an alias (AS name)\n", .{}),
         error.SchemaMismatch => diagnosticPrint("zpq query: schema mismatch across inputs\n", .{}),
         error.InvalidUtf8 => diagnosticPrint(
             "zpq query: column `{s}` holds a STRING value that is not valid UTF-8;\n" ++

@@ -106,11 +106,13 @@ pub const RowSource = struct {
                 try identity.keyValueAs(u128, owner.key(owner.ctx, slot.idx), out.source.key)
             else
                 try identity.keyValue(.{ .dense_u32 = @intCast(slot.idx) }, out.source.key);
-            return switch (key) {
+            const value: AggValue = switch (key) {
                 .null_val => .null_val,
                 .i => |v| .{ .i = v },
                 .s => |v| .{ .s = try gpa.dupe(u8, v) },
             };
+            if (out.derived) |e| if (e == .col_ref and e.col_ref.fetch != null) return fetched(gpa, e, value);
+            return value;
         }
         var buf: [48]u8 = undefined;
         const bytes = if (s.fixed_keys) expr_agg.canonicalKey(slot.key, &buf) else slot.key;
@@ -119,6 +121,8 @@ pub const RowSource = struct {
 
     fn keyValue(s: *const RowSource, gpa: std.mem.Allocator, bytes: []const u8, out: BoundOutputColumn) !AggValue {
         const e = out.derived orelse return deserializeKeyColumnMode(gpa, bytes, out.source.key, s.key_types, s.borrowed_strings.len != 0);
+        if (e == .col_ref and e.col_ref.fetch != null)
+            return fetched(gpa, e, try deserializeKeyColumnMode(gpa, bytes, out.source.key, s.key_types, true));
         const Reader = struct {
             src: *const RowSource,
             gpa: std.mem.Allocator,
@@ -257,6 +261,25 @@ pub const RowSource = struct {
         };
     }
 };
+
+/// A build column's value for its group (`expr_ast.Fetch`), from the value of the key that determines it, as the
+/// column would have read back as a key itself (`key_decode.keyTypeFromExpr`).
+fn fetched(gpa: std.mem.Allocator, e: expr_ast.Expr, base: AggValue) !AggValue {
+    const f = e.col_ref.fetch.?;
+    const key: i64 = switch (base) {
+        .null_val => return .null_val,
+        .i => |v| std.math.cast(i64, v) orelse return .null_val,
+        else => return error.BadGroupKey,
+    };
+    const v = f.value(f.ctx, f.payload, key) orelse return .null_val;
+    return switch (@import("key_decode.zig").keyTypeFromExpr(e)) {
+        .i64 => .{ .i = v.int },
+        .u64 => .{ .i = @as(u64, @bitCast(v.int)) },
+        .dec => |spec| .{ .dec = .{ .v = v.int, .spec = spec } },
+        .f64 => .{ .f = v.float },
+        .string => .{ .s = try gpa.dupe(u8, v.bytes) },
+    };
+}
 
 /// Drop groups before allocating their output cells. Key predicates and output forms whose finalization can
 /// fail stay with ResultProgram, so a discarded group cannot hide an output error.

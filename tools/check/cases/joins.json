@@ -4067,6 +4067,326 @@
    }
   },
   {
+   "id": "join:fd:chain-key-determines-its-table",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, gname, rname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:snow_region}' r WHERE f.fk = d.pk AND d.grp = g.gk AND g.grk = r.rk GROUP BY d.grp, gname, rname ORDER BY s DESC, d.grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, gname, rname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:snow_region}' r WHERE f.fk = d.pk AND d.grp = g.gk AND g.grk = r.rk GROUP BY d.grp, gname, rname ORDER BY s DESC, d.grp"
+   }
+  },
+  {
+   "id": "join:fd:probe-fk-determines-its-build",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, kind, w, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind, w ORDER BY s DESC, f.fk LIMIT 15"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, kind, w, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind, w ORDER BY s DESC, f.fk LIMIT 15"
+   }
+  },
+  {
+   "id": "join:fd:order-by-a-dependent",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, kind, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY kind DESC, f.fk LIMIT 12"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, kind, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY kind DESC, f.fk LIMIT 12"
+   }
+  },
+  {
+   "id": "join:fd:having-a-dependent",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk GROUP BY d.grp, gname HAVING gname <> 'g1' ORDER BY d.grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk GROUP BY d.grp, gname HAVING gname <> 'g1' ORDER BY d.grp"
+   }
+  },
+  {
+   "id": "join:fd:left-join-misses-and-null-fks",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, kind, count(DISTINCT q) AS dq, count(*) AS n FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk AND d.grp < 2 GROUP BY f.fk, kind ORDER BY f.fk NULLS FIRST LIMIT 20"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, kind, count(DISTINCT q) AS dq, count(*) AS n FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk AND d.grp < 2 GROUP BY f.fk, kind ORDER BY f.fk NULLS FIRST LIMIT 20"
+   }
+  },
+  {
+   "id": "join:fd:plain-strings",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, uname, ukind, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk GROUP BY f.fk, uname, ukind ORDER BY s DESC, f.fk LIMIT 10"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "8M"
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, uname, ukind, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk GROUP BY f.fk, uname, ukind ORDER BY s DESC, f.fk LIMIT 10"
+   }
+  },
+  {
+   "id": "join:fd:dependent-not-selected",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk GROUP BY d.grp, gname ORDER BY d.grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk GROUP BY d.grp, gname ORDER BY d.grp"
+   }
+  },
+  {
+   "id": "join:fd:without-its-base",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk GROUP BY gname ORDER BY gname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk GROUP BY gname ORDER BY gname"
+   }
+  },
+  {
    "id": "review:jr1:decimal-residual-and-sum",
    "fixture": "review-fact",
    "cli": [

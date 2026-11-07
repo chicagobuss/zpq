@@ -2029,13 +2029,14 @@ fn prepareAggregateWithMetas(
         for (outputs, col_types) |out, *ct| ct.* = switch (out.source) {
             .key => |k_idx| .{
                 .nullable = true,
-                .lane = switch (key_types[k_idx]) {
+                // A derived column's lane is its own: a fetched build column (`expr_ast.Fetch`) is no integer key's.
+                .lane = switch (if (out.derived) |d| keyTypeFromExpr(d) else key_types[k_idx]) {
                     .i64, .u64 => .i64,
                     .f64 => .f64,
                     .string => .string,
                     .dec => .dec,
                 },
-                .dec = if (key_types[k_idx] == .dec) key_types[k_idx].dec else null,
+                .dec = if (out.derived) |d| d.decSpec() else if (key_types[k_idx] == .dec) key_types[k_idx].dec else null,
                 .source = if (out.derived != null) null else if (keys[k_idx] == .col_ref)
                     leafSchemaElem(meta0, keys[k_idx].col_ref.col_idx)
                 else

@@ -60,6 +60,11 @@ pub const Payload = struct {
     /// dictionary-encode, laid out by slot without hashing (`build`). The scan publishes its values, never codes, so
     /// no consumer reads it as a dictionary.
     plain: bool = false,
+    /// A snowflake's column, published through this build (`chain`): the payload of this build holding the FK into
+    /// `inner`, and the column there. The FK's value determines it, as `inner`'s keys are unique.
+    via: ?Via = null,
+
+    pub const Via = struct { fk: usize, inner: *const Join, p: usize };
 };
 
 /// Per-slot codes, two bytes each when the dictionary has fewer than 2^16 values.
@@ -1174,16 +1179,30 @@ pub fn chain(a: std.mem.Allocator, j: *Join, fk: usize, inner: *const Join) !voi
     }
     const out = try a.alloc(Payload, j.payloads.len + inner.payloads.len);
     @memcpy(out[0..j.payloads.len], j.payloads);
-    for (inner.payloads, out[j.payloads.len..]) |ip, *op| {
+    for (inner.payloads, out[j.payloads.len..], 0..) |ip, *op, ip_index| {
         const codes: Codes = try .init(a, j.n, ip.dict.len());
         for (0..j.n) |s| {
             const at = by_code[f.codes.get(@intCast(s))];
             if (at == EMPTY) return error.LookupWithoutMatch;
             codes.set(@intCast(s), ip.codes.get(at));
         }
-        op.* = .{ .name = ip.name, .element = ip.element, .codes = codes, .dict = ip.dict, .plain = ip.plain };
+        op.* = .{ .name = ip.name, .element = ip.element, .codes = codes, .dict = ip.dict, .plain = ip.plain, .via = .{ .fk = fk, .inner = inner, .p = ip_index } };
     }
     j.payloads = out;
+}
+
+/// Payload `p` at the build row whose key is `key` (`expr_ast.Fetch.value`, `ctx` the join); null for no such row.
+pub fn fetch(ctx: *const anyopaque, p: usize, key: i64) ?@import("../expr/ast.zig").FetchValue {
+    const j: *const Join = @ptrCast(@alignCast(ctx));
+    const s = j.slot(key) orelse return null;
+    const payload = j.payloads[p];
+    const code = payload.codes.get(s);
+    return switch (payload.dict) {
+        .i32 => |d| .{ .int = d[code] },
+        .i64 => |d| .{ .int = d[code] },
+        .f64 => |d| .{ .float = d[code] },
+        .string => |d| .{ .bytes = d[code] },
+    };
 }
 
 // ---------------------------------------------------------------- group-join

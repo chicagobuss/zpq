@@ -244,7 +244,45 @@ pub const Prepared = struct {
             }
         }
         if (j.group) |g| g.order = self.order;
+        // Without a group-join, a GROUP BY key that is a build column another key determines groups by that key alone,
+        // and reads once per group (`expr_ast.Fetch`).
+        if (j.group == null) if (a.keys) |keys| {
+            a.keys = try self.withFetches(arena, keys);
+        };
         return q;
+    }
+
+    /// `keys` with each build-column key that another bare key determines marked with how to read it from that key's
+    /// value: the join's probe FK determines its build's columns, and a snowflake's FK published through the build
+    /// determines that table's columns (`lookup.Payload.via`).
+    fn withFetches(self: *const Prepared, arena: std.mem.Allocator, keys: []const expr_ast.Expr) ![]const expr_ast.Expr {
+        const all = try self.publishing(arena);
+        var out: ?[]expr_ast.Expr = null;
+        for (keys, 0..) |k, i| {
+            if (k != .col_ref or k.col_ref.fetch != null) continue;
+            const ci = k.col_ref.col_idx;
+            const j = for (all) |x| {
+                if (x.virtualPayload(ci) != null) break x;
+            } else continue;
+            const q = j.virtualPayload(ci).?;
+            const via = j.payloads[q].via;
+            const f: expr_ast.Fetch = if (via != null and isKey(keys, j.virtual_base + via.?.fk))
+                .{ .base = j.virtual_base + via.?.fk, .ctx = via.?.inner, .payload = via.?.p, .value = lookup.fetch }
+            else if (j.domain == .signed and isKey(keys, j.fk_leaf))
+                .{ .base = j.fk_leaf, .ctx = j, .payload = q, .value = lookup.fetch }
+            else
+                continue;
+            if (out == null) out = try arena.dupe(expr_ast.Expr, keys);
+            const fp = try arena.create(expr_ast.Fetch);
+            fp.* = f;
+            out.?[i].col_ref.fetch = fp;
+        }
+        return out orelse keys;
+    }
+
+    fn isKey(keys: []const expr_ast.Expr, leaf: usize) bool {
+        for (keys) |k| if (k == .col_ref and k.col_ref.col_idx == leaf) return true;
+        return false;
     }
 
     /// The publishing joins: the main one and a star's other dimensions.

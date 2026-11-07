@@ -9,6 +9,14 @@ const Range = struct { lo: i128, hi: i128, column: bool = false };
 /// Bare column keys are always retained. Return one dependency's old index for a removable expression; every
 /// reference must have its own retained key. Injectivity is unnecessary: the retained tuple fixes the result.
 pub fn dependency(expr: ast.Expr, keys: []const ast.Expr) ?usize {
+    // A build column whose value its join's key determines (`ast.Fetch`), beside that key kept bare.
+    if (expr == .col_ref) {
+        const f = expr.col_ref.fetch orelse return null;
+        return for (keys, 0..) |k, i| {
+            if (k == .col_ref and k.col_ref.col_idx == f.base and k.col_ref.fetch == null and k.col_ref.expr_type == .i64 and
+                !k.col_ref.unsigned_64) break i;
+        } else null;
+    }
     if (expr != .binop) return null;
     const bounds = range(expr, keys) orelse return null;
     if (!bounds.column) return null;

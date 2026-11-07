@@ -289,7 +289,25 @@ pub const ColRef = struct {
     temporal: ?Temporal = null,
     /// The TIMESTAMP is UTC-adjusted (TIMESTAMP WITH TIME ZONE): the same integers, another SQL type.
     utc: bool = false,
+    /// A join's build column whose value another column's determines (`Fetch`): as a GROUP BY key it is dropped
+    /// when that column is a key too, and its value fetched once per group.
+    fetch: ?*const Fetch = null,
 };
+
+/// How a build column's value follows from another column's (`base`, a leaf of the probe's schema): the join's key
+/// (its build's keys are unique) is looked up and the column read at that build row (`join/lookup.zig`). Only a
+/// value the build holds is read, so dropping the key can hide no per-row error.
+pub const Fetch = struct {
+    base: usize,
+    ctx: *const anyopaque,
+    payload: usize,
+    /// The column's value at the build row whose key is `key`; null when no build row has it (a LEFT JOIN's miss).
+    value: *const fn (ctx: *const anyopaque, payload: usize, key: i64) ?FetchValue,
+};
+
+/// A fetched value, by its lane: an integer (DECIMAL unscaled, a time in its unit, UINT64 as its bits), a DOUBLE, or
+/// bytes the build owns.
+pub const FetchValue = union(enum) { int: i64, float: f64, bytes: []const u8 };
 
 pub const BinOp = struct {
     op: Op,

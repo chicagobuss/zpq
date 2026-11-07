@@ -78,6 +78,12 @@ pub const Codes = union(enum) {
         }
     }
 
+    fn free(c: Codes, a: std.mem.Allocator) void {
+        switch (c) {
+            inline else => |v| a.free(v),
+        }
+    }
+
     /// These codes, copied into `a` at the narrowest width a dictionary of `entries` allows.
     fn narrowed(c: Codes, a: std.mem.Allocator, entries: usize) !Codes {
         const n = switch (c) {
@@ -412,6 +418,14 @@ const Part = struct {
     local: []Local = &.{},
     lo: i64 = std.math.maxInt(i64),
     hi: i64 = std.math.minInt(i64),
+
+    /// The keys and local codes, which `buildPart` allocates from the build's `gpa` rather than the part's arena.
+    fn freeLarge(p: *Part, gpa: std.mem.Allocator) void {
+        p.keys.free(gpa);
+        for (p.local) |l| l.codes.free(gpa);
+        p.keys = .{ .wide = &.{} };
+        p.local = &.{};
+    }
 };
 
 /// A part's survivors' keys, in row order: as they are, or as offsets from the part's `lo` when its keys span less
@@ -424,6 +438,12 @@ const Keys = union(enum) {
         return switch (k) {
             inline else => |v| v.len,
         };
+    }
+
+    fn free(k: Keys, a: std.mem.Allocator) void {
+        switch (k) {
+            inline else => |v| a.free(v),
+        }
     }
 
     /// Key `raw` of `v` as an i64, for a part whose smallest key is `lo`.
@@ -443,8 +463,11 @@ const Local = struct {
 pub const BuildError = error{ DuplicateBuildKey, JoinKeyType, JoinPayloadType, JoinBuildExceedsBudget, OutOfMemory };
 
 const Ctx = struct {
-    /// One per build row group: its survivors, until the build is laid out.
+    /// One per build row group: its survivors' dictionaries and remaps, until the build is laid out.
     arenas: []std.heap.ArenaAllocator,
+    /// The survivors' keys and local codes, each an exact allocation (`Part.freeLarge`): in a row group's arena
+    /// alone, a first block half again its first request held SF30 orders' 270 MB of them in ~400 MB.
+    gpa: std.mem.Allocator,
     /// One scratch arena per worker (`parallel`), reset between its row groups but kept: a row group's scratch
     /// mapped afresh and unmapped again faulted SF30 orders' 45M rows in at ~3.6 GB of new pages.
     workers: []std.heap.ArenaAllocator,
@@ -627,12 +650,16 @@ fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
         };
     }
     part.keys = if (keys.items.len != 0 and @as(i128, part.hi) - part.lo <= std.math.maxInt(u32)) blk: {
-        const out = try a.alloc(u32, keys.items.len);
+        const out = try c.gpa.alloc(u32, keys.items.len);
         for (keys.items, out) |k, *o| o.* = @intCast(k - part.lo);
         break :blk .{ .narrow = out };
-    } else .{ .wide = try a.dupe(i64, keys.items) };
+    } else .{ .wide = try c.gpa.dupe(i64, keys.items) };
+    errdefer part.keys.free(c.gpa);
+    var narrowed: usize = 0;
+    errdefer for (locals[0..narrowed]) |l| l.codes.free(c.gpa);
     for (locals) |*l| {
-        l.codes = try l.codes.narrowed(a, l.dict.len());
+        l.codes = try l.codes.narrowed(c.gpa, l.dict.len());
+        narrowed += 1;
         l.dict = switch (l.dict) {
             .string => |d| blk: {
                 const out = try a.alloc([]const u8, d.len);
@@ -816,7 +843,8 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     var workers: [max_workers]std.heap.ArenaAllocator = undefined;
     for (&workers) |*w| w.* = .init(gpa);
     defer for (&workers) |*w| w.deinit();
-    var ctx: Ctx = .{ .arenas = arenas, .workers = &workers, .bytes = bytes, .meta = meta, .spec = spec, .parts = parts };
+    defer for (parts) |*p| p.freeLarge(gpa);
+    var ctx: Ctx = .{ .arenas = arenas, .gpa = gpa, .workers = &workers, .bytes = bytes, .meta = meta, .spec = spec, .parts = parts };
     const trace = std.c.getenv("ZPQ_JOIN_TRACE") != null;
     var t = @import("../../clock.zig").monoNs();
     if (trace) t = lap("start", t);

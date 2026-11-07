@@ -1765,6 +1765,63 @@ test "a join whose group-join the budget refuses frees what it allocated, reques
     }
 }
 
+test "concurrent builds the budget refuses at any point free what they allocated" {
+    // Two dimensions build at once (`engine/join.zig` `Task`), each part's keys and codes outside its arena
+    // (`join/lookup.zig` `Part.freeLarge`): a budget that runs out anywhere in either build leaks nothing.
+    // The probe shares no column name with the dimensions, two copies of a 1600-row file its `v` matches.
+    const fact = "ci/fixtures/parquet/census_heavy.parquet"; // 8000 rows: h, g, v
+    const dim_src = "ci/fixtures/parquet/full_match.parquet"; // `ts` unique, 0..1599
+    std.Io.Dir.cwd().access(std.testing.io, fact, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(std.testing.io, dim_src, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const sql_parser = @import("../core/expr/sql_parser.zig");
+    const engine_join = @import("join.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().copyFile(dim_src, tmp.dir, "dim.parquet", std.testing.io, .{});
+    try std.Io.Dir.cwd().copyFile(dim_src, tmp.dir, "dim2.parquet", std.testing.io, .{});
+    var path_buf: [2][96]u8 = undefined;
+    const dim = try std.fmt.bufPrint(&path_buf[0], ".zig-cache/tmp/{s}/dim.parquet", .{tmp.sub_path});
+    const dim2 = try std.fmt.bufPrint(&path_buf[1], ".zig-cache/tmp/{s}/dim2.parquet", .{tmp.sub_path});
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(gpa);
+    try sql.print(gpa, "SELECT d.s, sum(e.x) AS sx, count(*) AS n FROM '{s}' c JOIN '{s}' d ON c.v = d.ts " ++
+        "JOIN '{s}' e ON c.v = e.ts GROUP BY d.s", .{ fact, dim, dim2 });
+    var answered = false;
+    var refused = false;
+    for ([_]usize{ 1, 4 }) |jobs| for ([_]usize{ 4, 16, 32, 64, 128, 256, 1024, 8192 }) |kib| {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var schemas: engine_join.LocalSchemas = .{ .arena = arena };
+        defer schemas.deinit();
+        const pq = (try sql_parser.parseSqlJoinPlan(arena, sql.items, .{ .ctx = &schemas, .footer = engine_join.LocalSchemas.footer })).?;
+        var r = runQuery(.{ .gpa = gpa, .env = .empty, .io = std.testing.io }, .{
+            .inputs = &.{fact},
+            .plan_source = @import("syntax_plan.zig").source(pq.syntax.?),
+            .aggregate = pq.aggregate_str,
+            .filter = pq.filter_str,
+            .group_by = pq.group_by_str,
+            .select = pq.select_str,
+            .select_cols = pq.select_cols,
+            .result_order = pq.result_order,
+            .parallelism = jobs,
+            .max_memory = kib * 1024,
+            .max_memory_explicit = kib * 1024,
+        }) catch |err| switch (err) {
+            error.JoinBuildExceedsBudget, error.ExceededMemoryBudget, error.DecodeExceededBudget => {
+                refused = true;
+                continue;
+            },
+            else => return err,
+        };
+        r.deinit(gpa);
+        answered = true;
+    };
+    // The sweep reaches both sides of the budget.
+    try std.testing.expect(answered and refused);
+}
+
 test "a group-join whose scan fails leaks nothing, request after request" {
     // Beside review R10's deterministic case (`join/lookup.zig`): a failed row group 0 and the later row groups' folds
     // at several job counts. The decode error's replay resets the group-join, so this does not force R10's ordering.

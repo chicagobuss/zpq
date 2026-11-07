@@ -71,7 +71,10 @@ must be a column or the alias of a select item that is one (`GroupingSetsKey`), 
 that is an expression of such a key (`coalesce(a, 'all')`) is refused by the ordinary GROUP BY check. Refused by name:
 `SELECT DISTINCT` over grouping sets (`GroupingSetsDistinct`), ROLLUP or CUBE inside GROUPING SETS (`GroupingSetsNesting`), and
 `GROUPING` of anything but a grouping key (`GroupingSetsGrouping`). A grouping-set query stands alone: as a branch of a set
-operation it is not rewritten.
+operation it is not rewritten. Lists follow DuckDB's grammar: one trailing comma is ignored (`GROUPING SETS ((a),)`), any
+other empty entry and an empty `ROLLUP ()`, `CUBE ()` or `GROUPING SETS ()` are syntax errors, and `()` among the sets is the
+grand total. A HAVING that names a key a set leaves out reads it as NULL there (`HAVING a IS NOT NULL` drops the grand-total
+row); `count(a)` and the like keep reading the column.
 
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 

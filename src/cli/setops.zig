@@ -362,7 +362,13 @@ pub fn run(
     defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
 
     var state: Run = .{ .arena = arena, .dir = dir, .stager = stager, .leaves = compound.leaves };
-    const result = try state.evalNode(compound.root);
+    var result = try state.evalNode(compound.root);
+    // A single branch (one grouping set) has not been through the pass that names its columns `c0`, `c1`, ...
+    if (!result.prepared) {
+        const kinds = try arena.alloc(Kind, result.cols.len);
+        for (result.cols, kinds) |c, *k| k.* = c.kind;
+        result = try state.prepare(result, kinds, null);
+    }
     const source = try state.glob(result.files);
 
     var select: std.ArrayList(u8) = .empty;

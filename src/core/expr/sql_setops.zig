@@ -201,7 +201,7 @@ pub fn quotedEnd(sql: []const u8, at: usize) usize {
 
 /// `tail` as the SELECT grammar takes it: ORDER BY, then LIMIT, then OFFSET. DuckDB takes LIMIT and OFFSET in either order,
 /// and an OFFSET alone (the rows after it all); the grammar needs a LIMIT, so the largest one stands in.
-fn normalizeTail(arena: std.mem.Allocator, tail: []const u8) ![]const u8 {
+pub fn normalizeTail(arena: std.mem.Allocator, tail: []const u8) ![]const u8 {
     if (tail.len == 0) return tail;
     var order: ?[]const u8 = null;
     var limit: ?[]const u8 = null;

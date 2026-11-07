@@ -49,7 +49,7 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8) Error!?setops.Compound 
     var sets: std.ArrayList(std.ArrayList(usize)) = .empty;
     try sets.append(arena, .empty);
     var grouped = false;
-    for (try split(arena, text[c.group_start..c.group_end])) |item_text| {
+    for (try commaList(arena, text[c.group_start..c.group_end])) |item_text| {
         const item = std.mem.trim(u8, item_text, " \t\r\n");
         if (item.len == 0) return error.SqlParseError;
         const alts = (try element(arena, item, &keys)) orelse blk: {
@@ -93,7 +93,7 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8) Error!?setops.Compound 
         bin.* = .{ .bin = .{ .op = .union_all, .left = root, .right = right } };
         root = bin;
     }
-    return .{ .leaves = leaves.items, .root = root, .tail = c.tail };
+    return .{ .leaves = leaves.items, .root = root, .tail = try setops.normalizeTail(arena, c.tail) };
 }
 
 const Clauses = struct {
@@ -159,6 +159,15 @@ fn clauses(arena: std.mem.Allocator, text: []const u8) Error!?Clauses {
         .having = if (having_at) |h| std.mem.trim(u8, text[h..tail_start], " \t\r\n") else "",
         .tail = std.mem.trim(u8, text[tail_start..], " \t\r\n"),
     };
+}
+
+/// A comma-separated list as DuckDB reads one in a grouping clause: one trailing comma is ignored, and an empty entry
+/// anywhere else (a leading or doubled comma, or nothing at all) is a syntax error.
+fn commaList(arena: std.mem.Allocator, text: []const u8) Error![]const []const u8 {
+    var parts = try split(arena, text);
+    if (parts.len > 1 and std.mem.trim(u8, parts[parts.len - 1], " \t\r\n").len == 0) parts = parts[0 .. parts.len - 1];
+    for (parts) |p| if (std.mem.trim(u8, p, " \t\r\n").len == 0) return error.SqlParseError;
+    return parts;
 }
 
 /// `text` cut at the commas outside parentheses and quotes.
@@ -229,6 +238,80 @@ fn callsGrouping(text: []const u8) bool {
     return false;
 }
 
+/// The HAVING of one set. A grouping key the set leaves out is NULL in its groups, so each mention of it outside an
+/// aggregate's arguments is the aggregate over no rows (`min(k) FILTER (WHERE k IS NULL AND k IS NOT NULL)`), NULL in the
+/// key's type; `HAVING a IS NOT NULL` then drops the grand-total row, as DuckDB's does. A mention inside a call
+/// (`count(a)`, `sum(a)`) is the column itself.
+fn havingForSet(arena: std.mem.Allocator, having: []const u8, keys: []const Key, set: []const usize) Error![]const u8 {
+    var absent = false;
+    for (keys, 0..) |k, i| if (k.column != null and std.mem.indexOfScalar(usize, set, i) == null) {
+        absent = true;
+    };
+    if (!absent) return having;
+    var out: std.ArrayList(u8) = .empty;
+    // Per open parenthesis: whether it opens a function call's arguments (or a FILTER's), where nothing is replaced.
+    var in_call: std.ArrayList(bool) = .empty;
+    var i: usize = 0;
+    var prev_word: []const u8 = "";
+    while (i < having.len) {
+        const ch = having[i];
+        if (ch == '\'' or ch == '"') {
+            const end = setops.quotedEnd(having, i);
+            try out.appendSlice(arena, having[i..end]);
+            i = end;
+            prev_word = "";
+            continue;
+        }
+        if (ch == '(') {
+            const parent = in_call.items.len > 0 and in_call.items[in_call.items.len - 1];
+            const keywords = [_][]const u8{ "in", "and", "or", "not", "between", "like", "case", "when", "then", "else", "end", "is", "exists", "any", "all", "having", "on", "where" };
+            var is_call = prev_word.len > 0;
+            if (is_call) for (keywords) |k| if (std.ascii.eqlIgnoreCase(prev_word, k)) {
+                is_call = false;
+            };
+            try in_call.append(arena, parent or is_call);
+            try out.append(arena, ch);
+            i += 1;
+            prev_word = "";
+            continue;
+        }
+        if (ch == ')') {
+            _ = in_call.pop();
+            try out.append(arena, ch);
+            i += 1;
+            prev_word = "";
+            continue;
+        }
+        if (setops.startsWord(having, i)) {
+            const w = setops.wordAt(having, i);
+            const end = i + w.len;
+            const skip = in_call.items.len > 0 and in_call.items[in_call.items.len - 1];
+            const preceded_by_dot = out.items.len > 0 and out.items[out.items.len - 1] == '.';
+            const followed_by_call = blk: {
+                const after = std.mem.trimStart(u8, having[end..], " \t\r\n");
+                break :blk after.len > 0 and after[0] == '(';
+            };
+            var replaced = false;
+            if (!skip and !followed_by_call and !preceded_by_dot) for (keys, 0..) |k, ki| {
+                const col = k.column orelse continue;
+                if (std.mem.indexOfScalar(usize, set, ki) != null) continue;
+                if (!std.ascii.eqlIgnoreCase(w, k.name)) continue;
+                try out.print(arena, "min({s}) FILTER (WHERE {s} IS NULL AND {s} IS NOT NULL)", .{ col, col, col });
+                replaced = true;
+                break;
+            };
+            if (!replaced) try out.appendSlice(arena, w);
+            i = end;
+            prev_word = w;
+            continue;
+        }
+        if (!std.ascii.isWhitespace(ch)) prev_word = "";
+        try out.append(arena, ch);
+        i += 1;
+    }
+    return out.items;
+}
+
 fn isGroupingElement(item: []const u8) bool {
     const w = setops.wordAt(item, 0);
     const rest = std.mem.trimStart(u8, item[w.len..], " \t\r\n");
@@ -245,7 +328,7 @@ fn element(arena: std.mem.Allocator, item: []const u8, keys: *std.ArrayList(Key)
     const is_sets = setops.eql(w, "grouping");
     if (is_sets) rest = std.mem.trimStart(u8, rest[setops.wordAt(rest, 0).len..], " \t\r\n");
     const inner = parenthesized(rest) orelse return error.SqlParseError;
-    const parts = try split(arena, inner);
+    const parts = try commaList(arena, inner);
 
     if (is_sets) {
         var out: std.ArrayList(std.ArrayList(usize)) = .empty;
@@ -253,8 +336,9 @@ fn element(arena: std.mem.Allocator, item: []const u8, keys: *std.ArrayList(Key)
             const part = std.mem.trim(u8, raw, " \t\r\n");
             if (isGroupingElement(part)) return error.GroupingSetsNesting;
             var set: std.ArrayList(usize) = .empty;
+            // `()` alone is the empty set; a set of keys may end in a comma.
             const members = parenthesized(part) orelse part;
-            if (std.mem.trim(u8, members, " \t\r\n").len > 0) for (try split(arena, members)) |m| {
+            if (std.mem.trim(u8, members, " \t\r\n").len > 0 or parenthesized(part) == null) for (try commaList(arena, members)) |m| {
                 const k = try keyIndex(arena, keys, std.mem.trim(u8, m, " \t\r\n"));
                 if (std.mem.indexOfScalar(usize, set.items, k) == null) try set.append(arena, k);
             };
@@ -270,7 +354,7 @@ fn element(arena: std.mem.Allocator, item: []const u8, keys: *std.ArrayList(Key)
         if (isGroupingElement(part)) return error.GroupingSetsNesting;
         unit.* = .empty;
         const members = parenthesized(part) orelse part;
-        for (try split(arena, members)) |m| try unit.append(arena, try keyIndex(arena, keys, std.mem.trim(u8, m, " \t\r\n")));
+        for (try commaList(arena, members)) |m| try unit.append(arena, try keyIndex(arena, keys, std.mem.trim(u8, m, " \t\r\n")));
     }
     var out: std.ArrayList(std.ArrayList(usize)) = .empty;
     if (setops.eql(w, "rollup")) {
@@ -352,7 +436,7 @@ const Item = union(enum) {
 
 fn selectItems(arena: std.mem.Allocator, text: []const u8, keys: []Key) Error![]const Item {
     var out: std.ArrayList(Item) = .empty;
-    for (try split(arena, text)) |raw| {
+    for (try commaList(arena, text)) |raw| {
         const item = std.mem.trim(u8, raw, " \t\r\n");
         if (item.len == 0) return error.SqlParseError;
         var expr = item;
@@ -464,7 +548,7 @@ fn leaf(arena: std.mem.Allocator, text: []const u8, c: Clauses, items: []const I
     }
     if (c.having.len > 0) {
         try out.append(arena, ' ');
-        try out.appendSlice(arena, c.having);
+        try out.appendSlice(arena, try havingForSet(arena, c.having, keys, set));
     }
     return out.items;
 }
@@ -516,4 +600,41 @@ test "what cannot be rewritten is refused by name" {
     try testing.expectEqualStrings("SELECT min(g) FILTER (WHERE g IS NULL AND g IS NOT NULL) AS k, count(*) AS n FROM t", al[1]);
     // A key every set has may be an expression.
     try testing.expectEqual(@as(usize, 2), (try leavesOf(a, "SELECT a % 2, b, count(*) FROM t GROUP BY a % 2, ROLLUP (b)")).len);
+}
+
+test "lists are read as DuckDB reads them: one trailing comma is ignored, any other empty entry is an error" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqual(@as(usize, 1), (try leavesOf(a, "SELECT a, count(*) FROM t GROUP BY GROUPING SETS ((a),)")).len);
+    try testing.expectEqual(@as(usize, 1), (try leavesOf(a, "SELECT a, count(*) FROM t GROUP BY GROUPING SETS ((a,))")).len);
+    try testing.expectEqual(@as(usize, 2), (try leavesOf(a, "SELECT a, count(*) FROM t GROUP BY GROUPING SETS (a, b,)")).len);
+    try testing.expectEqual(@as(usize, 2), (try leavesOf(a, "SELECT a, count(*) FROM t GROUP BY ROLLUP (a,)")).len);
+    try testing.expectEqual(@as(usize, 2), (try leavesOf(a, "SELECT a, count(*) FROM t GROUP BY GROUPING SETS ((a), ())")).len);
+    try testing.expectEqual(@as(usize, 2), (try leavesOf(a, "SELECT a, count(*) FROM t GROUP BY ROLLUP (a),")).len);
+    for ([_][]const u8{
+        "GROUPING SETS ()",
+        "GROUPING SETS ((a),,(b))",
+        "GROUPING SETS (,(a))",
+        "GROUPING SETS ((,a))",
+        "ROLLUP ()",
+        "CUBE ()",
+        "ROLLUP (a,,b)",
+        "ROLLUP (,a)",
+    }) |group| {
+        const sql = try std.fmt.allocPrint(a, "SELECT a, count(*) FROM t GROUP BY {s}", .{group});
+        try testing.expectError(error.SqlParseError, expand(a, sql));
+    }
+}
+
+test "the tail of a grouping query is the SELECT grammar's, and a key a set leaves out is NULL in its HAVING" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const t = (try expand(a, "SELECT a, count(*) AS n FROM t GROUP BY ROLLUP (a) ORDER BY a OFFSET 2")).?;
+    try testing.expectEqualStrings("ORDER BY a LIMIT 9223372036854775807 OFFSET 2", t.tail);
+    const h = (try expand(a, "SELECT count(*) AS n FROM t GROUP BY ROLLUP (a) HAVING a IS NOT NULL AND count(a) > 1 AND sum(a) > 3 OR (a + 1) > 2")).?;
+    try testing.expectEqualStrings("SELECT count(*) AS n FROM t GROUP BY a HAVING a IS NOT NULL AND count(a) > 1 AND sum(a) > 3 OR (a + 1) > 2", h.leaves[0]);
+    const nul = "min(a) FILTER (WHERE a IS NULL AND a IS NOT NULL)";
+    try testing.expectEqualStrings("SELECT count(*) AS n FROM t HAVING " ++ nul ++ " IS NOT NULL AND count(a) > 1 AND sum(a) > 3 OR (" ++ nul ++ " + 1) > 2", h.leaves[1]);
 }

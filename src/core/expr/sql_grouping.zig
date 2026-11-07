@@ -78,7 +78,8 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8) Error!?setops.Compound 
 
     if (callsGrouping(c.having) or callsGrouping(c.tail)) return error.GroupingSetsGrouping;
     var leaves: std.ArrayList([]const u8) = .empty;
-    for (sets.items) |set| try leaves.append(arena, try leaf(arena, text, c, items, keys.items, set.items));
+    const qualifier = fromQualifier(text[c.from_start..c.where_end]);
+    for (sets.items) |set| try leaves.append(arena, try leaf(arena, text, c, items, keys.items, set.items, qualifier));
 
     // UNION ALL, left to right.
     var root: *const setops.Node = blk: {
@@ -93,7 +94,7 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8) Error!?setops.Compound 
         bin.* = .{ .bin = .{ .op = .union_all, .left = root, .right = right } };
         root = bin;
     }
-    return .{ .leaves = leaves.items, .root = root, .tail = try setops.normalizeTail(arena, try withoutQualifier(arena, c.tail, fromQualifier(text[c.from_start..c.where_end]))) };
+    return .{ .leaves = leaves.items, .root = root, .tail = try setops.normalizeTail(arena, try withoutQualifier(arena, c.tail, qualifier)) };
 }
 
 /// What the FROM clause lets a column be qualified with: the alias of the one table, else the file's own name.
@@ -301,7 +302,7 @@ fn callsGrouping(text: []const u8) bool {
 /// aggregate's arguments is the aggregate over no rows (`min(k) FILTER (WHERE k IS NULL AND k IS NOT NULL)`), NULL in the
 /// key's type; `HAVING a IS NOT NULL` then drops the grand-total row, as DuckDB's does. A mention inside a call
 /// (`count(a)`, `sum(a)`) is the column itself.
-fn havingForSet(arena: std.mem.Allocator, having: []const u8, keys: []const Key, set: []const usize) Error![]const u8 {
+fn havingForSet(arena: std.mem.Allocator, having: []const u8, keys: []const Key, set: []const usize, qualifier: ?[]const u8) Error![]const u8 {
     var absent = false;
     for (keys, 0..) |k, i| if (k.column != null and std.mem.indexOfScalar(usize, set, i) == null) {
         absent = true;
@@ -351,10 +352,16 @@ fn havingForSet(arena: std.mem.Allocator, having: []const u8, keys: []const Key,
                 break :blk after.len > 0 and after[0] == '(';
             };
             var replaced = false;
-            if (!skip and !followed_by_call and !preceded_by_dot) for (keys, 0..) |k, ki| {
+            if (!skip and !followed_by_call) for (keys, 0..) |k, ki| {
                 const col = k.column orelse continue;
                 if (std.mem.indexOfScalar(usize, set, ki) != null) continue;
                 if (!std.ascii.eqlIgnoreCase(w, k.name)) continue;
+                if (preceded_by_dot) {
+                    // The table's own qualifier before the dot is part of the mention.
+                    const q = qualifier orelse continue;
+                    if (out.items.len < q.len + 1 or !std.ascii.eqlIgnoreCase(out.items[out.items.len - 1 - q.len .. out.items.len - 1], q)) continue;
+                    out.shrinkRetainingCapacity(out.items.len - 1 - q.len);
+                }
                 try out.print(arena, "min({s}) FILTER (WHERE {s} IS NULL AND {s} IS NOT NULL)", .{ col, col, col });
                 replaced = true;
                 break;
@@ -574,7 +581,7 @@ fn quote(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
 }
 
 /// The SELECT for `set`.
-fn leaf(arena: std.mem.Allocator, text: []const u8, c: Clauses, items: []const Item, keys: []const Key, set: []const usize) Error![]const u8 {
+fn leaf(arena: std.mem.Allocator, text: []const u8, c: Clauses, items: []const Item, keys: []const Key, set: []const usize, qualifier: ?[]const u8) Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "SELECT ");
     for (items, 0..) |item, n| {
@@ -607,7 +614,7 @@ fn leaf(arena: std.mem.Allocator, text: []const u8, c: Clauses, items: []const I
     }
     if (c.having.len > 0) {
         try out.append(arena, ' ');
-        try out.appendSlice(arena, try havingForSet(arena, c.having, keys, set));
+        try out.appendSlice(arena, try havingForSet(arena, c.having, keys, set, qualifier));
     }
     return out.items;
 }

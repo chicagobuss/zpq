@@ -1377,7 +1377,9 @@ fn evalCall(
         .length => return evalLength(arena, batch, column_lookup, c.args[0].*),
         .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract => return evalStringFn(arena, batch, column_lookup, c),
         .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp => return evalCast(arena, batch, column_lookup, c),
-        .floor, .ceil, .sqrt, .round => return evalMath(arena, batch, column_lookup, c),
+        .floor, .ceil, .sqrt, .round, .trunc => return evalMath(arena, batch, column_lookup, c),
+        .math => return evalMathFn(arena, batch, column_lookup, c),
+        .sign => return evalSign(arena, batch, column_lookup, c),
         .least, .greatest => return evalLeastGreatest(arena, batch, column_lookup, c),
     }
 }
@@ -1823,6 +1825,7 @@ fn evalMath(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
             r.* = switch (c.func) {
                 .floor => @divFloor(x, divisor),
                 .ceil => -@divFloor(-x, divisor),
+                .trunc => @divTrunc(x, divisor),
                 else => ast.roundDecimal(x, spec.scale, digits) catch {
                     if (quietDecimalRow(batch, rows.nulls, i)) {
                         r.* = 0;
@@ -1841,7 +1844,7 @@ fn evalMath(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
     switch (col) {
         .i64 => |in| {
             if (in.max_rep > 0) return error.NestedNotSupported;
-            if (c.func == .round) return col;
+            if (c.func == .round or c.func == .trunc) return col;
             const out = try arena.alloc(f64, n);
             for (in.values, out) |v, *r| {
                 const x: f64 = @floatFromInt(v);
@@ -1856,9 +1859,112 @@ fn evalMath(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
                 .sqrt => @sqrt(v),
                 .floor => @floor(v),
                 .ceil => @ceil(v),
+                .trunc => @trunc(v),
                 else => ast.roundDouble(v, digits),
             };
             return f64Column(out, in.def_levels, in.max_def, in.has_nulls);
+        },
+        else => return error.TypeMismatch,
+    }
+}
+
+const libm = struct {
+    extern "c" fn cbrt(x: f64) f64;
+    extern "c" fn asin(x: f64) f64;
+    extern "c" fn acos(x: f64) f64;
+    extern "c" fn atan(x: f64) f64;
+    extern "c" fn sinh(x: f64) f64;
+    extern "c" fn cosh(x: f64) f64;
+    extern "c" fn tanh(x: f64) f64;
+    extern "c" fn atan2(y: f64, x: f64) f64;
+};
+
+/// `x` and `y` through the C library's function, as DuckDB calls it (`MathFn` names the ones it agrees with).
+fn mathOf(m: ast.MathFn, x: f64, y: f64) f64 {
+    return switch (m) {
+        .cbrt => libm.cbrt(x),
+        .asin => libm.asin(x),
+        .acos => libm.acos(x),
+        .atan => libm.atan(x),
+        .sinh => libm.sinh(x),
+        .cosh => libm.cosh(x),
+        .tanh => libm.tanh(x),
+        .degrees => x * (180.0 / std.math.pi),
+        .radians => x * (std.math.pi / 180.0),
+        .atan2 => libm.atan2(x, y),
+    };
+}
+
+/// One argument of a `math` call as doubles: integers and DECIMALs convert, a DOUBLE is as it is.
+fn doubleArg(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, a: ast.Expr) Error!struct { values: []const f64, nulls: Batch.Column } {
+    const n = batch.num_rows;
+    if (a.typeOf() == .dec) {
+        const spec = a.decSpec().?;
+        const rows = try decRows(arena, batch, column_lookup, a, spec.scale);
+        const vals = try arena.alloc(f64, n);
+        for (rows.v, vals) |x, *r| r.* = ast.decimalToDouble(x, spec.scale);
+        return .{ .values = vals, .nulls = rows.nulls orelse .{ .f64 = .{ .values = &.{} } } };
+    }
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, a);
+    switch (col) {
+        .i64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            const vals = try arena.alloc(f64, n);
+            for (in.values, vals) |v, *r| r.* = @floatFromInt(v);
+            return .{ .values = vals, .nulls = col };
+        },
+        .f64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            return .{ .values = in.values, .nulls = col };
+        },
+        else => return error.TypeMismatch,
+    }
+}
+
+/// `ln`, `exp`, `pow`, ... of numbers: a row is NULL if any argument is.
+fn evalMathFn(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const n = batch.num_rows;
+    const first = try doubleArg(arena, batch, column_lookup, c.args[0].*);
+    const second = if (c.args.len == 2) try doubleArg(arena, batch, column_lookup, c.args[1].*) else null;
+    const out = try arena.alloc(f64, n);
+    const def = try arena.alloc(u32, n);
+    var any_null = false;
+    for (out, def, 0..) |*o, *d, i| {
+        if (rowIsNull(first.nulls, i) or (second != null and rowIsNull(second.?.nulls, i))) {
+            o.* = 0;
+            d.* = 0;
+            any_null = true;
+            continue;
+        }
+        o.* = mathOf(c.math.?, first.values[i], if (second) |sc| sc.values[i] else 0);
+        d.* = 1;
+    }
+    return f64Column(out, def, 1, any_null);
+}
+
+/// `sign(x)`: -1, 0 or 1, 0 for NaN and either zero.
+fn evalSign(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const arg = c.args[0].*;
+    const n = batch.num_rows;
+    const out = try arena.alloc(i64, n);
+    if (arg.typeOf() == .dec) {
+        const spec = arg.decSpec().?;
+        const rows = try decRows(arena, batch, column_lookup, arg, spec.scale);
+        for (rows.v, out) |x, *r| r.* = if (x > 0) 1 else if (x < 0) -1 else 0;
+        const def = rows.def;
+        return .{ .i64 = .{ .values = out, .def_levels = def orelse &.{}, .max_def = if (def != null) 1 else 0, .has_nulls = def != null and rows.nulls != null } };
+    }
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    switch (col) {
+        .i64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            for (in.values, out) |v, *r| r.* = if (v > 0) 1 else if (v < 0) -1 else 0;
+            return .{ .i64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+        },
+        .f64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            for (in.values, out) |v, *r| r.* = if (v > 0) 1 else if (v < 0) -1 else 0;
+            return .{ .i64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
         },
         else => return error.TypeMismatch,
     }
@@ -2692,7 +2798,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .math, .sign, .trunc => unreachable,
     }
     return .{ .i64 = .{
         .values = out,

@@ -782,6 +782,9 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "floor")) return .floor;
     if (asciiEqIgnoreCase(name, "ceil") or asciiEqIgnoreCase(name, "ceiling")) return .ceil;
     if (asciiEqIgnoreCase(name, "sqrt")) return .sqrt;
+    if (asciiEqIgnoreCase(name, "sign")) return .sign;
+    if (asciiEqIgnoreCase(name, "trunc")) return .trunc;
+    if (ast.MathFn.parse(name) != null) return .math;
     if (asciiEqIgnoreCase(name, "round")) return .round;
     if (asciiEqIgnoreCase(name, "least")) return .least;
     if (asciiEqIgnoreCase(name, "greatest")) return .greatest;
@@ -973,6 +976,21 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             if (args.len != 1) return error.WrongArity;
             if (!plainNumber(args[0].*)) return error.TypeMismatch;
             return .f64;
+        },
+        .math => {
+            if (args.len == 0) return error.WrongArity;
+            for (args) |a| if (!plainNumber(a.*)) return error.TypeMismatch;
+            return .f64;
+        },
+        .sign => {
+            if (args.len != 1) return error.WrongArity;
+            if (!plainNumber(args[0].*)) return error.TypeMismatch;
+            return .i64;
+        },
+        .trunc => {
+            if (args.len != 1) return error.WrongArity;
+            if (!plainNumber(args[0].*)) return error.TypeMismatch;
+            return args[0].typeOf();
         },
         // The digits are a constant, as DuckDB's DECIMAL form needs; an integer rounds to tens and up only in its own
         // type, which zpq does not resolve for an expression, so it is refused there.
@@ -1533,7 +1551,8 @@ fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
             return arithInt(file, b.left.*, b.right.*);
         },
         .call => |c| switch (c.func) {
-            .abs, .cast_i8, .cast_i16, .cast_i32, .cast_i64 => return c.int,
+            .abs, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .sign => return c.int,
+            .trunc => return intTypeOf(file, c.args[0].*),
             .strlen, .length, .date_part, .date_diff, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => return .i64,
             .round => return intTypeOf(file, c.args[0].*),
             .coalesce, .least, .greatest => {
@@ -1565,8 +1584,11 @@ fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, nam
         func = .epoch;
         args = args[1..];
     }
+    const math: ?ast.MathFn = if (func == .math) ast.MathFn.parse(name) else null;
+    if (math) |m| if (args.len != m.arity()) return error.WrongArity;
     var e = try bindCall(arena, file, func, args);
     if (isTryCast(name)) e.call.lenient = true;
+    e.call.math = math;
     return e;
 }
 
@@ -1580,7 +1602,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
     var dec: ?ast.Dec = null;
     if (func == .cast_dec) {
         dec = .{ .precision = @intCast(args[1].literal.i64), .scale = @intCast(args[2].literal.i64) };
-    } else if ((func == .floor or func == .ceil) and result_type == .dec) {
+    } else if ((func == .floor or func == .ceil or func == .trunc) and result_type == .dec) {
         dec = .{ .precision = args[0].decSpec().?.precision, .scale = 0 };
     } else if (func == .round and result_type == .dec) {
         dec = ast.roundedDec(args[0].decSpec().?, if (args.len == 2) @intCast(args[1].literal.i64) else 0);
@@ -1614,7 +1636,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
                 .split_part, .regexp_extract, .date_diff, .strftime => null,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => null,
-                .floor, .ceil, .sqrt, .round, .least, .greatest => null,
+                .floor, .ceil, .sqrt, .round, .least, .greatest, .math, .sign, .trunc => null,
             },
             // A truncated or coalesced TIMESTAMP is as UTC-adjusted as its argument, DuckDB's TIMESTAMP WITH TIME ZONE;
             // every cast and `epoch_ms` give a plain TIMESTAMP.
@@ -1629,6 +1651,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 .cast_i16 => .i16,
                 .cast_i32 => .i32,
                 .cast_i64 => .i64,
+                .sign => .i8,
                 else => null,
             },
             .part = switch (func) {

@@ -397,6 +397,43 @@ pub const Func = enum {
     /// are), numbers only; NaN is above every number.
     least,
     greatest,
+    /// A DOUBLE function of one or two numbers, which `Call.math` names (`cbrt`, `atan2`, ...). Integers and DECIMALs
+    /// convert to DOUBLE first, as DuckDB's overloads do; the result is a DOUBLE, NaN or infinite where the C library's is.
+    math,
+    /// `sign(x)`: -1, 0 or 1 as DuckDB's TINYINT, 0 for NaN and the zeros.
+    sign,
+    /// `trunc(x)`: toward zero. A DOUBLE gives a DOUBLE, a DECIMAL(p, s) DECIMAL(p, 0), an integer itself.
+    trunc,
+};
+
+/// The DOUBLE functions `Func.math` stands for: the ones whose C-library results DuckDB 2.0.0's agree with on millions of
+/// fuzzed inputs. `ln`, `log2`, `log10`, `exp`, `sin`, `cos`, `tan` and `pow` are not here: DuckDB's differ from a current
+/// C library's in the last digit for a few percent of inputs (and in the sign of a NaN), and `pow(-8, 27)` is twice what
+/// it should be, so they are refused as unknown functions.
+pub const MathFn = enum {
+    cbrt,
+    asin,
+    acos,
+    atan,
+    sinh,
+    cosh,
+    tanh,
+    degrees,
+    radians,
+    atan2,
+
+    pub fn arity(self: MathFn) usize {
+        return switch (self) {
+            .atan2 => 2,
+            else => 1,
+        };
+    }
+
+    pub fn parse(name: []const u8) ?MathFn {
+        var buf: [8]u8 = undefined;
+        if (name.len > buf.len) return null;
+        return std.meta.stringToEnum(MathFn, std.ascii.lowerString(&buf, name));
+    }
 };
 
 /// What an integer value stands for in time, so the date/time functions read it in its unit. Output keeps printing
@@ -492,6 +529,8 @@ pub const Call = struct {
     int: ?IntType = null,
     /// A `TRY_CAST`: a value that does not convert is NULL, not an error.
     lenient: bool = false,
+    /// Which DOUBLE function a `math` call is.
+    math: ?MathFn = null,
 };
 
 /// Searched `CASE WHEN cond THEN value ... [ELSE value] END`: per row, the first WHEN whose condition is TRUE gives
@@ -786,7 +825,10 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
+                .strlen, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .floor, .ceil, .sqrt, .round, .sign, .trunc => c.args[0].mayBeNull(),
+                .math => for (c.args) |a| {
+                    if (a.mayBeNull()) break true;
+                } else false,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp => c.lenient or c.args[0].mayBeNull(),
                 // Any of the three can be NULL (a literal year over a nullable month).
                 .make_date => for (c.args) |a| {

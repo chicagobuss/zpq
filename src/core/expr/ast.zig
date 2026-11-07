@@ -319,6 +319,15 @@ pub const Func = enum {
     make_date,
     /// `epoch_ms(ms)`: the TIMESTAMP `ms` milliseconds after the epoch, held in microseconds as DuckDB holds it.
     epoch_ms,
+    /// `epoch(t)`, which `date_part('epoch', t)` and `EXTRACT(epoch FROM t)` are: the seconds since the epoch of a DATE or
+    /// TIMESTAMP, a DOUBLE; NULL for an infinite time.
+    epoch,
+    /// `epoch_ms(t)`, `epoch_us(t)` and `epoch_ns(t)` of a DATE or TIMESTAMP: the count since the epoch in that unit, a
+    /// BIGINT (milliseconds rounded half away from zero); NULL for an infinite time. (`epoch_ms` of an integer is
+    /// `epoch_ms` above, the TIMESTAMP.)
+    to_epoch_ms,
+    to_epoch_us,
+    to_epoch_ns,
     /// `date_trunc('part', t)`: `t` floored to the part, a TIMESTAMP in microseconds (a DATE argument too, as DuckDB).
     date_trunc,
     /// `date_part('part', t)`, which `EXTRACT(part FROM t)` is: the part's BIGINT value.
@@ -785,7 +794,7 @@ pub const Expr = union(enum) {
                 } else false,
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
                 // Infinite times give NULL whatever the columns say.
-                .date_diff => true,
+                .date_diff, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => true,
                 .coalesce, .least, .greatest => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;
                 } else true,

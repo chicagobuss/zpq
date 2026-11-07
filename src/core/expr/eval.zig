@@ -1368,6 +1368,7 @@ fn evalCall(
         .strlen => return evalStrlen(arena, batch, column_lookup, c.args[0].*),
         .make_date => return if (c.args.len == 3) evalMakeDate3(arena, batch, column_lookup, c) else evalTemporal(arena, batch, column_lookup, c),
         .epoch_ms, .date_trunc, .date_part => return evalTemporal(arena, batch, column_lookup, c),
+        .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => return evalEpoch(arena, batch, column_lookup, c),
         .date_diff => return evalDateDiff(arena, batch, column_lookup, c),
         .strftime => return evalStrftime(arena, batch, column_lookup, c),
         .regexp_replace => return evalRegexpReplace(arena, batch, column_lookup, c, false),
@@ -2238,6 +2239,105 @@ fn evalDateDiff(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []
     return .{ .i64 = .{ .values = out, .def_levels = def, .max_def = 1, .has_nulls = any_null } };
 }
 
+/// The count `func` (`to_epoch_ms`, `_us` or `_ns`) gives for the time `v` counted in `unit`, as DuckDB 2.0 counts it, or
+/// null for an infinite time. A DATE counts its own days (an error where microseconds or nanoseconds overflow); a
+/// TIMESTAMP_MS and a TIMESTAMP_NS reach microseconds first (milliseconds exactly, nanoseconds to the nearest, a tie
+/// away from zero), and milliseconds round half away from zero from those; only a TIMESTAMP_NS gives its own
+/// nanoseconds.
+fn epochCount(func: ast.Func, unit: ast.Temporal, v: i64) error{ConversionOutOfRange}!?i64 {
+    if (unit == .date) {
+        if (v == std.math.maxInt(i32) or v == -std.math.maxInt(i32)) return null;
+        return switch (func) {
+            .to_epoch_ms => v * (us_per_day / 1000),
+            .to_epoch_us => std.math.mul(i64, v, us_per_day) catch error.ConversionOutOfRange,
+            .to_epoch_ns => std.math.mul(i64, v, ns_per_day) catch error.ConversionOutOfRange,
+            else => unreachable,
+        };
+    }
+    if (v == std.math.maxInt(i64) or v == -std.math.maxInt(i64)) return null;
+    if (func == .to_epoch_ns and unit == .ts_ns) return v;
+    const us: i64 = switch (unit) {
+        .ts_us => v,
+        .ts_ms => std.math.mul(i64, v, 1000) catch return error.ConversionOutOfRange,
+        .ts_ns => roundDivAway(v, 1000),
+        .date => unreachable,
+    };
+    return switch (func) {
+        .to_epoch_us => us,
+        // DuckDB goes through TIMESTAMP_MS and back, so a count whose microseconds do not fit is an error.
+        .to_epoch_ms => blk: {
+            const ms = roundDivAway(us, 1000);
+            _ = std.math.mul(i64, ms, 1000) catch return error.ConversionOutOfRange;
+            break :blk ms;
+        },
+        .to_epoch_ns => std.math.mul(i64, us, 1000) catch error.ConversionOutOfRange,
+        else => unreachable,
+    };
+}
+
+/// `epoch(t)`: the seconds since the epoch as a double, a TIMESTAMP's microseconds over a million and a DATE's days times
+/// a day's seconds; null for an infinite time.
+fn epochSeconds(unit: ast.Temporal, utc: bool, v: i64) error{ConversionOutOfRange}!?f64 {
+    if (unit == .date) {
+        if (v == std.math.maxInt(i32) or v == -std.math.maxInt(i32)) return null;
+        return @as(f64, @floatFromInt(v)) * 86_400.0;
+    }
+    const us = (try epochCount(.to_epoch_us, unit, v)) orelse return null;
+    // A TIMESTAMP WITH TIME ZONE adds its whole milliseconds, over a thousand, to the rest of its microseconds, over a million.
+    if (utc) {
+        const ms = @divFloor(us, 1000);
+        return @as(f64, @floatFromInt(ms)) / 1000.0 + @as(f64, @floatFromInt(us - ms * 1000)) / 1e6;
+    }
+    return @as(f64, @floatFromInt(us)) / 1e6;
+}
+
+/// `epoch`, `epoch_ms`, `epoch_us` and `epoch_ns` of a time. An infinite time is NULL; a row a selection leaves out
+/// raises no error.
+fn evalEpoch(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const arg = c.args[0].*;
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    if (col != .i64) return error.TypeMismatch;
+    const in = col.i64;
+    if (in.max_rep > 0) return error.NestedNotSupported;
+    const unit = arg.temporal().?;
+    const n = in.values.len;
+    const def = try arena.alloc(u32, n);
+    const ints: []i64 = if (c.func == .epoch) &.{} else try arena.alloc(i64, n);
+    const floats: []f64 = if (c.func == .epoch) try arena.alloc(f64, n) else &.{};
+    var any_null = false;
+    for (0..n) |i| {
+        def[i] = 0;
+        if (c.func == .epoch) floats[i] = 0 else ints[i] = 0;
+        if (rowIsNull(col, i)) {
+            any_null = true;
+            continue;
+        }
+        const got: ?union(enum) { i: i64, f: f64 } = blk: {
+            if (c.func == .epoch) {
+                const r = epochSeconds(unit, arg.isUtc(), in.values[i]) catch |err| {
+                    if (batch.sel != null and !batch.sel.?.isActive(i)) break :blk null;
+                    return err;
+                };
+                break :blk if (r) |f| .{ .f = f } else null;
+            }
+            const r = epochCount(c.func, unit, in.values[i]) catch |err| {
+                if (batch.sel != null and !batch.sel.?.isActive(i)) break :blk null;
+                return err;
+            };
+            break :blk if (r) |k| .{ .i = k } else null;
+        };
+        if (got) |g| {
+            switch (g) {
+                .i => |k| ints[i] = k,
+                .f => |f| floats[i] = f,
+            }
+            def[i] = 1;
+        } else any_null = true;
+    }
+    if (c.func == .epoch) return .{ .f64 = .{ .values = floats, .def_levels = def, .max_def = 1, .has_nulls = any_null } };
+    return .{ .i64 = .{ .values = ints, .def_levels = def, .max_def = 1, .has_nulls = any_null } };
+}
+
 const roundDivAway = calendar.roundDivAway;
 
 /// `CAST(v AS DATE)` (`to_date`) or `CAST(v AS TIMESTAMP)` of `v` counted in `unit`, as DuckDB 2.0 casts it. A day is the
@@ -2592,7 +2692,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => unreachable,
     }
     return .{ .i64 = .{
         .values = out,

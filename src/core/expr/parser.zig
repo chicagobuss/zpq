@@ -756,6 +756,9 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "strlen")) return .strlen;
     if (asciiEqIgnoreCase(name, "make_date")) return .make_date;
     if (asciiEqIgnoreCase(name, "epoch_ms")) return .epoch_ms;
+    if (asciiEqIgnoreCase(name, "epoch")) return .epoch;
+    if (asciiEqIgnoreCase(name, "epoch_us")) return .to_epoch_us;
+    if (asciiEqIgnoreCase(name, "epoch_ns")) return .to_epoch_ns;
     if (asciiEqIgnoreCase(name, "date_trunc")) return .date_trunc;
     if (asciiEqIgnoreCase(name, "date_part") or asciiEqIgnoreCase(name, "datepart")) return .date_part;
     if (asciiEqIgnoreCase(name, "regexp_replace")) return .regexp_replace;
@@ -875,6 +878,13 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             const a = args[0];
             if (a.typeOf() != .i64 or a.temporal() != null or a.isBoolean()) return error.TypeMismatch;
             return .i64;
+        },
+        .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => {
+            if (args.len != 1) return error.WrongArity;
+            const t = args[0].temporal() orelse return error.TypeMismatch;
+            // DuckDB has no epoch of a TIMESTAMPTZ_NS (UTC-adjusted nanoseconds).
+            if (t == .ts_ns and args[0].isUtc()) return error.TypeMismatch;
+            return if (func == .epoch) .f64 else .i64;
         },
         .date_trunc, .date_part => {
             if (args.len != 2) return error.WrongArity;
@@ -1524,7 +1534,7 @@ fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
         },
         .call => |c| switch (c.func) {
             .abs, .cast_i8, .cast_i16, .cast_i32, .cast_i64 => return c.int,
-            .strlen, .length, .date_part, .date_diff => return .i64,
+            .strlen, .length, .date_part, .date_diff, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => return .i64,
             .round => return intTypeOf(file, c.args[0].*),
             .coalesce, .least, .greatest => {
                 var br: IntBranches = .{ .file = file };
@@ -1544,7 +1554,17 @@ fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
 }
 
 /// `bindCall` of the function `name` spells; a `TRY_CAST` (`try_cast$integer`...) is the cast, lenient.
-fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, name: []const u8, func: ast.Func, args: []const *ast.Expr) Error!ast.Expr {
+fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, name: []const u8, func_named: ast.Func, args_named: []const *ast.Expr) Error!ast.Expr {
+    var func = func_named;
+    var args = args_named;
+    // `epoch_ms` of a time counts milliseconds (of an integer it makes the TIMESTAMP); `date_part('epoch', t)` is `epoch(t)`.
+    if (func == .epoch_ms and args.len == 1 and args[0].temporal() != null) func = .to_epoch_ms;
+    if (func == .date_part and args.len == 2 and args[0].* == .literal and args[0].literal == .str and
+        asciiEqIgnoreCase(args[0].literal.str, "epoch"))
+    {
+        func = .epoch;
+        args = args[1..];
+    }
     var e = try bindCall(arena, file, func, args);
     if (isTryCast(name)) e.call.lenient = true;
     return e;
@@ -1590,6 +1610,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 // Values of one unit (and one time zone) keep it; `resolveCallType` refuses a mix.
                 .coalesce => args[0].temporal(),
                 .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,
+                .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => null,
                 .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
                 .split_part, .regexp_extract, .date_diff, .strftime => null,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => null,

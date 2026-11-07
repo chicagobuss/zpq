@@ -318,6 +318,41 @@ fn quoteWholePaths(root: *c.LpNode) void {
     c.lp_ast_walk(root, &visitor);
 }
 
+/// What a single-table query's columns may be qualified with: the table's alias, else the file's own name (`t.g` for
+/// `FROM 'dir/t.parquet'`, as DuckDB names a file it reads).
+fn tableQualifier(path: []const u8, alias: ?[]const u8) []const u8 {
+    if (alias) |a| return a;
+    const base = std.fs.path.basename(path);
+    return if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
+}
+
+/// A column written `t.g` where `t` names the query's one table is the column `g`: drop the qualifier everywhere, so the
+/// rest of the frontend sees what it always has. A qualifier that names nothing here stays (a nested column's path), as
+/// does a schema-qualified name.
+fn dropTableQualifier(root: *c.LpNode, qualifier: []const u8) void {
+    const Visit = struct {
+        fn enter(data: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
+            const q: *const []const u8 = @ptrCast(@alignCast(data.*.user_data));
+            if (node.*.kind == c.LP_EXPR_COLUMN_REF) {
+                const ref = &node.*.u.column_ref;
+                const table = ref.table orelse return 0;
+                if (ref.schema != null or ref.column == null) return 0;
+                if (!std.ascii.eqlIgnoreCase(std.mem.span(table), q.*)) return 0;
+                ref.table = null;
+                ref.quoted &= ~@as(@TypeOf(ref.quoted), c.LP_QUOTED_TABLE);
+            } else if (node.*.kind == c.LP_EXPR_STAR) {
+                const star = &node.*.u.star;
+                const table = star.table orelse return 0;
+                if (std.ascii.eqlIgnoreCase(std.mem.span(table), q.*)) star.table = null;
+            }
+            return 0;
+        }
+    };
+    var qualifier_copy = qualifier;
+    var visitor: c.LpVisitor = .{ .user_data = @ptrCast(&qualifier_copy), .enter = Visit.enter, .leave = null };
+    c.lp_ast_walk(root, &visitor);
+}
+
 /// The grammar reads an unquoted `true` / `false` as a column name, which the unparser then quotes (`"true"`), and
 /// no column of that name exists: make each such reference the boolean literal SQL means. A quoted `"true"` stays a
 /// column.
@@ -1387,6 +1422,10 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
         diagnosticPrint("sql: only SELECT is supported (no UNION/INSERT/DDL)\n", .{});
         return error.UnsupportedStatement;
     }
+    if (root.*.u.select.from) |from| if (from.*.kind == c.LP_FROM_TABLE and from.*.u.from_table.name != null) {
+        const alias: ?[]const u8 = if (from.*.u.from_table.alias) |a| std.mem.span(a) else null;
+        dropTableQualifier(root, tableQualifier(stripQuotes(std.mem.span(from.*.u.from_table.name)), alias));
+    };
     try distinctAsGroupBy(root, lp_arena);
     try groupByAll(root, lp_arena, markers.groupAll());
     // Reject clauses we'd otherwise silently drop → wrong answers.

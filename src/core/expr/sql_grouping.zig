@@ -93,7 +93,66 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8) Error!?setops.Compound 
         bin.* = .{ .bin = .{ .op = .union_all, .left = root, .right = right } };
         root = bin;
     }
-    return .{ .leaves = leaves.items, .root = root, .tail = try setops.normalizeTail(arena, c.tail) };
+    return .{ .leaves = leaves.items, .root = root, .tail = try setops.normalizeTail(arena, try withoutQualifier(arena, c.tail, fromQualifier(text[c.from_start..c.where_end]))) };
+}
+
+/// What the FROM clause lets a column be qualified with: the alias of the one table, else the file's own name.
+fn fromQualifier(from: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    const first = setops.wordAt(from, 0);
+    i = first.len;
+    while (i < from.len and std.ascii.isWhitespace(from[i])) i += 1;
+    if (i >= from.len) return null;
+    var path: []const u8 = undefined;
+    if (from[i] == '\'' or from[i] == '"') {
+        const end = setops.quotedEnd(from, i);
+        path = from[i + 1 .. end - 1];
+        i = end;
+    } else {
+        path = setops.wordAt(from, i);
+        i += path.len;
+    }
+    const next = setops.nextWord(from, i);
+    var word = next.word;
+    if (setops.eql(word, "as")) word = setops.nextWord(from, next.end).word;
+    const keywords = [_][]const u8{ "where", "group", "having", "order", "limit", "offset", "join", "inner", "left", "cross", "window", "qualify", "union" };
+    if (word.len > 0) for (keywords) |k| if (std.ascii.eqlIgnoreCase(word, k)) {
+        word = "";
+        break;
+    };
+    if (word.len > 0) return word;
+    const base = std.fs.path.basename(path);
+    return if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
+}
+
+/// `text` without `qualifier.` before a name: the final query reads scratch files, where the table has no name.
+fn withoutQualifier(arena: std.mem.Allocator, text: []const u8, qualifier: ?[]const u8) ![]const u8 {
+    const q = qualifier orelse return text;
+    if (q.len == 0 or text.len == 0) return text;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = text[i];
+        if (ch == '\'' or ch == '"') {
+            const end = setops.quotedEnd(text, i);
+            try out.appendSlice(arena, text[i..end]);
+            i = end;
+            continue;
+        }
+        if (setops.startsWord(text, i)) {
+            const w = setops.wordAt(text, i);
+            if (std.ascii.eqlIgnoreCase(w, q) and i + w.len < text.len and text[i + w.len] == '.') {
+                i += w.len + 1;
+                continue;
+            }
+            try out.appendSlice(arena, w);
+            i += w.len;
+            continue;
+        }
+        try out.append(arena, ch);
+        i += 1;
+    }
+    return out.items;
 }
 
 const Clauses = struct {
@@ -637,4 +696,17 @@ test "the tail of a grouping query is the SELECT grammar's, and a key a set leav
     try testing.expectEqualStrings("SELECT count(*) AS n FROM t GROUP BY a HAVING a IS NOT NULL AND count(a) > 1 AND sum(a) > 3 OR (a + 1) > 2", h.leaves[0]);
     const nul = "min(a) FILTER (WHERE a IS NULL AND a IS NOT NULL)";
     try testing.expectEqualStrings("SELECT count(*) AS n FROM t HAVING " ++ nul ++ " IS NOT NULL AND count(a) > 1 AND sum(a) > 3 OR (" ++ nul ++ " + 1) > 2", h.leaves[1]);
+}
+
+test "the query's own table name is dropped from the tail that runs over scratch files" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const r = (try expand(a, "SELECT t.g, count(*) AS c FROM 'dir/in.parquet' t WHERE t.id > 1 GROUP BY ROLLUP (t.g) ORDER BY t.g NULLS FIRST, c")).?;
+    try testing.expectEqualStrings("ORDER BY g NULLS FIRST, c", r.tail);
+    try testing.expectEqualStrings("SELECT t.g, count(*) AS c FROM 'dir/in.parquet' t WHERE t.id > 1 GROUP BY t.g", r.leaves[0]);
+    const f = (try expand(a, "SELECT in.g, count(*) AS c FROM 'dir/in.parquet' GROUP BY ROLLUP (in.g) ORDER BY in.g")).?;
+    try testing.expectEqualStrings("ORDER BY g", f.tail);
+    const q = (try expand(a, "SELECT g, count(*) AS c FROM 'x.parquet' AS tt GROUP BY ROLLUP (g) ORDER BY 'tt.g', tt.c")).?;
+    try testing.expectEqualStrings("ORDER BY 'tt.g', c", q.tail);
 }

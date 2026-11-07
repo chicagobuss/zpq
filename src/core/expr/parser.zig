@@ -762,6 +762,7 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "lpad")) return .lpad;
     if (asciiEqIgnoreCase(name, "rpad")) return .rpad;
     if (asciiEqIgnoreCase(name, "split_part")) return .split_part;
+    if (asciiEqIgnoreCase(name, "date_diff") or asciiEqIgnoreCase(name, "datediff")) return .date_diff;
     if (asciiEqIgnoreCase(name, "regexp_extract")) return .regexp_extract;
     if (asciiEqIgnoreCase(name, "floor")) return .floor;
     if (asciiEqIgnoreCase(name, "ceil") or asciiEqIgnoreCase(name, "ceiling")) return .ceil;
@@ -814,8 +815,20 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             return .i64;
         },
         .make_date => {
+            // `make_date(year, month, day)` takes any integers (BIGINT), `make_date(days)` an INTEGER's range.
+            if (args.len == 3) {
+                for (args) |a| if (a.typeOf() != .i64 or a.temporal() != null or a.isBoolean()) return error.TypeMismatch;
+                return .i64;
+            }
             if (args.len != 1) return error.WrongArity;
             if (!integerArgument(args[0].*, file)) return error.TypeMismatch;
+            return .i64;
+        },
+        .date_diff => {
+            if (args.len != 3) return error.WrongArity;
+            if (!isStrLiteral(args[0].*)) return error.TypeMismatch;
+            if (ast.DiffPart.parse(args[0].literal.str) == null) return error.UnsupportedDatePart;
+            if (args[1].temporal() == null or args[2].temporal() == null) return error.TypeMismatch;
             return .i64;
         },
         .epoch_ms => {
@@ -1405,7 +1418,7 @@ fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
         },
         .call => |c| switch (c.func) {
             .abs, .cast_i8, .cast_i16, .cast_i32, .cast_i64 => return c.int,
-            .strlen, .length, .date_part => return .i64,
+            .strlen, .length, .date_part, .date_diff => return .i64,
             .round => return intTypeOf(file, c.args[0].*),
             .coalesce, .least, .greatest => {
                 var br: IntBranches = .{ .file = file };
@@ -1463,7 +1476,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 } else args[0].temporal(),
                 .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,
                 .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
-                .split_part, .regexp_extract => null,
+                .split_part, .regexp_extract, .date_diff => null,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => null,
                 .floor, .ceil, .sqrt, .round, .least, .greatest => null,
             },
@@ -1486,6 +1499,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 .date_trunc, .date_part => ast.DatePart.parse(args[0].literal.str) orelse unreachable,
                 else => null,
             },
+            .diff = if (func == .date_diff) ast.DiffPart.parse(args[0].literal.str) else null,
             .replace = if (func == .regexp_replace) blk: {
                 const r = try arena.create(regex.Replace);
                 const a = args;
@@ -1543,7 +1557,7 @@ pub fn bindAggregate(func: agg.AggFunc, original_arg: ?ast.Expr, where: ?filter_
     // answer as a DATE.
     var as_date = false;
     if (func == .min or func == .max) if (arg) |a| if (a == .call and a.call.func == .make_date and
-        a.call.args[0].* == .col_ref)
+        a.call.args.len == 1 and a.call.args[0].* == .col_ref)
     {
         arg = a.call.args[0].*;
         as_date = true;

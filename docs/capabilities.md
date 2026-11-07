@@ -74,6 +74,11 @@ character); `upper` and `lower` map one code point to one with DuckDB's own tabl
 there is no final-sigma form. Their other arguments are constants (a column there is refused; an empty `lpad`/`rpad`
 pad is an error only where padding is needed, as in DuckDB). `split_part(s, sep, n)` takes the `n`th field (1-based, a
 negative `n` from the end, an empty `sep` splitting into characters, `''` where there is none) and
+`make_date(year, month, day)` (any integers; a month or day the calendar has not, or a date past DuckDB's DATE, is an
+error) and `date_diff(part, start, end)` / `datediff` (BIGINT boundaries of the unit between two dates or timestamps:
+a month between 01-31 and 02-01, a week the day count over 7 truncated, a TIMESTAMP_NS rounded to microseconds first,
+NULL for an infinite time; `year` to `microsecond` plus `decade`, `century` and `millennium`, a constant) are the date
+functions beside them, and
 `regexp_extract(s, pattern [, group [, options]])` one group of the first match (`''` where there is none, group 0 the
 whole match, groups 0 to 9, DuckDB's option letters; the form with a list of group names is refused), the pattern, group
 and separator being constants. `trim`, `ltrim` and `rtrim` strip Unicode's space

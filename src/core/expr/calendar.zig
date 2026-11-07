@@ -6,7 +6,8 @@ const std = @import("std");
 const ast = @import("ast.zig");
 
 pub const Error = error{
-    /// A `make_date` argument outside INTEGER's range, as DuckDB's INTEGER cast refuses it.
+    /// A `make_date` argument outside INTEGER's range, as DuckDB's INTEGER cast refuses it; or year, month and day that
+    /// are no date DuckDB's DATE holds.
     DateOutOfRange,
     /// A time whose microseconds since the epoch do not fit 64 bits, which no DuckDB TIMESTAMP holds.
     TimestampOutOfRange,
@@ -42,6 +43,74 @@ pub fn civilFromDays(days: i64) Civil {
     const mp = @divFloor(5 * doy + 2, 153);
     const m = if (mp < 10) mp + 3 else mp - 9;
     return .{ .y = yoe + era * 400 + @intFromBool(m <= 2), .m = m, .d = doy - @divFloor(153 * mp + 2, 5) + 1 };
+}
+
+fn isLeap(y: i64) bool {
+    return @mod(y, 4) == 0 and (@mod(y, 100) != 0 or @mod(y, 400) == 0);
+}
+
+fn daysInMonth(y: i64, m: i64) i64 {
+    return switch (m) {
+        2 => if (isLeap(y)) 29 else 28,
+        4, 6, 9, 11 => 30,
+        else => 31,
+    };
+}
+
+/// The most days from the epoch DuckDB's DATE holds either way (5881580-07-10 and -5877641-06-25); one more is infinity.
+const max_date_days: i64 = std.math.maxInt(i32) - 1;
+
+/// `make_date(y, m, d)`: days since 1970-01-01, or `DateOutOfRange` for a month or day the calendar has not, or a date
+/// DuckDB's DATE cannot hold.
+pub fn makeDate(y: i64, m: i64, d: i64) Error!i64 {
+    if (m < 1 or m > 12 or d < 1 or y < -5877641 or y > 5881580 or d > daysInMonth(y, m)) return error.DateOutOfRange;
+    const days = daysFromCivil(y, m, d);
+    if (days > max_date_days or days < -max_date_days) return error.DateOutOfRange;
+    return days;
+}
+
+/// `v` over `per`, to the nearest, a tie away from zero: how DuckDB takes TIMESTAMP_NS to microseconds.
+pub fn roundDivAway(v: i64, per: i64) i64 {
+    const q = @divTrunc(v, per);
+    const r = @rem(v, per);
+    return if (@as(i128, @abs(r)) * 2 >= per) q + (if (v < 0) @as(i64, -1) else 1) else q;
+}
+
+/// `date_diff(unit, a, b)`: how many boundaries of `unit` lie between two times, `b` minus `a`, each counted in its own
+/// unit; a boundary is crossed, not a whole period elapsed (2020-01-31 to 2020-02-01 is a month). A DATE is its midnight,
+/// a TIMESTAMP_NS its microsecond to the nearest, as DuckDB casts it. A week is not a Monday's boundary: it is the day
+/// count over 7, truncated toward zero (1473 days are 210 weeks). Null where either time is infinite.
+pub fn diff(unit: ast.DiffPart, ta_in: ast.Temporal, a_in: i64, tb_in: ast.Temporal, b_in: i64) Error!?i64 {
+    const ts_infinity = std.math.maxInt(i64);
+    if ((ta_in != .date and (a_in == ts_infinity or a_in == -ts_infinity)) or
+        (tb_in != .date and (b_in == ts_infinity or b_in == -ts_infinity))) return null;
+    const ta: ast.Temporal = if (ta_in == .ts_ns) .ts_us else ta_in;
+    const tb: ast.Temporal = if (tb_in == .ts_ns) .ts_us else tb_in;
+    const a = if (ta_in == .ts_ns) roundDivAway(a_in, std.time.ns_per_us) else a_in;
+    const b = if (tb_in == .ts_ns) roundDivAway(b_in, std.time.ns_per_us) else b_in;
+    const sa = split(ta, a) catch |e| return if (e == error.InfiniteDate) null else e;
+    const sb = split(tb, b) catch |e| return if (e == error.InfiniteDate) null else e;
+    const ca = civilFromDays(sa.days);
+    const cb = civilFromDays(sb.days);
+    const da: i128 = sa.days;
+    const db: i128 = sb.days;
+    const r: i128 = switch (unit) {
+        .year => cb.y - ca.y,
+        .decade => @divTrunc(cb.y, 10) - @divTrunc(ca.y, 10),
+        .century => @divTrunc(cb.y, 100) - @divTrunc(ca.y, 100),
+        .millennium => @divTrunc(cb.y, 1000) - @divTrunc(ca.y, 1000),
+        .quarter => @divFloor(cb.y * 12 + cb.m - 1, 3) - @divFloor(ca.y * 12 + ca.m - 1, 3),
+        .month => (cb.y * 12 + cb.m) - (ca.y * 12 + ca.m),
+        .week => @divTrunc(db - da, 7),
+        .day => db - da,
+        .hour => (db * 24 + @divFloor(sb.of_day, us_per_hour)) - (da * 24 + @divFloor(sa.of_day, us_per_hour)),
+        .minute => (db * 1440 + @divFloor(sb.of_day, us_per_min)) - (da * 1440 + @divFloor(sa.of_day, us_per_min)),
+        .second => (db * 86400 + @divFloor(sb.of_day, us_per_s)) - (da * 86400 + @divFloor(sa.of_day, us_per_s)),
+        .millisecond => (db * 86_400_000 + @divFloor(sb.of_day, std.time.us_per_ms)) -
+            (da * 86_400_000 + @divFloor(sa.of_day, std.time.us_per_ms)),
+        .microsecond => (db * us_per_day + sb.of_day) - (da * us_per_day + sa.of_day),
+    };
+    return std.math.cast(i64, r) orelse error.TimestampOutOfRange;
 }
 
 /// A time split into its day and the microseconds into it; a DATE has none. DuckDB's infinite DATEs (`make_date` of
@@ -163,3 +232,54 @@ test "trunc and part match DuckDB on 2013-07-31 19:59:59.123, before the epoch a
     try testing.expectError(error.InfiniteDate, part(.year, .date, std.math.maxInt(i32)));
     try testing.expectError(error.TimestampOutOfRange, trunc(.day, .ts_ms, -9223372036854775));
 }
+
+test "make_date(y, m, d) and its edges match DuckDB 2.0.0" {
+    const T = std.testing;
+    try T.expectEqual(@as(i64, 0), try makeDate(1970, 1, 1));
+    try T.expectEqual(@as(i64, 18321), try makeDate(2020, 2, 29));
+    try T.expectEqual(@as(i64, -719528), try makeDate(0, 1, 1));
+    try T.expectEqual(@as(i64, 2147483646), try makeDate(5881580, 7, 10));
+    try T.expectEqual(@as(i64, -2147483646), try makeDate(-5877641, 6, 25));
+    for ([_][3]i64{ .{ 5881580, 7, 11 }, .{ -5877641, 6, 24 }, .{ 2021, 2, 29 }, .{ 2020, 13, 1 }, .{ 2020, 0, 1 }, .{ 2020, 1, 32 }, .{ 2020, 4, 31 }, .{ 2020, 1, 0 }, .{ 1900, 2, 29 }, .{ std.math.maxInt(i64), 1, 1 } }) |bad|
+        try T.expectError(error.DateOutOfRange, makeDate(bad[0], bad[1], bad[2]));
+    try T.expectEqual(@as(i64, 11016), try makeDate(2000, 2, 29));
+}
+
+test "date_diff counts boundaries crossed, not periods elapsed, and is NULL for infinity" {
+    const T = std.testing;
+    const d = struct {
+        fn at(y: i64, m: i64, day: i64) i64 {
+            return makeDate(y, m, day) catch unreachable;
+        }
+    }.at;
+    try T.expectEqual(@as(?i64, 1), try diff(.month, .date, d(2020, 1, 31), .date, d(2020, 2, 1)));
+    try T.expectEqual(@as(?i64, -1), try diff(.month, .date, d(2020, 3, 1), .date, d(2020, 2, 29)));
+    try T.expectEqual(@as(?i64, 1), try diff(.year, .date, d(2019, 12, 31), .date, d(2020, 1, 1)));
+    try T.expectEqual(@as(?i64, 1), try diff(.quarter, .date, d(2020, 3, 31), .date, d(2020, 4, 1)));
+    try T.expectEqual(@as(?i64, 0), try diff(.quarter, .date, d(2020, 4, 1), .date, d(2020, 6, 30)));
+    // A week is the day count over 7, truncated: 6 days are none, 7 are one, -6 none, -8 minus one.
+    try T.expectEqual(@as(?i64, 0), try diff(.week, .date, d(2020, 1, 1), .date, d(2020, 1, 7)));
+    try T.expectEqual(@as(?i64, 1), try diff(.week, .date, d(2020, 1, 1), .date, d(2020, 1, 8)));
+    try T.expectEqual(@as(?i64, 0), try diff(.week, .date, d(2020, 1, 7), .date, d(2020, 1, 1)));
+    try T.expectEqual(@as(?i64, -1), try diff(.week, .date, d(2020, 1, 9), .date, d(2020, 1, 1)));
+    try T.expectEqual(@as(?i64, 0), try diff(.week, .date, d(2020, 1, 5), .date, d(2020, 1, 6)));
+    // A TIMESTAMP_NS reaches microseconds to the nearest first: 499 ns short of midnight is midnight.
+    try T.expectEqual(@as(?i64, 0), try diff(.second, .ts_us, 0, .ts_ns, -499));
+    try T.expectEqual(@as(?i64, 1), try diff(.second, .ts_ns, -500, .ts_us, 0));
+    // 23:59:59.5 on 2019-12-31 to 00:00:00.25 the next day.
+    const a: i64 = d(2019, 12, 31) * 86_400_000_000 + 86_399_500_000;
+    const b: i64 = d(2020, 1, 1) * 86_400_000_000 + 250_000;
+    for ([_]struct { p: ast.DiffPart, want: i64 }{
+        .{ .p = .day, .want = 1 },         .{ .p = .hour, .want = 1 },        .{ .p = .minute, .want = 1 },
+        .{ .p = .second, .want = 1 },      .{ .p = .millisecond, .want = 750 }, .{ .p = .microsecond, .want = 750_000 },
+        .{ .p = .year, .want = 1 },        .{ .p = .decade, .want = 1 },      .{ .p = .century, .want = 0 },
+        .{ .p = .millennium, .want = 0 },  .{ .p = .week, .want = 0 },
+    }) |c| try T.expectEqual(@as(?i64, c.want), try diff(c.p, .ts_us, a, .ts_us, b));
+    // A DATE is its midnight and a mix of units compares on the same clock.
+    try T.expectEqual(@as(?i64, 24), try diff(.hour, .date, d(2020, 1, 1), .date, d(2020, 1, 2)));
+    try T.expectEqual(@as(?i64, 1), try diff(.day, .date, d(2020, 1, 1), .ts_ms, (d(2020, 1, 2) * 86_400_000) + 43_200_000));
+    // Infinity, either side and either kind of time.
+    try T.expectEqual(@as(?i64, null), try diff(.day, .date, std.math.maxInt(i32), .date, d(2020, 1, 1)));
+    try T.expectEqual(@as(?i64, null), try diff(.day, .ts_us, 0, .ts_us, std.math.maxInt(i64)));
+}
+

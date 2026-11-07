@@ -139,7 +139,7 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         error.TypeMismatch => diagnosticPrint("zpq query: type mismatch in expression\n", .{}),
         error.UnknownFunction => diagnosticPrint("zpq query: unknown scalar function in expression\n", .{}),
         error.UnsupportedDatePart => diagnosticPrint("zpq query: unsupported part for date_trunc/date_part\n", .{}),
-        error.DateOutOfRange => diagnosticPrint("zpq query: make_date argument is outside INTEGER's range\n", .{}),
+        error.DateOutOfRange => diagnosticPrint("zpq query: make_date is outside DATE's range, or not a date\n", .{}),
         error.TimestampOutOfRange => diagnosticPrint("zpq query: timestamp outside the TIMESTAMP range\n", .{}),
         error.InfiniteDate => diagnosticPrint("zpq query: an infinite DATE has no calendar fields\n", .{}),
         error.InvalidRegex => diagnosticPrint("zpq query: invalid regular expression or replacement\n", .{}),

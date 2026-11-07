@@ -347,6 +347,9 @@ pub const Func = enum {
     /// `split_part(s, sep, n)`: the `n`th field of `s` split by the constant `sep` (1-based; a negative `n` counts from the
     /// end; an empty `sep` splits into characters); empty where there is none.
     split_part,
+    /// `date_diff(part, start, end)` (also `datediff`): the number of `part` boundaries between two dates or timestamps (a
+    /// BIGINT, negative when `end` is before `start`); NULL where either is NULL or infinite.
+    date_diff,
     /// `regexp_extract(s, pattern [, group [, options]])`: the text of one group of the first match, empty where there is
     /// none. The pattern, group and options are constants.
     regexp_extract,
@@ -384,6 +387,36 @@ pub const Temporal = enum {
     ts_ms,
     ts_us,
     ts_ns,
+};
+
+/// The units of `date_diff`, by DuckDB's names (singular or plural): it counts the boundaries of the unit between two times.
+pub const DiffPart = enum {
+    year,
+    quarter,
+    month,
+    week,
+    day,
+    hour,
+    minute,
+    second,
+    millisecond,
+    microsecond,
+    decade,
+    century,
+    millennium,
+
+    pub fn parse(name: []const u8) ?DiffPart {
+        const plural = [_]struct { []const u8, DiffPart }{
+            .{ "years", .year },         .{ "quarters", .quarter },         .{ "months", .month },
+            .{ "weeks", .week },         .{ "days", .day },                 .{ "hours", .hour },
+            .{ "minutes", .minute },     .{ "seconds", .second },           .{ "milliseconds", .millisecond },
+            .{ "microseconds", .microsecond }, .{ "decades", .decade },     .{ "centuries", .century },
+            .{ "millennia", .millennium },
+        };
+        for (std.enums.values(DiffPart)) |p| if (std.ascii.eqlIgnoreCase(name, @tagName(p))) return p;
+        for (plural) |p| if (std.ascii.eqlIgnoreCase(name, p[0])) return p[1];
+        return null;
+    }
 };
 
 /// The parts `date_trunc` and `date_part` take, by DuckDB's names (singular or plural). `date_trunc` takes the ones
@@ -428,6 +461,8 @@ pub const Call = struct {
     utc: bool = false,
     /// `date_trunc`/`date_part`'s part, resolved from the literal first argument.
     part: ?DatePart = null,
+    /// `date_diff`'s unit.
+    diff: ?DiffPart = null,
     /// `regexp_replace`'s pattern and replacement, compiled from its literal arguments; shared read-only by workers.
     replace: ?*const regex.Replace = null,
     /// `regexp_extract`'s pattern, group and options, compiled likewise.
@@ -640,6 +675,8 @@ pub const Expr = union(enum) {
             .call => |c| switch (c.func) {
                 .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
+                // Infinite times give NULL whatever the columns say.
+                .date_diff => true,
                 .coalesce, .least, .greatest => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;
                 } else true,

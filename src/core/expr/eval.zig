@@ -1357,7 +1357,9 @@ fn evalCall(
     switch (c.func) {
         .coalesce => return evalCoalesce(arena, batch, column_lookup, c.args, c.result_type, c.dec),
         .strlen => return evalStrlen(arena, batch, column_lookup, c.args[0].*),
-        .make_date, .epoch_ms, .date_trunc, .date_part => return evalTemporal(arena, batch, column_lookup, c),
+        .make_date => return if (c.args.len == 3) evalMakeDate3(arena, batch, column_lookup, c) else evalTemporal(arena, batch, column_lookup, c),
+        .epoch_ms, .date_trunc, .date_part => return evalTemporal(arena, batch, column_lookup, c),
+        .date_diff => return evalDateDiff(arena, batch, column_lookup, c),
         .regexp_replace => return evalRegexpReplace(arena, batch, column_lookup, c, false),
         .cast_text => return evalCastText(arena, batch, column_lookup, c.args[0].*),
         .abs => return evalAbs(arena, batch, column_lookup, c),
@@ -2028,12 +2030,70 @@ fn quietDecimalRow(batch: *const Batch, nulls: ?Batch.Column, i: usize) bool {
 const us_per_day: i64 = 86_400_000_000;
 const ms_per_day: i64 = 86_400_000;
 
-/// `v` divided by `per`, to the nearest, a tie away from zero.
-fn roundDivAway(v: i64, per: i64) i64 {
-    const q = @divTrunc(v, per);
-    const r = @rem(v, per);
-    return if (@as(i128, @abs(r)) * 2 >= per) q + (if (v < 0) @as(i64, -1) else 1) else q;
+/// `make_date(year, month, day)`: a NULL in any argument is NULL; a month or day the calendar has not, or a date DuckDB's
+/// DATE cannot hold, fails the query in a row it consumes.
+fn evalMakeDate3(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const y = try evalGroupKeyExpr(arena, batch, column_lookup, c.args[0].*);
+    const m = try evalGroupKeyExpr(arena, batch, column_lookup, c.args[1].*);
+    const d = try evalGroupKeyExpr(arena, batch, column_lookup, c.args[2].*);
+    if (y != .i64 or m != .i64 or d != .i64) return error.TypeMismatch;
+    if (y.i64.max_rep > 0 or m.i64.max_rep > 0 or d.i64.max_rep > 0) return error.NestedNotSupported;
+    const n = y.i64.values.len;
+    const out = try arena.alloc(i64, n);
+    const needs_def = colHasNulls(y) or colHasNulls(m) or colHasNulls(d);
+    const def: ?[]u32 = if (needs_def) try arena.alloc(u32, n) else null;
+    var any_null = false;
+    for (out, 0..) |*o, i| {
+        const is_null = rowIsNull(y, i) or rowIsNull(m, i) or rowIsNull(d, i);
+        if (def) |dl| dl[i] = @intFromBool(!is_null);
+        o.* = 0;
+        if (is_null) {
+            any_null = true;
+            continue;
+        }
+        o.* = calendar.makeDate(y.i64.values[i], m.i64.values[i], d.i64.values[i]) catch |err| {
+            if (batch.sel != null and !batch.sel.?.isActive(i)) continue;
+            return err;
+        };
+    }
+    return .{ .i64 = .{ .values = out, .def_levels = def, .max_def = if (needs_def) 1 else 0, .has_nulls = any_null } };
 }
+
+/// `date_diff(part, start, end)`: BIGINT boundaries between two times of any unit, NULL where either is NULL or infinite.
+fn evalDateDiff(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const a = try evalGroupKeyExpr(arena, batch, column_lookup, c.args[1].*);
+    const b = try evalGroupKeyExpr(arena, batch, column_lookup, c.args[2].*);
+    if (a != .i64 or b != .i64) return error.TypeMismatch;
+    if (a.i64.max_rep > 0 or b.i64.max_rep > 0) return error.NestedNotSupported;
+    const ua = c.args[1].temporal().?;
+    const ub = c.args[2].temporal().?;
+    const n = a.i64.values.len;
+    const out = try arena.alloc(i64, n);
+    const def = try arena.alloc(u32, n);
+    var any_null = false;
+    for (out, def, 0..) |*o, *dl, i| {
+        o.* = 0;
+        dl.* = 0;
+        if (rowIsNull(a, i) or rowIsNull(b, i)) {
+            any_null = true;
+            continue;
+        }
+        const r = calendar.diff(c.diff.?, ua, a.i64.values[i], ub, b.i64.values[i]) catch |err| {
+            if (batch.sel != null and !batch.sel.?.isActive(i)) {
+                any_null = true;
+                continue;
+            }
+            return err;
+        };
+        if (r) |v| {
+            o.* = v;
+            dl.* = 1;
+        } else any_null = true;
+    }
+    return .{ .i64 = .{ .values = out, .def_levels = def, .max_def = 1, .has_nulls = any_null } };
+}
+
+const roundDivAway = calendar.roundDivAway;
 
 /// `CAST(v AS DATE)` (`to_date`) or `CAST(v AS TIMESTAMP)` of `v` counted in `unit`, as DuckDB 2.0 casts it. A day is the
 /// floor of the time over a day (so a time before 1970 is the day before); a TIMESTAMP_NS reaches microseconds to the
@@ -2292,7 +2352,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest => unreachable,
     }
     return .{ .i64 = .{
         .values = out,

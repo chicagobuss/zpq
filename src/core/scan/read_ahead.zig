@@ -194,7 +194,7 @@ pub const ReadAhead = struct {
     /// cap (the window, or what the ledger has free), and past it the rest is left to demand faults. Never waits. What
     /// it admits is added to `held`, the worker's own, which it gives back at its next claim (`releaseHeld`).
     pub fn adviseClaimed(self: *ReadAhead, file: usize, range: []const u8, held: *u64) void {
-        if (builtin.os.tag != .linux or file >= self.sources.len or range.len == 0) return;
+        if (builtin.target.os.tag != .linux or file >= self.sources.len or range.len == 0) return;
         const page = std.heap.pageSize();
         const src = self.sources[file];
         const src_lo = std.mem.alignBackward(usize, @intFromPtr(src.ptr), page);
@@ -266,7 +266,7 @@ pub const ReadAhead = struct {
 
     /// Release what claims have taken, then advise block by block up to the lookahead and the cap.
     fn advance(self: *ReadAhead, columns: ?agg_plan.Columns) void {
-        if (builtin.os.tag != .linux) return;
+        if (builtin.target.os.tag != .linux) return;
         if (self.busy.swap(true, .acquire)) return;
         defer self.busy.store(false, .release);
         const hi = @min(self.claimed_hi.load(.monotonic), self.work.len);
@@ -446,7 +446,7 @@ const Chunks = struct {
 };
 
 test "a pass's start advises nothing, and each claim advises about one item past it" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -475,7 +475,7 @@ test "a pass's start advises nothing, and each claim advises about one item past
 }
 
 test "the cap holds within an oversized item: advice stops mid-chunk" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -500,7 +500,7 @@ test "the cap holds within an oversized item: advice stops mid-chunk" {
 }
 
 test "a chunk's boundary page counts whole: one byte inside a page advises and counts that page" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -527,7 +527,7 @@ test "a chunk's boundary page counts whole: one byte inside a page advises and c
 }
 
 test "through a file's descriptor: resident pages are left alone, and the rest advised" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const local_fs = @import("../../local_fs.zig");
     const page = std.heap.pageSize();
     var tmp = std.testing.tmpDir(.{});
@@ -563,7 +563,7 @@ test "through a file's descriptor: resident pages are left alone, and the rest a
 }
 
 test "a column read behind the filter's gate is left to its reader until a reader says the gate kept all of it" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -595,7 +595,7 @@ test "a column read behind the filter's gate is left to its reader until a reade
 }
 
 test "a gated column's kept pages are advised within the window and the ledger, as the cursor's are (review R3)" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const thrift = @import("../thrift.zig");
     const local_fs = @import("../../local_fs.zig");
     const consumer_plan = @import("../consumer/plan.zig");
@@ -715,7 +715,7 @@ test "a gated column's kept pages are advised within the window and the ledger, 
 }
 
 test "the cap never passes what the query's ledger has free" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -748,7 +748,7 @@ test "a pass keeps a lookahead of items within the window" {
     const bytes = (try @import("test_support.zig").loadFixture("ci/fixtures/parquet/topk_skew.parquet")) orelse
         return error.SkipZigTest;
     defer testing.allocator.free(bytes);
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();

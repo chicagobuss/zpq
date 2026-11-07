@@ -44,7 +44,7 @@ const QueryArgs = types.QueryArgs;
 
 /// A Sink that appends into an in-memory buffer (offsets relative to 0).
 const BufSink = struct {
-    buf: *std.ArrayListUnmanaged(u8),
+    buf: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
     fn writeFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *BufSink = @ptrCast(@alignCast(ctx));
@@ -171,7 +171,7 @@ pub const Piece = struct {
 const PiecePool = struct {
     io: std.Io = undefined,
     mutex: std.Io.Mutex = .init,
-    free: std.ArrayListUnmanaged(*Piece) = .empty,
+    free: std.ArrayList(*Piece) = .empty,
     gpa: std.mem.Allocator,
     rows_alloc: std.mem.Allocator = undefined,
     ledger: ?*core_memory.SharedBudget = null,
@@ -287,7 +287,7 @@ fn copyRGToBuffer(
     bloom_leaves: []const ?f64,
     dictionary_bloom: bool,
 ) !EncodedRG {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
     var bufsink = BufSink{ .buf = &buf, .gpa = gpa };
     const sink: streaming.Sink = .{ .ctx = @ptrCast(&bufsink), .write_fn = BufSink.writeFn };
@@ -312,15 +312,15 @@ fn copyRGToBuffer(
 const Assembler = struct {
     w: *WinCtx,
     target: RowGroupTarget,
-    ranges: std.ArrayListUnmanaged(Range) = .empty,
+    ranges: std.ArrayList(Range) = .empty,
     rows: usize = 0,
     bits: u64 = 0,
     /// Pieces whose rows are all in `ranges`: the assembler's own reference to each goes once they are sealed.
-    done: std.ArrayListUnmanaged(*Piece) = .empty,
+    done: std.ArrayList(*Piece) = .empty,
     /// The piece being fed, until all its rows are in `ranges` (it is then in `done`).
     current: ?*Piece = null,
     /// Sealed row groups not yet written, oldest first.
-    pending: std.ArrayListUnmanaged(*EncodeJob) = .empty,
+    pending: std.ArrayList(*EncodeJob) = .empty,
     pending_bytes: u64 = 0,
 
     const Range = struct { piece: *Piece, lo: usize, hi: usize };
@@ -398,7 +398,7 @@ const Assembler = struct {
         // Only the ranges here: the job joins them into columns on its own thread.
         job.ranges = try w.gpa.dupe(Range, a.ranges.items);
         // The job holds every piece its rows point into until it has encoded them.
-        var pieces: std.ArrayListUnmanaged(*Piece) = .empty;
+        var pieces: std.ArrayList(*Piece) = .empty;
         defer pieces.deinit(w.gpa);
         for (a.ranges.items) |r| {
             if (std.mem.indexOfScalar(*Piece, pieces.items, r.piece) == null) try pieces.append(w.gpa, r.piece);
@@ -674,7 +674,7 @@ const EncodeJob = struct {
         }
         const prof = profile.threadOf(w.profiler, .writer);
         const rg_index = w.new_row_groups.items.len;
-        var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+        var columns: std.ArrayList(schema.ColumnChunk) = .empty;
         try columns.ensureTotalCapacity(w.arena, job.encs.len);
         var total: i64 = 0;
         for (job.encs, 0..) |enc, ci| {
@@ -1015,7 +1015,7 @@ pub const WinCtx = struct {
     // Writer-owned (single writer → no races); read back after the fan-out.
     sink: streaming.Sink,
     out_offset: u64,
-    new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
+    new_row_groups: *std.ArrayList(schema.RowGroup),
     arena: std.mem.Allocator, // writer-only append target
     /// Re-encoded chunks' page indexes, written after the row groups.
     page_indexes: *page_index.Deferred,
@@ -1613,7 +1613,7 @@ pub const RecompressCtx = struct {
     // Writer-owned; read back after the fan-out.
     sink: streaming.Sink,
     out_offset: u64,
-    new_row_groups: *std.ArrayListUnmanaged(schema.RowGroup),
+    new_row_groups: *std.ArrayList(schema.RowGroup),
     arena: std.mem.Allocator, // writer-only: footer metadata
     rows_kept: i64 = 0,
     rgs_kept: usize = 0,
@@ -2435,7 +2435,7 @@ test "a byte-copy sink error wins over later allocation and producer errors" {
         .{ .meta_arena = .init(gpa), .enc = .{ .rg = rg, .surviving = 1 }, .done = .init(true) },
         .{ .meta_arena = .init(gpa), .enc = .{ .err = error.OutOfMemory }, .done = .init(true) },
     };
-    var row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+    var row_groups: std.ArrayList(schema.RowGroup) = .empty;
     var window: std.Io.Semaphore = .{};
     var w: WinCtx = undefined;
     w.encode_scratch = null;

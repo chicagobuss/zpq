@@ -389,7 +389,7 @@ pub const Plan = struct {
         } else {
             try encodings.appendSlice(arena, &.{ .RLE, self.values_encoding });
         }
-        var enc_stats: std.ArrayListUnmanaged(schema.PageEncodingStats) = .empty;
+        var enc_stats: std.ArrayList(schema.PageEncodingStats) = .empty;
         // Every value is in the dictionary when there is one: readers may prune row groups on it.
         if (has_dict) try enc_stats.append(arena, .{
             .page_type = @backingInt(schema.PageType.DICTIONARY_PAGE),
@@ -555,7 +555,7 @@ fn pageEnds(
     };
     const page_rows = @max(1, page_rows_in);
     const budget_bits: u64 = @as(u64, @max(1, page_bytes)) * 8;
-    var ends: std.ArrayListUnmanaged(usize) = .empty;
+    var ends: std.ArrayList(usize) = .empty;
     if (n == 0) {
         try ends.append(arena, 0);
         return ends.items;

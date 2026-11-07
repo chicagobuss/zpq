@@ -275,7 +275,7 @@ test "initOutputAggregator widens FLOAT16 passthrough to DOUBLE" {
 
     var path: schema.StringList = .empty;
     try path.append(arena, "half");
-    var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var columns: std.ArrayList(schema.ColumnChunk) = .empty;
     try columns.append(arena, .{
         .file_path = null,
         .file_offset = 0,
@@ -344,7 +344,7 @@ test "initOutputAggregator rewrites BYTE_ARRAY decimal to FIXED_LEN_BYTE_ARRAY w
 
     var path: schema.StringList = .empty;
     try path.append(arena, "price");
-    var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var columns: std.ArrayList(schema.ColumnChunk) = .empty;
     try columns.append(arena, .{
         .file_path = null,
         .file_offset = 0,
@@ -412,7 +412,7 @@ test "initOutputAggregator maps precision > 38 BYTE_ARRAY decimal to f64" {
 
     var path: schema.StringList = .empty;
     try path.append(arena, "big_dec");
-    var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var columns: std.ArrayList(schema.ColumnChunk) = .empty;
     try columns.append(arena, .{
         .file_path = null,
         .file_offset = 0,

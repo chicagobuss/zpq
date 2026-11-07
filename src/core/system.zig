@@ -13,9 +13,9 @@ pub fn discoverAvailableMemory(env: ?std.process.Environ) usize {
     }
 
     // 2. OS-specific discovery
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         return linuxDiscover();
-    } else if (builtin.os.tag == .macos) {
+    } else if (builtin.target.os.tag == .macos) {
         return macosDiscover();
     }
 
@@ -54,7 +54,7 @@ fn lambdaMemoryMb(env: ?std.process.Environ) ?usize {
 /// cgroup v2 limits nest, so the process's own cgroup and every ancestor count; for v1 only the `cpu` mount root is
 /// read, which inside a container is the container's own group.
 fn cgroupCpuQuota() ?usize {
-    if (builtin.os.tag != .linux) return null;
+    if (builtin.target.os.tag != .linux) return null;
     var buf: [4096]u8 = undefined;
     const self_cgroup = readSmallFile("/proc/self/cgroup", &buf) orelse return null;
     var lines = std.mem.tokenizeScalar(u8, self_cgroup, '\n');
@@ -225,7 +225,7 @@ fn linuxDiscover() usize {
 
 /// The tightest cgroup v2 `memory.max` over this process's cgroup and its ancestors, or null when none is set.
 fn cgroupMemoryLimit() ?usize {
-    if (builtin.os.tag != .linux) return null;
+    if (builtin.target.os.tag != .linux) return null;
     var buf: [4096]u8 = undefined;
     const self_cgroup = readSmallFile("/proc/self/cgroup", &buf) orelse return null;
     var lines = std.mem.tokenizeScalar(u8, self_cgroup, '\n');

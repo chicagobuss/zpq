@@ -34,7 +34,7 @@ pub fn retainedCarry(allowance: usize) usize {
 /// target, so a build without them (musl, macOS, Windows, no libc) never references them. A weak extern's null check
 /// decided it at run time before, and under static musl it did not hold: the call jumped to address 0, and every query
 /// of the release CLI and the Lambda crashed on start.
-const glibc_heap = hasGlibcHeap(builtin.os.tag, builtin.abi, builtin.link_libc);
+const glibc_heap = hasGlibcHeap(builtin.target.os.tag, builtin.target.abi, builtin.link_libc);
 
 fn hasGlibcHeap(os: std.Target.Os.Tag, abi: std.Target.Abi, link_libc: bool) bool {
     return link_libc and os == .linux and abi.isGnu();
@@ -98,7 +98,7 @@ pub fn processAllocator(init_gpa: std.mem.Allocator) std.mem.Allocator {
 /// build.zig links mimalloc (`usesMimalloc`) for exactly the builds `ownHeap` names, libzpq's aside.
 const use_mimalloc = @import("build_options").use_mimalloc;
 comptime {
-    if (use_mimalloc) std.debug.assert(ownHeap(builtin.mode, builtin.abi, builtin.link_libc, builtin.single_threaded));
+    if (use_mimalloc) std.debug.assert(ownHeap(builtin.mode, builtin.target.abi, builtin.link_libc, builtin.single_threaded));
 }
 
 /// mimalloc's aligned API as a Zig allocator: thread-safe, and a block's in-place growth is mimalloc's usable size.

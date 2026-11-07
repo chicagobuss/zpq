@@ -33,7 +33,7 @@ fn distinctSlice(v: u64) usize {
 const Phase1Task = struct {
     gpa: std.mem.Allocator,
     sources: []const *const expr_agg.DistinctSet,
-    slices: []std.ArrayListUnmanaged(u64),
+    slices: []std.ArrayList(u64),
     cursor: *std.atomic.Value(usize),
     err: ?anyerror = null,
 
@@ -55,7 +55,7 @@ const Phase1Task = struct {
                 return;
             };
             eachDistinctU64(t.sources[m], row, struct {
-                fn f(r: []std.ArrayListUnmanaged(u64), v: u64) void {
+                fn f(r: []std.ArrayList(u64), v: u64) void {
                     r[distinctSlice(v)].appendAssumeCapacity(v);
                 }
             }.f);
@@ -65,7 +65,7 @@ const Phase1Task = struct {
 
 const Phase2Task = struct {
     gpa: std.mem.Allocator,
-    slices: []std.ArrayListUnmanaged(u64),
+    slices: []std.ArrayList(u64),
     M: usize,
     counts: []usize,
     cursor: *std.atomic.Value(usize),
@@ -108,7 +108,7 @@ pub fn parallelDistinctCountU64(
     n_workers: usize,
 ) !u64 {
     const M = sources.len;
-    const slices = try arena.alloc(std.ArrayListUnmanaged(u64), M * 16);
+    const slices = try arena.alloc(std.ArrayList(u64), M * 16);
     for (slices) |*cell| cell.* = .empty;
     defer for (slices) |*cell| cell.deinit(gpa);
 

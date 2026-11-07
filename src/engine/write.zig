@@ -531,7 +531,7 @@ const WriteRows = struct {
         if (!self.need_encoder and self.args.codec != null and anyChunkNeedsRecompress(self.metas, self.kept_opt, self.args.codec.?)) {
             // Byte copy with a codec change: recompression is CPU-bound, so row groups fan out across the CPU budget
             // behind a byte window, as the re-encode path below does.
-            var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
+            var jobs: std.ArrayList(RGJob) = .empty;
             for (self.inputs, self.metas, 0..) |in, *meta_p, ii| {
                 self.bytes_in += in.bytes.len;
                 for (meta_p.row_groups.items, 0..) |*src_rg, ri| {
@@ -688,7 +688,7 @@ const WriteRows = struct {
             const bytecopy_ok = self.select_items == null and self.filter_opt != null and !has_widened_output;
 
             // 1. Collect surviving row groups (serial, cheap stats-only pruning).
-            var jobs: std.ArrayListUnmanaged(RGJob) = .empty;
+            var jobs: std.ArrayList(RGJob) = .empty;
             for (self.inputs, 0..) |in, ii| {
                 self.bytes_in += in.bytes.len;
                 const meta_p = &self.metas[ii];
@@ -917,7 +917,7 @@ const WriteRows = struct {
 /// FIXED_LEN_BYTE_ARRAY with minimal byte width for its precision. Used after
 /// the re-encode path, where BYTE_ARRAY decimals are emitted as FLBA by the encoder.
 /// The file's footer must agree.
-pub fn coerceByteArrayDecimalLeavesToFlba(items: *std.ArrayListUnmanaged(schema.SchemaElement)) void {
+pub fn coerceByteArrayDecimalLeavesToFlba(items: *std.ArrayList(schema.SchemaElement)) void {
     for (items.items) |*elem| {
         // Only leaves (no children) can be DECIMAL.
         const nc = elem.num_children orelse 0;
@@ -934,7 +934,7 @@ pub fn coerceByteArrayDecimalLeavesToFlba(items: *std.ArrayListUnmanaged(schema.
 /// FLOAT16 decodes into the f64 lane and the writer has no half-float
 /// encoder. Re-encoded output is therefore DOUBLE; keep the footer in
 /// lockstep with the column metadata and eight-byte PLAIN values.
-pub fn coerceFloat16LeavesToDouble(items: *std.ArrayListUnmanaged(schema.SchemaElement)) void {
+pub fn coerceFloat16LeavesToDouble(items: *std.ArrayList(schema.SchemaElement)) void {
     for (items.items) |*elem| {
         const nc = elem.num_children orelse 0;
         if (nc != 0 or !schema.isFloat16(elem.*)) continue;
@@ -952,8 +952,8 @@ pub fn buildSelectSchema(
     arena: std.mem.Allocator,
     meta: *const schema.FileMetaData,
     specs: []const consumer.OutputCol,
-) !std.ArrayListUnmanaged(schema.SchemaElement) {
-    var out: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+) !std.ArrayList(schema.SchemaElement) {
+    var out: std.ArrayList(schema.SchemaElement) = .empty;
     try out.ensureTotalCapacity(arena, specs.len + 1);
 
     // Root group.
@@ -1054,7 +1054,7 @@ test "re-encoded FLOAT16 footer widens to DOUBLE" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    var items: std.ArrayList(schema.SchemaElement) = .empty;
     try items.append(arena, .{
         .type = .FIXED_LEN_BYTE_ARRAY,
         .type_length = 2,

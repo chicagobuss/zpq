@@ -27,7 +27,7 @@ pub fn closeChecked(fd: fd_t) !void {
 /// Flush data and the metadata needed to read it before publication. Darwin has no fdatasync.
 pub fn syncData(fd: fd_t) !void {
     while (true) {
-        const rc = if (builtin.os.tag == .macos) posix.system.fsync(fd) else posix.system.fdatasync(fd);
+        const rc = if (builtin.target.os.tag == .macos) posix.system.fsync(fd) else posix.system.fdatasync(fd);
         switch (posix.errno(rc)) {
             .SUCCESS => return,
             .INTR => continue,
@@ -40,7 +40,7 @@ pub fn syncData(fd: fd_t) !void {
 
 /// Start Linux writeback without waiting for completion; publication still needs its final data sync.
 pub fn startWriteback(fd: fd_t, offset: u64, len: u64) !void {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     const linux = std.os.linux;
     while (true) {
         const rc = linux.syscall4(.sync_file_range, @intCast(fd), @intCast(offset), @intCast(len), 2);
@@ -62,7 +62,7 @@ pub fn openRead(path: []const u8) !fd_t {
 pub fn sameFile(a: []const u8, b: []const u8) !bool {
     const az = try posix.toPosixPath(a);
     const bz = try posix.toPosixPath(b);
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         const linux = std.os.linux;
         var ast = std.mem.zeroes(linux.Statx);
         var bst = std.mem.zeroes(linux.Statx);
@@ -108,14 +108,14 @@ pub fn removeFile(path: []const u8) void {
 /// elsewhere `fstat` does both, since Darwin's `mmap` answers a directory with EINVAL, which `std.posix.mmap` treats
 /// as unreachable.
 pub fn fileSize(fd: fd_t) !usize {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         // A directory "seeks" fine and then fails to map with a confusing error; a FIFO has no size at all.
         const linux = std.os.linux;
         var st = std.mem.zeroes(linux.Statx);
         if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &st)) == .SUCCESS and
             !linux.S.ISREG(st.mode)) return error.NotAFile;
     }
-    if (builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux) {
         var st: posix.system.Stat = undefined;
         if (posix.errno(posix.system.fstat(fd, &st)) != .SUCCESS) return error.StatFailed;
         if (!posix.S.ISREG(st.mode)) return error.NotAFile;
@@ -244,7 +244,7 @@ pub const Mapped = struct {
 /// mmap_lock; disjoint MADV_DONTNEED calls can release those PTEs in parallel on the context's persistent workers.
 /// The mapping stays valid through this call, including when dispatch fails and the caller does the work.
 pub fn releaseMappingPages(bytes: []align(std.heap.page_size_min) const u8, io: std.Io) void {
-    if (builtin.os.tag != .linux or bytes.len < 64 << 20) return;
+    if (builtin.target.os.tag != .linux or bytes.len < 64 << 20) return;
     const slice_len = 32 << 20;
     const Release = struct {
         bytes: []align(std.heap.page_size_min) const u8,
@@ -290,7 +290,7 @@ fn releaseLeftOver(min_bytes: usize) void {
         left.deinit(std.heap.page_allocator);
         left = .empty;
     }
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     const slice_len = 32 << 20;
     var total: usize = 0;
     var slices: usize = 0;
@@ -349,7 +349,7 @@ pub fn raiseOpenFileLimit() void {
     if (posix.rlimit_resource == void) return;
     var lim = posix.getrlimit(.NOFILE) catch return;
     // macOS refuses a soft limit past OPEN_MAX, whatever the hard limit says.
-    const most = if (builtin.os.tag.isDarwin()) @min(lim.max, 10240) else lim.max;
+    const most = if (builtin.target.os.tag.isDarwin()) @min(lim.max, 10240) else lim.max;
     if (lim.cur >= most) return;
     lim.cur = most;
     posix.setrlimit(.NOFILE, lim) catch {};
@@ -374,7 +374,7 @@ pub const Stamp = struct {
 };
 
 pub fn fdStamp(fd: fd_t) !Stamp {
-    if (builtin.os.tag == .linux) return statxStamp(fd, "", std.os.linux.AT.EMPTY_PATH);
+    if (builtin.target.os.tag == .linux) return statxStamp(fd, "", std.os.linux.AT.EMPTY_PATH);
     var st: posix.system.Stat = undefined;
     if (posix.errno(posix.system.fstat(fd, &st)) != .SUCCESS) return error.StatFailed;
     return statStamp(st);
@@ -386,7 +386,7 @@ pub fn pathStamp(path: []const u8) !Stamp {
     if (path.len >= path_z.len) return error.NameTooLong;
     @memcpy(path_z[0..path.len], path);
     path_z[path.len] = 0;
-    if (builtin.os.tag == .linux) return statxStamp(posix.AT.FDCWD, path_z[0..path.len :0], 0);
+    if (builtin.target.os.tag == .linux) return statxStamp(posix.AT.FDCWD, path_z[0..path.len :0], 0);
     var st: posix.system.Stat = undefined;
     if (posix.errno(posix.system.stat(path_z[0..path.len :0], &st)) != .SUCCESS) return error.StatFailed;
     return statStamp(st);
@@ -398,7 +398,7 @@ fn statxStamp(dirfd: fd_t, path: [*:0]const u8, flags: u32) !Stamp {
     const mask: linux.STATX = .{ .INO = true, .SIZE = true, .MTIME = true };
     if (linux.errno(linux.statx(dirfd, path, flags, mask, &st)) != .SUCCESS) return error.StatFailed;
     return .{
-        .dev = @as(u64, st.dev_major) << 32 | st.dev_minor,
+        .dev = (@as(u64, st.dev_major) << 32) | st.dev_minor,
         .ino = st.ino,
         .size = st.size,
         .mtime_sec = st.mtime.sec,
@@ -543,7 +543,7 @@ const guard = struct {
 /// not report types), in directory order. Names are `arena`-owned.
 pub fn listFiles(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         const linux = std.os.linux;
         const fd = try posix.openat(posix.AT.FDCWD, dir_path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
         defer close(fd);
@@ -629,7 +629,7 @@ test "createNewFile refuses an existing path; rename replaces its target" {
 }
 
 test "releaseLeft drops a left mapping's pages from the resident set and leaves its bytes readable" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -637,7 +637,7 @@ test "releaseLeft drops a left mapping's pages from the resident set and leaves 
     const arena = arena_state.allocator();
     const file_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/big.bin", .{tmp.sub_path});
     const data = try arena.alloc(u8, 40 << 20);
-    for (data, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 7);
+    for (data, 0..) |*b, i| b.* = @truncate((i *% 2654435761) >> 7);
     const fd = try createFile(file_path);
     try writeAll(fd, data);
     close(fd);
@@ -667,7 +667,7 @@ test "mapFile rejects an empty file" {
 /// page's tail, or the guard's zero page over a removed one); macOS goes on serving the bytes it mapped, or zeros
 /// should the page be evicted and fault. Either way `Mapped.intact` is what reports the cut.
 fn expectCutByte(byte: u8) !void {
-    if (builtin.os.tag.isDarwin() and byte == 0xab) return;
+    if (builtin.target.os.tag.isDarwin() and byte == 0xab) return;
     try testing.expectEqual(@as(u8, 0), byte);
 }
 
@@ -802,7 +802,7 @@ test "regression: the SIGBUS handler is in place only while a mapping is, and yi
 }
 
 test "regression: mapFile and readFile refuse a directory and a FIFO instead of misreporting or blocking" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [256]u8 = undefined;
@@ -819,7 +819,7 @@ test "regression: mapFile and readFile refuse a directory and a FIFO instead of 
 }
 
 test "writeAll distinguishes a full device from a broken pipe" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const fd = try posix.openat(posix.AT.FDCWD, "/dev/full", .{ .ACCMODE = .WRONLY }, 0);
     defer close(fd);
     try testing.expectError(error.NoSpaceLeft, writeAll(fd, "x"));
@@ -830,14 +830,14 @@ test "writeAll distinguishes a full device from a broken pipe" {
 }
 
 test "parallel mapping release keeps bytes intact and falls back when concurrency is unavailable" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const path = try std.fmt.allocPrint(arena.allocator(), ".zig-cache/tmp/{s}/release.bin", .{tmp.sub_path});
     const data = try arena.allocator().alloc(u8, 65 << 20);
-    for (data, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 7);
+    for (data, 0..) |*b, i| b.* = @truncate((i *% 2654435761) >> 7);
     const fd = try createFile(path);
     try writeAll(fd, data);
     close(fd);
@@ -896,7 +896,7 @@ test "ordered segment writes preserve empty buffers and vector batch boundaries 
     try writeSegments(fd, &.{});
     const got = try readFile(a, path);
     try testing.expectEqualSlices(u8, try std.mem.concat(a, u8, &segments), got);
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         const full = try posix.openat(posix.AT.FDCWD, "/dev/full", .{ .ACCMODE = .WRONLY }, 0);
         defer close(full);
         try testing.expectError(error.NoSpaceLeft, writeSegments(full, &.{ "a", "", "b" }));

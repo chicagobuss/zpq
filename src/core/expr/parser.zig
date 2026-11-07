@@ -1224,7 +1224,7 @@ const filter_eval_mod = @import("../filter/eval.zig");
 fn fakeFile(arena: std.mem.Allocator, names: []const []const u8, types: []const schema.Type) !schema.FileMetaData {
     // Build a minimal FileMetaData with a flat schema: one root group +
     // one leaf per name. Enough for findColumnIndex / getColumnSchema.
-    var elems: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    var elems: std.ArrayList(schema.SchemaElement) = .empty;
     try elems.append(arena, .{
         .type = null,
         .type_length = null,

@@ -390,8 +390,8 @@ pub const PageType = enum(i32) {
 };
 
 // Aliases for ArrayLists
-pub const EncodingList = std.ArrayListUnmanaged(Encoding);
-pub const StringList = std.ArrayListUnmanaged([]const u8);
+pub const EncodingList = std.ArrayList(Encoding);
+pub const StringList = std.ArrayList([]const u8);
 
 pub const FieldRepetitionType = enum(i32) {
     REQUIRED = 0,
@@ -939,7 +939,7 @@ pub const ColumnMetaData = struct {
     statistics: ?Statistics = null,
     /// Field 13: the chunk's pages by type and encoding. It is what tells a dictionary that covers every value from one
     /// a writer abandoned partway; a byte copy keeps the pages, so it keeps these too.
-    encoding_stats: ?std.ArrayListUnmanaged(PageEncodingStats) = null,
+    encoding_stats: ?std.ArrayList(PageEncodingStats) = null,
     /// Fields 14/15: where the chunk's split-block Bloom filter (header and bitset) lies in the file. Older
     /// parquet-java leaves the length out. A copy that moves the chunk must move or drop these with it.
     bloom_filter_offset: ?i64 = null,
@@ -1024,7 +1024,7 @@ pub const ColumnMetaData = struct {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
                     if (size == 0xF) size = try reader.readVarInt(usize);
-                    var list: std.ArrayListUnmanaged(PageEncodingStats) = .empty;
+                    var list: std.ArrayList(PageEncodingStats) = .empty;
                     errdefer list.deinit(allocator);
                     try list.ensureTotalCapacityPrecise(
                         allocator,
@@ -1223,7 +1223,7 @@ pub const PageLocation = struct {
 };
 
 pub const OffsetIndex = struct {
-    page_locations: std.ArrayListUnmanaged(PageLocation) = .empty,
+    page_locations: std.ArrayList(PageLocation) = .empty,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !OffsetIndex {
         const saved_id = reader.last_field_id;
@@ -1267,16 +1267,16 @@ pub const OffsetIndex = struct {
 
 pub const ColumnIndex = struct {
     /// One bool per page: whether the page holds only nulls.
-    null_pages: std.ArrayListUnmanaged(bool) = .empty,
+    null_pages: std.ArrayList(bool) = .empty,
     /// Per-page min/max bytes (empty slice for a null page). Length
     /// matches `null_pages`.
-    min_values: std.ArrayListUnmanaged([]const u8) = .empty,
-    max_values: std.ArrayListUnmanaged([]const u8) = .empty,
+    min_values: std.ArrayList([]const u8) = .empty,
+    max_values: std.ArrayList([]const u8) = .empty,
     boundary_order: BoundaryOrder = .UNORDERED,
     /// Optional per-page null counts. Histograms (fields 6-7) skipped.
-    null_counts: ?std.ArrayListUnmanaged(i64) = null,
+    null_counts: ?std.ArrayList(i64) = null,
     /// Optional per-page NaN counts of a FLOAT/DOUBLE column; missing means any page may hold NaN.
-    nan_counts: ?std.ArrayListUnmanaged(i64) = null,
+    nan_counts: ?std.ArrayList(i64) = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnIndex {
         const saved_id = reader.last_field_id;
@@ -1385,11 +1385,11 @@ pub const ColumnIndex = struct {
 };
 
 /// A `list<i64>` field's elements, the list header included.
-fn readI64List(allocator: std.mem.Allocator, reader: *thrift.Reader) !std.ArrayListUnmanaged(i64) {
+fn readI64List(allocator: std.mem.Allocator, reader: *thrift.Reader) !std.ArrayList(i64) {
     const header = try reader.readByte();
     var size = @as(usize, header >> 4);
     if (size == 0xF) size = try reader.readVarInt(usize);
-    var list: std.ArrayListUnmanaged(i64) = .empty;
+    var list: std.ArrayList(i64) = .empty;
     errdefer list.deinit(allocator);
     try list.ensureTotalCapacityPrecise(allocator, safeListReserve(i64, size, reader.remaining()));
     for (0..size) |_| try list.append(allocator, try reader.readZigZag(i64));
@@ -1397,7 +1397,7 @@ fn readI64List(allocator: std.mem.Allocator, reader: *thrift.Reader) !std.ArrayL
 }
 
 pub const RowGroup = struct {
-    columns: std.ArrayListUnmanaged(ColumnChunk),
+    columns: std.ArrayList(ColumnChunk),
     total_byte_size: i64,
     num_rows: i64,
     // sorting_columns skipped
@@ -1496,13 +1496,13 @@ pub const COLUMN_ORDER_INT96_TIMESTAMP: i16 = 3;
 
 pub const FileMetaData = struct {
     version: i32,
-    schema: std.ArrayListUnmanaged(SchemaElement),
+    schema: std.ArrayList(SchemaElement),
     num_rows: i64,
     created_by: ?[]const u8,
-    row_groups: std.ArrayListUnmanaged(RowGroup),
+    row_groups: std.ArrayList(RowGroup),
     /// Per leaf, the `ColumnOrder` union member the writer declared (0 = an empty union). Null when the footer has no
     /// column_orders. Written from `outputColumnOrders`.
-    column_orders: ?std.ArrayListUnmanaged(i16) = null,
+    column_orders: ?std.ArrayList(i16) = null,
     /// Fields 8/9 (encryption_algorithm, footer_signing_key_metadata): a plaintext footer over encrypted columns.
     encrypted: bool = false,
     /// Each leaf's element and levels, and the first leaf of each path, from one schema walk at footer open
@@ -1592,12 +1592,12 @@ pub const FileMetaData = struct {
         return meta;
     }
 
-    fn readColumnOrders(allocator: std.mem.Allocator, reader: *thrift.Reader) !std.ArrayListUnmanaged(i16) {
+    fn readColumnOrders(allocator: std.mem.Allocator, reader: *thrift.Reader) !std.ArrayList(i16) {
         const header = try reader.readByte();
         var size = @as(usize, header >> 4);
         if (size == 0xF) size = try reader.readVarInt(usize);
         if (header & 0x0f != @backingInt(thrift.Type.Struct)) return error.InvalidThriftType;
-        var orders: std.ArrayListUnmanaged(i16) = .empty;
+        var orders: std.ArrayList(i16) = .empty;
         errdefer orders.deinit(allocator);
         try orders.ensureTotalCapacityPrecise(allocator, safeListReserve(i16, size, reader.remaining()));
         var i: usize = 0;
@@ -1672,10 +1672,10 @@ pub const FileMetaData = struct {
         n_leaves: usize,
         kept: ?[]const usize,
         copied_from: []const *const FileMetaData,
-    ) !?std.ArrayListUnmanaged(i16) {
+    ) !?std.ArrayList(i16) {
         var undeclared = false;
         for (copied_from) |m| undeclared = undeclared or m.column_orders == null;
-        var out: std.ArrayListUnmanaged(i16) = .empty;
+        var out: std.ArrayList(i16) = .empty;
         errdefer out.deinit(allocator);
         try out.ensureTotalCapacityPrecise(allocator, n_leaves);
         for (0..n_leaves) |j| {
@@ -1775,7 +1775,7 @@ pub const FileMetaData = struct {
 /// leaf with it, as the walk would find it.
 pub const LeafIndex = struct {
     schema_len: usize,
-    leaves: std.ArrayListUnmanaged(Entry) = .empty,
+    leaves: std.ArrayList(Entry) = .empty,
     first_by_path: PathMap = .empty,
 
     const PathMap = std.HashMapUnmanaged([]const []const u8, u32, PathContext, std.hash_map.default_max_load_percentage);
@@ -2110,10 +2110,10 @@ test "ColumnIndex roundtrip" {
     try ci.null_pages.appendSlice(allocator, &[_]bool{ false, true });
     try ci.min_values.appendSlice(allocator, &[_][]const u8{ "\x01\x00\x00\x00", "" });
     try ci.max_values.appendSlice(allocator, &[_][]const u8{ "\xff\x00\x00\x00", "" });
-    var nc: std.ArrayListUnmanaged(i64) = .empty;
+    var nc: std.ArrayList(i64) = .empty;
     try nc.appendSlice(allocator, &[_]i64{ 0, 1000 });
     ci.null_counts = nc;
-    var nans: std.ArrayListUnmanaged(i64) = .empty;
+    var nans: std.ArrayList(i64) = .empty;
     try nans.appendSlice(allocator, &[_]i64{ 3, 0 });
     ci.nan_counts = nans;
 
@@ -2206,7 +2206,7 @@ test "FileMetaData writes column_orders and reads them back" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var orders: std.ArrayListUnmanaged(i16) = .empty;
+    var orders: std.ArrayList(i16) = .empty;
     try orders.appendSlice(a, &.{ COLUMN_ORDER_TYPE_DEFINED, 3, 0 });
     const meta: FileMetaData = .{
         .version = 1,

@@ -141,7 +141,7 @@ pub fn mask(h: u64) Mask {
 /// Whether every bit of `m` is set in `block`: one 32-byte load and a vector AND/compare.
 pub fn blockHas(block: *const [block_bytes]u8, m: Mask) bool {
     var w: Mask = @bitCast(block.*);
-    if (comptime builtin.cpu.arch.endian() == .big) w = @byteSwap(w);
+    if (comptime builtin.target.cpu.arch.endian() == .big) w = @byteSwap(w);
     return @reduce(.And, (w & m) == m);
 }
 

@@ -75,7 +75,7 @@ pub fn copyRG(
     defer out_offset.* = out.offset;
 
     if (kept_eff) |kept| {
-        var new_cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+        var new_cols: std.ArrayList(schema.ColumnChunk) = .empty;
         try new_cols.ensureTotalCapacity(out_arena, rg.columns.items.len);
         var rg_total: i64 = 0;
 
@@ -148,7 +148,7 @@ pub fn copyRG(
     const delta = offsetDelta(out.pos(), range.start);
     try timedWrite(&out, rg_slice, timings);
 
-    var cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var cols: std.ArrayList(schema.ColumnChunk) = .empty;
     try cols.ensureTotalCapacity(out_arena, rg.columns.items.len);
     // Whole-RG copy: one delta for the group. Index bytes for each
     // chunk are appended after the RG data block, in column order.
@@ -257,7 +257,7 @@ pub const FilterJobs = struct {
     /// The job records. Only the copy thread allocates from it.
     arena: std.mem.Allocator,
     group: std.Io.Group = .init,
-    jobs: std.ArrayListUnmanaged(*Job) = .empty,
+    jobs: std.ArrayList(*Job) = .empty,
     /// The row group `copyRG` is copying; the caller sets it around each call.
     hold: ?*Hold = null,
     joined: bool = false,

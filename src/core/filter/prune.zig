@@ -528,7 +528,7 @@ test "pruneRowGroup uses DECIMAL stat decoding when file_meta provided" {
     });
 
     // File metadata with a schema declaring DECIMAL(18, 2) on "value".
-    var meta_schema: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    var meta_schema: std.ArrayList(schema.SchemaElement) = .empty;
     try meta_schema.append(a, .{
         .type = null,
         .type_length = null,
@@ -704,7 +704,7 @@ test "float pruning reads bounds under IEEE_754_TOTAL_ORDER, and a page index's 
     const lt_neg: ast.Filter = .{ .double = .{ .col_idx = 0, .op = .Lt, .value = -1 } };
 
     var fx = try ProofFixture.init(a, leafElem(.DOUBLE), .{ .min_value = &lo, .max_value = &hi, .null_count = 0, .nan_count = 0 });
-    var orders: std.ArrayListUnmanaged(i16) = .empty;
+    var orders: std.ArrayList(i16) = .empty;
     try orders.append(a, schema.COLUMN_ORDER_IEEE_754_TOTAL);
     fx.fm.column_orders = orders;
     try testing.expectEqual(Decision.skip, fx.decide(gt5));
@@ -777,7 +777,7 @@ test "full-match proof: INT64 needs trusted min_value/max_value and zero nulls" 
 
     // A declared order other than TYPE_DEFINED_ORDER; an absent list is read as type-defined, like parquet-mr does.
     // Bounds in an order zpq cannot read neither prove nor rule out anything.
-    var orders: std.ArrayListUnmanaged(i16) = .empty;
+    var orders: std.ArrayList(i16) = .empty;
     try orders.append(a, 0);
     ok.fm.column_orders = orders;
     try testing.expectEqual(Decision.unknown, ok.decide(ge10));
@@ -908,7 +908,7 @@ test "bounds are unreadable under an undeclared column order or an unordered ann
     try testing.expectEqual(Decision.skip, fx.decide(eq_b));
     try testing.expectEqual(Decision.skip, prunePage(&fx.rg, 0, eq_b, &cis, &fx.fm, false));
 
-    var orders: std.ArrayListUnmanaged(i16) = .empty;
+    var orders: std.ArrayList(i16) = .empty;
     try orders.append(a, 3); // an order this reader does not implement
     fx.fm.column_orders = orders;
     try testing.expectEqual(Decision.unknown, fx.decide(eq_b));

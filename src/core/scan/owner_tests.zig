@@ -434,7 +434,7 @@ test "unfiltered record COUNT retains row identities instead of a dictionary his
     var file = try consumer.AggregateFile.init(a, sink.sink());
     defer file.deinit();
     var values: [4096]i64 = undefined;
-    for (&values, 0..) |*v, i| v.* = @as(i64, @intCast(i * 7 % 16)) * (1 << 40);
+    for (&values, 0..) |*v, i| v.* = @as(i64, @intCast((i * 7) % 16)) * (1 << 40);
     const columns = [_]expr_agg.OutputCol{
         .{ .name = "unused", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &values } } },
         .{ .name = "k", .parquet_type = .INT64, .nullable = false, .col = .{ .i64 = .{ .values = &values } } },
@@ -467,7 +467,7 @@ test "unfiltered record COUNT retains row identities instead of a dictionary his
         try got.output.applyResultOrder(gpa, args.result_order);
         try testing.expectEqual(@as(usize, 10), got.output.group_rows.?.len);
         for (got.output.group_rows.?, 0..) |row, i| {
-            try testing.expectEqual(@as(i128, @intCast(i * 7 % 16)) * (1 << 40), row[0].i);
+            try testing.expectEqual(@as(i128, @intCast((i * 7) % 16)) * (1 << 40), row[0].i);
             try testing.expectEqual(@as(i128, 512), row[1].i);
         }
     };
@@ -891,7 +891,7 @@ test "integer and packed COUNT owner caps agree with EXPLAIN beyond sixty four w
     var keys: [1025]i64 = undefined;
     var flags: [1025]i64 = undefined;
     for (&keys, &flags, 0..) |*key, *flag, i| {
-        key.* = @as(i64, @intCast(i * 17 % 61)) * (1 << 40);
+        key.* = @as(i64, @intCast((i * 17) % 61)) * (1 << 40);
         flag.* = @intCast(i % 3);
     }
     const columns = [_]expr_agg.OutputCol{

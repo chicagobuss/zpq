@@ -399,7 +399,7 @@ fn packedTrial(a: std.mem.Allocator, workers: usize) !void {
             const l = &s.locals[(i / 31) % workers];
             if (i % 31 == 0) l.start();
             try l.append(.{
-                .key = @as(u128, id) << 64 | std.math.maxInt(u64),
+                .key = (@as(u128, id) << 64) | std.math.maxInt(u64),
                 .ordinal = (1 << 40) + 4095 - i,
                 .weight = 1,
                 .values = .{ -7, -7, -7, 1 },
@@ -561,7 +561,7 @@ test "owner window append keeps row records, cache trials and exact wide results
                 var off: usize = 0;
                 while (off < count) {
                     const n = @min(count - off, ([_]usize{ 17, 1, 64, 3 })[off % 4]);
-                    const wi = off / 64 % workers;
+                    const wi = (off / 64) % workers;
                     for (off..off + n) |i| try old.locals[wi].append(try payload.record(keys[i], i, 1000 + i));
                     try std.testing.expect(try bulk.locals[wi].appendWindow(
                         keys[off..][0..n],
@@ -692,7 +692,7 @@ fn mixedStorageTrial(a: std.mem.Allocator, workers: usize, direct: bool) !void {
     defer mixed.deinit();
     for (0..count) |i| {
         const id = if (i < count - 17) i % 17 else 17 + i - (count - 17);
-        const wi = i / 31 % workers;
+        const wi = (i / 31) % workers;
         if (i % 31 == 0) {
             old.locals[wi].start();
             mixed.locals[wi].start();

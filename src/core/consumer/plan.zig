@@ -82,7 +82,7 @@ fn baseColumns(a: std.mem.Allocator, in: AggRowGroup, target: AggTarget) ![]bool
 /// reads too, is all of it read. Records in `ws.kept` whether the gate kept every data page. Advisory only: a header
 /// the walk cannot read ends it, unrecorded. Not for a row subgroup, whose readers seek by the page index.
 pub fn adviseGated(in: AggRowGroup, ci: usize, gate: *const filter_selection.SelectionVector, ws: AggWorkspace) void {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     const kept = ws.kept orelse return;
     if (in.subgroup != null or ci >= kept.len or ci >= in.rg.columns.items.len) return;
     const cm = in.rg.columns.items[ci].meta_data orelse return;

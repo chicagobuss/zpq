@@ -138,7 +138,7 @@ fn sourceLibraries(
     b: *std.Build,
     dep: *std.Build.Dependency,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.OptimizeMode,
 ) ![2]*std.Build.Step.Compile {
     const json_path = try dep.builder.root.joinString(b.allocator, "gen/sources.json");
     const json_text = try std.Io.Dir.cwd().readFileAlloc(b.graph.io, json_path, b.allocator, .limited(4 << 20));

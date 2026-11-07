@@ -54,7 +54,7 @@ pub fn Layout(comptime Bits: type, comptime Ordinal: type) type {
         }
 
         fn hash(key: Key, first: Ordinal) u64 {
-            return hashBits(@as(u128, hashBits(key.group)) << 64 | valueHash(key.value, first & null_arg != 0));
+            return hashBits((@as(u128, hashBits(key.group)) << 64) | valueHash(key.value, first & null_arg != 0));
         }
 
         pub fn hashRecord(r: Record) u64 {

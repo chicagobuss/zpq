@@ -86,7 +86,7 @@ fn tag(out: anytype, t: thrift.Type, id: i16, previous: *i16, replacement: ?i32)
     w.buffer.capacity = bytes.len;
     const delta = @as(i32, id) - @as(i32, previous.*);
     if (delta > 0 and delta <= 15) {
-        try w.writeByte(@as(u8, @intCast(delta)) << 4 | @backingInt(t));
+        try w.writeByte((@as(u8, @intCast(delta)) << 4) | @backingInt(t));
     } else {
         try w.writeByte(@backingInt(t));
         try w.writeZigZag(id);

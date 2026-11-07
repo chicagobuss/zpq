@@ -1712,11 +1712,11 @@ fn foldAvg(
 
 pub fn testI64Meta(
     arena: std.mem.Allocator,
-    row_groups: std.ArrayListUnmanaged(schema.RowGroup),
+    row_groups: std.ArrayList(schema.RowGroup),
     num_rows: i64,
     repetition: schema.FieldRepetitionType,
 ) !schema.FileMetaData {
-    var elems: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    var elems: std.ArrayList(schema.SchemaElement) = .empty;
     try elems.append(arena, .{
         .type = null,
         .type_length = null,
@@ -2120,7 +2120,7 @@ test "updateOneFromStats sum: constant-column RG folds num_rows × value" {
     var encs: schema.EncodingList = .empty;
     try encs.append(a, .PLAIN);
 
-    var col_chunks: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var col_chunks: std.ArrayList(schema.ColumnChunk) = .empty;
     try col_chunks.append(a, .{
         .file_path = null,
         .file_offset = 0,
@@ -2180,7 +2180,7 @@ test "updateOneFromStats: an all-null row group leaves sum/min/max NULL" {
     std.mem.writeInt(i64, bound[0..8], 7, .little);
     var path: schema.StringList = .empty;
     try path.append(a, "x");
-    var col_chunks: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var col_chunks: std.ArrayList(schema.ColumnChunk) = .empty;
     try col_chunks.append(a, .{
         .file_path = null,
         .file_offset = 0,
@@ -2230,7 +2230,7 @@ test "updateOneFromStats decodes typed min/max bytes" {
     var encs: schema.EncodingList = .empty;
     try encs.append(a, .PLAIN);
 
-    var col_chunks: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var col_chunks: std.ArrayList(schema.ColumnChunk) = .empty;
     try col_chunks.append(a, .{
         .file_path = null,
         .file_offset = 0,
@@ -2280,7 +2280,7 @@ test "updateOneFromStats returns false when stats absent" {
     var encs: schema.EncodingList = .empty;
     try encs.append(a, .PLAIN);
 
-    var col_chunks: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var col_chunks: std.ArrayList(schema.ColumnChunk) = .empty;
     try col_chunks.append(a, .{
         .file_path = null,
         .file_offset = 0,
@@ -2322,7 +2322,7 @@ test "updateOneFromStats: count(*) uses num_rows; count(col) uses num_rows - nul
     var encs: schema.EncodingList = .empty;
     try encs.append(a, .PLAIN);
 
-    var col_chunks: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var col_chunks: std.ArrayList(schema.ColumnChunk) = .empty;
     try col_chunks.append(a, .{
         .file_path = null,
         .file_offset = 0,
@@ -2379,7 +2379,7 @@ test "updateOneFromStats: count(*) uses num_rows; count(col) uses num_rows - nul
     try testing.expectEqual(@as(u64, 83), col_state.count);
 
     // REQUIRED count(x) does not need null_count; every row is present.
-    var col_chunks2: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var col_chunks2: std.ArrayList(schema.ColumnChunk) = .empty;
     try col_chunks2.append(a, .{
         .file_path = null,
         .file_offset = 0,
@@ -2450,15 +2450,15 @@ test "statsCoverageComplete: prunable iff every RG has the right stat field" {
         .statistics = null,
     };
 
-    var rg0_chunks: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var rg0_chunks: std.ArrayList(schema.ColumnChunk) = .empty;
     try rg0_chunks.append(a, .{ .file_path = null, .file_offset = 0, .meta_data = cm_with_stats });
-    var rg1_chunks: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var rg1_chunks: std.ArrayList(schema.ColumnChunk) = .empty;
     try rg1_chunks.append(a, .{ .file_path = null, .file_offset = 0, .meta_data = cm_without_stats });
 
-    var rgs_complete: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+    var rgs_complete: std.ArrayList(schema.RowGroup) = .empty;
     try rgs_complete.append(a, .{ .columns = rg0_chunks, .total_byte_size = 800, .num_rows = 100 });
     try rgs_complete.append(a, .{ .columns = rg0_chunks, .total_byte_size = 800, .num_rows = 100 });
-    var rgs_partial: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+    var rgs_partial: std.ArrayList(schema.RowGroup) = .empty;
     try rgs_partial.append(a, .{ .columns = rg0_chunks, .total_byte_size = 800, .num_rows = 100 });
     try rgs_partial.append(a, .{ .columns = rg1_chunks, .total_byte_size = 800, .num_rows = 100 });
 
@@ -2902,7 +2902,7 @@ test "zero float bounds never prove sign even with known zero NaNs" {
             std.mem.writeInt(U, &hi, @bitCast(c.hi), .little);
             var path: schema.StringList = .empty;
             try path.append(a, "x");
-            var chunks: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+            var chunks: std.ArrayList(schema.ColumnChunk) = .empty;
             try chunks.append(a, .{
                 .file_path = null,
                 .file_offset = 0,

@@ -290,7 +290,7 @@ pub const MappedSource = struct {
 
     /// MADV_WILLNEED on the pages under each span: the kernel queues every read at once.
     fn prefetchFn(ctx: *anyopaque, spans: []const Span) void {
-        if (builtin.os.tag != .linux) return;
+        if (builtin.target.os.tag != .linux) return;
         const self: *const MappedSource = @ptrCast(@alignCast(ctx));
         const page = std.heap.pageSize();
         for (spans) |s| {
@@ -3497,7 +3497,7 @@ test "dictionaryCoversChunk: encoding_stats decide; without them only the v1 sig
         var cm = (try test_fixtures.StatsColumn.init(a, plain(.INT32), .{})).rg.columns.items[0].meta_data.?;
         try cm.encodings.appendSlice(a, c.encodings);
         if (c.stats) |st| {
-            var list: std.ArrayListUnmanaged(S) = .empty;
+            var list: std.ArrayList(S) = .empty;
             try list.appendSlice(a, st);
             cm.encoding_stats = list;
         }

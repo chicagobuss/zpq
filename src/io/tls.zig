@@ -531,12 +531,12 @@ fn sendNoSignal(fd: posix.fd_t, buf: []const u8) @TypeOf(posix.system.sendto(fd,
 /// wait polls briefly and gives up when that clock passes, and a wall-clock backstop is a different failure.
 fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32, clock_ms: ?*const fn () u64, deadline_ms: ?u64) Error!posix.fd_t {
     // Darwin has no SOCK_CLOEXEC; set FD_CLOEXEC right after instead.
-    const cloexec_flag = if (builtin.os.tag == .linux) posix.SOCK.CLOEXEC else 0;
+    const cloexec_flag = if (builtin.target.os.tag == .linux) posix.SOCK.CLOEXEC else 0;
     const r = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM | cloexec_flag, posix.IPPROTO.TCP);
     if (posix.errno(r) != .SUCCESS) return error.SocketFailed;
     const fd: posix.fd_t = @intCast(r);
     errdefer closeFd(fd);
-    if (builtin.os.tag != .linux) _ = posix.system.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
+    if (builtin.target.os.tag != .linux) _ = posix.system.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
     // Darwin has no MSG_NOSIGNAL: the socket itself is told not to raise SIGPIPE (see `sendNoSignal`).
     if (@hasDecl(posix.SO, "NOSIGPIPE")) {
         const one: c_int = 1;
@@ -563,7 +563,7 @@ fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32, clock_ms: ?*const fn () u64, de
             if (clock_ms) |clk| {
                 // The batch deadline, not a fresh timeout: a clock step between the budget and this wait
                 // still stops at the same instant as the other addresses.
-                const virtual_deadline = deadline_ms orelse clk() + timeout_ms;
+                const virtual_deadline = deadline_ms orelse (clk() + timeout_ms);
                 const real_start = monoMs();
                 while (true) {
                     if (clk() >= virtual_deadline) {
@@ -835,7 +835,7 @@ fn sendError(err: WriteError) Error {
 /// closed before the response, not a failed read), the end of the stream 0. Elsewhere, and for anything else, the
 /// refusal is a local failure.
 fn readShut(fd: posix.fd_t, buf: []u8) ReadError!usize {
-    if (comptime !builtin.os.tag.isDarwin()) return error.ReadFailed;
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.ReadFailed;
     const r = posix.system.recvfrom(fd, buf.ptr, buf.len, posix.MSG.DONTWAIT, null, null);
     return switch (posix.errno(r)) {
         .SUCCESS => @intCast(r),
@@ -1253,7 +1253,7 @@ test "a connect the listener never completes fails within its timeout" {
     var addr: posix.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
     var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
     if (posix.errno(posix.system.bind(lfd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
-    if (!builtin.os.tag.isDarwin() and posix.errno(posix.system.listen(lfd, 0)) != .SUCCESS) return error.SkipZigTest;
+    if (!builtin.target.os.tag.isDarwin() and posix.errno(posix.system.listen(lfd, 0)) != .SUCCESS) return error.SkipZigTest;
     if (posix.errno(posix.system.getsockname(lfd, @ptrCast(&addr), &len)) != .SUCCESS) return error.SkipZigTest;
 
     var peer: Peer = .loopback(std.mem.bigToNative(u16, addr.port));
@@ -1307,7 +1307,7 @@ const Interrupter = struct {
 };
 
 test "signals interrupting a wait do not extend the handshake, first-byte, idle read or send deadlines" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var irq: Interrupter = .{ .target = std.c.pthread_self() };
     try irq.start();
     defer irq.finish();

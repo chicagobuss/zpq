@@ -107,7 +107,7 @@ pub fn encodeAggregator(
         }
     }
 
-    var rg_columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var rg_columns: std.ArrayList(schema.ColumnChunk) = .empty;
     try rg_columns.ensureTotalCapacity(out_arena, n_specs);
     var rg_total: i64 = 0;
     const placer: ChunkPlacer = .{
@@ -308,7 +308,7 @@ fn encodeAggColumn(
 /// and drop each column before the next (the per-row-group re-encode's working set is then one column, not a row
 /// group). Offsets are relative to `out_offset`; no page index (see `encodeAggregator`'s `emit_page_index`).
 pub const RGEncoder = struct {
-    columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty,
+    columns: std.ArrayList(schema.ColumnChunk) = .empty,
     total: i64 = 0,
     out_arena: std.mem.Allocator,
     sink: streaming.Sink,
@@ -452,7 +452,7 @@ const ChunkPlacer = struct {
     out_offset: *u64,
     timings: *Timings,
     emit_page_index: bool,
-    columns: *std.ArrayListUnmanaged(schema.ColumnChunk),
+    columns: *std.ArrayList(schema.ColumnChunk),
     total: *i64,
 
     fn place(self: ChunkPlacer, enc: encoder.EncodedColumn, elem: *const schema.SchemaElement) !void {
@@ -834,7 +834,7 @@ pub const AggregateFile = struct {
     off: u64 = 4,
     rows: i64 = 0,
     parquet_version: schema.ParquetVersion = .v2,
-    groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty,
+    groups: std.ArrayList(schema.RowGroup) = .empty,
     cached_wave: ?AggColumnWave = null,
     cached_width: usize = 0,
     cached_alone: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
@@ -935,10 +935,10 @@ fn appendAggregateRows(
         }
         break :blk all;
     };
-    var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+    var new_row_groups: std.ArrayList(schema.RowGroup) = .empty;
     try new_row_groups.ensureTotalCapacity(arena, n_rg);
 
-    var rg_columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var rg_columns: std.ArrayList(schema.ColumnChunk) = .empty;
     var rg_total: i64 = 0;
     // Columns are encoded in waves, in order: as many at once as the workers and the budget admit, each on a thread. A
     // column the budget cannot hold beside the one before it starts a wave alone, which encodes as the serial loop
@@ -1057,14 +1057,14 @@ fn aggregateFooter(
     sink: streaming.Sink,
     output_cols: []const expr_agg.OutputCol,
     num_rows: i64,
-    new_row_groups: std.ArrayListUnmanaged(schema.RowGroup),
+    new_row_groups: std.ArrayList(schema.RowGroup),
     start: u64,
     parquet_version: schema.ParquetVersion,
 ) !u64 {
     var out: streaming.SinkOut = .{ .sink = sink, .offset = @intCast(start) };
     try fastpath.placeFilters(&out, new_row_groups.items);
     var off: u64 = out.offset;
-    var new_schema: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    var new_schema: std.ArrayList(schema.SchemaElement) = .empty;
     try new_schema.append(arena, .{
         .type = null,
         .type_length = null,

@@ -552,8 +552,8 @@ const ParquetPrint = struct {
     fd_sink: FdSink,
     codec: schema.CompressionCodec,
     zstd: compression.ZstdPlan,
-    schema_items: std.ArrayListUnmanaged(schema.SchemaElement),
-    rgs: std.ArrayListUnmanaged(schema.RowGroup) = .empty,
+    schema_items: std.ArrayList(schema.SchemaElement),
+    rgs: std.ArrayList(schema.RowGroup) = .empty,
     out_offset: u64 = 0,
     /// Where row groups are cut (`RowGroupTarget`), as on every write.
     target: RowGroupTarget = .{},

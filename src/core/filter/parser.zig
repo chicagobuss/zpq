@@ -1647,7 +1647,7 @@ test "unsigned IN lists compare stored bits on both lanes, out-of-range literals
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    var items: std.ArrayList(schema.SchemaElement) = .empty;
     const root: schema.SchemaElement = .{
         .type = null,
         .type_length = null,
@@ -2679,7 +2679,7 @@ test "parse unsigned literals: in-range compares as u64, out-of-range folds to a
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    var items: std.ArrayList(schema.SchemaElement) = .empty;
     const root: schema.SchemaElement = .{
         .type = null,
         .type_length = null,

@@ -522,7 +522,7 @@ test "count-ranked DISTINCT replays a runtime dictionary-domain violation" {
         .{ .page_type = @backingInt(schema.PageType.DICTIONARY_PAGE), .encoding = @backingInt(schema.Encoding.PLAIN), .count = 1 },
         .{ .page_type = @backingInt(schema.PageType.DATA_PAGE), .encoding = @backingInt(schema.Encoding.RLE_DICTIONARY), .count = 1 },
     });
-    meta.row_groups.items[0].columns.items[0].meta_data.?.encoding_stats = std.ArrayListUnmanaged(schema.PageEncodingStats).fromOwnedSlice(stats);
+    meta.row_groups.items[0].columns.items[0].meta_data.?.encoding_stats = std.ArrayList(schema.PageEncodingStats).fromOwnedSlice(stats);
     var args: MultiAggArgs = .{ .inputs = &.{.{ .name = "runtime-domain-refusal", .bytes = bytes }}, .metas = &.{meta}, .aggregate = "sum(y) AS s,count(*) AS c,avg(x) AS a,count(DISTINCT x) AS d", .group_by = "k", .parallelism = 1, .max_memory = 128 << 20, .result_order = .{ .keys = &.{.{ .column = 2, .descending = true }}, .limit = 5 }, .count_ranked_distinct = .off };
     var ordinary = args;
     ordinary.aggregate = "sum(y),count(*),avg(x)";

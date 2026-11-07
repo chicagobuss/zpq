@@ -70,10 +70,10 @@ fn checkColumn(
 ) !?Failure {
     var held = std.heap.ArenaAllocator.init(gpa);
     defer held.deinit();
-    var reader = Reader.init(held.allocator(), gpa, in.rg, in.meta, in.src, ci, options) catch |err| {
+    var reader = (Reader.init(held.allocator(), gpa, in.rg, in.meta, in.src, ci, options) catch |err| {
         if (!isDecodeError(err)) return err;
         return Failure{ .err = err, .site = makeSite(in, ci, null) };
-    } orelse return null; // Repeated aggregate columns are refused before scanning.
+    }) orelse return null; // Repeated aggregate columns are refused before scanning.
     defer reader.deinit();
     reader.beginProbe();
     if (ci < levels_only.len and levels_only[ci]) reader.levelsOnly();

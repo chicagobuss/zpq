@@ -220,7 +220,7 @@ test "distinct admission refuses declared dictionary fallback before retaining a
         .{ .page_type = @backingInt(schema.PageType.DATA_PAGE), .encoding = @backingInt(schema.Encoding.RLE_DICTIONARY), .count = 1 },
         .{ .page_type = @backingInt(schema.PageType.DATA_PAGE), .encoding = @backingInt(schema.Encoding.PLAIN), .count = 1 },
     });
-    meta.row_groups.items[0].columns.items[2].meta_data.?.encoding_stats = std.ArrayListUnmanaged(schema.PageEncodingStats).fromOwnedSlice(stats);
+    meta.row_groups.items[0].columns.items[2].meta_data.?.encoding_stats = std.ArrayList(schema.PageEncodingStats).fromOwnedSlice(stats);
     const ex = try explainAggregate(gpa, a, args);
     try testing.expect(ex.record_path == null or ex.record_path.?.layout != .pair_distinct);
     var got = try runMultiAggregate(gpa, a, args);

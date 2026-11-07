@@ -550,7 +550,7 @@ fn instantiate(
             return .{ .string = text };
         },
         .array => |xs| {
-            var out = std.json.Array.init(arena);
+            var out = std.array_list.Managed(std.json.Value).init(arena);
             for (xs.items) |x| switch (try instantiate(arena, x, env)) {
                 // An element that is exactly "${VAR}" naming a list splices it (flag lists in `cli`).
                 .array => |inner| if (x == .string)

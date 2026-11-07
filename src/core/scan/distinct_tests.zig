@@ -947,7 +947,7 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
             const all = candidates[0..count];
             for (0..@as(usize, 1) << @intCast(all.len)) |bits| {
                 var t: S = .{};
-                for (all, 0..) |path, i| if (bits >> @intCast(i) & 1 != 0) t.insert(path);
+                for (all, 0..) |path, i| if ((bits >> @intCast(i)) & 1 != 0) t.insert(path);
                 if (!armable(st, t)) continue;
                 var chain = st.chain;
                 const may_fit = st.may_fit or t.contains(.one_table_may_fit);

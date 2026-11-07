@@ -475,7 +475,7 @@ test "nextInvocation reads a large event the runtime API sends chunked" {
         "Transfer-Encoding: chunked\r\n\r\n");
     var off: usize = 0;
     var step: usize = 1;
-    while (off < event.items.len) : (step = step * 7 % 8191 + 1) {
+    while (off < event.items.len) : (step = (step * 7) % 8191 + 1) {
         const n = @min(step, event.items.len - off);
         try resp.print(a, "{x}\r\n", .{n});
         try resp.appendSlice(a, event.items[off..][0..n]);

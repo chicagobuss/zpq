@@ -22,8 +22,8 @@ pub fn columnIndex(
 ) !?schema.ColumnIndex {
     if (pages.len == 0) return null;
     var ci: schema.ColumnIndex = .{};
-    var nulls: std.ArrayListUnmanaged(i64) = .empty;
-    var nans: std.ArrayListUnmanaged(i64) = .empty;
+    var nulls: std.ArrayList(i64) = .empty;
+    var nans: std.ArrayList(i64) = .empty;
     const float = elem.type == .FLOAT or elem.type == .DOUBLE;
     for (pages) |p| {
         const null_page = p.null_count == @as(i64, @intCast(p.rows));
@@ -147,7 +147,7 @@ fn chunkStart(chunk: *const schema.ColumnChunk) i64 {
 
 /// Page indexes of chunks already placed, written together once the row groups are (`write`).
 pub const Deferred = struct {
-    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    entries: std.ArrayList(Entry) = .empty,
 
     const Entry = struct {
         rg: usize,

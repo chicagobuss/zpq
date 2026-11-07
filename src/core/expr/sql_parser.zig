@@ -897,7 +897,7 @@ fn resultOrder(
         }
         const expr = term.*.u.order_term.expr orelse return error.SqlParseError;
         const column = try orderColumn(sel, lp_arena, select_cols, expr) orelse
-            select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, .order_by, hidden, lower);
+            (select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, .order_by, hidden, lower));
         key.* = .{ .column = column, .descending = term.*.u.order_term.direction == c.LP_SORT_DESC };
     }
     order.keys = keys;

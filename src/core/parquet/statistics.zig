@@ -511,7 +511,7 @@ test "pageIndexIsPlausible: each contradiction drops the index on its own" {
                 try ci.max_values.append(alloc, bound);
             }
             if (null_counts) |nc| {
-                var list: std.ArrayListUnmanaged(i64) = .empty;
+                var list: std.ArrayList(i64) = .empty;
                 try list.appendSlice(alloc, nc);
                 ci.null_counts = list;
             }
@@ -767,7 +767,7 @@ test "pageIndexIsPlausible: inverted page bounds are refused under any trust, co
     const Fx = struct {
         fn index(alloc: std.mem.Allocator, pages: []const Page) !schema.ColumnIndex {
             var ci: schema.ColumnIndex = .{};
-            var nc: std.ArrayListUnmanaged(i64) = .empty;
+            var nc: std.ArrayList(i64) = .empty;
             for (pages) |p| {
                 try ci.null_pages.append(alloc, p.null_page);
                 try ci.min_values.append(alloc, p.min);

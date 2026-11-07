@@ -277,7 +277,7 @@ test "copyRG no-projection: writes only this RG's bounding box, not src.bytes" {
 
     // RG0: two columns at offsets 100 and 140 (each 20 bytes
     // compressed). Bounding box: [100, 160).
-    var rg0_cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var rg0_cols: std.ArrayList(schema.ColumnChunk) = .empty;
     try rg0_cols.append(a, .{
         .file_path = null,
         .file_offset = 0,
@@ -1718,7 +1718,7 @@ test "retained delta pages reset under the decode ledger, including optional lev
         .field_id = null,
     });
     try file_meta.schema.append(arena, elem);
-    var columns: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var columns: std.ArrayList(schema.ColumnChunk) = .empty;
     try columns.append(arena, .{ .file_path = null, .file_offset = 0, .meta_data = enc.meta });
     try file_meta.row_groups.append(arena, .{
         .columns = columns,

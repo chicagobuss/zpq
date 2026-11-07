@@ -484,7 +484,7 @@ fn denseDictionaryFile(a: std.mem.Allocator, entries: []const i64, codes: []cons
         const cm = &chunk.meta_data.?;
         cm.encodings = .empty;
         try cm.encodings.appendSlice(a, &.{ .PLAIN, .RLE, .RLE_DICTIONARY });
-        cm.encoding_stats = std.ArrayListUnmanaged(schema.PageEncodingStats).fromOwnedSlice(try a.dupe(schema.PageEncodingStats, &.{
+        cm.encoding_stats = std.ArrayList(schema.PageEncodingStats).fromOwnedSlice(try a.dupe(schema.PageEncodingStats, &.{
             .{ .page_type = @backingInt(schema.PageType.DICTIONARY_PAGE), .encoding = @backingInt(schema.Encoding.PLAIN), .count = 1 },
             .{ .page_type = @backingInt(schema.PageType.DATA_PAGE), .encoding = @backingInt(schema.Encoding.RLE_DICTIONARY), .count = 1 },
         }));
@@ -517,7 +517,7 @@ fn denseCountFixture(a: std.mem.Allocator, sub_path: []const u8) ![]const u8 {
     const codes = try a.alloc(u16, rows);
     const f = try a.alloc(i64, rows);
     for (codes, f, 0..) |*c, *v, i| {
-        c.* = @intCast(i * 7 % entries.len);
+        c.* = @intCast((i * 7) % entries.len);
         v.* = @intCast(i % 1000);
     }
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/dense.parquet", .{sub_path});

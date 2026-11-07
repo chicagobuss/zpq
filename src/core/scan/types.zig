@@ -353,7 +353,7 @@ test "owner original ordinals include pruned and empty row groups across files b
             return .{ .num_rows = n, .columns = .empty, .total_byte_size = 0 };
         }
         fn meta(rgs: []schema.RowGroup) schema.FileMetaData {
-            var list: std.ArrayListUnmanaged(schema.RowGroup) = .initBuffer(rgs);
+            var list: std.ArrayList(schema.RowGroup) = .initBuffer(rgs);
             list.items = rgs;
             return .{
                 .version = 1,

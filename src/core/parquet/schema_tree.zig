@@ -216,8 +216,8 @@ pub const SchemaTree = struct {
     pub fn writeFlatThrift(
         self: *const SchemaTree,
         arena: std.mem.Allocator,
-    ) Error!std.ArrayListUnmanaged(schema.SchemaElement) {
-        var out: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    ) Error!std.ArrayList(schema.SchemaElement) {
+        var out: std.ArrayList(schema.SchemaElement) = .empty;
         const root_count: i32 = @intCast(self.root.children.len);
         try out.append(arena, .{
             .type = null,
@@ -459,7 +459,7 @@ const Projector = struct {
 fn writeNodeFlat(
     arena: std.mem.Allocator,
     node: Node,
-    out: *std.ArrayListUnmanaged(schema.SchemaElement),
+    out: *std.ArrayList(schema.SchemaElement),
 ) Error!void {
     switch (node) {
         .primitive => |p| try out.append(arena, .{

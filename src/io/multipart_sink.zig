@@ -1141,7 +1141,7 @@ fn stallPartSize() usize {
 /// Two parts of `part` bytes.
 fn bigPayload(part: usize) ![]u8 {
     const b = try testing.allocator.alloc(u8, 2 * part);
-    for (b, 0..) |*x, i| x.* = @truncate(i *% 2654435761 >> 7);
+    for (b, 0..) |*x, i| x.* = @truncate((i *% 2654435761) >> 7);
     return b;
 }
 
@@ -1314,7 +1314,7 @@ test "a CreateMultipartUpload whose connections are all refused gives up after t
     var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
     if (posix.errno(posix.system.bind(fd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
     if (posix.errno(posix.system.getsockname(fd, @ptrCast(&addr), &len)) != .SUCCESS) return error.SkipZigTest;
-    if (builtin.os.tag.isDarwin()) {
+    if (builtin.target.os.tag.isDarwin()) {
         _ = posix.system.close(fd);
         open = false;
     }
@@ -1586,7 +1586,7 @@ test "regression: a write of several full-size parts completes under the default
     defer fake.deinit();
     const payload = try testing.allocator.alloc(u8, 24 << 20);
     defer testing.allocator.free(payload);
-    for (payload, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 13);
+    for (payload, 0..) |*b, i| b.* = @truncate((i *% 2654435761) >> 13);
     try writeToPort(fake.port, "large.parquet", payload, .{}, .{ .target_part_size = 8 << 20 });
     const obj = fake.object("large.parquet") orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.endsWith(u8, obj.etag, "-3"));

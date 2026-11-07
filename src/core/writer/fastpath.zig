@@ -141,7 +141,7 @@ pub fn assemble(
     try out.reserve(copied_len +| MAGIC.len * 2 + 4 + 64 * 1024);
 
     try out.write(&MAGIC);
-    var new_row_groups: std.ArrayListUnmanaged(schema.RowGroup) = .empty;
+    var new_row_groups: std.ArrayList(schema.RowGroup) = .empty;
     errdefer new_row_groups.deinit(arena);
     var total_rows: i64 = 0;
     for (files) |f| for (f.survivors, f.meta.row_groups.items) |keep, *rg| {
@@ -223,7 +223,7 @@ fn copyRowGroup(
         if (writerPolicy(c, meta) != .trust) break true;
     } else false;
     if (rewrite) {
-        var cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+        var cols: std.ArrayList(schema.ColumnChunk) = .empty;
         errdefer cols.deinit(arena);
         try cols.ensureTotalCapacity(arena, src.columns.items.len);
         for (src.columns.items) |*chunk| {
@@ -236,7 +236,7 @@ fn copyRowGroup(
     const delta = offsetDelta(out.pos(), range.start);
     try out.write(input[range.start .. range.start + range.len]);
 
-    var cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var cols: std.ArrayList(schema.ColumnChunk) = .empty;
     errdefer cols.deinit(arena);
     try cols.ensureTotalCapacity(arena, src.columns.items.len);
     // Every chunk in the group moved by the same delta; the rebased
@@ -273,7 +273,7 @@ fn copyProjectedRowGroup(
     kept: []const usize,
     meta: *const schema.FileMetaData,
 ) !schema.RowGroup {
-    var new_cols: std.ArrayListUnmanaged(schema.ColumnChunk) = .empty;
+    var new_cols: std.ArrayList(schema.ColumnChunk) = .empty;
     errdefer new_cols.deinit(arena);
     try new_cols.ensureTotalCapacity(arena, kept.len);
 
@@ -506,10 +506,10 @@ pub fn shiftChunk(src: *const schema.ColumnChunk, delta: i64) schema.ColumnChunk
 /// path only; the flat-schema invariant is checked by `validateInputs`.
 pub fn projectSchema(
     arena: std.mem.Allocator,
-    src: std.ArrayListUnmanaged(schema.SchemaElement),
+    src: std.ArrayList(schema.SchemaElement),
     kept: []const usize,
-) Error!std.ArrayListUnmanaged(schema.SchemaElement) {
-    var out: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+) Error!std.ArrayList(schema.SchemaElement) {
+    var out: std.ArrayList(schema.SchemaElement) = .empty;
     errdefer out.deinit(arena);
     try out.ensureTotalCapacity(arena, 1 + kept.len);
 
@@ -529,7 +529,7 @@ pub fn copiedColumnOrders(
     arena: std.mem.Allocator,
     files: []const FileSpec,
     kept_columns: ?[]const usize,
-) Error!?std.ArrayListUnmanaged(i16) {
+) Error!?std.ArrayList(i16) {
     const metas = try arena.alloc(*const schema.FileMetaData, files.len);
     for (files, metas) |f, *m| m.* = f.meta;
     var n_leaves: usize = 0;

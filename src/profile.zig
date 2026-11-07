@@ -453,7 +453,7 @@ const CountingWriter = struct {
 pub const Meta = struct {
     version: []const u8 = build_options.version,
     build_mode: []const u8 = @tagName(builtin.mode),
-    target: []const u8 = @tagName(builtin.cpu.arch) ++ "-" ++ @tagName(builtin.os.tag) ++ "-" ++ @tagName(builtin.abi),
+    target: []const u8 = @tagName(builtin.target.cpu.arch) ++ "-" ++ @tagName(builtin.target.os.tag) ++ "-" ++ @tagName(builtin.target.abi),
     cpu_count: usize = 0,
     /// `system.discoverAvailableParallelism`: what the engine sizes its workers from.
     parallelism: usize = 0,
@@ -514,7 +514,7 @@ pub const RssScope = enum {
 /// Reset this process's RSS high-water mark (`VmHWM`) to its current RSS. False where the kernel refuses or has no
 /// such file.
 fn resetPeakRss() bool {
-    if (builtin.os.tag != .linux) return false;
+    if (builtin.target.os.tag != .linux) return false;
     const linux = std.os.linux;
     const rc = linux.open("/proc/self/clear_refs", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return false;
@@ -526,7 +526,7 @@ fn resetPeakRss() bool {
 
 /// `VmHWM` from /proc/self/status, bytes; 0 where unavailable.
 fn peakRssSinceReset() u64 {
-    if (builtin.os.tag != .linux) return 0;
+    if (builtin.target.os.tag != .linux) return 0;
     const linux = std.os.linux;
     const rc = linux.open("/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return 0;
@@ -547,8 +547,8 @@ fn peakRssSinceReset() u64 {
 
 /// This process's usage, or (Linux only) the calling thread's.
 pub fn usage(comptime who: enum { process, thread }) Usage {
-    if (builtin.os.tag == .windows) return .{};
-    if (who == .thread and builtin.os.tag != .linux) return .{};
+    if (builtin.target.os.tag == .windows) return .{};
+    if (who == .thread and builtin.target.os.tag != .linux) return .{};
     const ru = std.posix.getrusage(if (who == .thread) 1 else 0);
     const tvNs = struct {
         fn f(tv: anytype) u64 {
@@ -567,16 +567,16 @@ pub fn usage(comptime who: enum { process, thread }) Usage {
 
 /// The process's lifetime peak RSS from `getrusage`, bytes.
 fn lifetimePeakRss() u64 {
-    if (builtin.os.tag == .windows) return 0;
+    if (builtin.target.os.tag == .windows) return 0;
     const ru = std.posix.getrusage(0);
     // Linux reports maxrss in KiB, macOS in bytes.
-    const rss_unit: u64 = if (builtin.os.tag == .linux) 1024 else 1;
+    const rss_unit: u64 = if (builtin.target.os.tag == .linux) 1024 else 1;
     return @as(u64, @intCast(@max(0, ru.maxrss))) * rss_unit;
 }
 
 /// Current resident set from /proc/self/statm; 0 where that does not exist.
 pub fn currentRss() u64 {
-    if (builtin.os.tag != .linux) return 0;
+    if (builtin.target.os.tag != .linux) return 0;
     const linux = std.os.linux;
     const rc = linux.open("/proc/self/statm", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) return 0;
@@ -651,7 +651,7 @@ pub const Profiler = struct {
     pub fn finish(self: *Profiler) void {
         if (self.end_ns != 0) return;
         self.stop.store(1, .release);
-        if (builtin.os.tag == .linux) _ = std.os.linux.futex_3arg(&self.stop.raw, .{ .cmd = .WAKE, .private = true }, 1);
+        if (builtin.target.os.tag == .linux) _ = std.os.linux.futex_3arg(&self.stop.raw, .{ .cmd = .WAKE, .private = true }, 1);
         if (self.sampler) |t| t.join();
         self.sampler = null;
         self.end_ns = clock.monoNs();
@@ -785,7 +785,7 @@ pub const Profiler = struct {
                 .sec = @intCast(interval / std.time.ns_per_s),
                 .nsec = @intCast(interval % std.time.ns_per_s),
             };
-            if (builtin.os.tag == .linux) {
+            if (builtin.target.os.tag == .linux) {
                 // Returns early on the wake from `finish` (or spuriously); either way the loop re-checks.
                 _ = std.os.linux.futex_4arg(&self.stop.raw, .{ .cmd = .WAIT, .private = true }, 0, &ts);
             } else {
@@ -1192,7 +1192,7 @@ test "the RSS sampler keeps its own ring: it never spends the event budget and t
 }
 
 test "peak RSS is this run's, not the process's: a later run does not inherit an earlier peak" {
-    if (!enabled or builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!enabled or builtin.target.os.tag != .linux) return error.SkipZigTest;
     const big = 96 << 20;
     var peaks: [2]u64 = undefined;
     for (&peaks, 0..) |*peak, run| {

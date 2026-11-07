@@ -172,7 +172,7 @@ const Artifacts = struct {
     integration_tests: *std.Build.Step.Compile,
 };
 
-fn artifacts(b: *std.Build, cfg: Config, optimize: std.builtin.Optimize) Artifacts {
+fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts {
     const target = cfg.target;
     var deps = CoreDeps.init(b, target, optimize, cfg.fetch_prebuilt, false);
     deps.profile = cfg.profile;
@@ -217,7 +217,7 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.builtin.Optimize) Artifac
         },
     });
     var libs: [2]*std.Build.Step.Compile = undefined;
-    for ([_]std.builtin.LinkMode{ .dynamic, .static }, 0..) |linkage, i| {
+    for ([_]std.lang.LinkMode{ .dynamic, .static }, 0..) |linkage, i| {
         const lib = b.addLibrary(.{ .name = "zpq", .linkage = linkage, .root_module = libzpq_mod });
         if (linkage == .dynamic and target.result.ofmt == .elf) {
             lib.setVersionScript(b.path("src/libzpq/libzpq.map"));
@@ -604,7 +604,7 @@ const CoreDeps = struct {
     fn init(
         b: *std.Build,
         target: std.Build.ResolvedTarget,
-        optimize: std.builtin.Optimize,
+        optimize: std.lang.Optimize,
         fetch_prebuilt: bool,
         /// BoringSSL compiled from source, position-independent, for a shared library; else the pinned prebuilts.
         boringssl_from_source: bool,
@@ -693,7 +693,7 @@ fn addCoreModule(
     b: *std.Build,
     deps: CoreDeps,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     options: CoreOptions,
 ) Core {
     const opts = b.addOptions();
@@ -775,7 +775,7 @@ fn addBinaryModules(
     b: *std.Build,
     deps: CoreDeps,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     binary: Binary,
     sql: bool,
     strip: bool,
@@ -819,7 +819,7 @@ fn addBinaryModules(
 fn serviceModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     zpq_mod: *std.Build.Module,
 ) *std.Build.Module {
     return b.createModule(.{
@@ -837,7 +837,7 @@ fn serviceModule(
 fn cHeaderModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     name: []const u8,
     contents: []const u8,
 ) *std.Build.Step.TranslateC {
@@ -867,7 +867,7 @@ fn archiveFlags(shared: bool) []const []const u8 {
 /// and Zig's `smp_allocator` both map and unmap pages as allocation-heavy folds grow, and every `munmap` stalls the
 /// other threads. glibc, macOS, Debug/ReleaseSafe and libzpq keep their heaps; the C codecs keep musl's malloc, since
 /// mimalloc is built without `MI_MALLOC_OVERRIDE`.
-fn usesMimalloc(target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) bool {
+fn usesMimalloc(target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) bool {
     return target.result.os.tag == .linux and target.result.abi.isMusl() and
         (optimize == .fast or optimize == .small);
 }
@@ -876,7 +876,7 @@ fn usesMimalloc(target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize
 fn mimallocLibrary(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
 ) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
         .linkage = .static,
@@ -896,7 +896,7 @@ fn mimallocLibrary(
 fn zstdLibrary(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     shared: bool,
 ) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
@@ -968,7 +968,7 @@ fn zstdLibrary(
 fn zstdCModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     zstd_lib: *std.Build.Step.Compile,
 ) *std.Build.Module {
     // The static-linking API (ZSTD_compressSequences) is safe: libzstd is vendored and linked statically.
@@ -985,7 +985,7 @@ fn zstdCModule(
 fn libdeflateLibrary(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     shared: bool,
 ) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
@@ -1016,7 +1016,7 @@ fn libdeflateLibrary(
 fn libdeflateCModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     lib: *std.Build.Step.Compile,
 ) *std.Build.Module {
     const tc = cHeaderModule(b, target, optimize, "libdeflate_c.h", "#include <libdeflate.h>\n");
@@ -1028,7 +1028,7 @@ fn libdeflateCModule(
 fn lz4Library(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     shared: bool,
 ) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
@@ -1054,7 +1054,7 @@ fn lz4Library(
 fn lz4CModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
     lib: *std.Build.Step.Compile,
 ) *std.Build.Module {
     const tc = cHeaderModule(b, target, optimize, "lz4_c.h", "#include <lz4.h>\n");
@@ -1065,7 +1065,7 @@ fn lz4CModule(
 fn liteparserCModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.Optimize,
+    optimize: std.lang.Optimize,
 ) *std.Build.Module {
     const tc = cHeaderModule(b, target, optimize, "liteparser_c.h",
         \\#include "liteparser.h"

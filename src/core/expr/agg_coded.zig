@@ -1205,7 +1205,7 @@ fn testExactBatches(a: std.mem.Allocator, space: usize) !void {
         f.* = 0;
         // Every third selection word's products leave 64 bits: their windows take the i128 lane, the rest do not.
         // Those products sum past 2^127, beyond what an i128 partial could carry.
-        t.* = if (r / 64 % 3 != 1) 1 else if (b.* > 0) 100_000_000_000_000_000 else 10;
+        t.* = if ((r / 64) % 3 != 1) 1 else if (b.* > 0) 100_000_000_000_000_000 else 10;
         d.* = @intFromBool(r % 19 != 0);
         // A null row's slot holds garbage the fold must not read as a value.
         if (d.* == 0) {

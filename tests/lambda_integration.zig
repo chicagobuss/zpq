@@ -954,7 +954,7 @@ test "an S3 query over an object with a corrupt footer fails and frees all it ma
     const res = try runCliOnS3(a, &s3, &.{ "query", "s3://bkt/f.parquet", "--aggregate", "count(*) AS c" });
     defer a.free(res.stdout);
     defer a.free(res.stderr);
-    if (res.term == .exited and res.term.exited == 0 or std.mem.indexOf(u8, res.stderr, "leaked") != null) {
+    if ((res.term == .exited and res.term.exited == 0) or std.mem.indexOf(u8, res.stderr, "leaked") != null) {
         std.debug.print("[s3 corrupt footer] {any}\nstderr: {s}\n", .{ res.term, res.stderr });
         return error.TestUnexpectedResult;
     }

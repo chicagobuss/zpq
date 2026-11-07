@@ -838,7 +838,7 @@ fn probeAggregateInputs(
         for (ranges) |r| if (args.inputs[r.file].readerBacked()) {
             probe_bytes +|= std.mem.alignForward(u64, r.end, page) - std.mem.alignBackward(u64, r.start, page);
         };
-        const probe_ok = probe_bytes <= args.probe_cap orelse ndv.probeCap(args.max_memory);
+        const probe_ok = probe_bytes <= (args.probe_cap orelse ndv.probeCap(args.max_memory));
         if (plan_inputs.readers) {
             probe_facts.probe_ranges = ranges.len;
             probe_facts.probe_bytes = probe_bytes;

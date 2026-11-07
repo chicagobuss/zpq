@@ -804,7 +804,7 @@ fn planValues(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
 }
 
 /// `c`'s present values in `encoding` (as `planValues` chose it).
-fn encodeValuesAs(
+pub fn encodeValuesAs(
     arena: std.mem.Allocator,
     c: filter_eval.Batch.Column,
     def_levels: ?[]const u32,
@@ -1464,7 +1464,7 @@ fn planDictionary(
 /// strict readers (pyarrow) reject it ("Invalid number of indices: 0"), so a column filtered down to one distinct
 /// value would be unreadable elsewhere while zpq's lenient reader hid it. parquet-mr uses the same minimum. Found by
 /// the differential harness (zpq writes, pyarrow reads).
-fn dictIndexBitWidth(dict_count: usize) u8 {
+pub fn dictIndexBitWidth(dict_count: usize) u8 {
     return if (dict_count <= 1) 1 else bitWidthFor(@intCast(dict_count - 1));
 }
 
@@ -1479,7 +1479,7 @@ fn levelPrefix(arena: std.mem.Allocator, levels: []const u32, bit_width: u8) Err
 
 /// Def-level stream for a column that carries one. Without source levels every slot is present, so the stream is
 /// all ones: a few bytes of RLE however many values there are.
-fn defLevelPrefix(arena: std.mem.Allocator, def_levels: ?[]const u32, max_def: u32, num_values: i64) Error![]const u8 {
+pub fn defLevelPrefix(arena: std.mem.Allocator, def_levels: ?[]const u32, max_def: u32, num_values: i64) Error![]const u8 {
     const levels = def_levels orelse blk: {
         const ones = try arena.alloc(u32, @intCast(num_values));
         @memset(ones, 1);
@@ -1734,7 +1734,7 @@ fn sourceMaxRep(c: filter_eval.Batch.Column) u32 {
 /// Bits to encode 0..max inclusive (parquet uses ceil(log2(max+1))).
 /// Mirrors the helper in `core/parquet/column.zig` — kept local here
 /// so encoder doesn't have to import the column module.
-fn bitWidthFor(max: u32) u8 {
+pub fn bitWidthFor(max: u32) u8 {
     if (max == 0) return 0;
     return @intCast(32 - @clz(max));
 }
@@ -1746,7 +1746,7 @@ inline fn isPresent(def_levels: ?[]const u32, max_def: u32, i: usize) bool {
     return true;
 }
 
-fn encodeValuesPlain(
+pub fn encodeValuesPlain(
     arena: std.mem.Allocator,
     vals: filter_eval.Batch.Column,
     def_levels: ?[]const u32,
@@ -2105,7 +2105,7 @@ fn nanRows(entries: anytype, indices: []const u32) i64 {
     return n;
 }
 
-fn computeStats(
+pub fn computeStats(
     arena: std.mem.Allocator,
     c: filter_eval.Batch.Column,
     def_levels: ?[]const u32,

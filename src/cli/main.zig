@@ -576,6 +576,13 @@ fn runQuery(
         if (comptime build_options.enable_sql) {
             if (machine_diagnostics) zpq.core.expr.sql_parser.diagnostic_fn = captureSqlDiagnostic;
             defer zpq.core.expr.sql_parser.diagnostic_fn = null;
+            if (try zpq.core.expr.sql_parser.parseSqlUpdate(arena, q_str)) |up| {
+                if (format != null or limit != null or explain or codec != null or bloom_filters.items.len > 0 or profile_out.wanted()) {
+                    diagnosticPrint("zpq query: UPDATE takes -o, --fsync/--no-fsync and --summary=json only\n", .{});
+                    return error.BadArgs;
+                }
+                return runUpdate(io, gpa, arena, up, output, fsync, summary);
+            }
             // A two-table join binds its column names against both footers; the engine reads the build.
             var schemas: engine.join.LocalSchemas = .{ .arena = arena };
             defer schemas.deinit();
@@ -818,6 +825,61 @@ fn parseCsvTypes(
     if (out.items.len == 0) return error.BadArgs;
 }
 
+/// `UPDATE 'file' SET ... WHERE ...` (`engine.update`): in place unless `output` names another file.
+fn runUpdate(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    up: zpq.core.expr.sql_parser.ParsedUpdate,
+    output: ?[]const u8,
+    fsync: bool,
+    summary: bool,
+) !void {
+    const started = nowMonoNs();
+    if (output) |o| if (std.mem.eql(u8, o, "-")) {
+        diagnosticPrint("zpq query: UPDATE writes a file; -o - names none\n", .{});
+        return error.BadArgs;
+    };
+    const sets = try arena.alloc(engine.update.Set, up.sets.len);
+    for (sets, up.sets) |*s, u| s.* = .{ .column = u.column, .assignment = u.assignment };
+    var problem: engine.update.Problem = .{};
+    const s = engine.update.run(gpa, io, .{
+        .target = up.table,
+        .output = output,
+        .where = up.where,
+        .sets = sets,
+        .fsync = fsync,
+    }, &problem) catch |err| {
+        if (problem.len > 0) {
+            diagnosticPrint("zpq query: {s}\n", .{problem.text()});
+            return error.BadArgs;
+        }
+        return err;
+    };
+    if (!summary) return;
+    const elapsed = nowMonoNs() - started;
+    var w: StdoutWriter = .{ .fd = 2 };
+    try w.writeAll("{\"type\":\"summary\",\"ok\":true,\"statement\":\"update\",\"output\":");
+    if (s.unchanged) try w.writeAll("null") else {
+        try w.writeByte('"');
+        try writeJsonString(&w, output orelse up.table);
+        try w.writeByte('"');
+    }
+    try w.print(",\"rows_in\":{d},\"row_groups_pruned\":{d},\"rows_matched\":{d},\"values_changed\":{d},\"pages_rewritten\":{d},\"bytes_out\":{d}", .{
+        s.rows_in, s.row_groups_pruned, s.rows_matched, s.values_changed, s.pages_rewritten, s.bytes_out,
+    });
+    if (!s.unchanged) {
+        const path = if (s.kernel_bytes == s.copied_bytes) "range_copy" else if (s.kernel_bytes == 0) "write" else "mixed";
+        try w.print(",\"byte_copy\":{{\"bytes\":{d},\"kernel_bytes\":{d},\"written_bytes\":{d},\"pad_bytes\":{d},\"path\":\"{s}\"}}", .{
+            s.copied_bytes, s.kernel_bytes, s.copied_bytes - s.kernel_bytes, s.pad_bytes, path,
+        });
+    }
+    try w.print(",\"total_ms\":{d},\"total_us\":{d}}}\n", .{
+        @divTrunc(elapsed, std.time.ns_per_ms), @divTrunc(elapsed, std.time.ns_per_us),
+    });
+    try w.flush();
+}
+
 const SummaryStats = struct {
     /// An aggregate: its workers' third phase folds rows into aggregates, where a write's or a row output's encodes.
     aggregate: bool = false,
@@ -922,6 +984,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "NestedColumnSelected",        "NestedAggregateNotSupported", "NestedGroupKeyNotSupported",   "UnsupportedDatePart",      "InvalidRegex",         "UnsupportedRegex",
         "RegexTooBig",                 "TypedLiteralColumn",          "BadInterval",                  "IntervalNotSupported",
         "TemporalOutOfRange",             "ConstantTooDeep",              "IlikePatternNotAscii",         "PostAggNotSupported",
+        "UpdateWithoutWhere",           "UnparseError",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

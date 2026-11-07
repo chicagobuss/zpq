@@ -24,6 +24,10 @@ usage:
             [--csv-delimiter C] [--csv-header | --csv-no-header]
             [--csv-null STR ...] [--csv-types COL:TYPE,...] [--csv-strict]
             [--codec ...] [--row-group-size ROWS] [-j N] [--max-memory SIZE]
+  zpq query --query "UPDATE 'f.parquet' SET col = literal [, ...] WHERE ..."
+            [-o <other.parquet>] [--fsync | --no-fsync] [--summary=json]
+            rewrites only the pages holding matched rows, in place unless -o
+            (docs/capabilities.md, UPDATE)
   zpq schema <file.parquet>
   zpq inspect FILE... [--format json] [--detail]
   zpq conform <file.parquet>

@@ -1190,6 +1190,79 @@ fn peelSemis(a: std.mem.Allocator, sql: []const u8, schemas: Schemas, markers: l
     return .{ .semis = semis.items, .rest = rest };
 }
 
+/// `UPDATE 'file' SET col = literal [, ...] WHERE predicate`, read into what the engine's UPDATE binds: the WHERE
+/// and each assignment as filter text, lowered the way a SELECT's WHERE is (`col = literal` binds the literal to the
+/// column's type exactly as a comparison does). Null for any other statement, which the SELECT parser then reads.
+pub const ParsedUpdate = struct {
+    table: []const u8,
+    where: syntax.Predicate,
+    sets: []const SetClause,
+};
+
+pub const SetClause = struct {
+    column: []const u8,
+    /// `column = literal`; null for NULL.
+    assignment: ?syntax.Predicate,
+};
+
+/// `allocator` must be an arena: everything returned lives on it.
+pub fn parseSqlUpdate(allocator: std.mem.Allocator, sql: []const u8) !?ParsedUpdate {
+    var report: literals.Report = .{};
+    const folded = try fold(allocator, sql, &report);
+    const lp_arena = c.arena_create(64 * 1024) orelse return error.OutOfMemory;
+    defer c.arena_destroy(lp_arena);
+    var error_msg: [*c]const u8 = null;
+    const z = try allocator.dupeSentinel(u8, folded, 0);
+    const stmts = c.lp_parse_all(z, lp_arena, &error_msg);
+    if (stmts == null or stmts.*.count != 1) return null;
+    const root = stmts.*.items[0] orelse return null;
+    if (root.*.kind != c.LP_STMT_UPDATE) return null;
+    const u = root.*.u.update;
+    if (u.from != null or u.order_by.count > 0 or u.limit != null or u.returning.count > 0 or u.or_conflict != 0) {
+        diagnosticPrint("sql: UPDATE takes SET and WHERE only (no FROM, ORDER BY, LIMIT, RETURNING or OR ...)\n", .{});
+        return error.UnsupportedStatement;
+    }
+    if (u.table == null) return error.MissingTableName;
+    boolLiterals(root);
+    const where = u.where orelse {
+        diagnosticPrint("sql: UPDATE needs a WHERE clause; to rewrite a whole column, use a SELECT written with -o\n", .{});
+        return error.UpdateWithoutWhere;
+    };
+    const where_c = c.lp_ast_to_sql(where, lp_arena);
+    if (where_c == null) return error.UnparseError;
+    const sets = try allocator.alloc(SetClause, @intCast(u.set_clauses.count));
+    for (sets, 0..) |*set, i| {
+        const node = u.set_clauses.items[i] orelse return error.SqlParseError;
+        const sc = node.*.u.set_clause;
+        if (sc.column == null) {
+            diagnosticPrint("sql: UPDATE sets one column per assignment\n", .{});
+            return error.UnsupportedStatement;
+        }
+        const expr = sc.expr orelse return error.SqlParseError;
+        const column = try allocator.dupe(u8, std.mem.span(sc.column));
+        if (expr.*.kind == c.LP_EXPR_LITERAL_NULL) {
+            set.* = .{ .column = column, .assignment = null };
+            continue;
+        }
+        const expr_c = c.lp_ast_to_sql(expr, lp_arena);
+        if (expr_c == null) return error.UnparseError;
+        const text = try std.fmt.allocPrint(allocator, "{s} = {s}", .{ column, std.mem.span(expr_c) });
+        set.* = .{ .column = column, .assignment = try updatePredicate(allocator, text, report.markers) };
+    }
+    return .{
+        .table = try allocator.dupe(u8, stripQuotes(std.mem.span(u.table))),
+        .where = try updatePredicate(allocator, std.mem.span(where_c), report.markers),
+        .sets = sets,
+    };
+}
+
+/// A predicate of an UPDATE as filter text: read as the WHERE of a SELECT, under that SELECT's rules.
+fn updatePredicate(allocator: std.mem.Allocator, predicate: []const u8, markers: literals.Markers) !syntax.Predicate {
+    const select = try std.fmt.allocPrint(allocator, "SELECT * FROM 'update_target' WHERE {s}", .{predicate});
+    const pq = try parseFolded(true, allocator, select, markers);
+    return pq.syntax.?.filter orelse error.SqlParseError;
+}
+
 pub fn parseSqlPlan(allocator: std.mem.Allocator, sql: []const u8) !ParsedQuery {
     return parseSql(true, allocator, sql);
 }

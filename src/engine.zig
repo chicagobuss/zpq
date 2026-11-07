@@ -37,6 +37,7 @@ pub const rank = @import("engine/rank.zig");
 pub const print = @import("engine/print.zig");
 pub const print_window = @import("engine/print_window.zig");
 pub const aggregate = @import("engine/aggregate.zig");
+pub const update = @import("engine/update.zig");
 
 pub const fetchS3Schema = input.fetchS3Schema;
 pub const READ_CONCURRENCY = s3_fetch.READ_CONCURRENCY;

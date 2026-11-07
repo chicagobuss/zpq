@@ -209,6 +209,14 @@ adds `byte_copy`; other answers have no such field.
 | `pad_bytes` | zero bytes placed before copied runs to keep them at their input offset modulo 4 KiB |
 | `path` | `range_copy` (every byte by the kernel), `write` (none) or `mixed` |
 
+### UPDATE
+
+An UPDATE's summary has `"statement":"update"` and its own fields: `output` (the file written, null when no value
+changed and nothing was), `rows_in`, `row_groups_pruned` (by the WHERE's statistics), `rows_matched`,
+`values_changed` (matched rows whose value differed, over every SET column), `pages_rewritten`, `bytes_out`, then
+`byte_copy` as above, its `pad_bytes` the zero bytes of the rewritten pages' header pads, and `total_ms` /
+`total_us`.
+
 ### Time
 
 Every field is whole milliseconds (`_ms`, rounded down) or microseconds (`_us`).

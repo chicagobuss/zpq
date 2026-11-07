@@ -294,8 +294,32 @@ is at most 4,095 bytes per run and always fewer than the run's whole blocks; the
 copy: each input's row groups are copied whole, in input order, under one footer. The inputs' schemas must agree
 column for column (names, physical and logical types, repetition, nesting and DECIMAL scale and precision); the first
 that differs is refused, naming the file and the column where it parts from the first input's. Inputs that declare
-different column orders are re-encoded instead. File key-value metadata (an embedded Arrow schema among it) is not
-carried by any write, so it never decides a concatenation.
+different column orders are re-encoded instead. File key-value metadata (an embedded Arrow schema among it) is
+carried by no write but UPDATE, so it never decides a concatenation.
+
+**UPDATE.** `zpq query --query "UPDATE 'f.parquet' SET col = literal [, col = NULL ...] WHERE predicate"` sets the
+matching rows' values by rewriting only the data pages that hold them; every other byte of the file is copied as it
+lies, and shared on a filesystem that shares blocks. A rewritten page keeps its own encoding and codec (PLAIN,
+DELTA_*, BYTE_STREAM_SPLIT, RLE booleans, or dictionary indices, the value appended to the chunk's dictionary when it
+holds none), its version (V1 or V2) and its CRC, recomputed. A page whose size changes carries a pad in its header,
+PageHeader field 20 (binary, short form, before the STOP byte), sized so the pages after it keep their offsets modulo
+4 KiB; every reader of the 0.6.0 reader survey skips it. The statistics move with the edit: page header statistics,
+the ColumnIndex entry (a boundary order the edit breaks becomes UNORDERED), the OffsetIndex sizes, the chunk's null
+count and bounds (widened, never narrowed; a bound whose value was edited away is no longer marked exact), size
+statistics and level histograms. The new value goes into the chunk's Bloom filter, whose old values stay (a false
+positive is allowed), and a row group's `sorting_columns` is dropped when an edited column is one of its keys. Page
+indexes are written after the row groups, then the Bloom filters, then the footer, every footer field the source wrote
+kept (key-value metadata among them). In place, the result is staged beside the file, synced and renamed over it,
+keeping its mode, and refused if the file changed while it ran; `-o` writes it elsewhere and leaves the file as it was.
+
+- The literal is cast as a WHERE comparison casts it, and must be a value the column's type holds exactly.
+- `WHERE` is required; to rewrite a whole column, write a `SELECT` with `-o`.
+- Any number of rows may match; the cost grows with the pages they touch. A statement that changes no value writes
+  nothing.
+- Refused, exit 2, naming the reason: repeated (LIST/MAP) columns, INT96 and FLOAT16 columns, encrypted files, S3
+  targets, a page zpq cannot rewrite exactly, and every option but `-o`, `--fsync`/`--no-fsync` and `--summary=json`.
+- On ext4 and other filesystems that share no blocks, the copy is written in full: time and transient disk grow with
+  the file. On btrfs or XFS with reflink they grow with the pages touched.
 
 `--codec` sets the output codec. Without it, re-encoded output is SNAPPY and a plain copy keeps each column chunk's own
 codec; with it, a plain copy recompresses any chunk stored in another codec. The `codec` field of the write summary names

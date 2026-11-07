@@ -78,6 +78,21 @@ pub const Codes = union(enum) {
         }
     }
 
+    /// These codes, copied into `a` at the narrowest width a dictionary of `entries` allows.
+    fn narrowed(c: Codes, a: std.mem.Allocator, entries: usize) !Codes {
+        const n = switch (c) {
+            inline else => |v| v.len,
+        };
+        const out: Codes = if (entries <= 1 << 8)
+            .{ .u8 = try a.alloc(u8, n) }
+        else if (entries <= 1 << 16)
+            .{ .u16 = try a.alloc(u16, n) }
+        else
+            .{ .u32 = try a.alloc(u32, n) };
+        for (0..n) |i| out.set(@intCast(i), c.get(@intCast(i)));
+        return out;
+    }
+
     fn bytes(c: Codes) usize {
         return switch (c) {
             inline else => |v| v.len * @sizeOf(@TypeOf(v[0])),
@@ -391,7 +406,7 @@ pub const Spec = struct {
 
 /// One build row group's survivors: their keys, and per payload a local dictionary and each survivor's local code.
 const Part = struct {
-    keys: []i64 = &.{},
+    keys: Keys = .{ .wide = &.{} },
     /// A row the build's filter kept had a NULL key: `NOT IN` is then UNKNOWN for every probe row.
     null_key: bool = false,
     local: []Local = &.{},
@@ -399,8 +414,27 @@ const Part = struct {
     hi: i64 = std.math.minInt(i64),
 };
 
+/// A part's survivors' keys, in row order: as they are, or as offsets from the part's `lo` when its keys span less
+/// than 2^32 (half the bytes, for keys held until the build is laid out).
+const Keys = union(enum) {
+    wide: []i64,
+    narrow: []u32,
+
+    fn len(k: Keys) usize {
+        return switch (k) {
+            inline else => |v| v.len,
+        };
+    }
+
+    /// Key `raw` of `v` as an i64, for a part whose smallest key is `lo`.
+    inline fn of(raw: anytype, lo: i64) i64 {
+        return if (@TypeOf(raw) == u32) lo + raw else raw;
+    }
+};
+
 const Local = struct {
-    codes: []u32,
+    /// Each survivor's local code, at its dictionary's width.
+    codes: Codes,
     dict: Dict,
     /// Local code -> global code, filled when the dictionaries unify.
     global: []u32 = &.{},
@@ -476,7 +510,7 @@ fn localDict(comptime T: type, a: std.mem.Allocator, c: filter_eval.ColumnT(T), 
         []const u8 => .{ .string = dict.items },
         else => unreachable,
     };
-    return .{ .codes = codes, .dict = d };
+    return .{ .codes = .{ .u32 = codes }, .dict = d };
 }
 
 /// A payload chunk that is dictionary-encoded throughout, as its own dictionary and the survivors' codes in it: the
@@ -503,7 +537,7 @@ fn codedLocal(comptime T: type, a: std.mem.Allocator, bytes: []const u8, meta: *
         []const u8 => .{ .string = coded.dict },
         else => unreachable,
     };
-    return .{ .codes = codes, .dict = d };
+    return .{ .codes = .{ .u32 = codes }, .dict = d };
 }
 
 fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
@@ -592,9 +626,13 @@ fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
             else => return error.JoinPayloadType,
         };
     }
-    part.keys = try a.dupe(i64, keys.items);
+    part.keys = if (keys.items.len != 0 and @as(i128, part.hi) - part.lo <= std.math.maxInt(u32)) blk: {
+        const out = try a.alloc(u32, keys.items.len);
+        for (keys.items, out) |k, *o| o.* = @intCast(k - part.lo);
+        break :blk .{ .narrow = out };
+    } else .{ .wide = try a.dupe(i64, keys.items) };
     for (locals) |*l| {
-        l.codes = try a.dupe(u32, l.codes);
+        l.codes = try l.codes.narrowed(a, l.dict.len());
         l.dict = switch (l.dict) {
             .string => |d| blk: {
                 const out = try a.alloc([]const u8, d.len);
@@ -693,17 +731,50 @@ fn unify(comptime T: type, a: std.mem.Allocator, scratch: std.mem.Allocator, are
     };
 }
 
+/// Each part's keys into the dense map's bits, flagging a key set twice. With `disjoint` (no two parts' key ranges
+/// overlap, as in a file sorted by its key) a word strictly inside a part's own range is that part's alone and takes
+/// a plain store; only its two edge words, which a neighbour may share, take an atomic one.
 const SetBits = struct {
     parts: []const Part,
     d: *const Dense,
     dup: *std.atomic.Value(bool),
+    disjoint: bool,
     fn run(c: @This(), _: usize, i: usize) !void {
-        for (c.parts[i].keys) |k| {
-            const at: u64 = @bitCast(k -% c.d.lo);
-            const bit = @as(u64, 1) << @intCast(at & 63);
-            const old = @atomicRmw(u64, &c.d.bits[@intCast(at >> 6)], .Or, bit, .monotonic);
-            if (old & bit != 0) c.dup.store(true, .monotonic);
+        const part = c.parts[i];
+        if (part.keys.len() == 0) return;
+        const first: u64 = @as(u64, @bitCast(part.lo -% c.d.lo)) >> 6;
+        const last: u64 = @as(u64, @bitCast(part.hi -% c.d.lo)) >> 6;
+        var dup = false;
+        switch (part.keys) {
+            inline else => |keys| for (keys) |raw| {
+                const k = Keys.of(raw, part.lo);
+                const at: u64 = @bitCast(k -% c.d.lo);
+                const w = at >> 6;
+                const bit = @as(u64, 1) << @intCast(at & 63);
+                const word = &c.d.bits[@intCast(w)];
+                const old = if (c.disjoint and w > first and w < last) blk: {
+                    const o = word.*;
+                    word.* = o | bit;
+                    break :blk o;
+                } else @atomicRmw(u64, word, .Or, bit, .monotonic);
+                dup = dup or old & bit != 0;
+            },
         }
+        if (dup) c.dup.store(true, .monotonic);
+    }
+
+    /// Whether no two parts' `[lo, hi]` key ranges overlap.
+    fn disjointParts(a: std.mem.Allocator, parts: []const Part) !bool {
+        var order: std.ArrayList(*const Part) = .empty;
+        defer order.deinit(a);
+        for (parts) |*p| if (p.keys.len() != 0) try order.append(a, p);
+        std.mem.sort(*const Part, order.items, {}, struct {
+            fn lt(_: void, x: *const Part, y: *const Part) bool {
+                return x.lo < y.lo;
+            }
+        }.lt);
+        for (order.items[0..order.items.len -| 1], order.items[@min(1, order.items.len)..]) |x, y| if (x.hi >= y.lo) return false;
+        return true;
     }
 };
 
@@ -713,9 +784,11 @@ const FillCodes = struct {
     codes: []const Codes,
     fn run(c: @This(), _: usize, i: usize) !void {
         const part = c.parts[i];
-        for (part.keys, 0..) |k, row| {
-            const s = c.j.slot(k).?;
-            for (c.codes, part.local) |dst, l| dst.set(s, l.global[l.codes[row]]);
+        switch (part.keys) {
+            inline else => |keys| for (keys, 0..) |raw, row| {
+                const s = c.j.slot(Keys.of(raw, part.lo)).?;
+                for (c.codes, part.local) |dst, l| dst.set(s, l.global[l.codes.get(@intCast(row))]);
+            },
         }
     }
 };
@@ -758,7 +831,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     var hi: i64 = std.math.minInt(i64);
     var null_key = false;
     for (parts) |p| {
-        n += p.keys.len;
+        n += p.keys.len();
         lo = @min(lo, p.lo);
         hi = @max(hi, p.hi);
         null_key = null_key or p.null_key;
@@ -780,7 +853,8 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
         const d: Dense = .{ .lo = if (n == 0) 0 else lo, .bits = try a.alloc(u64, words), .rank = try a.alloc(u32, words) };
         @memset(d.bits, 0);
         var dup = std.atomic.Value(bool).init(false);
-        try parallel(parts.len, spec.threads, SetBits{ .parts = parts, .d = &d, .dup = &dup }, SetBits.run);
+        const disjoint = try SetBits.disjointParts(gpa, parts);
+        try parallel(parts.len, spec.threads, SetBits{ .parts = parts, .d = &d, .dup = &dup, .disjoint = disjoint }, SetBits.run);
         // A SEMI join keeps a probe row with any match: a key twice is still one key.
         if (dup.load(.monotonic) and spec.kind.unique()) return error.DuplicateBuildKey;
         var r: u32 = 0;
@@ -795,18 +869,21 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
         @memset(h.slots, EMPTY);
         const mask = hash_cap - 1;
         var next: u32 = 0;
-        for (parts) |p| for (p.keys) |k| {
-            var i = h.home(k);
-            const dup = while (h.slots[i] != EMPTY) : (i = (i + 1) & mask) {
-                if (h.keys[i] == k) break true;
-            } else false;
-            if (dup) {
-                if (spec.kind.unique()) return error.DuplicateBuildKey;
-                continue;
-            }
-            h.keys[i] = k;
-            h.slots[i] = next;
-            next += 1;
+        for (parts) |p| switch (p.keys) {
+            inline else => |keys| for (keys) |raw| {
+                const k = Keys.of(raw, p.lo);
+                var i = h.home(k);
+                const dup = while (h.slots[i] != EMPTY) : (i = (i + 1) & mask) {
+                    if (h.keys[i] == k) break true;
+                } else false;
+                if (dup) {
+                    if (spec.kind.unique()) return error.DuplicateBuildKey;
+                    continue;
+                }
+                h.keys[i] = k;
+                h.slots[i] = next;
+                next += 1;
+            },
         };
         j.keys = .{ .hash = h };
     }
@@ -1493,4 +1570,30 @@ test "the group-join's cut keeps a NULL group first under NULLS FIRST (review R1
     defer for (rows) |row| a.free(row);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqual(@as(i128, 0), rows[0][0].i);
+}
+
+test "dense bits: disjoint parts set their own words plainly and still see a duplicate key" {
+    const a = std.testing.allocator;
+    var k0: [200]i64 = undefined;
+    for (&k0, 0..) |*k, i| k.* = @intCast(i);
+    var k1: [201]i64 = undefined;
+    for (k1[0..200], 0..) |*k, i| k.* = @intCast(200 + i);
+    k1[200] = 300;
+    const parts = [_]Part{ .{ .keys = .{ .wide = &k1 }, .lo = 200, .hi = 399 }, .{ .keys = .{ .wide = &k0 }, .lo = 0, .hi = 199 } };
+    try std.testing.expect(try SetBits.disjointParts(a, &parts));
+    var bits: [7]u64 = @splat(0);
+    var rank: [7]u32 = @splat(0);
+    const d: Dense = .{ .lo = 0, .bits = &bits, .rank = &rank };
+    var dup = std.atomic.Value(bool).init(false);
+    const c: SetBits = .{ .parts = &parts, .d = &d, .dup = &dup, .disjoint = true };
+    try c.run(0, 0);
+    try std.testing.expect(dup.load(.monotonic));
+    dup.store(false, .monotonic);
+    try c.run(0, 1);
+    try std.testing.expect(!dup.load(.monotonic));
+    var set: usize = 0;
+    for (bits) |w| set += @popCount(w);
+    try std.testing.expectEqual(@as(usize, 400), set);
+    const overlapping = [_]Part{ .{ .keys = .{ .wide = &k0 }, .lo = 0, .hi = 199 }, .{ .keys = .{ .wide = &k1 }, .lo = 199, .hi = 399 } };
+    try std.testing.expect(!try SetBits.disjointParts(a, &overlapping));
 }

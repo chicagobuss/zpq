@@ -419,6 +419,12 @@ pub const Func = enum {
     strpos,
     /// `concat_ws('sep', a, b, ...)`: the non-NULL texts joined by the constant separator; empty where all are NULL.
     concat_ws,
+    /// `ascii(s)`: the code point of the first character, an INTEGER; 0 for the empty text.
+    ascii,
+    /// `chr(n)`: the one-character text of code point `n`. DuckDB's takes an INTEGER, so a BIGINT is refused here as there.
+    chr,
+    /// `repeat(s, n)`: `s` `n` times, empty for an `n` that is not positive; `n` is a constant.
+    repeat,
 };
 
 /// The string tests `Func.str_test` stands for.
@@ -875,7 +881,7 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .floor, .ceil, .sqrt, .round, .sign, .trunc => c.args[0].mayBeNull(),
+                .strlen, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .floor, .ceil, .sqrt, .round, .sign, .trunc, .ascii, .chr, .repeat => c.args[0].mayBeNull(),
                 .math => for (c.args) |a| {
                     if (a.mayBeNull()) break true;
                 } else false,

@@ -6,6 +6,7 @@ const Lower = @import("sql_lower.zig").Lower;
 const parser = @import("parser.zig");
 const literals = @import("sql_literals.zig");
 const sql_join = @import("sql_join.zig");
+const sql_setops = @import("sql_setops.zig");
 const schema = @import("../schema.zig");
 const metadata = @import("../parquet/metadata.zig");
 
@@ -533,6 +534,73 @@ fn selectColumn(rc: *c.LpNode, lp_arena: *c.arena_t, allocator: std.mem.Allocato
 fn aliasText(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
     if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return allocator.dupe(u8, raw);
     return std.mem.replaceOwned(u8, allocator, raw[1 .. raw.len - 1], "\"\"", "\"");
+}
+
+/// `sql` with every `position(needle IN text)` written `strpos(text, needle)`, which it means. The `IN` that splits the call is
+/// the first outside nested parentheses and quotes; quoted text is left as it is.
+fn positionAsStrpos(allocator: std.mem.Allocator, sql: []const u8) ![:0]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < sql.len) {
+        const ch = sql[i];
+        if (ch == '\'' or ch == '"') {
+            const end = sql_setops.quotedEnd(sql, i);
+            try out.appendSlice(allocator, sql[i..end]);
+            i = end;
+            continue;
+        }
+        if (sql_setops.startsWord(sql, i)) {
+            const w = sql_setops.wordAt(sql, i);
+            if (sql_setops.eql(w, "position")) rewrite: {
+                var open = i + w.len;
+                while (open < sql.len and std.ascii.isWhitespace(sql[open])) open += 1;
+                if (open >= sql.len or sql[open] != '(') break :rewrite;
+                // The call's closing parenthesis, and the first IN at its own level.
+                var depth: usize = 0;
+                var split: ?usize = null;
+                var k = open;
+                var close: ?usize = null;
+                while (k < sql.len) {
+                    const at = sql[k];
+                    if (at == '\'' or at == '"') {
+                        k = sql_setops.quotedEnd(sql, k);
+                        continue;
+                    }
+                    if (at == '(') depth += 1;
+                    if (at == ')') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            close = k;
+                            break;
+                        }
+                    }
+                    if (depth == 1 and split == null and sql_setops.startsWord(sql, k)) {
+                        const word = sql_setops.wordAt(sql, k);
+                        if (sql_setops.eql(word, "in")) split = k;
+                        k += word.len;
+                        continue;
+                    }
+                    k += 1;
+                }
+                const close_at = close orelse break :rewrite;
+                const split_at = split orelse break :rewrite;
+                const needle = try positionAsStrpos(allocator, sql[open + 1 .. split_at]);
+                defer allocator.free(needle);
+                const text = try positionAsStrpos(allocator, sql[split_at + 2 .. close_at]);
+                defer allocator.free(text);
+                try out.print(allocator, "strpos({s}, {s})", .{ std.mem.trim(u8, text, " \t\r\n"), std.mem.trim(u8, needle, " \t\r\n") });
+                i = close_at + 1;
+                continue;
+            }
+            try out.appendSlice(allocator, w);
+            i += w.len;
+            continue;
+        }
+        try out.append(allocator, ch);
+        i += 1;
+    }
+    return out.toOwnedSliceSentinel(allocator, 0);
 }
 
 /// `sql` with every `EXTRACT(part FROM x)` written `date_part('part', x)`, which is what it means (DuckDB's own
@@ -1393,7 +1461,9 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
     defer c.arena_destroy(lp_arena);
 
     var error_msg: [*c]const u8 = null;
-    const extracted = try extractAsDatePart(allocator, folded_sql);
+    const positioned = try positionAsStrpos(allocator, folded_sql);
+    defer allocator.free(positioned);
+    const extracted = try extractAsDatePart(allocator, positioned);
     defer allocator.free(extracted);
     const keyworded = try substringKeywords(allocator, extracted);
     defer allocator.free(keyworded);
@@ -3068,6 +3138,26 @@ test "sql_parser reads EXTRACT(part FROM x) as date_part('part', x), quoted text
     const q = try parseSqlQuery(a, "SELECT extract(minute FROM t) AS m, count(*) FROM f GROUP BY m");
     defer q.deinit(a);
     try std.testing.expectEqualStrings("date_part('minute', t)", q.select_cols[0].expr);
+}
+
+test "sql_parser reads position(a IN b) as strpos(b, a), quoted text and other calls left alone" {
+    const a = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "SELECT position('a' IN s), POSITION ( 'b'\nin d) FROM t", "SELECT strpos(s, 'a'), strpos(d, 'b') FROM t" },
+        // The IN that splits is the first at the call's own level; a nested call and quoted text keep theirs.
+        .{ "position('x' IN lower(s || ' in '))", "strpos(lower(s || ' in '), 'x')" },
+        .{ "position(f(a IN b) IN s)", "strpos(s, f(a IN b))" },
+        .{ "position('a' IN position('b' IN s))", "strpos(strpos(s, 'b'), 'a')" },
+        .{ "SELECT 'position(a IN b)', \"position\" FROM t WHERE position = 1", "SELECT 'position(a IN b)', \"position\" FROM t WHERE position = 1" },
+        // No IN at its level: the call is left for the binder.
+        .{ "position(s)", "position(s)" },
+        .{ "xposition('a' IN s)", "xposition('a' IN s)" },
+    };
+    for (cases) |c2| {
+        const got = try positionAsStrpos(a, c2[0]);
+        defer a.free(got);
+        try std.testing.expectEqualStrings(c2[1], got);
+    }
 }
 
 test "sql_parser reads substring(x FROM a FOR b) as substring(x, a, b), and only that" {

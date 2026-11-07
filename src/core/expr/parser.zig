@@ -788,6 +788,9 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "last_day")) return .last_day;
     if (asciiEqIgnoreCase(name, "strpos") or asciiEqIgnoreCase(name, "instr")) return .strpos;
     if (asciiEqIgnoreCase(name, "concat_ws")) return .concat_ws;
+    if (asciiEqIgnoreCase(name, "ascii")) return .ascii;
+    if (asciiEqIgnoreCase(name, "chr")) return .chr;
+    if (asciiEqIgnoreCase(name, "repeat")) return .repeat;
     if (asciiEqIgnoreCase(name, "sign")) return .sign;
     if (asciiEqIgnoreCase(name, "trunc")) return .trunc;
     if (ast.MathFn.parse(name) != null) return .math;
@@ -993,6 +996,27 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             const t = args[0].temporal() orelse return error.TypeMismatch;
             if (t == .ts_ns and args[0].isUtc()) return error.TypeMismatch;
             return if (func == .date_name) .str else .i64;
+        },
+        .ascii => {
+            if (args.len != 1) return error.WrongArity;
+            if (args[0].typeOf() != .str) return error.TypeMismatch;
+            return .i64;
+        },
+        .chr => {
+            if (args.len != 1) return error.WrongArity;
+            // DuckDB's `chr` takes an INTEGER: a BIGINT argument is no function it has.
+            const t = intTypeOf(file, args[0].*) orelse return error.TypeMismatch;
+            if (args[0].typeOf() != .i64 or args[0].temporal() != null or args[0].isBoolean()) return error.TypeMismatch;
+            switch (t) {
+                .i8, .i16, .i32, .u8, .u16 => {},
+                else => return error.TypeMismatch,
+            }
+            return .str;
+        },
+        .repeat => {
+            if (args.len != 2) return error.WrongArity;
+            if (args[0].typeOf() != .str or !isIntLiteral(args[1].*)) return error.TypeMismatch;
+            return .str;
         },
         .strpos => {
             if (args.len != 2) return error.WrongArity;
@@ -1585,7 +1609,7 @@ fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
             return arithInt(file, b.left.*, b.right.*);
         },
         .call => |c| switch (c.func) {
-            .abs, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .sign => return c.int,
+            .abs, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .sign, .ascii => return c.int,
             .trunc => return intTypeOf(file, c.args[0].*),
             .strlen, .length, .date_part, .date_diff, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .strpos => return .i64,
             .round => return intTypeOf(file, c.args[0].*),
@@ -1673,7 +1697,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 .split_part, .regexp_extract, .date_diff, .strftime => null,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => null,
                 .floor, .ceil, .sqrt, .round, .least, .greatest, .math, .sign, .trunc, .str_test, .regexp_matches => null,
-                .date_name, .strpos, .concat_ws => null,
+                .date_name, .strpos, .concat_ws, .ascii, .chr, .repeat => null,
             },
             // A truncated or coalesced TIMESTAMP is as UTC-adjusted as its argument, DuckDB's TIMESTAMP WITH TIME ZONE;
             // every cast and `epoch_ms` give a plain TIMESTAMP.
@@ -1689,6 +1713,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 .cast_i32 => .i32,
                 .cast_i64 => .i64,
                 .sign => .i8,
+                .ascii => .i32,
                 else => null,
             },
             .part = switch (func) {

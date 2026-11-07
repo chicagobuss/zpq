@@ -1375,7 +1375,9 @@ fn evalCall(
         .cast_text => return evalCastText(arena, batch, column_lookup, c.args[0].*),
         .abs => return evalAbs(arena, batch, column_lookup, c),
         .length => return evalLength(arena, batch, column_lookup, c.args[0].*),
-        .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract => return evalStringFn(arena, batch, column_lookup, c),
+        .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .repeat => return evalStringFn(arena, batch, column_lookup, c),
+        .ascii => return evalAscii(arena, batch, column_lookup, c.args[0].*),
+        .chr => return evalChr(arena, batch, column_lookup, c.args[0].*),
         .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp => return evalCast(arena, batch, column_lookup, c),
         .floor, .ceil, .sqrt, .round, .trunc => return evalMath(arena, batch, column_lookup, c),
         .math => return evalMathFn(arena, batch, column_lookup, c),
@@ -1595,6 +1597,16 @@ fn applyStringFn(arena: std.mem.Allocator, bytes: *std.ArrayList(u8), scratch: *
             if (c.func == .lpad) try bytes.appendSlice(arena, text);
             return .{ .built = .{ start, bytes.items.len } };
         },
+        .repeat => {
+            const times = int(c, 1);
+            if (times <= 0 or text.len == 0) return .{ .text = "" };
+            // DuckDB's longest text.
+            if (@as(i128, @intCast(text.len)) * times > std.math.maxInt(u32)) return error.ConversionOutOfRange;
+            const start = bytes.items.len;
+            var left: usize = @intCast(times);
+            while (left > 0) : (left -= 1) try bytes.appendSlice(arena, text);
+            return .{ .built = .{ start, bytes.items.len } };
+        },
         .split_part => return .{ .text = splitPart(text, c.args[1].literal.str, int(c, 2)) },
         .regexp_extract => return .{ .text = try c.extract.?.apply(scratch, text) },
         else => unreachable,
@@ -1795,6 +1807,56 @@ fn stringRows(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []co
         return .{ .col = arg.col, .values = out };
     }
     return .{ .col = arg.col, .values = s.values };
+}
+
+/// The code point `text` starts with, 0 for the empty text.
+fn firstCodePoint(text: []const u8) i64 {
+    if (text.len == 0) return 0;
+    const len = std.unicode.utf8ByteSequenceLength(text[0]) catch return text[0];
+    if (len > text.len) return text[0];
+    return std.unicode.utf8Decode(text[0..len]) catch text[0];
+}
+
+/// `ascii(s)`: the code point of the first character, 0 for the empty text.
+fn evalAscii(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, arg_expr: ast.Expr) Error!Batch.Column {
+    const arg = try stringArgument(arena, batch, column_lookup, arg_expr);
+    const s = arg.s;
+    const out = try arena.alloc(i64, s.rowCount());
+    if (s.codes) |codes| {
+        const of_entry = try arena.alloc(i64, s.dict.len);
+        for (s.dict, of_entry) |v, *x| x.* = firstCodePoint(v);
+        for (codes, out) |code, *o| o.* = if (code < of_entry.len) of_entry[code] else 0;
+    } else for (s.values, out) |v, *o| {
+        o.* = firstCodePoint(v);
+    }
+    return .{ .i64 = .{ .values = out, .def_levels = s.def_levels, .max_def = s.max_def, .has_nulls = s.has_nulls } };
+}
+
+/// The text of code point `v`, or null where it is none: past Unicode, negative or a surrogate.
+fn codePointText(buf: *[4]u8, v: i64) ?[]const u8 {
+    const cp = std.math.cast(u21, v) orelse return null;
+    const n = std.unicode.utf8Encode(cp, buf) catch return null;
+    return buf[0..n];
+}
+
+/// `chr(n)`: the one-character text of code point `n`. A code point that is none is an error in a row the batch wants and
+/// that is not NULL.
+fn evalChr(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, arg_expr: ast.Expr) Error!Batch.Column {
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg_expr);
+    if (col != .i64) return error.TypeMismatch;
+    const in = col.i64;
+    if (in.max_rep > 0) return error.NestedNotSupported;
+    const values = try arena.alloc([]const u8, in.values.len);
+    for (in.values, values, 0..) |v, *out, i| {
+        var buf: [4]u8 = undefined;
+        if (codePointText(&buf, v)) |text| {
+            out.* = try arena.dupe(u8, text);
+        } else {
+            out.* = "";
+            if (!rowIsNull(col, i) and (batch.sel == null or batch.sel.?.isActive(i))) return error.ConversionOutOfRange;
+        }
+    }
+    return .{ .string = .{ .values = values, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
 }
 
 /// `length(s)`: characters of each text, once per dictionary entry where the chunk is coded.
@@ -2974,7 +3036,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .math, .sign, .trunc, .str_test, .regexp_matches, .strpos, .concat_ws, .date_name, .last_day => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .math, .sign, .trunc, .str_test, .regexp_matches, .strpos, .concat_ws, .date_name, .last_day, .ascii, .chr, .repeat => unreachable,
     }
     return .{ .i64 = .{
         .values = out,
@@ -4899,8 +4961,36 @@ test "left, right, trim, replace and the pads match DuckDB's answers" {
     try expectString("日本日héllo", .lpad, "héllo", &.{ intArg(8), strArg("日本") });
     try std.testing.expectError(error.InsufficientPadding, stringFn(.lpad, "héllo", &.{ intArg(8), strArg("") }));
     try std.testing.expectError(error.InsufficientPadding, stringFn(.rpad, "héllo", &.{ intArg(8), strArg("") }));
+    // `repeat` is whole copies, nothing for a count that is not positive, and an error past DuckDB's longest text.
+    try expectString("ababab", .repeat, "ab", &.{intArg(3)});
+    try expectString("日本日本", .repeat, "日本", &.{intArg(2)});
+    try expectString("", .repeat, "ab", &.{intArg(0)});
+    try expectString("", .repeat, "ab", &.{intArg(-4)});
+    try expectString("", .repeat, "", &.{intArg(1_000_000_000_000)});
+    try std.testing.expectError(error.ConversionOutOfRange, stringFn(.repeat, "abcdefgh", &.{intArg(2_147_483_647)}));
     // Characters, not bytes, and not grapheme clusters.
     try std.testing.expectEqual(@as(usize, 11), charCount("héllo wörld"));
     try std.testing.expectEqual(@as(usize, 2), charCount("a\u{301}"));
     try std.testing.expectEqual(@as(usize, 5), charCount("👨‍👩‍👧"));
+}
+
+test "ascii and chr: the first code point of a text, and the text of a code point" {
+    try std.testing.expectEqual(@as(i64, 97), firstCodePoint("abc"));
+    try std.testing.expectEqual(@as(i64, 0), firstCodePoint(""));
+    try std.testing.expectEqual(@as(i64, 0xE9), firstCodePoint("é"));
+    try std.testing.expectEqual(@as(i64, 0x65E5), firstCodePoint("日本"));
+    try std.testing.expectEqual(@as(i64, 0x1F468), firstCodePoint("👨‍👩‍👧"));
+    // A combining mark follows its base, so the first code point is the base.
+    try std.testing.expectEqual(@as(i64, 'e'), firstCodePoint("e\u{301}"));
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("a", codePointText(&buf, 97).?);
+    try std.testing.expectEqualStrings("\x00", codePointText(&buf, 0).?);
+    try std.testing.expectEqualStrings("€", codePointText(&buf, 0x20AC).?);
+    try std.testing.expectEqualStrings("\u{10FFFF}", codePointText(&buf, 0x10FFFF).?);
+    // None past Unicode's last code point, below zero or among the surrogates.
+    try std.testing.expect(codePointText(&buf, 0x110000) == null);
+    try std.testing.expect(codePointText(&buf, -1) == null);
+    try std.testing.expect(codePointText(&buf, 0xD800) == null);
+    try std.testing.expect(codePointText(&buf, 0xDFFF) == null);
+    try std.testing.expect(codePointText(&buf, 2_147_483_647) == null);
 }

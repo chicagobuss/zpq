@@ -95,7 +95,8 @@
   `epoch_us`, `epoch_ns` and `EXTRACT(epoch FROM ...)` of a DATE or TIMESTAMP (the TIMESTAMP WITH TIME ZONE double differs
   from a TIMESTAMP's, as DuckDB's does); `cbrt`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `degrees`, `radians`, `atan2`, `sign`
   and `trunc` (fuzzed against DuckDB on 140,000 rows each); `starts_with`, `ends_with`, `contains` and `regexp_matches` as
-  BOOLEANs, in WHERE too; `dayname`, `monthname`, `last_day`, `weekofyear`, `strpos`, `concat_ws` and `mod`. `ln`, `exp`, `pow`,
+  BOOLEANs, in WHERE too; `dayname`, `monthname`, `last_day`, `weekofyear`, `strpos`, `concat_ws` and `mod`; `ascii`, `chr`,
+  `repeat` and `position(needle IN s)`. `ln`, `exp`, `pow`,
   `sin` and their kin stay refused: DuckDB's math library differs from a current one's in the last digit for many inputs.
 - **`ROLLUP`, `CUBE`, `GROUPING SETS` and `GROUPING()` in SQL** (`zpq query --query`): `GROUP BY ROLLUP (a, b)`, `CUBE (a, b)`,
   `GROUPING SETS ((a), (b), ())` and their products with plain keys match DuckDB, including the NULL a key takes in a set

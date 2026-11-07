@@ -88,8 +88,12 @@ so they stay unknown functions. `starts_with` (`prefix`), `ends_with` (`suffix`)
 [, 'options'])` of a text against a constant are BOOLEANs in a SELECT, an aggregate argument (`bool_or`, `count`), a GROUP BY
 key, under `coalesce` and `CASE`, and in WHERE (alone, under NOT, AND, OR, and in an aggregate's FILTER). `dayname`,
 `monthname` (English names), `last_day` (a DATE; an error past DuckDB's last DATE), `weekofyear`, `strpos` / `instr` (the 1-based
-character position of a constant text, 0 for none), `concat_ws('sep', a, b, ...)` (NULLs skipped; texts only) and `mod(a, b)` (`a % b`)
-match DuckDB too. A function whose second argument must be a constant (`contains`, `strpos`, `regexp_matches`) refuses a column.
+character position of a constant text, 0 for none; `position(needle IN s)` is its spelling), `concat_ws('sep', a, b, ...)` (NULLs
+skipped; texts only), `ascii(s)` (the first code point, an INTEGER; 0 for `''`), `chr(n)` (a code point of Unicode, not a surrogate; an
+INTEGER or narrower, a BIGINT being no function DuckDB has either; an error otherwise), `repeat(s, n)` (`n` a constant; `''` for
+`n` of 0 or less; an error past DuckDB's longest text, 4 GiB) and `mod(a, b)` (`a % b`) match DuckDB too. A function whose second
+argument must be a constant (`contains`, `strpos`, `position`, `repeat`, `regexp_matches`) refuses a column. `reverse` stays
+unknown: DuckDB reverses grapheme clusters, and zpq has no Unicode segmentation table.
 
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 

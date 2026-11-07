@@ -331,8 +331,11 @@ pub const Conjunct = union(enum) {
     pub fn reads(c: Conjunct, marks: []bool) void {
         switch (c) {
             .predicate => |f| filter_ast.markColumns(f, marks),
-            .lookup => |l| if (l.col_idx < marks.len) {
-                marks[l.col_idx] = true;
+            .lookup => |l| {
+                if (l.col_idx < marks.len) marks[l.col_idx] = true;
+                if (l.residual) |r| for (r.reads) |ci| if (ci < marks.len) {
+                    marks[ci] = true;
+                };
             },
         }
     }
@@ -342,7 +345,8 @@ pub const Conjunct = union(enum) {
     pub fn soleColumn(c: Conjunct) ?usize {
         return switch (c) {
             .predicate => |f| filter_ast.leafColumn(f),
-            .lookup => |l| l.col_idx,
+            // A residual reads more than the key.
+            .lookup => |l| if (l.residual == null) l.col_idx else null,
         };
     }
 };
@@ -489,6 +493,7 @@ pub const GatedFilter = struct {
                 else
                     null;
                 try join_lookup.narrow(l.join, batch.cols[pos], sel, a, capture);
+                if (l.residual) |r| try filter_eval.evalResidual(r, batch, sel, lookup, a);
             },
             .predicate => {},
         };
@@ -863,7 +868,14 @@ fn markFilter(u: CodeUses, f: filter_ast.Filter) void {
         .null_check => |l| mark(u.levels, l.col_idx),
         .like => |l| mark(u.code, l.col_idx),
         // A coded foreign key is looked up once per dictionary entry (`join.lookup.narrow`).
-        .lookup => |l| mark(u.code, l.col_idx),
+        .lookup => |l| {
+            mark(u.code, l.col_idx);
+            // A residual's columns are read as its own predicates read them; the joins' FKs as their lookups do.
+            if (l.residual) |r| {
+                markFilter(u, r.filter);
+                for (r.joins) |j| mark(u.code, j.fk_leaf);
+            }
+        },
         .expr => |e| {
             markExprValues(u, e.left.*);
             markExprValues(u, e.right.*);

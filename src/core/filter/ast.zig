@@ -472,7 +472,10 @@ pub const Filter = union(enum) {
             .boolean => |f| try list.append(allocator, f.col_idx),
             .null_check => |f| try list.append(allocator, f.col_idx),
             .like => |f| try list.append(allocator, f.col_idx),
-            .lookup => |f| try list.append(allocator, f.col_idx),
+            .lookup => |f| {
+                try list.append(allocator, f.col_idx);
+                if (f.residual) |r| try list.appendSlice(allocator, r.reads);
+            },
             .expr => |e| {
                 try appendExprColumns(e.left.*, list, allocator);
                 try appendExprColumns(e.right.*, list, allocator);
@@ -485,6 +488,22 @@ pub const Filter = union(enum) {
 pub const Lookup = struct {
     col_idx: usize,
     join: *const @import("../join/lookup.zig").Join,
+    /// Conditions on build columns of more than one join, or on build and probe columns (a cycle of the join tree,
+    /// PDS-H q5's `c_nationkey = s_nationkey`): narrowed right after this lookup, the main one, which runs after every
+    /// other (`Residual`).
+    residual: ?*const Residual = null,
+};
+
+/// A join's conditions on build columns, which no build's filter can take: they need its published columns, which
+/// exist only once its lookups ran. They are built, for the rows still selected, from their slots, which are looked up
+/// again from each join's FK (`filter/eval.zig` `evalResidual`).
+pub const Residual = struct {
+    filter: Filter,
+    /// The probe's leaves it reads: its own real columns and each of `joins`' FK, decoded with the filter.
+    reads: []const usize,
+    /// The build columns (virtual leaves) it reads, and the joins that publish them.
+    virtual: []const usize,
+    joins: []const *const @import("../join/lookup.zig").Join,
 };
 
 /// The column a leaf reads; null for a composite.
@@ -533,7 +552,7 @@ pub fn eql(a: Filter, b: Filter) bool {
             l.trust_missing_nan_count == b.double.trust_missing_nan_count and l.trust_stats == b.double.trust_stats,
         .null_check => |n| n.col_idx == b.null_check.col_idx and n.is_not == b.null_check.is_not and
             n.trust_stats == b.null_check.trust_stats,
-        .lookup => |l| l.col_idx == b.lookup.col_idx and l.join == b.lookup.join,
+        .lookup => |l| l.col_idx == b.lookup.col_idx and l.join == b.lookup.join and l.residual == b.lookup.residual,
         // The same bound sides only: two spellings of one comparison are not recognized as one.
         .expr => |e| e.op == b.expr.op and e.left == b.expr.left and e.right == b.expr.right,
         .like => |m| m.col_idx == b.like.col_idx and m.kind == b.like.kind and m.negate == b.like.negate and
@@ -617,6 +636,12 @@ fn markAllColumns(f: Filter, cols: []bool) void {
         .expr => |e| {
             e.left.collectColumns(cols);
             e.right.collectColumns(cols);
+        },
+        .lookup => |l| {
+            if (l.col_idx < cols.len) cols[l.col_idx] = true;
+            if (l.residual) |r| for (r.reads) |ci| if (ci < cols.len) {
+                cols[ci] = true;
+            };
         },
         else => if (leafColumn(f)) |ci| if (ci < cols.len) {
             cols[ci] = true;

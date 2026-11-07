@@ -463,8 +463,16 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         }
         level = next;
     }
+    // A condition across tables (a cycle of the tree, or a build column against the probe's) stays the probe's: it
+    // narrows after the lookups, over the columns they publish (`filter_ast.Residual`).
+    var residuals: std.ArrayList(*c.LpNode) = .empty;
     for (conjuncts.items, used) |node, u| {
         if (u) continue;
+        if (@popCount(try sides.reads(node, a)) > 1) {
+            try residuals.append(a, node);
+            try wheres[probe].append(a, node);
+            continue;
+        }
         const side = try sides.only(node, a) orelse probe;
         try wheres[side].append(a, node);
     }
@@ -503,7 +511,10 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         const e = rc.*.u.result_column.expr;
         nm.* = if (rc.*.u.result_column.alias == null and e != null and e.*.kind == c.LP_EXPR_COLUMN_REF) span(e.*.u.column_ref.column) else null;
     }
-    for (try columnRefs(p.root, a)) |ref| {
+    var refs: std.ArrayList(*c.LpNode) = .empty;
+    try refs.appendSlice(a, try columnRefs(p.root, a));
+    for (residuals.items) |node| try refs.appendSlice(a, try columnRefs(node, a));
+    for (refs.items) |ref| {
         const side = try sides.of(ref);
         ref.*.u.column_ref.table = null;
         var d = side orelse continue;
@@ -703,6 +714,7 @@ test "a snowflake plans as a tree: a dimension's dimension under its build, its 
     try std.testing.expectEqual(@as(usize, 1), g.columns.len);
     try std.testing.expectEqualStrings("gname", g.columns[0]);
     try std.testing.expect(std.mem.indexOf(u8, p.probe_sql, "grp") != null);
-    // A second edge to a table already in the tree is a cycle: a residual, refused.
-    try std.testing.expectError(error.JoinResidualNotSupported, plan(a, "SELECT gname, count(*) AS n FROM 'f.parquet' f, 'd.parquet' d, 'g.parquet' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.amt = g.gk GROUP BY gname", t));
+    // A second edge to a table already in the tree is a cycle: a residual of the probe, over the published key.
+    const cyc = try plan(a, "SELECT gname, count(*) AS n FROM 'f.parquet' f, 'd.parquet' d, 'g.parquet' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.amt = g.gk GROUP BY gname", t);
+    try std.testing.expect(std.mem.indexOf(u8, cyc.probe_sql, "WHERE grp = amt") != null);
 }

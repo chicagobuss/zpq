@@ -223,9 +223,13 @@ pub const Prepared = struct {
             // Row output of a join is not in this release.
             .projection => return error.JoinRowsNotSupported,
         };
+        // Conditions on build columns come out of the probe's filter: they narrow after the lookups (`Residual`).
+        const residual = try self.splitResidual(arena, &a.filter);
         for (self.semis) |s| a.filter = try withLookup(arena, a.filter, try leafOf(meta, s, diag));
         for (self.dims) |d| a.filter = try withLookup(arena, a.filter, try leafOf(meta, d, diag));
-        a.filter = try withLookup(arena, a.filter, try leafOf(meta, self.main, diag));
+        var main_leaf = try leafOf(meta, self.main, diag);
+        if (residual.items.len != 0) main_leaf.lookup.residual = try self.residualOf(arena, residual.items);
+        a.filter = try withLookup(arena, a.filter, main_leaf);
         const j = self.main.join;
         if (j.group == null and j.kind == .inner) {
             const admitted = groupJoin(self.charge.allocator(), j, a.*, meta) catch |err| {
@@ -241,6 +245,69 @@ pub const Prepared = struct {
         }
         if (j.group) |g| g.order = self.order;
         return q;
+    }
+
+    /// The publishing joins: the main one and a star's other dimensions.
+    fn publishing(self: *const Prepared, a: std.mem.Allocator) ![]*const lookup.Join {
+        const out = try a.alloc(*const lookup.Join, 1 + self.dims.len);
+        out[0] = self.main.join;
+        for (self.dims, out[1..]) |d, *o| o.* = d.join;
+        return out;
+    }
+
+    fn isVirtual(self: *const Prepared, ci: usize) bool {
+        if (self.main.join.virtualPayload(ci) != null) return true;
+        for (self.dims) |d| if (d.join.virtualPayload(ci) != null) return true;
+        return false;
+    }
+
+    /// The conjuncts of `filter` that read a build column, taken out of it.
+    fn splitResidual(self: *const Prepared, a: std.mem.Allocator, filter: *?filter_ast.Filter) !std.ArrayList(filter_ast.Filter) {
+        var out: std.ArrayList(filter_ast.Filter) = .empty;
+        const f = filter.* orelse return out;
+        const kids: []const filter_ast.Filter = if (f == .and_filter and f.and_filter.in_set == null and !f.and_filter.null_member)
+            f.and_filter.children
+        else
+            (&f)[0..1];
+        var kept: std.ArrayList(filter_ast.Filter) = .empty;
+        var cols: std.ArrayList(usize) = .empty;
+        for (kids) |k| {
+            cols.clearRetainingCapacity();
+            try k.collectColumns(&cols, a);
+            const reads_build = for (cols.items) |ci| {
+                if (self.isVirtual(ci)) break true;
+            } else false;
+            try (if (reads_build) &out else &kept).append(a, k);
+        }
+        if (out.items.len == 0) return out;
+        filter.* = if (kept.items.len == 0) null else try filter_ast.join(a, true, kept.items);
+        return out;
+    }
+
+    /// The residual of `conjuncts`: what it reads of the probe (its own columns and each join's FK) and of the builds.
+    fn residualOf(self: *const Prepared, a: std.mem.Allocator, conjuncts: []const filter_ast.Filter) !*const filter_ast.Residual {
+        const all = try self.publishing(a);
+        var reads: std.ArrayList(usize) = .empty;
+        var virtual: std.ArrayList(usize) = .empty;
+        var joins: std.ArrayList(*const lookup.Join) = .empty;
+        var cols: std.ArrayList(usize) = .empty;
+        for (conjuncts) |k| try k.collectColumns(&cols, a);
+        for (cols.items) |ci| {
+            if (!self.isVirtual(ci)) {
+                try reads.append(a, ci);
+                continue;
+            }
+            try virtual.append(a, ci);
+            for (all) |j| if (j.virtualPayload(ci) != null) {
+                if (std.mem.indexOfScalar(*const lookup.Join, joins.items, j) == null) {
+                    try joins.append(a, j);
+                    try reads.append(a, j.fk_leaf);
+                }
+            };
+        }
+        const r = try a.create(filter_ast.Residual);
+        r.* = .{ .filter = try filter_ast.join(a, true, conjuncts), .reads = reads.items, .virtual = virtual.items, .joins = joins.items };
+        return r;
     }
 
     /// The group-join's answer in place of the empty one the group tables gave, then its slots go back.

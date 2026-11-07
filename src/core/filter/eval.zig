@@ -525,6 +525,7 @@ pub fn evaluate(
         .lookup => |leaf| {
             const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
             try @import("../join/lookup.zig").narrow(leaf.join, batch.cols[col_pos], sel, arena, null);
+            if (leaf.residual) |r| try evalResidual(r, batch, sel, column_lookup, arena);
         },
         .expr => |x| try evalExprCompare(x, batch, sel, column_lookup, arena),
         .int32 => |leaf| {
@@ -786,6 +787,38 @@ fn rescaled(v: i128, from: u8, to: expr_ast.Dec) Error!i256 {
     const out = @as(i256, v) * std.math.pow(i256, 10, to.scale - from);
     if (@abs(out) >= std.math.pow(u256, 10, to.precision)) return error.ComparisonValueOutOfRange;
     return out;
+}
+
+/// A join's residual over the rows its lookups kept (`ast.Residual`): each build column it reads is published for
+/// them, from slots looked up again from its join's FK, beside the batch's own columns, and the residual narrows.
+pub fn evalResidual(r: *const ast.Residual, batch: *const Batch, sel: *selection.SelectionVector, column_lookup: []const ?usize, arena: std.mem.Allocator) Error!void {
+    const join_lookup = @import("../join/lookup.zig");
+    const lookup = try arena.dupe(?usize, column_lookup);
+    var cols: std.ArrayList(Batch.Column) = .empty;
+    try cols.appendSlice(arena, batch.cols);
+    const slots = try arena.alloc(?[]u32, r.joins.len);
+    @memset(slots, null);
+    for (r.virtual) |ci| {
+        if (ci >= lookup.len) return error.BadColumn;
+        if (lookup[ci] != null) continue;
+        const k = for (r.joins, 0..) |j, k| {
+            if (j.virtualPayload(ci) != null) break k;
+        } else return error.BadColumn;
+        const j = r.joins[k];
+        if (slots[k] == null) {
+            const fk = column_lookup[j.fk_leaf] orelse return error.BadColumn;
+            slots[k] = try join_lookup.slotsFor(j, batch.cols[fk], sel, arena);
+        }
+        const col = join_lookup.column(j, j.virtualPayload(ci).?, slots[k].?, sel, arena, true) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.BadColumn,
+        };
+        lookup[ci] = cols.items.len;
+        try cols.append(arena, col);
+    }
+    var ext = batch.*;
+    ext.cols = cols.items;
+    try evaluate(r.filter, &ext, sel, lookup, arena);
 }
 
 /// `x.left op x.right` over the selected rows (`ast.ExprCompare`), both sides evaluated over those rows only, so a

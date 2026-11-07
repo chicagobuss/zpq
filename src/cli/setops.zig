@@ -274,13 +274,19 @@ fn readColumns(arena: std.mem.Allocator, path: []const u8) ![]const Col {
     return cols;
 }
 
+/// A column zpq does not rewrite, by its physical type and whatever annotates it, so two that differ in either are two kinds.
+fn signature(arena: std.mem.Allocator, leaf: schema_tree.PrimitiveNode) ![]const u8 {
+    const logical: []const u8 = if (leaf.logical_type) |lt| @tagName(lt) else if (leaf.converted_type) |ct| @tagName(ct) else "";
+    return std.fmt.allocPrint(arena, "{s}/{s}", .{ @tagName(leaf.type), logical });
+}
+
 fn classify(arena: std.mem.Allocator, leaf: schema_tree.PrimitiveNode) !Kind {
     if (leaf.path.len != 1 or leaf.max_rep > 0) return .{ .plain = "nested" };
     if (leaf.logical_type) |lt| switch (lt) {
         .STRING => if (leaf.type == .BYTE_ARRAY) return .varchar,
         .DATE => return .date,
         .DECIMAL => |d| return .{ .decimal = .{ .precision = d.precision, .scale = d.scale } },
-        .INTEGER => |i| if (i.isSigned) return .int,
+        .INTEGER => |i| if (i.isSigned) return .int else return .{ .plain = try std.fmt.allocPrint(arena, "UINT{d}", .{i.bitWidth}) },
         .TIMESTAMP => |t| {
             const unit = @tagName(t.unit);
             if (!t.isAdjustedToUTC and std.mem.eql(u8, unit, "MICROS")) return .timestamp;
@@ -292,13 +298,43 @@ fn classify(arena: std.mem.Allocator, leaf: schema_tree.PrimitiveNode) !Kind {
         .DATE => return .date,
         .DECIMAL => return .{ .decimal = .{ .precision = leaf.precision orelse 0, .scale = leaf.scale orelse 0 } },
         .INT_8, .INT_16, .INT_32, .INT_64 => return .int,
+        .UINT_8, .UINT_16, .UINT_32, .UINT_64 => return .{ .plain = try std.fmt.allocPrint(arena, "{s}", .{@tagName(ct)}) },
         else => {},
     };
     return switch (leaf.type) {
-        .INT32, .INT64 => if (leaf.logical_type == null and leaf.converted_type == null) .int else .{ .plain = try std.fmt.allocPrint(arena, "{s}", .{@tagName(leaf.type)}) },
+        .INT32, .INT64 => if (leaf.logical_type == null and leaf.converted_type == null) .int else .{ .plain = try signature(arena, leaf) },
         .DOUBLE => .double,
-        else => .{ .plain = try std.fmt.allocPrint(arena, "{s}", .{@tagName(leaf.type)}) },
+        else => .{ .plain = try signature(arena, leaf) },
     };
+}
+
+/// Where the scratch directory goes: in `dir_hint` (the output's directory, whose filesystem has room for the result) or
+/// the system's temporary one, but never in a directory a branch reads from: its files would sit among the inputs.
+fn scratchParent(leaves: []const []const u8, dir_hint: ?[]const u8) []const u8 {
+    const preferred = dir_hint orelse "/tmp";
+    if (!readsFrom(leaves, preferred)) return preferred;
+    return if (!readsFrom(leaves, "/tmp")) "/tmp" else preferred;
+}
+
+/// Whether a quoted path in the branches (a table, a glob, a join's other table) is in the directory `dir`.
+fn readsFrom(leaves: []const []const u8, dir: []const u8) bool {
+    for (leaves) |sql| {
+        var i: usize = 0;
+        while (i < sql.len) {
+            if (sql[i] != '\'') {
+                i += 1;
+                continue;
+            }
+            const end = sql_setops.quotedEnd(sql, i);
+            const text = sql[i + 1 .. @max(i + 1, end -| 1)];
+            i = end;
+            if (std.mem.indexOfScalar(u8, text, '/') == null and !std.mem.endsWith(u8, text, ".parquet") and
+                !std.mem.endsWith(u8, text, ".csv") and std.mem.indexOfScalar(u8, text, '*') == null) continue;
+            const in_dir = std.fs.path.dirname(text) orelse ".";
+            if (local_fs.sameFile(dir, in_dir) catch false) return true;
+        }
+    }
+    return false;
 }
 
 /// Run the combination `compound` writes and give the result to `stager.finish`. `dir_hint` is a directory on the
@@ -314,7 +350,7 @@ pub fn run(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const parent = dir_hint orelse "/tmp";
+    const parent = scratchParent(compound.leaves, dir_hint);
     const pid: u32 = @bitCast(std.posix.system.getpid());
     const dir = try std.fmt.allocPrint(arena, "{s}/.zpq-setop-{d}", .{ std.mem.trimEnd(u8, parent, "/"), pid });
     // The directory's name goes into queries as a quoted path with a wildcard.
@@ -373,4 +409,20 @@ test "a column name is quoted as an identifier" {
     const a = arena_state.allocator();
     try std.testing.expectEqualStrings("\"count(*)\"", try quoted(a, "count(*)"));
     try std.testing.expectEqualStrings("\"say \"\"hi\"\"\"", try quoted(a, "say \"hi\""));
+}
+
+test "scratch files do not go in a directory a branch reads from" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const here = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var q1: [320]u8 = undefined;
+    const reads_here = try std.fmt.bufPrint(&q1, "SELECT x FROM '{s}/in.parquet' WHERE y > 1", .{here});
+    try std.testing.expectEqualStrings("/tmp", scratchParent(&.{reads_here}, here));
+    var q2: [320]u8 = undefined;
+    const reads_glob = try std.fmt.bufPrint(&q2, "SELECT x FROM '{s}/*.parquet'", .{here});
+    try std.testing.expectEqualStrings("/tmp", scratchParent(&.{ "SELECT 1 FROM 'elsewhere/a.parquet'", reads_glob }, here));
+    // Another directory, or a string that is no path, leaves it where the output is.
+    try std.testing.expectEqualStrings(here, scratchParent(&.{"SELECT x FROM 'elsewhere/in.parquet' WHERE s = 'a'"}, here));
+    try std.testing.expectEqualStrings("/tmp", scratchParent(&.{"SELECT x FROM 'a.parquet'"}, null));
 }

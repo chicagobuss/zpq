@@ -95,7 +95,9 @@
   precedence, parentheses, NULL, NaN and zero semantics and one ORDER BY / LIMIT / OFFSET for the whole result. Each SELECT
   runs to a scratch Parquet file and the operator is a query over those files; column types must be equal, integers of
   any width, or an integer with a DOUBLE, and anything else is refused by name (`SetOperationTypes`, `-Columns`,
-  `-Nullability`, `-All`, `-ByName`, `-Order`, `-Nesting`). It was `UnsupportedStatement`. See docs/capabilities.md.
+  `-Nullability`, `-All`, `-ByName`, `-Order`, `-Nesting`). The result may not overwrite a file a branch reads (as for a plain
+  query), each branch releases its tables before the next, and a trailing `OFFSET` may stand without a `LIMIT` or precede
+  it. It was `UnsupportedStatement`. See docs/capabilities.md.
 - **`CAST(x AS VARCHAR)` of a number, BOOLEAN, DECIMAL, DATE or TIMESTAMP in SQL** (also `TEXT`, `STRING`, `VARCHAR(n)`,
   `x::VARCHAR` and `TRY_CAST`), in a SELECT, an aggregate argument (`min`, `max`, `count(DISTINCT ...)`) or a GROUP BY key,
   prints the value as DuckDB 2.0 does: a DOUBLE by its shortest digits (`1e+16`, `5e-324`, `nan`, `-0.0`), a DECIMAL at its

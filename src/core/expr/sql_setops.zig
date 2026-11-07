@@ -84,6 +84,7 @@ fn parseLevel(arena: std.mem.Allocator, sql: []const u8, leaves: *std.ArrayList(
         last.text = last.text[0..at];
     } else last.text = std.mem.trimEnd(u8, last.text, " \t\r\n;");
     if (tail.len > 0 and !outermost) return error.SetOperationNesting;
+    tail = try normalizeTail(arena, tail);
     for (pieces.items[0 .. pieces.items.len - 1]) |p| if (tailStart(p.text) != null) return error.SetOperationOrder;
 
     // One tree node per branch: a SELECT is a leaf, a parenthesized combination is its own tree.
@@ -183,7 +184,7 @@ fn nextWord(sql: []const u8, from: usize) struct { word: []const u8, end: usize 
 }
 
 /// Past the quoted text that starts at `sql[at]` (a doubled quote is one inside it).
-fn quotedEnd(sql: []const u8, at: usize) usize {
+pub fn quotedEnd(sql: []const u8, at: usize) usize {
     const q = sql[at];
     var i = at + 1;
     while (i < sql.len) : (i += 1) {
@@ -196,6 +197,74 @@ fn quotedEnd(sql: []const u8, at: usize) usize {
         }
     }
     return sql.len;
+}
+
+/// `tail` as the SELECT grammar takes it: ORDER BY, then LIMIT, then OFFSET. DuckDB takes LIMIT and OFFSET in either order,
+/// and an OFFSET alone (the rows after it all); the grammar needs a LIMIT, so the largest one stands in.
+fn normalizeTail(arena: std.mem.Allocator, tail: []const u8) ![]const u8 {
+    if (tail.len == 0) return tail;
+    var order: ?[]const u8 = null;
+    var limit: ?[]const u8 = null;
+    var offset: ?[]const u8 = null;
+    var kind: enum { none, order, limit, offset } = .none;
+    var start: usize = 0;
+    var depth: usize = 0;
+    var i: usize = 0;
+    while (i <= tail.len) {
+        var boundary: ?@TypeOf(kind) = null;
+        var word_len: usize = 0;
+        if (i < tail.len) {
+            const ch = tail[i];
+            if (ch == '\'' or ch == '"') {
+                i = quotedEnd(tail, i);
+                continue;
+            }
+            if (ch == '(') depth += 1;
+            if (ch == ')') depth -|= 1;
+            if (depth == 0 and startsWord(tail, i)) {
+                const w = wordAt(tail, i);
+                word_len = w.len;
+                if (eql(w, "limit")) boundary = .limit;
+                if (eql(w, "offset")) boundary = .offset;
+                if (eql(w, "order") and eql(nextWord(tail, i + w.len).word, "by")) {
+                    boundary = .order;
+                    word_len = nextWord(tail, i + w.len).end - i;
+                }
+                if (boundary == null) {
+                    i += w.len;
+                    continue;
+                }
+            } else {
+                i += 1;
+                continue;
+            }
+        }
+        // `i` is the start of the next clause, or the end: the clause begun at `start` ends here.
+        const body = std.mem.trim(u8, tail[start..i], " \t\r\n");
+        switch (kind) {
+            .none => {},
+            .order => if (order != null) return tail else {
+                order = body;
+            },
+            .limit => if (limit != null) return tail else {
+                limit = body;
+            },
+            .offset => if (offset != null) return tail else {
+                offset = body;
+            },
+        }
+        if (boundary) |b| {
+            kind = b;
+            start = i + word_len;
+            i += word_len;
+        } else break;
+    }
+    if (offset != null and limit == null) limit = "9223372036854775807";
+    var out: std.ArrayList(u8) = .empty;
+    if (order) |o| try out.print(arena, "ORDER BY {s}", .{o});
+    if (limit) |l| try out.print(arena, "{s}LIMIT {s}", .{ if (out.items.len > 0) " " else "", l });
+    if (offset) |o| try out.print(arena, "{s}OFFSET {s}", .{ if (out.items.len > 0) " " else "", o });
+    return out.items;
 }
 
 /// Where a top-level `ORDER BY`, `LIMIT` or `OFFSET` starts in `text`, or null.
@@ -317,4 +386,22 @@ test "operators zpq does not carry are refused by name" {
     try testing.expectError(error.SetOperationByName, split(a, "SELECT a FROM t UNION BY NAME SELECT b FROM u"));
     try testing.expectError(error.SetOperationByName, split(a, "SELECT a FROM t UNION ALL BY NAME SELECT b FROM u"));
     try testing.expectError(error.SqlParseError, split(a, "SELECT a FROM t UNION"));
+}
+
+test "the tail takes LIMIT and OFFSET in either order, and an OFFSET alone" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cases = [_][2][]const u8{
+        .{ "ORDER BY 1 LIMIT 5 OFFSET 2", "ORDER BY 1 LIMIT 5 OFFSET 2" },
+        .{ "LIMIT 5", "LIMIT 5" },
+        .{ "OFFSET 3", "LIMIT 9223372036854775807 OFFSET 3" },
+        .{ "ORDER BY x DESC OFFSET 3", "ORDER BY x DESC LIMIT 9223372036854775807 OFFSET 3" },
+        .{ "OFFSET 3 LIMIT 9", "LIMIT 9 OFFSET 3" },
+        .{ "ORDER BY f(a, 'limit 1') OFFSET 1 LIMIT 2", "ORDER BY f(a, 'limit 1') LIMIT 2 OFFSET 1" },
+    };
+    for (cases) |c| {
+        const got = (try split(a, std.fmt.allocPrint(a, "SELECT a FROM t UNION ALL SELECT b FROM u {s}", .{c[0]}) catch unreachable)).?;
+        try testing.expectEqualStrings(c[1], got.tail);
+    }
 }

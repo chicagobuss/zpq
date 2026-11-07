@@ -48,12 +48,14 @@ query of its own (a scan, an aggregate, a GROUP BY, a DISTINCT, `SELECT *`), gro
 first, then UNION and EXCEPT left to right, parentheses honoured), with the trailing ORDER BY, LIMIT and OFFSET applying to the whole
 result and a parenthesized SELECT keeping its own. The result is named by the first SELECT. NULLs are equal in UNION,
 INTERSECT and EXCEPT, as are all NaNs and the two zeros (which one is printed is arbitrary, as in DuckDB). Each SELECT runs
-to a scratch Parquet file beside the output (in `/tmp` for stdout), a pass renames and casts its
-columns, and the operator is a query over those files; the scratch directory is removed when the query ends or fails. The
+to a scratch Parquet file in its own directory beside the output (in `/tmp` for stdout, and when a branch reads from the
+output's directory), a pass renames and casts its columns, and the operator is a query over those files; the scratch
+directory is removed when the query ends or fails, and each branch releases its memory before the next starts. The output
+may not be a file any branch reads, as for a plain query (`BadArgs`, a hard link or symlink to it included). The
 two sides' column types must be equal, or integers of any width (BIGINT), or an integer with a DOUBLE (DOUBLE): any other
 difference is `SetOperationTypes` (a FLOAT with a DOUBLE, DECIMALs of different scales, a DATE with a TIMESTAMP, text with a
-number), a different column count is `SetOperationColumns`, and a BOOLEAN, FLOAT or non-microsecond TIMESTAMP column that is
-nullable on one side only is `SetOperationNullability`. `INTERSECT ALL`, `EXCEPT ALL` and `UNION BY NAME` are refused
+number), a different column count is `SetOperationColumns`, and a BOOLEAN, FLOAT, unsigned-integer or non-microsecond TIMESTAMP column that is
+nullable on one side only, or of another unsigned width, is `SetOperationNullability` or `SetOperationTypes`. `INTERSECT ALL`, `EXCEPT ALL` and `UNION BY NAME` are refused
 (`SetOperationAll`, `SetOperationByName`), as are an ORDER BY or LIMIT before an operator without parentheses
 (`SetOperationOrder`) and a parenthesized combination with its own ORDER BY or LIMIT (`SetOperationNesting`). `--explain`
 is not available for them, the in-process SQL requests (libzpq, the service, Lambda) do not carry them yet, and

@@ -236,6 +236,16 @@ const QueryOptions = struct {
     csv: engine.csv_write.Options = .{},
     csv_nulls: std.ArrayList([]const u8) = .empty,
     csv_types: std.ArrayList(engine.csv_write.Options.Pinned) = .empty,
+    /// False for a query after which the process goes on (a set operation's branches): its tables and mappings are
+    /// released, not left for the process to drop at exit.
+    exit_after: bool = true,
+    /// A set operation's final query: the branches' own input files, which its output may not name (its inputs are
+    /// scratch files, so the ordinary check alone would not see them).
+    protect: []const []const u8 = &.{},
+    /// A set operation's branch: refuses an input that is this output, before it reads anything.
+    refuse_output: ?[]const u8 = null,
+    /// A set operation's branch: receives the input files the query expanded to.
+    collect_inputs: ?*std.ArrayList([]const u8) = null,
 
     fn deinit(self: *QueryOptions, gpa: std.mem.Allocator) void {
         self.bloom_filters.deinit(gpa);
@@ -489,6 +499,8 @@ const SetopStager = struct {
     options: *const QueryOptions,
     diag: *Diag,
     arena: std.mem.Allocator,
+    /// The input files of every branch run so far.
+    collected: std.ArrayList([]const u8) = .empty,
 
     fn interface(self: *SetopStager) setops.Stager {
         return .{ .ptr = self, .stage = stage, .finish = finish, .say = say };
@@ -496,22 +508,8 @@ const SetopStager = struct {
 
     fn stage(ptr: *anyopaque, sql: []const u8, out: []const u8, leaf: bool) anyerror!void {
         const self: *SetopStager = @ptrCast(@alignCast(ptr));
-        var o = self.options.*;
-        o.query = sql;
-        o.output = out;
-        o.format = .parquet;
-        o.limit = null;
-        o.summary = false;
-        o.explain = false;
-        o.fsync = false;
-        o.profile_out = .{};
-        o.bloom_filters = .empty;
-        if (!leaf) {
-            o.input_format = .auto;
-            o.csv = .{};
-            o.csv_nulls = .empty;
-            o.csv_types = .empty;
-        }
+        var o = stageOptions(self.options.*, sql, out, leaf);
+        if (leaf) o.collect_inputs = &self.collected;
         try runParsed(self.init, &o, self.diag, self.arena);
     }
 
@@ -523,6 +521,7 @@ const SetopStager = struct {
         o.csv = .{};
         o.csv_nulls = .empty;
         o.csv_types = .empty;
+        o.protect = self.collected.items;
         try runParsed(self.init, &o, self.diag, self.arena);
     }
 
@@ -530,6 +529,46 @@ const SetopStager = struct {
         diagnosticPrint("{s}", .{message});
     }
 };
+
+/// The options a set operation runs one of its queries into the scratch file `out` with: the user's execution
+/// flags, none of their output. Only the user's own query ends the process; a branch's resources are released.
+fn stageOptions(base: QueryOptions, sql: []const u8, out: []const u8, leaf: bool) QueryOptions {
+    var o = base;
+    o.query = sql;
+    o.output = out;
+    o.format = .parquet;
+    o.limit = null;
+    o.summary = false;
+    o.explain = false;
+    o.fsync = false;
+    o.profile_out = .{};
+    o.bloom_filters = .empty;
+    o.exit_after = false;
+    o.protect = &.{};
+    o.collect_inputs = null;
+    // A branch may not read the file the user's query will write.
+    o.refuse_output = if (leaf) base.output else null;
+    if (!leaf) {
+        o.input_format = .auto;
+        o.csv = .{};
+        o.csv_nulls = .empty;
+        o.csv_types = .empty;
+    }
+    return o;
+}
+
+test "a set operation's scratch queries release their resources and name the output they must not read" {
+    const base: QueryOptions = .{ .output = "result.parquet", .limit = 5, .summary = true };
+    const leaf = stageOptions(base, "SELECT 1", "scratch/raw1.parquet", true);
+    try std.testing.expect(!leaf.exit_after);
+    try std.testing.expect(leaf.limit == null and !leaf.summary and leaf.format.? == .parquet);
+    try std.testing.expectEqualStrings("scratch/raw1.parquet", leaf.output.?);
+    try std.testing.expectEqualStrings("result.parquet", leaf.refuse_output.?);
+    const over = stageOptions(base, "SELECT 1", "scratch/p2.parquet", false);
+    try std.testing.expect(!over.exit_after and over.refuse_output == null);
+    // The user's own query is still the one that ends the process.
+    try std.testing.expect(base.exit_after);
+}
 
 fn runQuery(
     init: std.process.Init,
@@ -712,6 +751,14 @@ fn runParsed(
         }
     }
     const inputs = inputs_list.items;
+    if (options.collect_inputs) |list| for (inputs) |p| try list.append(arena, p);
+    if (options.refuse_output) |out| for (inputs) |in| {
+        if (std.mem.startsWith(u8, in, "s3://")) continue;
+        if (local_fs.sameFile(in, out) catch false) {
+            diagnosticPrint("zpq query: input and output must be different files\n", .{});
+            return error.BadArgs;
+        }
+    };
     const fmt = format orelse if (output != null and !std.mem.eql(u8, output.?, "-"))
         engine.PrintFormat.parquet
     else
@@ -736,7 +783,7 @@ fn runParsed(
     if (group_by != null) result_order.limit = if (limit) |n| @intCast(n) else result_order.limit;
     var publication: zpq.output_publication.OutputPublication = .{ .fsync = fsync };
     defer publication.abort();
-    const engine_output = if (explain) output else if (to_stdout) null else publication.prepare(io, output, inputs) catch |err| {
+    const engine_output = if (explain) output else if (to_stdout) null else publication.prepare(io, output, if (options.protect.len == 0) inputs else try std.mem.concat(arena, []const u8, &.{ inputs, options.protect })) catch |err| {
         switch (err) {
             error.InputOutputSame => diagnosticPrint("zpq query: input and output must be different files\n", .{}),
             error.OutputNotRegular => diagnosticPrint("zpq query: output must be a regular file\n", .{}),
@@ -843,7 +890,7 @@ fn runParsed(
         .diag = diag,
         .profiler = profiler,
     };
-    const ctx: engine.Context = .{ .gpa = gpa, .env = env, .io = io, .exit_after = true };
+    const ctx: engine.Context = .{ .gpa = gpa, .env = env, .io = io, .exit_after = options.exit_after };
     const started = nowMonoNs();
     var rows: usize = 0;
     var stats: SummaryStats = .{};

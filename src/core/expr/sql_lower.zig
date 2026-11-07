@@ -583,6 +583,7 @@ pub const Lower = struct {
         const f = node.u.function;
         const name_ = std.mem.span(f.name);
         const state = std.ascii.eqlIgnoreCase(name_, "avg_state");
+        const boolean_only = parser.isBooleanAggName(name_);
         var func = if (state) .avg else parser.resolveAggFunc(name_) orelse return error.UnknownAggFunc;
         if (f.distinct != 0) func = .count_distinct;
         if (f.args.count != 1) return if (f.args.count == 0) error.UnexpectedChar else error.ExpectedRParen;
@@ -596,6 +597,7 @@ pub const Lower = struct {
             .alias = if (alias) |a| try self.copy(a) else try self.copy(name_),
             .default_name = if (alias != null) null else try self.copy(display),
             .state = state,
+            .boolean_only = boolean_only,
         };
     }
 };

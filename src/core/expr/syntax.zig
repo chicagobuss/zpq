@@ -40,6 +40,8 @@ pub const Aggregate = struct {
     alias: []const u8,
     default_name: ?[]const u8,
     state: bool = false,
+    /// `bool_or` and `bool_and`, which are `max` and `min` of a BOOLEAN and take nothing else.
+    boolean_only: bool = false,
 };
 
 pub const SelectItem = struct { expr: Expr, alias: ?[]const u8 = null, display: []const u8 = "" };

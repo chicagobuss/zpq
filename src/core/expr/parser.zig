@@ -372,7 +372,7 @@ pub fn bindAggSyntax(arena: std.mem.Allocator, node: syntax.Aggregate, file: *co
     const where = if (node.where) |f| try filter_parser.bindSyntax(arena, f, file, diag) else null;
     if (arg == null and node.func != .count) return error.StarOnlyValidInCount;
     if (node.state and node.func != .avg) return error.BadAggArg;
-    return bindAggregate(node.func, arg, where, node.alias, node.default_name, node.state);
+    return bindAggregate(node.func, arg, where, node.alias, node.default_name, node.state, node.boolean_only);
 }
 
 fn parseSelectOf(
@@ -1141,6 +1141,7 @@ fn parseAggCall(
     if (name_tok.kind != .ident) return error.ExpectedAggFunc;
     const call_start = @intFromPtr(name_tok.text.ptr) - @intFromPtr(lex.src.ptr);
     const state = asciiEqIgnoreCase(name_tok.text, "avg_state");
+    const boolean_only = isBooleanAggName(name_tok.text);
     var func: agg.AggFunc = if (state) .avg else resolveAggFunc(name_tok.text) orelse return error.UnknownAggFunc;
 
     // 2. Open paren.
@@ -1222,7 +1223,10 @@ fn parseAggCall(
         default_name = null;
     }
 
-    return if (bound) bindAggregate(func, arg, where, alias, default_name, state) else .{ .func = func, .arg = arg, .where = where, .alias = alias, .default_name = default_name, .state = state };
+    return if (bound)
+        bindAggregate(func, arg, where, alias, default_name, state, boolean_only)
+    else
+        .{ .func = func, .arg = arg, .where = where, .alias = alias, .default_name = default_name, .state = state, .boolean_only = boolean_only };
 }
 
 /// `sum(x + c)`, `sum(c + x)` or `sum(x - c)` as `x` and `c`, for `sum(x) + c·count(x)`: one pass over `x` instead of
@@ -1240,7 +1244,21 @@ fn sumOffset(arg: ast.Expr) ?struct { col: *ast.Expr, offset: i64 } {
     return .{ .col = col, .offset = if (b.op == .add) c else -c };
 }
 
+/// `bool_or(b)` and `bool_and(b)` over a BOOLEAN are `max(b)` and `min(b)`: the largest of false and true is true, and an
+/// all-NULL group is NULL, as DuckDB's.
+pub fn isBooleanAggName(name: []const u8) bool {
+    return asciiEqIgnoreCase(name, "bool_or") or asciiEqIgnoreCase(name, "bool_and");
+}
+
+/// The aggregate functions SQL names (the ones `resolveAggFunc` knows but `count_distinct`, which SQL spells
+/// `count(DISTINCT x)`, and `avg_state`, which is added here): the one list the SQL front end reads.
+pub fn isSqlAggName(name: []const u8) bool {
+    return !asciiEqIgnoreCase(name, "count_distinct") and (resolveAggFunc(name) != null or asciiEqIgnoreCase(name, "avg_state"));
+}
+
 pub fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
+    if (asciiEqIgnoreCase(name, "bool_or")) return .max;
+    if (asciiEqIgnoreCase(name, "bool_and")) return .min;
     if (asciiEqIgnoreCase(name, "count")) return .count;
     if (asciiEqIgnoreCase(name, "count_distinct")) return .count_distinct;
     if (asciiEqIgnoreCase(name, "sum")) return .sum;
@@ -1588,8 +1606,17 @@ pub fn bindCase(whens: []const ast.Case.When, else_: ?*ast.Expr) Error!ast.Expr 
     } };
 }
 
-pub fn bindAggregate(func: agg.AggFunc, original_arg: ?ast.Expr, where: ?filter_ast.Filter, alias: []const u8, default_name: ?[]const u8, state: bool) Error!agg.AggCall {
+pub fn bindAggregate(
+    func: agg.AggFunc,
+    original_arg: ?ast.Expr,
+    where: ?filter_ast.Filter,
+    alias: []const u8,
+    default_name: ?[]const u8,
+    state: bool,
+    boolean_only: bool,
+) Error!agg.AggCall {
     var arg = original_arg;
+    if (boolean_only) if (arg == null or !arg.?.isBoolean()) return error.TypeMismatch;
     // `make_date` over a column it takes is the identity on that column's values, each of them an INTEGER, and it
     // keeps their order. So `min`/`max` of it fold the column itself, through its encoded and statistics paths, and
     // answer as a DATE.
@@ -1623,6 +1650,21 @@ pub fn bindAggregate(func: agg.AggFunc, original_arg: ?ast.Expr, where: ?filter_
 // ============================================================
 
 const testing = std.testing;
+
+test "bool_or and bool_and are max and min, of a BOOLEAN only" {
+    try testing.expectEqual(agg.AggFunc.max, resolveAggFunc("BOOL_OR").?);
+    try testing.expectEqual(agg.AggFunc.min, resolveAggFunc("bool_and").?);
+    try testing.expect(isBooleanAggName("Bool_And") and !isBooleanAggName("max"));
+    try testing.expect(isSqlAggName("bool_or") and isSqlAggName("avg_state") and !isSqlAggName("count_distinct"));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try fakeFile(a, &.{"i"}, &.{.INT32});
+    const int_col = try parseExprOnly(a, "i", &file, null);
+    try testing.expectError(error.TypeMismatch, bindAggregate(.max, int_col, null, "bool_or", null, false, true));
+    _ = try bindAggregate(.max, int_col, null, "max", null, false, false);
+    try testing.expectError(error.TypeMismatch, bindAggregate(.max, null, null, "bool_or", null, false, true));
+}
 const test_fixtures = @import("../parquet/test_fixtures.zig");
 const filter_eval_mod = @import("../filter/eval.zig");
 

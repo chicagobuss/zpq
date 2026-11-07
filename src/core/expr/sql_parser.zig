@@ -3,6 +3,7 @@ const c = @import("liteparser_c");
 const ast = @import("ast.zig");
 const syntax = @import("syntax.zig");
 const Lower = @import("sql_lower.zig").Lower;
+const parser = @import("parser.zig");
 const literals = @import("sql_literals.zig");
 const sql_join = @import("sql_join.zig");
 const schema = @import("../schema.zig");
@@ -111,11 +112,7 @@ fn analyzeExpr(node: *const c.LpNode) ExprInfo {
                 if (std.ascii.eqlIgnoreCase(name, "count")) {
                     is_agg = true;
                     is_count = true;
-                } else if (std.ascii.eqlIgnoreCase(name, "sum") or
-                    std.ascii.eqlIgnoreCase(name, "avg") or
-                    std.ascii.eqlIgnoreCase(name, "avg_state") or
-                    std.ascii.eqlIgnoreCase(name, "min") or
-                    std.ascii.eqlIgnoreCase(name, "max")) is_agg = true;
+                } else if (parser.isSqlAggName(name)) is_agg = true;
             }
             if (is_agg) info.has_agg = true;
             if (node.u.function.over != null) info.has_window = true; // `f() OVER (...)`
@@ -1712,9 +1709,7 @@ const PostArena = struct {
 fn isAggregateCall(node: *const c.LpNode) bool {
     if (node.kind != c.LP_EXPR_FUNCTION) return false;
     const name = std.mem.span(node.u.function.name orelse return false);
-    return for ([_][]const u8{ "count", "sum", "avg", "avg_state", "min", "max" }) |agg_name| {
-        if (std.ascii.eqlIgnoreCase(name, agg_name)) break true;
-    } else false;
+    return parser.isSqlAggName(name);
 }
 
 /// The names `unsupported` gives a post-aggregate expression: what stays refused, by name.

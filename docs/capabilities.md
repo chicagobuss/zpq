@@ -111,7 +111,8 @@ digits, a `CAST AS DOUBLE`) converts to the nearest double, as DuckDB's cast doe
 (`/* a /* b */ c */` is one comment) and one that is never closed is an error, as in DuckDB; comments are blanked before
 any other reading of the query.
 
-**Aggregate** with `sum / count / min / max / avg / avg_state`, conditional `agg(...) FILTER (WHERE ...)`, and
+**Aggregate** with `sum / count / min / max / avg / avg_state`, `bool_or` and `bool_and` of a BOOLEAN (`max` and `min`
+of it: true if any, false unless all, NULL over no values), conditional `agg(...) FILTER (WHERE ...)`, and
 `GROUP BY`. In SQL, GROUP BY keys may be expressions (bound by value, not spelling), SELECT positions or aliases (a
 column of the name wins, as in DuckDB); `HAVING` compares aggregates or keys with literals, or with one another (only
 TRUE keeps a group; without GROUP BY the one group may be dropped); ORDER BY may rank by aggregates or keys the SELECT

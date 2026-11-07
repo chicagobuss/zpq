@@ -596,6 +596,8 @@ fn hasHighBit(bytes: []const u8) bool {
 const Builder = struct {
     cols: []consumer.OutputAggregator.ColumnBuf,
     types: []const Type,
+    /// A pinned DECIMAL holds its declared precision; an inferred one any its physical type holds (`decimalCap`).
+    pinned: []const bool,
     max_abs: []u128,
     rows: usize = 0,
 
@@ -613,7 +615,7 @@ const Builder = struct {
                 inline else => |*buf| try buf.values.ensureTotalCapacity(pa, reserve),
             }
         }
-        b.* = .{ .cols = cols, .types = p.types, .max_abs = try pa.alloc(u128, ncols) };
+        b.* = .{ .cols = cols, .types = p.types, .pinned = p.pinned, .max_abs = try pa.alloc(u128, ncols) };
         @memset(b.max_abs, 0);
         piece.agg = .{
             .arena = pa,
@@ -658,8 +660,7 @@ const Builder = struct {
                 const v: i64 = switch (t.kind) {
                     .int64 => csv_types.parseInt(s) orelse return false,
                     .decimal => blk: {
-                        const cap = csv_types.decimalIntCapacity(t);
-                        const d = csv_types.parseDecimal(s, t.scale, cap) orelse return false;
+                        const d = csv_types.parseDecimal(s, t.scale, decimalCap(t, b.pinned[col])) orelse return false;
                         b.max_abs[col] = @max(b.max_abs[col], @abs(d));
                         break :blk @intCast(d);
                     },
@@ -670,7 +671,7 @@ const Builder = struct {
                 if (x.max_def > 0) try x.def_levels.append(a, 1);
             },
             .i128 => |*x| {
-                const d = csv_types.parseDecimal(s, t.scale, csv_types.decimalIntCapacity(t)) orelse return false;
+                const d = csv_types.parseDecimal(s, t.scale, decimalCap(t, b.pinned[col])) orelse return false;
                 b.max_abs[col] = @max(b.max_abs[col], @abs(d));
                 try x.values.append(a, d);
                 if (x.max_def > 0) try x.def_levels.append(a, 1);
@@ -708,6 +709,17 @@ const Builder = struct {
         _ = s.rows.fetchAdd(b.rows, .monotonic);
     }
 };
+
+/// The integer digits a DECIMAL column takes: a pinned one its declared precision's, an inferred one all its physical
+/// type holds, its precision then set from the data.
+fn decimalCap(t: Type, pinned: bool) u8 {
+    return if (pinned) t.int_digits else csv_types.decimalIntCapacity(t);
+}
+
+/// A DECIMAL column's precision in the footer and the report: the declared one when pinned, else the data's.
+fn decimalPrecisionOf(t: Type, pinned: bool, max_abs: u128) i32 {
+    return if (pinned) @intCast(t.precision()) else csv_types.decimalPrecision(t, max_abs);
+}
 
 fn columnLane(t: Type) std.meta.Tag(consumer.OutputAggregator.ColumnBuf) {
     return switch (t.kind) {
@@ -802,11 +814,11 @@ pub fn run(
             continue;
         };
         @memcpy(types, p.types);
-        // A DECIMAL's precision is the data's, as its footer has it (`writeOnce`), not the sample's.
-        for (types, 0..) |*t, c| if (t.kind == .decimal) {
+        // A DECIMAL's precision is the footer's (`writeOnce`): the declared one, or the data's, never the sample's.
+        for (types, p.pinned, 0..) |*t, pinned, c| if (t.kind == .decimal) {
             var max: u128 = 0;
             for (0..source.count) |i| max = @max(max, source.max_abs[i * p.names.len + c]);
-            t.int_digits = @intCast(csv_types.decimalPrecision(t.*, max) - t.scale);
+            t.int_digits = @intCast(decimalPrecisionOf(t.*, pinned, max) - t.scale);
         };
         report.types = types;
         return result;
@@ -1065,12 +1077,12 @@ fn writeOnce(
         .precision = null,
         .field_id = null,
     });
-    for (source.elems, p.types, 0..) |e, ty, c| {
+    for (source.elems, p.types, p.pinned, 0..) |e, ty, pinned, c| {
         var elem = e;
         if (ty.kind == .decimal) {
             var max: u128 = 0;
             for (0..source.count) |i| max = @max(max, source.max_abs[i * ncols + c]);
-            const prec: i32 = csv_types.decimalPrecision(ty, max);
+            const prec = decimalPrecisionOf(ty, pinned, max);
             elem.precision = prec;
             elem.logical_type = .{ .DECIMAL = .{ .scale = ty.scale, .precision = prec } };
         }

@@ -640,3 +640,42 @@ test "csv write: a record with too many fields is counted to its own end, not in
         try testing.expectEqual(@as(u64, 3), diag.detail.csv.line);
     }
 }
+
+test "csv write: a pinned DECIMAL keeps its declared precision, and a value wider than it is refused (review P2-7)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    const in = try tmpPath(&b1, &tmp, "pin.csv");
+    const out = try tmpPath(&b2, &tmp, "pin.parquet");
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    const csv_types = @import("../core/csv/types.zig");
+    // The reviewer's fixture: 99.9 does not fit DECIMAL(2,1), which once wrote DECIMAL(3,1) without a word.
+    try writeFile(in, "v\n9.9\n99.9\n");
+    const narrow: csv_write.Options = .{
+        .header = true,
+        .types = &.{.{ .column = "v", .type = csv_types.parseName("DECIMAL(2,1)").? }},
+    };
+    var report: csv_write.Report = .{};
+    try testing.expectError(
+        error.CsvPinnedType,
+        csv_write.run(ctx, .{ .inputs = &.{in} }, in, out, narrow, &report, a),
+    );
+    const left = std.Io.Dir.cwd().access(testing.io, out, .{});
+    try testing.expectError(error.FileNotFound, left);
+    // Values that fit are written at the declared precision, though the data needs less.
+    try writeFile(in, "v\n9.9\n-1.5\n");
+    const wide: csv_write.Options = .{
+        .header = true,
+        .types = &.{.{ .column = "v", .type = csv_types.parseName("DECIMAL(9,1)").? }},
+    };
+    report = .{};
+    _ = try csv_write.run(ctx, .{ .inputs = &.{in} }, in, out, wide, &report, a);
+    const meta = try metadata.open(a, try metadata.readFileSlice(out, a));
+    try testing.expectEqual(@as(?i32, 9), meta.schema.items[1].precision);
+    try testing.expectEqual(@as(?i32, 1), meta.schema.items[1].scale);
+    try testing.expectEqual(@as(u32, 9), report.types[0].precision());
+}

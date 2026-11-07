@@ -324,7 +324,7 @@ test "syntax: native fanout preparation and structured workers share exact aggre
     var result = try aggregate.runQuery(ctx, .{
         .inputs = &.{fixture},
         .parallelism = 1,
-        .row_groups = &.{[2]u32{ 0, 8 }},
+        .row_groups = &.{types.RowGroupRange{ .start = 0, .end = 8 }},
         .plan_source = @import("syntax_plan.zig").source(&query),
     });
     defer result.deinit(a);

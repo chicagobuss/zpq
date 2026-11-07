@@ -19,13 +19,20 @@ pub fn prepare(ctx: types.Context, args: types.QueryArgs, result_limit: usize, v
     return prepareOver(ctx, args, result_limit, version, charged.allocator(), &ledger) catch |err| return charged.refusal(err);
 }
 
-fn prepareOver(ctx: types.Context, args: types.QueryArgs, result_limit: usize, version: u32, scratch: std.mem.Allocator, ledger: *memory.SharedBudget) ![]u8 {
-    var state = std.heap.ArenaAllocator.init(scratch);
-    defer state.deinit();
-    const a = state.allocator();
-    const original = args.aggregate orelse return error.EmptyAggregate;
-    const calls = try parser.parseAggSyntax(a, original);
-    const keys = if (args.group_by) |group| try parser.parseSelectSyntax(a, group) else null;
+/// The query a fan-out worker runs, and what a coordinator merges its partial answers by.
+pub const Mergeable = struct {
+    query: syntax.Query,
+    /// Per aggregate, in order: its merge function and the caller's output name. Aggregate `i` answers as `_a{i}`.
+    aggregates: []const MergeColumn,
+    /// The caller's group output names, in key order. Group key `i` answers as `_g{i}`.
+    groups: []const []const u8,
+};
+
+/// The caller's aggregate, GROUP BY and filter as worker syntax: aggregates aliased `_aN` (AVG as its partial state),
+/// group keys `_gN`. COUNT, SUM, MIN, MAX and AVG merge; anything else is `UnmergeableAggregate`.
+pub fn mergeable(a: std.mem.Allocator, aggregate: []const u8, group_by: ?[]const u8, filter: ?[]const u8) !Mergeable {
+    const calls = try parser.parseAggSyntax(a, aggregate);
+    const keys = if (group_by) |group| try parser.parseSelectSyntax(a, group) else null;
     const merge_columns = try a.alloc(MergeColumn, calls.len);
     for (calls, merge_columns, 0..) |*call, *out, i| {
         if (call.state) return error.UnmergeableAggregate;
@@ -43,12 +50,41 @@ fn prepareOver(ctx: types.Context, args: types.QueryArgs, result_limit: usize, v
         out.* = key.alias orelse key.display;
         key.alias = try std.fmt.allocPrint(a, "_g{d}", .{i});
     };
-    const query: syntax.Query = .{
-        .aggregate = true,
-        .calls = calls,
-        .keys = keys,
-        .filter = if (args.filter) |f| (if (f.len == 0) null else try filters.parseSyntax(a, f)) else null,
+    return .{
+        .query = .{
+            .aggregate = true,
+            .calls = calls,
+            .keys = keys,
+            .filter = if (filter) |f| (if (f.len == 0) null else try filters.parseSyntax(a, f)) else null,
+        },
+        .aggregates = merge_columns,
+        .groups = groups,
     };
+}
+
+/// The members a `partial_aggregate` answer adds, without braces: `plan_digest` (the first 16 bytes of SHA-256 over
+/// the plan's JSON, in hex; workers that planned the query apart answer different digests), then `aggregates` and
+/// `groups` as `Mergeable` holds them.
+pub fn partialMembers(a: std.mem.Allocator, m: Mergeable) ![]const u8 {
+    const plan = try std.json.Stringify.valueAlloc(a, m.query, .{});
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(plan, &digest, .{});
+    const json = try std.json.Stringify.valueAlloc(a, .{
+        .plan_digest = std.fmt.bytesToHex(digest[0..16].*, .lower),
+        .aggregates = m.aggregates,
+        .groups = m.groups,
+    }, .{});
+    return json[1 .. json.len - 1];
+}
+
+fn prepareOver(ctx: types.Context, args: types.QueryArgs, result_limit: usize, version: u32, scratch: std.mem.Allocator, ledger: *memory.SharedBudget) ![]u8 {
+    var state = std.heap.ArenaAllocator.init(scratch);
+    defer state.deinit();
+    const a = state.allocator();
+    const m = try mergeable(a, args.aggregate orelse return error.EmptyAggregate, args.group_by, args.filter);
+    const query = m.query;
+    const merge_columns = m.aggregates;
+    const groups = m.groups;
     var cache: plans.Cache = .{};
     var bound_args = args;
     bound_args.plan_source = syntax_plan.source(&query);

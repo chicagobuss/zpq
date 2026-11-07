@@ -89,7 +89,7 @@ pub const OpenedInputs = struct {
     metas: []schema.FileMetaData,
     meta_ready: []bool,
     /// `QueryArgs.row_groups`, applied to each footer as it is parsed (`restrictRowGroups`).
-    row_groups: ?[]const ?[2]u32 = null,
+    row_groups: ?[]const ?types.RowGroupRange = null,
     has_preparsed_meta: bool = false,
     /// Per-input mmap state — set for local files so we can munmap on
     /// deinit. Null for s3 inputs (their bytes live in the arena).
@@ -203,21 +203,20 @@ pub fn materializeMetas(
     return metas;
 }
 
-/// Keep row groups `range[0]` up to but not including `range[1]` of a footer, and the row count they hold. A range
+/// Keep the row groups `range` resolves to in a footer (`RowGroupRange.resolve`), and the row count they hold. A range
 /// past the footer's row groups is refused, naming the input, rather than clamped.
 fn restrictRowGroups(
     arena: std.mem.Allocator,
     meta: *schema.FileMetaData,
-    range: ?[2]u32,
+    range: ?types.RowGroupRange,
     diag: ?*Diag,
     name: []const u8,
 ) !void {
-    const r = range orelse return;
     const all = meta.row_groups.items;
-    if (r[0] > r[1] or r[1] > all.len) {
+    const r = (range orelse return).resolve(all.len) orelse {
         Diag.setInput(diag, name, error.RowGroupOutOfRange);
         return error.RowGroupOutOfRange;
-    }
+    };
     const kept = try arena.dupe(schema.RowGroup, all[r[0]..r[1]]);
     var rows: i64 = 0;
     for (kept) |rg| rows +|= rg.num_rows;

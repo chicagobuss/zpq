@@ -26,7 +26,7 @@ the CLI flags of the same name.
 | `bloom_filters` | array of strings | As `--bloom-filter`, one `"col"` or `"col:fpp"` per entry; only with `output_url`. |
 | `row_group_size` | positive integer | As `--row-group-size`: rows per re-encoded output row group (default 131072). |
 | `row_group_bytes` | positive number, or size string | As `--row-group-bytes`: uncompressed bytes per re-encoded output row group (default 64MB). A `max_memory` the request names caps it at a sixteenth of that. |
-| `row_groups` | array, one per input, of `[start, end]` or `null` | Read only row groups `start` up to but not including `end` of that input; `null` reads every row group. See below. |
+| `row_groups` | array, one per input, of `[start, end]`, `[start, end, of]` or `null` | Read only row groups `start` up to but not including `end` of that input, or that fraction of them; `null` reads every row group. See below. |
 
 A `columns` entry is one name, commas included; entries are trimmed, and empty entries or an empty array mean no
 projection. Every field may be `null`, which means absent. Unknown fields are ignored; the parser skips them
@@ -38,12 +38,42 @@ answer for its first input.
 
 `row_groups` lets a coordinator give each worker a contiguous slice of an input's row groups, numbered from 0 in
 footer order, for example `{"inputs":["s3://b/f.parquet"],"row_groups":[[8,16]],"aggregate":"..."}`. The array has
-one entry per input; `[k, k]` is an empty slice (the aggregates of no rows: counts 0, the rest `null`). The ranges
-are checked twice: one that is not a pair of non-negative integers with `start <= end`, or an array whose length is
-not the number of inputs, is `bad_json`/`BadFieldType` naming `row_groups`; an `end` past the input's row groups is
-`engine`/`RowGroupOutOfRange` naming the input. The field cannot be combined with `sql`. Statistics pruning,
+one entry per input; `[k, k]` is an empty slice (the aggregates of no rows: counts 0, the rest `null`).
+
+`[start, end, of]` is a fraction of the input: with n row groups in its footer, the worker reads row groups
+`floor(start·n/of)` up to but not including `floor(end·n/of)`. Workers given adjacent fractions of one input (`[0, 1,
+3]`, `[1, 2, 3]`, `[2, 3, 3]`) compute their shared boundaries from the same n, so together they read every row group
+once whatever n is, and the coordinator need not know it.
+
+The ranges are checked twice: one that is not two non-negative integers with `start <= end` (or three with also
+`0 < of` and `end <= of`), or an array whose length is not the number of inputs, is `bad_json`/`BadFieldType`
+naming `row_groups`; an `end` past the input's row groups is `engine`/`RowGroupOutOfRange` naming the input.
+The field cannot be combined with `sql`. Statistics pruning,
 Bloom filters and the response's `rows_in`/`row_groups_in` all see only the slice. `tools/serverless/fanout.py`
 splits inputs this way and merges the answers.
+
+### Partial aggregates for a fan-out coordinator
+
+`{"operation":"partial_aggregate","plan_version":1,"partial":{...}}` runs one worker's share of a fanned-out
+aggregate. `partial` holds `inputs`, `row_groups`, `aggregate`, and optionally `group_by` and `filter`, and those
+fields are refused anywhere else in the request (as are `sql`, `plan`, `select`, `columns`, `column_order` and
+`output_url`, in or out of it); the other fields (`trust_stats`, `max_memory`, ...) stay at the top level. A worker
+from before this operation finds no `inputs`, `s3_url` or `sql` outside `partial`, so it refuses the request
+(`MissingField`, or `BadFieldType` naming `operation`) before it opens an input.
+
+The worker prepares the aggregate itself, as `prepare_aggregate` does: aggregate `i` answers as `_a{i}` (an AVG as its
+`{"sum", "count"}` state) and group key `i` as `_g{i}`, and an aggregate whose partials do not merge is refused while
+parsing. The answer is the aggregate response plus:
+
+| Field | Meaning |
+|-------|---------|
+| `partial_version` | `1`. |
+| `schema_fingerprint` | 32 hex digits: the first 16 bytes of SHA-256 over the inputs' schema as the aggregate's schema check compares inputs (element count, nesting, names in lower case, DECIMAL scale). Two workers' fingerprints are equal when one worker reading both their inputs would accept them together. |
+| `plan_digest` | 32 hex digits: the first 16 bytes of SHA-256 over the plan's JSON. |
+| `aggregates`, `groups` | As in the `prepare_aggregate` response: each aggregate's merge function and output name, and the group output names. |
+
+`{"operation":"capabilities"}` answers `partial_aggregate_version: 1` beside the structured plan versions. The
+coordinator protocol is in `tools/serverless/PLAN-V1.md`.
 
 ## Responses
 

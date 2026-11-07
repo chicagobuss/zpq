@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 
@@ -104,7 +105,7 @@ class FakeLambdaClient:
         self.rt, self.calls = rt, []
         self.meta = types.SimpleNamespace(region_name=region)
 
-    def invoke(self, FunctionName, Payload, LogType):  # noqa: N803 (boto3's names)
+    def invoke(self, FunctionName, Payload, LogType=None):  # noqa: N803 (boto3's names)
         payload = json.loads(Payload)
         self.calls.append((FunctionName, payload.get("operation")))
         resp, _ = self.rt.invoke(payload)
@@ -192,7 +193,8 @@ class Fanout(unittest.TestCase):
             for workers in (1, 3, 8, 64):
                 with self.subTest(inputs=inputs, agg=agg, group=group, filter=flt, workers=workers):
                     got = fanout.run(self.rt.invoke, req, workers)
-                    self.assertEqual(got["workers"], min(workers, 8 * inputs.count(FULL) + 24 * inputs.count(GROUPS)))
+                    self.assertEqual(got["protocol"], "partial")
+                    self.assertEqual(got["workers"], workers)  # without counts, every worker gets a fraction
                     if group:
                         g, o, d = keyed(got["agg"], names), keyed(one["agg"], names), keyed(ref, names)
                         self.assertEqual(g.keys(), o.keys())
@@ -204,29 +206,42 @@ class Fanout(unittest.TestCase):
                         self.assertTrue(same(got["agg"], one["agg"]), (got["agg"], one["agg"]))
                         self.assertTrue(same(got["agg"], ref[0]), (got["agg"], ref[0]))
 
-    def test_supplied_counts_plan_from_one_footer_check_every_footer_and_answer_the_same(self):
-        prepared = []
+    def test_counts_right_wrong_or_absent_answer_the_same_with_no_call_before_the_scatter(self):
+        sent = []
 
         def invoke(payload):
-            if payload.get("operation") == "prepare_aggregate":
-                prepared.append(payload["inputs"])  # each input of a preparation is one footer opened
+            sent.append(payload)
             return self.rt.invoke(payload)
 
         for inputs, agg, group, flt in CASES:
             req = request(inputs, agg, group, flt)
+            right = [ROW_GROUPS[f] for f in inputs]
+            want = fanout.run(self.rt.invoke, req, 1)
             for workers in (1, 3, 8):
-                with self.subTest(inputs=inputs, agg=agg, group=group, filter=flt, workers=workers):
-                    prepared.clear()
-                    got = fanout.run(invoke, req, workers, counts=[ROW_GROUPS[f] for f in inputs])
-                    self.assertEqual(prepared, [inputs[:1], inputs])  # the plan first, then the full check
-                    want = fanout.run(self.rt.invoke, req, workers)
-                    self.assertEqual(got["workers"], want["workers"])
-                    if group:
-                        g, w = keyed(got["agg"], GROUP_NAMES[group]), keyed(want["agg"], GROUP_NAMES[group])
-                        self.assertEqual(g.keys(), w.keys())
-                        self.assertTrue(all(same(g[k], w[k]) for k in g), (g, w))
-                    else:
-                        self.assertTrue(same(got["agg"], want["agg"]), (got["agg"], want["agg"]))
+                for counts in (right, None, [c * 3 for c in right], [1] * len(inputs), [0] * len(inputs)):
+                    with self.subTest(inputs=inputs, agg=agg, group=group, filter=flt, workers=workers, counts=counts):
+                        sent.clear()
+                        got = fanout.run(invoke, req, workers, counts=counts)
+                        self.assertTrue(all(p["operation"] == "partial_aggregate" for p in sent), sent)
+                        self.assertEqual(len(sent), got["workers"])
+                        # Every input reaches a worker, so every footer is opened and its schema checked.
+                        self.assertEqual({u for p in sent for u in p["partial"]["inputs"]}, set(inputs))
+                        if group:
+                            g, w = keyed(got["agg"], GROUP_NAMES[group]), keyed(want["agg"], GROUP_NAMES[group])
+                            self.assertEqual(g.keys(), w.keys())
+                            self.assertTrue(all(same(g[k], w[k]) for k in g), (g, w))
+                        else:
+                            self.assertTrue(same(got["agg"], want["agg"]), (got["agg"], want["agg"]))
+
+    def test_fractions_of_one_input_cover_it_once_whatever_its_row_group_count(self):
+        # FULL holds 8 row groups of 200 rows; thirds of it are row groups [0, 2), [2, 5) and [5, 8).
+        seen = []
+        for k in range(3):
+            resp, _ = self.rt.invoke({"operation": "partial_aggregate", "plan_version": 1, "partial": {
+                "inputs": [FULL], "row_groups": [[k, k + 1, 3]], "aggregate": "count(*) AS c"}})
+            self.assertEqual(resp.get("partial_version"), 1, resp)
+            seen.append((resp["row_groups_in"], resp["agg"]["_a0"]))
+        self.assertEqual(seen, [(2, 400), (3, 600), (3, 600)])
 
     def test_a_glob_input_is_prepared_whole_even_with_counts(self):
         prepared = []
@@ -250,10 +265,11 @@ class Fanout(unittest.TestCase):
 
         invoke.capability_key = ("test", "cached-function")
         fanout.CAPABILITIES.pop(invoke.capability_key, None)
-        req = {"inputs": [FULL], "aggregate": "count(*) AS c, sum(n) AS sn, avg(x) AS ax"}
-        answers = [fanout.run(invoke, req, 4, counts=[8])["agg"] for _ in range(3)]
+        pattern = os.path.join(os.path.dirname(FULL), "full_matc*.parquet")
+        req = {"inputs": [pattern], "aggregate": "count(*) AS c, sum(n) AS sn, avg(x) AS ax"}
+        answers = [fanout.run(invoke, req, 4)["agg"] for _ in range(3)]
         self.assertEqual(operations.count("capabilities"), 1)
-        self.assertEqual(operations.count("prepare_aggregate"), 6)  # per query: the first footer, then every footer
+        self.assertEqual(operations.count("prepare_aggregate"), 3)  # one full prepare per query; the ack is cached
         self.assertTrue(all(same(a, answers[0]) for a in answers))
         self.assertTrue(same(answers[0], fanout.run(self.rt.invoke, req, 4)["agg"]))
 
@@ -263,14 +279,15 @@ class Fanout(unittest.TestCase):
             duckdb(f"COPY (SELECT 1.00::DECIMAL(15,2) AS x) TO '{dec}' (FORMAT parquet)")
             duckdb(f"COPY (SELECT 1::BIGINT AS x) TO '{big}' (FORMAT parquet)")
             req = {"inputs": [dec, big], "aggregate": "count(*) AS c", "group_by": "x"}
-            with self.assertRaisesRegex(fanout.Refused, "SchemaMismatch"):  # the released path: every footer first
-                fanout.run(self.rt.invoke, req, 2)
-            for counts in ([1, 1], [1, 0]):  # each worker binding one file alone; the mismatched input unscanned
-                with self.subTest(counts=counts), self.assertRaisesRegex(fanout.Refused, "SchemaMismatch"):
+            for counts in (None, [1, 1], [1, 0]):
+                with self.subTest(counts=counts), self.assertRaisesRegex(fanout.Refused, "SchemaMismatch") as caught:
                     fanout.run(self.rt.invoke, req, 2, counts=counts)
+                self.assertIn(dec, str(caught.exception))
+                self.assertIn(big, str(caught.exception))
 
     def test_only_a_published_version_caches_the_capability_answer(self):
-        req = {"inputs": [FULL], "aggregate": "count(*) AS c"}
+        pattern = os.path.join(os.path.dirname(FULL), "full_matc*.parquet")
+        req = {"inputs": [pattern], "aggregate": "count(*) AS c"}
         arn = "arn:aws:lambda:us-west-2:123456789012:function:zpq-w"
         for function, key in [("zpq-w", None), ("zpq-w:live", None), ("zpq-w:$LATEST", None), (arn + ":prod", None),
                               ("zpq-w:7", ("lambda", None, "us-west-2", "zpq-w", "7")),
@@ -281,7 +298,7 @@ class Fanout(unittest.TestCase):
                 self.assertEqual(invoke.capability_key, key)
                 fanout.CAPABILITIES.pop(key, None)
                 for _ in range(3):
-                    self.assertEqual(fanout.run(invoke, req, 2, counts=[8])["agg"]["c"], 1600)
+                    self.assertEqual(fanout.run(invoke, req, 2)["agg"]["c"], 1600)
                 self.assertEqual(sum(op == "capabilities" for _, op in client.calls), 3 if key is None else 1)
 
     def test_a_pinned_version_keeps_preparation_and_partials_on_it(self):
@@ -290,9 +307,11 @@ class Fanout(unittest.TestCase):
         fanout.CAPABILITIES.pop(invoke.capability_key, None)
         got = fanout.run(invoke, {"inputs": [FULL, FULL], "aggregate": "count(*) AS c"}, 4, counts=[8, 8])
         self.assertEqual(got["agg"]["c"], 3200)
+        self.assertEqual(got["protocol"], "partial")
         self.assertEqual({f for f, _ in client.calls}, {"zpq-w:7"})
         ops = [op for _, op in client.calls]
-        self.assertEqual((ops.count("capabilities"), ops.count("prepare_aggregate"), ops.count(None)), (1, 2, 4))
+        self.assertTrue(ops and all(op == "partial_aggregate" for op in ops))
+        self.assertEqual(len(ops), got["workers"])
 
     def test_an_empty_range_merges_as_no_rows(self):
         prepared = fanout.prepare(self.rt.invoke, {"inputs": [FULL], "aggregate": UNGROUPED_AGG})
@@ -328,10 +347,12 @@ class Fanout(unittest.TestCase):
         one, _ = self.rt.invoke(req)
         got = fanout.run(invoke, req, 3)
         self.assertTrue(same(keyed(got["agg"], ["group name"]), keyed(one["agg"], ["group name"])))
-        partials = [p for p in requests if p.get("operation") not in ("capabilities", "prepare_aggregate")]
+        partials = [p for p in requests if p.get("operation") == "partial_aggregate"]
         self.assertEqual(len(partials), got["workers"])
-        self.assertTrue(all(p["plan_version"] == 1 and "plan" in p for p in partials))
-        self.assertTrue(all(not any(k in p for k in ("aggregate", "group_by", "filter", "sql")) for p in partials))
+        self.assertTrue(all(p["plan_version"] == 1 and "plan" not in p for p in partials))
+        self.assertTrue(all(p["partial"]["aggregate"] == req["aggregate"] and p["partial"]["group_by"] == req["group_by"]
+                            for p in partials))
+        self.assertTrue(all(not any(k in p for k in ("aggregate", "group_by", "filter", "sql", "inputs")) for p in partials))
 
     def test_worker_rejects_version_conflicts_and_deep_plans_before_input_io(self):
         for payload, reason in [
@@ -353,9 +374,19 @@ class Fanout(unittest.TestCase):
         response, _ = self.rt.invoke({"inputs": ["missing.parquet"], "plan_version": 1, "plan": deep})
         self.assertEqual(response.get("reason"), "PlanTooDeep", response)
 
-    def test_a_range_past_the_footer_fails_the_query(self):
-        with self.assertRaisesRegex(fanout.WorkerFailed, "RowGroupOutOfRange"):
-            fanout.run(self.rt.invoke, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4, counts=[9])
+    def test_an_exact_range_past_the_footer_is_refused(self):
+        payload = {"operation": "partial_aggregate", "plan_version": 1, "partial": {
+            "inputs": [FULL], "row_groups": [[0, 9]], "aggregate": "count(*) AS c"}}
+        resp, _ = self.rt.invoke(payload)
+        with self.assertRaisesRegex(fanout.Refused, "RowGroupOutOfRange"):
+            fanout.check_partial(resp, payload)
+
+    def test_disagreeing_plans_are_refused(self):
+        base = {"partial_version": 1, "agg": {"_a0": 1}, "schema_fingerprint": "aa", "plan_digest": "d1",
+                "aggregates": [{"function": "count", "name": "c"}], "groups": []}
+        payloads = [{"partial": {"inputs": ["a.parquet"]}}, {"partial": {"inputs": ["b.parquet"]}}]
+        with self.assertRaisesRegex(fanout.Refused, "PlanMismatch"):
+            fanout.agree([base, dict(base, plan_digest="d2")], payloads)
 
 
 class Refusals(unittest.TestCase):
@@ -370,9 +401,10 @@ class Refusals(unittest.TestCase):
         try:
             for agg in ["count(DISTINCT s) AS d", "median(x) AS m", "quantile(x, 0.9) AS q",
                         "sum(x) OVER (PARTITION BY b) AS w", "sum(x) / count(*) AS r", "x AS y"]:
-                with self.subTest(agg=agg), self.assertRaises(fanout.Refused):
-                    fanout.run(invoke, {"inputs": [FULL], "aggregate": agg}, 4, counts=[8])
-            self.assertTrue(all(p.get("operation") in ("capabilities", "prepare_aggregate") for p in requests))
+                with self.subTest(agg=agg), self.assertRaises(fanout.Refused) as caught:
+                    fanout.run(invoke, {"inputs": ["missing.parquet"], "aggregate": agg}, 4)
+                self.assertNotIn('"input"', str(caught.exception))  # no answer about an input: none was opened
+            self.assertTrue(all(p.get("operation") == "partial_aggregate" for p in requests))
         finally:
             rt.close()
 
@@ -383,9 +415,11 @@ class Refusals(unittest.TestCase):
             requests.append(payload)
             return {"error": "bad_json", "reason": "MissingField"}, {}
 
-        with self.assertRaisesRegex(fanout.Refused, "structured aggregate plan v1"):
+        with self.assertRaisesRegex(fanout.Refused, "partial_aggregate"):
             fanout.run(old_worker, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4)
-        self.assertEqual(requests, [{"operation": "capabilities"}])
+        self.assertTrue(requests and all(p.get("operation") == "partial_aggregate" for p in requests))
+        self.assertNotIn("inputs", requests[0])
+        self.assertEqual(requests[0]["partial"]["inputs"], [FULL])
 
     def test_capability_versions_require_integers(self):
         for capability in [{"prepare_aggregate_version": True, "structured_plan_versions": [1]},
@@ -397,7 +431,8 @@ class Refusals(unittest.TestCase):
                 return capability, {}
 
             with self.assertRaises(fanout.Refused):
-                fanout.run(invoke, {"inputs": [FULL], "aggregate": "count(*) AS c"}, 4)
+                pattern = os.path.join(os.path.dirname(FULL), "full_matc*.parquet")
+                fanout.run(invoke, {"inputs": [pattern], "aggregate": "count(*) AS c"}, 4)
             self.assertEqual(requests, [{"operation": "capabilities"}])
 
     def test_split_is_contiguous_and_even(self):
@@ -405,6 +440,334 @@ class Refusals(unittest.TestCase):
         self.assertEqual(fanout.split([3, 0, 2], 2), [[(0, 0, 2)], [(0, 2, 3), (2, 0, 2)]])
         self.assertEqual(fanout.split([2], 5), [[(0, 0, 1)], [(0, 1, 2)]])
         self.assertEqual(fanout.split([0], 4), [])
+        runs = fanout.partial_runs([3, 0, 2], 2)
+        covered = {}
+        for run in runs:
+            for i, s, e, of in run:
+                covered.setdefault(i, []).append((s, e, of))
+        self.assertEqual(set(covered), {0, 1, 2})
+        for parts in covered.values():
+            parts = sorted(parts)
+            self.assertEqual(parts[0][0], 0)
+            self.assertEqual(parts[-1][1], parts[-1][2])
+            for left, right in zip(parts, parts[1:]):
+                self.assertEqual(left[1], right[0])
+                self.assertEqual(left[2], right[2])
+
+
+class SignedInvokeTest(unittest.TestCase):
+    def test_endpoint_keeps_a_pinned_qualifier(self):
+        url, region = fanout.lambda_endpoint("zpq-w", "us-west-2")
+        self.assertEqual(url, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/zpq-w/invocations")
+        self.assertEqual(region, "us-west-2")
+        url, region = fanout.lambda_endpoint("zpq-w:7", "us-west-2")
+        self.assertEqual(url, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/zpq-w/invocations?Qualifier=7")
+        self.assertEqual(region, "us-west-2")
+        url, region = fanout.lambda_endpoint("arn:aws:lambda:eu-west-1:123456789012:function:zpq-w:7", None)
+        self.assertEqual(region, "eu-west-1")
+        self.assertIn(
+            "/functions/arn%3Aaws%3Alambda%3Aeu-west-1%3A123456789012%3Afunction%3Azpq-w/invocations?Qualifier=7",
+            url)
+
+    def test_a_non_200_and_a_function_error_are_told_apart(self):
+        with self.assertRaises(fanout.WorkerFailed):
+            fanout._read_invoke(429, {}, b"slow")
+        resp, stats = fanout._read_invoke(200, {"X-Amz-Function-Error": "Unhandled"},
+                                           b'{"error":"boom","total_ms":12.2}')
+        self.assertEqual(resp["error"], "boom")
+        self.assertEqual(stats["function_error"], "Unhandled")
+        self.assertEqual(stats["billed_ms"], 13)
+        self.assertEqual(stats["duration_ms"], 12.2)
+
+    def test_a_hundred_and_twenty_eight_local_invokes_stay_under_the_old_spread(self):
+        """boto3 held the GIL for about 1.5 ms per invoke, so the last of 128 started ~150 ms late. A keep-alive
+        server that answers immediately should take a fraction of a millisecond each, and the whole fan well under
+        that 150 ms."""
+        import socket
+        from botocore.credentials import Credentials
+
+        def serve(sock):
+            f = sock.makefile("rb")
+            try:
+                while True:
+                    if not f.readline():
+                        break
+                    n = 0
+                    while True:
+                        h = f.readline()
+                        if h in (b"\r\n", b"\n", b""):
+                            break
+                        if h.lower().startswith(b"content-length:"):
+                            n = int(h.split(b":", 1)[1])
+                    got = f.read(n) if n else b""
+                    if b"slow" in got:
+                        time.sleep(0.04)  # hold the request open so the fan's sends overlap, as a worker does
+                    body = b'{"agg":{"c":1},"total_ms":1}'
+                    sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n%s"
+                                 % (len(body), body))
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(256)
+        port = listener.getsockname()[1]
+
+        def accept():
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                threading.Thread(target=serve, args=(conn,), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
+        try:
+            inv = fanout.SignedInvoke(
+                "zpq-w", "us-west-2", 64, credentials=Credentials("example-access-key", "s" * 40),
+                endpoint=f"http://127.0.0.1:{port}")
+            inv({"n": 0})  # the pool's first connection
+            t0 = time.perf_counter()
+            for i in range(32):
+                resp, stats = inv({"n": i})
+            each = (time.perf_counter() - t0) / 32 * 1000
+            self.assertLess(each, 2, f"one kept-alive invoke took {each:.2f} ms")
+            self.assertEqual(resp["agg"]["c"], 1)
+            self.assertEqual(stats["billed_ms"], 1)
+            out, scatter_ms = fanout.scatter(inv, [{"slow": 1, "n": i} for i in range(128)])
+            self.assertEqual(len(out), 128)
+            # Pool of 64, so 128 calls are two waves of the 40 ms hold (80 ms). The old invoker added ~150 ms of
+            # start skew on top of that and landed near 230 ms; serial issue would take seconds.
+            self.assertLess(scatter_ms, 220, f"128 overlapped invokes took {scatter_ms:.0f} ms")
+        finally:
+            pool = fanout._POOLS.pop((inv._pool.host, inv._pool.port, inv._pool.tls), None)
+            if pool is not None:
+                pool.close()
+            listener.close()
+
+
+def _http_frame(body=b'{"agg":{"_a0":1},"total_ms":1}', close=False):
+    conn = b"close" if close else b"keep-alive"
+    return b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: " + conn + b"\r\n\r\n" + body
+
+
+class _Sock:
+    """An in-memory socket. `on_read` runs once, on the first recv, so a test can advance a clock while the
+    response is being read."""
+
+    def __init__(self, data=None, on_read=None):
+        self.data = _http_frame() if data is None else data
+        self.sent, self.closed, self.on_read = [], False, on_read
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def recv(self, n):
+        if self.on_read:
+            self.on_read()
+            self.on_read = None
+        out, self.data = self.data[:n], self.data[n:]
+        return out
+
+    def close(self):
+        self.closed = True
+
+
+class _ShortQueue(queue.LifoQueue):
+    """The production checkout waits 900s. A regression that forgets to wake a waiter should fail this queue's
+    0.2s wait, not hang the suite."""
+
+    def __init__(self):
+        super().__init__()
+        self.waiting = threading.Event()
+
+    def get(self, block=True, timeout=None):
+        if block:
+            self.waiting.set()
+            timeout = 0.2
+        return super().get(block, timeout)
+
+
+def _wire(raw):
+    head, body = raw.split(b"\r\n\r\n", 1)
+    lines = head.decode().split("\r\n")
+    headers = dict((k.lower(), v.strip()) for k, v in (line.split(":", 1) for line in lines[1:]))
+    return lines[0], headers, body
+
+
+class InvokeFixTest(unittest.TestCase):
+    """The review's reproducers: account-bearing names, a closed connection's waiters, a leaked pool slot,
+    a retry's stale signature, and an omitted region. No AWS calls."""
+
+    def tearDown(self):
+        for pool in fanout._POOLS.values():
+            pool.close()
+        fanout._POOLS.clear()
+
+    def test_full_and_partial_arns_keep_the_account(self):
+        from urllib.parse import urlsplit
+        from botocore.serialize import create_serializer
+        from botocore.session import Session
+
+        model = Session().get_service_model("lambda")
+        op = model.operation_model("Invoke")
+        serializer = create_serializer(model.metadata["protocol"])
+        arn = "arn:aws:lambda:eu-west-1:222222222222:function:zpq-w"
+        expected = serializer.serialize_to_request({"FunctionName": arn, "Qualifier": "7", "Payload": b"{}"}, op)
+        actual, region = fanout.lambda_endpoint(arn + ":7", "us-west-2")
+        other, _ = fanout.lambda_endpoint(arn.replace("222222222222", "333333333333") + ":7", "us-west-2")
+        partial, partial_region = fanout.lambda_endpoint("222222222222:function:zpq-w:7", "eu-west-1")
+        self.assertEqual(region, "eu-west-1")
+        self.assertEqual(urlsplit(actual).path, expected["url_path"])
+        self.assertNotEqual(actual, other)
+        self.assertIn("222222222222%3Afunction%3Azpq-w", partial)
+        self.assertIn("Qualifier=7", partial)
+        self.assertEqual(partial_region, "eu-west-1")
+        self.assertNotIn("/functions/zpq-w/", partial)
+
+    def test_a_close_response_wakes_a_queued_checkout(self):
+        import concurrent.futures as cf
+        from unittest import mock
+
+        release, reading = threading.Event(), threading.Event()
+
+        def hold():
+            reading.set()
+            self.assertTrue(release.wait(2))
+
+        sockets = [_Sock(_http_frame(close=True), hold), _Sock(_http_frame(close=True))]
+        pool = fanout._ConnPool("offline", 443, False, 1)
+        pool.idle = _ShortQueue()
+        with mock.patch.object(pool, "open", side_effect=sockets) as opened, cf.ThreadPoolExecutor(2) as ex:
+            first = ex.submit(pool.post, "/", [("Host", "offline")], b"{}")
+            self.assertTrue(reading.wait(2))
+            second = ex.submit(pool.post, "/", [("Host", "offline")], b"{}")
+            self.assertTrue(pool.idle.waiting.wait(2))
+            release.set()
+            self.assertEqual(first.result(2)[0], 200)
+            result = second.result(2)
+        self.assertEqual(result[0], 200)
+        self.assertEqual(opened.call_count, 2)
+        self.assertEqual(pool.n, 0)
+        pool.close()
+
+    def test_a_failed_open_wakes_a_queued_checkout(self):
+        import concurrent.futures as cf
+        from unittest import mock
+
+        started, release = threading.Event(), threading.Event()
+        made = []
+
+        def opening():
+            made.append(1)
+            if len(made) == 1:
+                started.set()
+                self.assertTrue(release.wait(2))
+                raise OSError("handshake failed")
+            return _Sock(_http_frame())
+
+        pool = fanout._ConnPool("offline", 443, False, 1)
+        pool.idle = _ShortQueue()
+        with mock.patch.object(pool, "open", side_effect=opening), cf.ThreadPoolExecutor(2) as ex:
+            first = ex.submit(pool.checkout)
+            self.assertTrue(started.wait(2))
+            second = ex.submit(pool.checkout)
+            self.assertTrue(pool.idle.waiting.wait(2))
+            release.set()
+            with self.assertRaises(OSError):
+                first.result(2)
+            sock = second.result(2)
+        self.assertFalse(sock.closed)
+        self.assertEqual(pool.n, 1)
+        pool.drop(sock)
+        self.assertEqual(pool.n, 0)
+
+    def test_protocol_failure_releases_the_pool_slot(self):
+        from unittest import mock
+
+        bodies = (
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}",
+            b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n",
+        )
+        for raw in bodies:
+            sock = _Sock(raw)
+            pool = fanout._ConnPool("offline", 443, False, 1)
+            with mock.patch.object(pool, "open", return_value=sock):
+                with self.assertRaises((fanout.WorkerFailed, ValueError)):
+                    pool.post("/", [("Host", "offline")], b"{}")
+            self.assertEqual(pool.n, 0, raw)
+            self.assertTrue(sock.closed)
+            leftover = []
+            while True:
+                try:
+                    leftover.append(pool.idle.get_nowait())
+                except queue.Empty:
+                    break
+            self.assertTrue(leftover)
+            self.assertTrue(all(item is fanout._SLOT for item in leftover))
+            pool.close()
+
+        # The retry's own framing error has to give the slot back too. The first socket dies mid-headers.
+        first, second = _Sock(b""), _Sock(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}")
+        pool = fanout._ConnPool("offline", 443, False, 1)
+        with mock.patch.object(pool, "open", side_effect=[first, second]):
+            with self.assertRaises(fanout.WorkerFailed):
+                pool.post("/", [("Host", "offline")], b"{}")
+        self.assertEqual(pool.n, 0)
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
+        pool.close()
+
+    def test_retry_refreshes_the_timestamp_and_credentials(self):
+        import datetime as dt
+        from unittest import mock
+        from botocore.credentials import ReadOnlyCredentials
+
+        now = [dt.datetime(2026, 11, 7, 12, 0)]
+
+        class Rotating:
+            def __init__(self):
+                self.calls = 0
+
+            def get_frozen_credentials(self):
+                self.calls += 1
+                return ReadOnlyCredentials("KEY" + str(self.calls), "s" * 40, "TOKEN" + str(self.calls))
+
+        def age():
+            now[0] += dt.timedelta(seconds=910)
+
+        creds = Rotating()
+        sockets = [_Sock(b"", age), _Sock()]
+        pool = fanout._ConnPool("lambda.us-west-2.amazonaws.com", 443, False, 1)
+        with mock.patch.object(fanout, "_pool", return_value=pool), \
+                mock.patch.object(pool, "open", side_effect=sockets), \
+                mock.patch("botocore.auth.get_current_datetime", side_effect=lambda: now[0]):
+            inv = fanout.SignedInvoke("zpq-w:7", "us-west-2", 1, credentials=creds)
+            inv({"n": 1})
+        first = _wire(sockets[0].sent[0])[1]
+        second = _wire(sockets[1].sent[0])[1]
+        self.assertEqual(first["x-amz-date"], "20261107T120000Z")
+        self.assertEqual(first["x-amz-security-token"], "TOKEN1")
+        self.assertEqual(second["x-amz-date"], now[0].strftime("%Y%m%dT%H%M%SZ"))
+        self.assertEqual(second["x-amz-security-token"], "TOKEN2")
+        self.assertEqual(creds.calls, 2)
+        self.assertEqual(sockets[0].sent[0].split(b"\r\n\r\n", 1)[1], sockets[1].sent[0].split(b"\r\n\r\n", 1)[1])
+        pool.close()
+
+    def test_default_region_matches_sdk_configuration(self):
+        from unittest import mock
+        from botocore.session import Session
+
+        env = {"AWS_REGION": "eu-west-1", "AWS_DEFAULT_REGION": "eu-west-1", "AWS_EC2_METADATA_DISABLED": "true"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(fanout, "_pool", return_value=mock.Mock(host="offline")):
+            expected = Session().get_config_variable("region")
+            inv = fanout.lambda_invoker("zpq-w")
+        self.assertEqual(expected, "eu-west-1")
+        self.assertEqual(inv.region, expected)
+        self.assertEqual(inv.url, "https://lambda.eu-west-1.amazonaws.com/2015-03-31/functions/zpq-w/invocations")
 
 
 def main():

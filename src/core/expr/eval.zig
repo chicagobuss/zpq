@@ -2091,7 +2091,7 @@ fn evalSign(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
         const rows = try decRows(arena, batch, column_lookup, arg, spec.scale);
         for (rows.v, out) |x, *r| r.* = if (x > 0) 1 else if (x < 0) -1 else 0;
         const def = rows.def;
-        return .{ .i64 = .{ .values = out, .def_levels = def orelse &.{}, .max_def = if (def != null) 1 else 0, .has_nulls = def != null and rows.nulls != null } };
+        return .{ .i64 = .{ .values = out, .def_levels = def, .max_def = if (def != null) 1 else 0, .has_nulls = def != null } };
     }
     const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg);
     switch (col) {
@@ -2529,9 +2529,10 @@ fn epochSeconds(unit: ast.Temporal, utc: bool, v: i64) error{ConversionOutOfRang
     }
     const us = (try epochCount(.to_epoch_us, unit, v)) orelse return null;
     // A TIMESTAMP WITH TIME ZONE adds its whole milliseconds, over a thousand, to the rest of its microseconds, over a million.
+    // The rest is the floor remainder: `ms * 1000` is past the minimum for the earliest finite times.
     if (utc) {
         const ms = @divFloor(us, 1000);
-        return @as(f64, @floatFromInt(ms)) / 1000.0 + @as(f64, @floatFromInt(us - ms * 1000)) / 1e6;
+        return @as(f64, @floatFromInt(ms)) / 1000.0 + @as(f64, @floatFromInt(@mod(us, 1000))) / 1e6;
     }
     return @as(f64, @floatFromInt(us)) / 1e6;
 }
@@ -2646,6 +2647,14 @@ test "epoch counts and seconds are DuckDB 2.0.0's, an infinite time is NULL" {
     try T.expectEqual(@as(?f64, 4724991793.3989935), try epochSeconds(.ts_us, true, 4724991793398994));
     try T.expectEqual(@as(?f64, 4724991793.398994), try epochSeconds(.ts_us, false, 4724991793398994));
     try T.expectEqual(@as(?f64, null), try epochSeconds(.ts_us, false, -inf));
+    // The earliest finite times: `ms * 1000` of the floor quotient is past the minimum there, the remainder is not.
+    try T.expectEqual(@as(?f64, -9223372036854.775), try epochSeconds(.ts_us, true, -9223372036854775806));
+    try T.expectEqual(@as(?f64, -9223372036854.775), try epochSeconds(.ts_us, true, -9223372036854775805));
+    try T.expectEqual(@as(?f64, -9223372036854.773), try epochSeconds(.ts_us, true, -9223372036854775001));
+    try T.expectEqual(@as(?f64, -9223372036854.775), try epochSeconds(.ts_us, true, -9223372036854775000));
+    try T.expectEqual(@as(?f64, -9223372036854.775), try epochSeconds(.ts_us, false, -9223372036854775806));
+    try T.expectEqual(@as(?f64, null), try epochSeconds(.ts_us, true, -inf));
+    try T.expectEqual(@as(?f64, 9223372036854.775), try epochSeconds(.ts_us, true, 9223372036854775806));
 }
 
 test "negating a DOUBLE flips its sign bit, a zero's and a NaN's included" {

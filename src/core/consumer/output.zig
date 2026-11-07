@@ -441,7 +441,6 @@ test "initOutputAggregator maps precision > 38 BYTE_ARRAY decimal to f64" {
     try testing.expectEqual(schema.Type.DOUBLE, agg.schema_elems[0].type.?);
 }
 
-
 /// Rows `lo..hi` of an output buffer as the column the encoder takes: its values, or its codes into the dictionary
 /// they index, and its levels; an exact DECIMAL as its unscaled integers (the encoder narrows them to the schema's
 /// width).
@@ -466,9 +465,12 @@ pub const BufRange = struct {
 };
 
 /// The rows of `ranges`, in order, as one column (`bufRows` of each, joined on `arena`). Ranges of buffers coded by
-/// one dictionary stay codes; otherwise values, a coded range's taken from its dictionary. Levels run at the deepest
-/// range's `max_def`, a range without levels present throughout. Which of these a column comes out as never changes
-/// its encoding: coded and plain columns, with or without all-present levels, encode to the same bytes.
+/// one dictionary stay codes. String ranges each coded by its own dictionary become codes into their merged one when
+/// the dictionaries together hold at most a sixteenth of the rows: each entry is hashed once, not each row, which
+/// pays only where entries are that much fewer than rows. Otherwise values, a coded range's taken
+/// from its dictionary. Levels run at the deepest range's `max_def`, a range without levels present throughout.
+/// Which of these a column comes out as never changes its encoding: coded and plain columns, with or without
+/// all-present levels, encode to the same bytes.
 pub fn joinRows(arena: std.mem.Allocator, ranges: []const BufRange) !filter_eval.Batch.Column {
     std.debug.assert(ranges.len > 0);
     if (ranges.len == 1) return bufRows(ranges[0].buf.*, ranges[0].lo, ranges[0].hi);
@@ -479,14 +481,25 @@ pub fn joinRows(arena: std.mem.Allocator, ranges: []const BufRange) !filter_eval
             var total: usize = 0;
             var max_def: u32 = 0;
             var one_dict = first.coded;
+            var all_coded = true;
+            var entries: usize = 0;
             for (ranges) |r| {
                 const b = @field(r.buf.*, @tagName(tag));
                 total += r.hi - r.lo;
                 max_def = @max(max_def, b.max_def);
                 one_dict = one_dict and b.coded and b.dict.ptr == first.dict.ptr and b.dict.len == first.dict.len;
+                all_coded = all_coded and b.coded;
+                entries += b.dict.len;
             }
             var out: filter_eval.ColumnT(T) = .{ .values = &.{}, .max_def = max_def, .has_nulls = max_def > 0 };
-            if (one_dict) {
+            const merge = if (comptime T == []const u8) !one_dict and all_coded and entries <= total / 16 else false;
+            if (merge) {
+                if (comptime T == []const u8) {
+                    const m = try mergedCodes(arena, ranges, total, entries);
+                    out.codes = m.codes;
+                    out.dict = m.dict;
+                }
+            } else if (one_dict) {
                 const codes = try arena.alloc(u32, total);
                 var pos: usize = 0;
                 for (ranges) |r| {
@@ -535,6 +548,39 @@ pub fn joinRows(arena: std.mem.Allocator, ranges: []const BufRange) !filter_eval
     }
 }
 
+/// String ranges, each coded by its own dictionary, as codes into one dictionary of their entries (`joinRows`). First
+/// entries keep their first code: the encoder rebuilds the dictionary in first-occurrence order over the rows anyway,
+/// so the merge order never shows in the bytes.
+fn mergedCodes(
+    arena: std.mem.Allocator,
+    ranges: []const BufRange,
+    total: usize,
+    entries: usize,
+) !struct { codes: []u32, dict: []const []const u8 } {
+    var merged: std.StringHashMapUnmanaged(u32) = .empty;
+    try merged.ensureTotalCapacity(arena, @intCast(entries));
+    var dict: std.ArrayList([]const u8) = try .initCapacity(arena, entries);
+    const codes = try arena.alloc(u32, total);
+    var pos: usize = 0;
+    for (ranges) |r| {
+        const b = &r.buf.string;
+        const remap = try arena.alloc(u32, b.dict.len);
+        for (b.dict, remap) |e, *m| {
+            const gop = merged.getOrPutAssumeCapacity(e);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = @intCast(dict.items.len);
+                dict.appendAssumeCapacity(e);
+            }
+            m.* = gop.value_ptr.*;
+        }
+        for (codes[pos..][0 .. r.hi - r.lo], b.codes.items[r.lo..r.hi], r.lo..) |*d, k, row| {
+            const present = b.max_def == 0 or b.def_levels.items[row] == b.max_def;
+            d.* = if (present) remap[k] else 0;
+        }
+        pos += r.hi - r.lo;
+    }
+    return .{ .codes = codes, .dict = dict.items };
+}
 
 /// Append the rows `sel` keeps of a flat column straight into the aggregator's buffer: one copy, no intermediate
 /// filtered column. String bytes are copied into one block of `arena`, since the decoded pages they point into die
@@ -753,7 +799,6 @@ test "appendSelected keeps one level per row when a column's batches come with a
     try std.testing.expectEqual(@as(usize, 0), plain.i64.def_levels.items.len);
 }
 
-
 /// A named passthrough's leaf as the flat column it is written as: present (`def == max_def`) or NULL, at one level.
 /// A nested leaf counts its parents' levels too, which a flat leaf has none of. Others pass through as they are.
 pub fn namedLevels(scratch: std.mem.Allocator, pt: OutputCol.Passthrough, col: filter_eval.Batch.Column) !filter_eval.Batch.Column {
@@ -847,7 +892,6 @@ test "regression: a renamed passthrough is its leaf renamed and flat, NULL where
     const flat: filter_eval.Batch.Column = .{ .i32 = .{ .values = &vals, .def_levels = &flat_defs, .max_def = 1, .has_nulls = true } };
     try testing.expectEqual(flat.i32.def_levels.?.ptr, (try namedLevels(a, .{ .ci = 0, .name = "k" }, flat)).i32.def_levels.?.ptr);
 }
-
 
 /// Decode + filter + eval one input RG; project survivors into the
 /// aggregator. Uses a per-RG scratch arena that's freed at function
@@ -1245,7 +1289,6 @@ pub fn appendSliceRows(
     return surviving;
 }
 
-
 test "Survivors: computed outputs evaluate over the kept rows only, with their levels, codes and exact values" {
     const testing = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1340,4 +1383,3 @@ test "appendSliceRows: a computed column over the kept rows is the one computed 
         if (d == 1) try testing.expectEqual(w, g);
     }
 }
-

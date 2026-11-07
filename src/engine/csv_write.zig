@@ -69,6 +69,9 @@ pub const Options = struct {
     overhang: ?usize = null,
     /// Forced-path control for tests: chunk `fault_chunk`'s producer fails before it reads, as a failed read does.
     fault_chunk: ?usize = null,
+    /// Forced-path control: string columns are parsed into dictionary codes (`Coder`); off, into values. Either way
+    /// the output's bytes are the same.
+    dictionaries: bool = true,
 
     pub const Pinned = struct { column: []const u8, type: Type };
 };
@@ -592,6 +595,24 @@ fn hasHighBit(bytes: []const u8) bool {
     return (@reduce(.Or, acc) | tail) & 0x80 != 0;
 }
 
+/// A string column's rows as codes into the piece's own dictionary while its values repeat: each distinct string is
+/// hashed and kept once (copied once, where it must be), a row takes four bytes, and the encoder builds the chunk's
+/// dictionary from the codes (`encoder.planCoded`) without hashing a value, to the bytes hashing the values writes.
+/// Only a column that repeats a lot pays: its rows are hashed here instead of in the encoder, and its dictionary is
+/// merged with the other pieces' (`consumer.joinRows`), so one whose dictionary outgrows a sixteenth of its rows, or
+/// the encoder's 1 MiB dictionary page, goes back to values for the rest of the piece.
+const Coder = struct {
+    map: std.StringHashMapUnmanaged(u32) = .empty,
+    dict: std.ArrayList([]const u8) = .empty,
+    bytes: usize = 0,
+
+    /// Entries a dictionary is judged at: a column is coded until its dictionary holds this many.
+    const judged_entries = 256;
+    /// At most one entry per this many rows.
+    const repeats = 16;
+    const max_bytes = 1 << 20;
+};
+
 /// Typed output columns being filled from one chunk's fields.
 const Builder = struct {
     cols: []consumer.OutputAggregator.ColumnBuf,
@@ -599,6 +620,8 @@ const Builder = struct {
     /// A pinned DECIMAL holds its declared precision; an inferred one any its physical type holds (`decimalCap`).
     pinned: []const bool,
     max_abs: []u128,
+    /// Per column; used by coded string columns only.
+    coders: []Coder,
     rows: usize = 0,
 
     fn init(b: *Builder, piece: *window_mod.Piece, s: *const Source, span_bytes: usize) !void {
@@ -612,11 +635,24 @@ const Builder = struct {
                 inline else => |lane| @unionInit(consumer.OutputAggregator.ColumnBuf, @tagName(lane), .{}),
             };
             switch (c.*) {
+                .string => |*buf| if (t.kind == .null_only or !s.opts.dictionaries) {
+                    try buf.values.ensureTotalCapacity(pa, reserve);
+                } else {
+                    buf.coded = true;
+                    try buf.codes.ensureTotalCapacity(pa, reserve);
+                },
                 inline else => |*buf| try buf.values.ensureTotalCapacity(pa, reserve),
             }
         }
-        b.* = .{ .cols = cols, .types = p.types, .pinned = p.pinned, .max_abs = try pa.alloc(u128, ncols) };
+        b.* = .{
+            .cols = cols,
+            .types = p.types,
+            .pinned = p.pinned,
+            .max_abs = try pa.alloc(u128, ncols),
+            .coders = try pa.alloc(Coder, ncols),
+        };
         @memset(b.max_abs, 0);
+        @memset(b.coders, .{});
         piece.agg = .{
             .arena = pa,
             .cols = cols,
@@ -645,11 +681,13 @@ const Builder = struct {
                 inline else => |*x| {
                     if (x.max_def == 0) {
                         x.max_def = 1;
-                        try x.def_levels.ensureTotalCapacity(a, x.values.capacity);
+                        try x.def_levels.ensureTotalCapacity(a, @max(x.values.capacity, x.codes.capacity));
                         x.def_levels.appendNTimesAssumeCapacity(1, b.rows);
                     }
                     try x.def_levels.append(a, 0);
-                    try x.values.append(a, std.mem.zeroes(@TypeOf(x.values.items[0])));
+                    if (x.coded) {
+                        try x.codes.append(a, 0);
+                    } else try x.values.append(a, std.mem.zeroes(@TypeOf(x.values.items[0])));
                 },
             }
             return true;
@@ -691,6 +729,24 @@ const Builder = struct {
             .string => |*x| {
                 if (t.kind == .string and !ascii and !std.unicode.utf8ValidateSlice(s)) return false;
                 if (t.kind == .null_only) return false;
+                if (x.coded) {
+                    const c = &b.coders[col];
+                    const gop = try c.map.getOrPut(a, s);
+                    if (!gop.found_existing) {
+                        // The key must outlive the chunk as the entry does.
+                        const owned = if (copy) try a.dupe(u8, s) else s;
+                        gop.key_ptr.* = owned;
+                        gop.value_ptr.* = @intCast(c.dict.items.len);
+                        try c.dict.append(a, owned);
+                        c.bytes += 4 + s.len;
+                    }
+                    try x.codes.append(a, gop.value_ptr.*);
+                    if (x.max_def > 0) try x.def_levels.append(a, 1);
+                    if (!gop.found_existing and c.dict.items.len >= Coder.judged_entries and
+                        (Coder.repeats * c.dict.items.len > x.codes.items.len or c.bytes > Coder.max_bytes))
+                        try uncode(a, x, c);
+                    return true;
+                }
                 // Every other string stays a slice of the input, which outlives the write.
                 const owned = if (copy) try a.dupe(u8, s) else s;
                 try x.values.append(a, owned);
@@ -701,8 +757,27 @@ const Builder = struct {
         return true;
     }
 
+    /// A coded column's rows so far as values, and values from here on.
+    fn uncode(a: std.mem.Allocator, x: *consumer.OutputAggregator.TypedBuf([]const u8), c: *Coder) !void {
+        try x.values.ensureTotalCapacity(a, x.codes.capacity);
+        for (x.codes.items, 0..) |k, r| {
+            const present = x.max_def == 0 or x.def_levels.items[r] == x.max_def;
+            x.values.appendAssumeCapacity(if (present) c.dict.items[k] else "");
+        }
+        x.coded = false;
+        x.codes = .empty;
+        c.* = .{};
+    }
+
     fn finish(b: *Builder, piece: *window_mod.Piece, s: *Source, i: usize) !void {
         const pa = piece.arena.allocator();
+        for (b.cols, b.coders) |*col, *c| switch (col.*) {
+            .string => |*x| if (x.coded) {
+                // No value at all (every row NULL, or none): plain, so no code points past an empty dictionary.
+                if (c.dict.items.len == 0) try uncode(pa, x, c) else x.dict = c.dict.items;
+            },
+            else => {},
+        };
         piece.agg.num_rows = b.rows;
         piece.bits_prefix = try consumer.plainBitsPrefix(pa, &piece.agg);
         @memcpy(s.max_abs[i * b.cols.len ..][0..b.cols.len], b.max_abs);

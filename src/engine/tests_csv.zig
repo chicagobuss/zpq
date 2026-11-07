@@ -679,3 +679,45 @@ test "csv write: a pinned DECIMAL keeps its declared precision, and a value wide
     try testing.expectEqual(@as(?i32, 1), meta.schema.items[1].scale);
     try testing.expectEqual(@as(u32, 9), report.types[0].precision());
 }
+
+test "csv write: strings parsed into dictionary codes write the bytes values write, at every chunk size" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    var b3: [128]u8 = undefined;
+    const in = try tmpPath(&b1, &tmp, "dict.csv");
+    const plain = try tmpPath(&b2, &tmp, "plain.parquet");
+    const coded = try tmpPath(&b3, &tmp, "coded.parquet");
+    // Columns a dictionary takes (few values, some NULL, some escaped), one it gives up on early (every value new),
+    // one that repeats within a chunk but not across the file, and one that turns from repeating to new mid-file.
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(a, "id,low,nul,esc,high,mid,turn\n");
+    for (0..40_000) |i| {
+        const nul: []const u8 = if (i % 7 == 0) "" else if (i % 2 == 0) "x" else "yy";
+        const esc: []const u8 = if (i % 3 == 0) "\"a\"\"b\"" else "\"c,d\"";
+        try text.print(a, "{d},k{d},{s},{s},h{d},m{d},{s}{d}\n", .{
+            i, i % 5, nul, esc, i * 7919, i % 3000, if (i < 20_000) "r" else "n", if (i < 20_000) i % 4 else i,
+        });
+    }
+    try writeFile(in, text.items);
+    var failure: csv_write.Failure = .{};
+    _ = try runCsv(in, plain, 4, .{ .chunk_bytes = 16 << 10, .dictionaries = false }, &failure);
+    const want = try metadata.readFileSlice(plain, testing.allocator);
+    defer testing.allocator.free(want);
+    for ([_]usize{ 16 << 10, 64 << 10, 1 << 20 }) |chunk| for ([_]usize{ 1, 4 }) |j| {
+        _ = try runCsv(in, coded, j, .{ .chunk_bytes = chunk }, &failure);
+        const got = try metadata.readFileSlice(coded, testing.allocator);
+        defer testing.allocator.free(got);
+        try testing.expectEqualSlices(u8, want, got);
+    };
+    // The low-cardinality columns were written as dictionaries.
+    const meta = try metadata.open(a, want);
+    for ([_]usize{ 1, 2, 3 }) |c| {
+        const cm = meta.row_groups.items[0].columns.items[c].meta_data.?;
+        try testing.expect(cm.dictionary_page_offset != null);
+    }
+}

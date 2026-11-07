@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const test_skip = @import("../test_skip.zig");
 const posix = std.posix;
 const boring = @import("boring_tls");
 const clock = @import("../clock.zig");
@@ -1307,7 +1308,7 @@ const Interrupter = struct {
 };
 
 test "signals interrupting a wait do not extend the handshake, first-byte, idle read or send deadlines" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "signal-interrupted waits");
     var irq: Interrupter = .{ .target = std.c.pthread_self() };
     try irq.start();
     defer irq.finish();

@@ -1,5 +1,6 @@
 const core_memory = @import("../../memory.zig");
 const std = @import("std");
+const test_skip = @import("../../../test_skip.zig");
 const testing = std.testing;
 const filter_eval = @import("../../filter/eval.zig");
 const SharedBudget = @import("../../memory.zig").SharedBudget;
@@ -1555,7 +1556,7 @@ test "consumed numeric distinct source releases only nonphysical credit" {
 }
 
 test "distinct hash growth remaps without copy when replacement overlap does not fit" {
-    if (!core_memory.page_growth_without_copy) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "mremap page growth");
     const a = std.heap.page_allocator;
     var budget: SharedBudget = .{ .limit = 16 << 20, .block = 1 };
     var set: DistinctSet = .{ .shared = &budget };
@@ -1588,7 +1589,7 @@ test "distinct hash growth remaps without copy when replacement overlap does not
 
 test "distinct wide and string maps retain identities after no-copy growth" {
     // Each budget fits only the growth no-copy remap gives, which needs Linux's mremap.
-    if (!core_memory.page_growth_without_copy) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "mremap page growth");
     const a = std.heap.page_allocator;
     {
         var budget: SharedBudget = .{ .limit = 16 << 20, .block = 1 };

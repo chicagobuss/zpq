@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const test_skip = @import("../test_skip.zig");
 const blocking = @import("blocking.zig");
 
 /// What a GROUP BY's merge and answer may hold past the ledger's limit once the scan is done: a small answer never
@@ -370,9 +371,13 @@ pub fn remapWithoutCopy(a: std.mem.Allocator, old: anytype, new_len: usize) ?@Ty
     return null;
 }
 
+test "the skips that name mremap are exactly the targets without it" {
+    try std.testing.expectEqual(builtin.os.tag == .linux, page_growth_without_copy);
+}
+
 test "no-copy remap supports page-backed SMP allocations" {
     // 96 KiB to 192 KiB crosses pages, which only mremap moves without a copy.
-    if (!page_growth_without_copy) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "mremap page growth");
     const a = std.heap.smp_allocator;
     const old = try a.alloc(u8, 96 << 10);
     @memset(old, 0xa5);
@@ -386,7 +391,7 @@ test "no-copy remap supports page-backed SMP allocations" {
 }
 
 test "no-copy remap supports page-backed safe allocations" {
-    if (!page_growth_without_copy) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "mremap page growth");
     var safe: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer std.testing.expect(safe.deinit() == 0) catch @panic("safe allocator leaked");
     const a = safe.allocator();
@@ -401,7 +406,8 @@ test "no-copy remap supports page-backed safe allocations" {
 }
 
 test "tight native group heap remaps large buffers without copying" {
-    if (comptime use_mimalloc or !builtin.link_libc or !page_growth_without_copy) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "mremap page growth");
+    if (comptime use_mimalloc or !builtin.link_libc) return error.SkipZigTest;
     const c = std.heap.c_allocator;
     const tight = groupAllocatorForBudget(c, 3500 * 1024);
     const ample = groupAllocatorForBudget(c, 2 << 30);

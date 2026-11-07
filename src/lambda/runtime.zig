@@ -26,6 +26,7 @@
 //!     errors before entering the invocation loop.
 
 const std = @import("std");
+const test_skip = @import("zpq").test_skip;
 const linux = std.os.linux;
 
 pub const Error = error{
@@ -436,7 +437,7 @@ const FakeRuntimeApi = struct {
 };
 
 test "regression: a response the runtime API refuses is an error, not taken as posted" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "Linux socket syscalls");
     const a = std.testing.allocator;
     for ([_][]const u8{
         "HTTP/1.1 202 Accepted\r\nContent-Length: 16\r\n\r\n{\"status\":\"OK\"}",
@@ -459,7 +460,7 @@ test "regression: a response the runtime API refuses is an error, not taken as p
 
 test "nextInvocation reads a large event the runtime API sends chunked" {
     // The client makes Linux syscalls directly, as Lambda runs only on Linux.
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "Linux socket syscalls");
     const a = std.testing.allocator;
 
     // ~64 KiB of JSON in uneven chunks, the way the runtime API frames events above a few KiB.

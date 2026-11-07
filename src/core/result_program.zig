@@ -44,6 +44,9 @@ pub const ResultProgram = struct {
     /// computed columns read, which the scan's own column types (`GroupColType`) leave to the lane.
     calls: []const expr_agg.AggCall = &.{},
     sources: []const ?schema.SchemaElement = &.{},
+    /// The query has a GROUP BY, whether or not any key is selected: it picks the plan an AVG of a DECIMAL is computed
+    /// by (`Facts`), and no `key` column says so when the keys are projected away.
+    grouped: bool = false,
 
     /// The order the strategies before this stage may cut by. A cut ranks groups before HAVING has dropped any, so
     /// under HAVING it would keep the top rows of the wrong set and underfill the answer: the limit is masked there,
@@ -233,10 +236,7 @@ pub const ResultProgram = struct {
         const ints = try arena.alloc(?expr_ast.IntType, width);
         const rewritten = try arena.alloc(bool, width);
         const programs = try arena.alloc(?*const Compiled, width);
-        // A GROUP BY shows in the columns as a key, wherever it is listed.
-        const grouped = for (0..width) |j| {
-            if (self.column(j).role == .key) break true;
-        } else false;
+        const grouped = self.grouped;
         var raw: usize = 0;
         // Without GROUP BY every scanned column is an aggregate (`.named`); with it, the `.agg` ones are, and each takes
         // the next call, as the scan binds them.
@@ -1266,6 +1266,7 @@ test "finish computes derived columns once per group, typed as SQL types them, t
         .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .hidden = &post_hidden, .post = true },
         .select = &post_select,
         .calls = &post_calls,
+        .grouped = true,
         .visible = 3,
     };
     // The strategies before this stage cut nothing, and see neither key nor hidden-term positions.
@@ -1308,6 +1309,7 @@ test "HAVING reads its columns first: a group it drops is never evaluated" {
         .order = .{ .hidden = &post_hidden, .post = true, .having = &only_a },
         .select = &select,
         .calls = &post_calls,
+        .grouped = true,
     };
     try with_having.finish(gpa, &kept, &col_types);
     try std.testing.expectEqual(@as(usize, 1), kept.group_rows.?.len);
@@ -1316,7 +1318,12 @@ test "HAVING reads its columns first: a group it drops is never evaluated" {
     var all = try threeColumnOutput(gpa, &.{ "a", "b", "c" }, &.{ dec2(100), dec2(200), dec2(300) }, &.{ .{ .i = 1 }, .{ .i = 5 }, .{ .i = 7 } });
     defer all.deinit(gpa);
     col_types = &scan_types;
-    const without: ResultProgram = .{ .order = .{ .hidden = &post_hidden, .post = true }, .select = &select, .calls = &post_calls };
+    const without: ResultProgram = .{
+        .order = .{ .hidden = &post_hidden, .post = true },
+        .select = &select,
+        .calls = &post_calls,
+        .grouped = true,
+    };
     try std.testing.expectError(error.IntegerOverflowMul, without.finish(gpa, &all, &col_types));
 }
 
@@ -1336,6 +1343,7 @@ test "HAVING compares two result columns, and a derived column against a literal
         .order = .{ .hidden = &post_hidden, .post = true, .having = &having },
         .select = &post_select,
         .calls = &post_calls,
+        .grouped = true,
     };
     try program.finish(gpa, &out, &col_types);
     try std.testing.expectEqual(@as(usize, 2), out.group_rows.?.len);
@@ -1663,6 +1671,7 @@ test "finish with computed columns leaves the answer whole when it runs out of m
                 .order = .{ .keys = &.{.{ .column = 1, .descending = true }}, .hidden = &post_hidden, .post = true, .having = &having, .limit = 1 },
                 .select = &post_select,
                 .calls = &post_calls,
+                .grouped = true,
             };
             try program.finish(gpa, &out, &col_types);
             try std.testing.expectEqualStrings("b", out.group_rows.?[0][0].s);

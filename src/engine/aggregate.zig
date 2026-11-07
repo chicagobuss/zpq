@@ -477,8 +477,10 @@ fn executeAggregateOver(
     // computed columns they index the wider row `ResultProgram` makes.
     const post = args.result_order.post;
     if (!post) if (r.output.group_cols) |cols| for (args.result_order.keys) |key| std.debug.assert(key.column < cols.len);
-    if (post and r.output.group_rows == null) try scalarAsRows(ctx.gpa, &r);
+    const grouped = r.output.group_rows != null;
+    if (post and !grouped) try scalarAsRows(ctx.gpa, &r);
     const program: ResultProgram = .{
+        .grouped = grouped,
         .order = args.result_order,
         .visible = r.visible_cols,
         .select = if (post) args.select_cols.? else &.{},

@@ -1362,7 +1362,7 @@ fn evalCall(
         .cast_text => return evalCastText(arena, batch, column_lookup, c.args[0].*),
         .abs => return evalAbs(arena, batch, column_lookup, c),
         .length => return evalLength(arena, batch, column_lookup, c.args[0].*),
-        .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => return evalStringFn(arena, batch, column_lookup, c),
+        .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract => return evalStringFn(arena, batch, column_lookup, c),
         .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp => return evalCast(arena, batch, column_lookup, c),
         .floor, .ceil, .sqrt, .round => return evalMath(arena, batch, column_lookup, c),
         .least, .greatest => return evalLeastGreatest(arena, batch, column_lookup, c),
@@ -1460,7 +1460,7 @@ fn spaceAtEnd(s: []const u8) usize {
 }
 
 /// One text through a string function; `bytes` holds what is built. Characters are code points, positions 1-based.
-fn applyStringFn(arena: std.mem.Allocator, bytes: *std.ArrayList(u8), c: ast.Call, text: []const u8) Error!Mapped {
+fn applyStringFn(arena: std.mem.Allocator, bytes: *std.ArrayList(u8), scratch: *regex.Scratch, c: ast.Call, text: []const u8) Error!Mapped {
     const int = struct {
         fn at(call: ast.Call, k: usize) i128 {
             return call.args[k].literal.i64;
@@ -1576,7 +1576,36 @@ fn applyStringFn(arena: std.mem.Allocator, bytes: *std.ArrayList(u8), c: ast.Cal
             if (c.func == .lpad) try bytes.appendSlice(arena, text);
             return .{ .built = .{ start, bytes.items.len } };
         },
+        .split_part => return .{ .text = splitPart(text, c.args[1].literal.str, int(c, 2)) },
+        .regexp_extract => return .{ .text = try c.extract.?.apply(scratch, text) },
         else => unreachable,
+    }
+}
+
+/// The `n`th field of `text` split by `sep`, as DuckDB's `split_part`: 1-based, a negative `n` from the end, `""` for
+/// zero or beyond the fields; an empty `sep` makes each character a field. Fields are cut left to right, not overlapping.
+fn splitPart(text: []const u8, sep: []const u8, n: i128) []const u8 {
+    if (n == 0) return "";
+    if (sep.len == 0) {
+        const chars: i128 = @intCast(charCount(text));
+        const at = if (n > 0) n else chars + n + 1;
+        if (at < 1 or at > chars) return "";
+        return charRange(text, @intCast(chars), at, at);
+    }
+    var want = n;
+    if (n < 0) {
+        var fields: i128 = 1;
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, text, from, sep)) |hit| : (from = hit + sep.len) fields += 1;
+        want = fields + n + 1;
+        if (want < 1) return "";
+    }
+    var start: usize = 0;
+    var k: i128 = 1;
+    while (true) : (k += 1) {
+        const hit = std.mem.indexOfPos(u8, text, start, sep);
+        if (k == want) return text[start .. hit orelse text.len];
+        start = (hit orelse return "") + sep.len;
     }
 }
 
@@ -1588,6 +1617,7 @@ fn evalStringFn(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []
     const s = arg.s;
     const inputs = if (s.codes != null) s.dict else s.values;
     var bytes: std.ArrayList(u8) = .empty;
+    var scratch: regex.Scratch = .init(arena);
     const mapped = try arena.alloc(Mapped, inputs.len);
     var last: ?usize = null;
     for (inputs, mapped, 0..) |text, *m, i| {
@@ -1598,7 +1628,7 @@ fn evalStringFn(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []
             continue;
         };
         last = i;
-        m.* = try applyStringFn(arena, &bytes, c, text);
+        m.* = try applyStringFn(arena, &bytes, &scratch, c, text);
     }
     const texts = try arena.alloc([]const u8, inputs.len);
     for (mapped, texts) |m, *t| t.* = switch (m) {
@@ -2262,7 +2292,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest => unreachable,
     }
     return .{ .i64 = .{
         .values = out,
@@ -4043,12 +4073,39 @@ fn stringFn(func: ast.Func, text: []const u8, extra: []const ast.Expr) ![]const 
     }
     const call: ast.Call = .{ .func = func, .args = args, .result_type = .str, .depth = 1 };
     var bytes: std.ArrayList(u8) = .empty;
-    const mapped = try applyStringFn(a, &bytes, call, text);
+    var scratch: regex.Scratch = .init(a);
+    const mapped = try applyStringFn(a, &bytes, &scratch, call, text);
     // Copy out of the arena the answer lives in.
     return std.testing.allocator.dupe(u8, switch (mapped) {
         .text => |t| t,
         .built => |b| bytes.items[b[0]..b[1]],
     });
+}
+
+test "split_part cuts fields left to right, from either end, and an empty separator makes characters" {
+    const T = std.testing;
+    // DuckDB 2.0.0's answers.
+    try T.expectEqualStrings("b", splitPart("a,b,c", ",", 2));
+    try T.expectEqualStrings("a", splitPart("a,b,c", ",", 1));
+    try T.expectEqualStrings("c", splitPart("a,b,c", ",", -1));
+    try T.expectEqualStrings("a", splitPart("a,b,c", ",", -3));
+    for ([_]i128{ 0, 4, -4, std.math.maxInt(i64), std.math.minInt(i64) }) |n| try T.expectEqualStrings("", splitPart("a,b,c", ",", n));
+    try T.expectEqualStrings("", splitPart("a,,c", ",", 2));
+    try T.expectEqualStrings("", splitPart("a,b,", ",", 3));
+    try T.expectEqualStrings("abc", splitPart("abc", ",", 1));
+    try T.expectEqualStrings("b", splitPart("a::b::c", "::", 2));
+    try T.expectEqualStrings("a", splitPart("aaa", "aa", 2));
+    try T.expectEqualStrings("日本", splitPart("é,日本,x", ",", 2));
+    try T.expectEqualStrings("", splitPart("", ",", 1));
+    try T.expectEqualStrings("", splitPart("abc", "abc", 2));
+    try T.expectEqualStrings("", splitPart("abc", "abc", -2));
+    try T.expectEqualStrings("a", splitPart("abc", "", 1));
+    try T.expectEqualStrings("c", splitPart("abc", "", -1));
+    try T.expectEqualStrings("日", splitPart("éa日", "", 3));
+    try T.expectEqualStrings("", splitPart("abc", "", 4));
+    try T.expectEqualStrings("a", splitPart("abc", "", -3));
+    try T.expectEqualStrings("", splitPart("abc", "", -4));
+    try T.expectEqualStrings("", splitPart("", "", 1));
 }
 
 fn expectString(want: []const u8, func: ast.Func, text: []const u8, extra: []const ast.Expr) !void {

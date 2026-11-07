@@ -6,6 +6,9 @@
   expression, and `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `isodow` and
   `dayofyear` of a date or timestamp, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB (a DECIMAL keeps
   DECIMAL(p, 0) after `floor`, an integer floors to a DOUBLE, `least` skips NULLs, `sqrt` of a negative is NaN).
+- **`split_part` and `regexp_extract` in SQL.** `split_part(s, sep, n)` and `regexp_extract(s, pattern [, group [,
+  options]])` run over a text column or expression, in a SELECT, an aggregate or a GROUP BY key, and match DuckDB, each
+  distinct text once. The separator, pattern, group and options are constants; the group-name list form is refused.
 - **`%`, `//` and integer arithmetic typed as DuckDB types it.** `a % b` and `a // b` (DuckDB's integer division) run
   over integers, DOUBLEs and DECIMALs in a SELECT, an aggregate argument or a GROUP BY key and match DuckDB. Integer `+`,
   `-`, `*`, `%` and `//` now take the SQL type DuckDB resolves for the pair and raise its overflow error where the

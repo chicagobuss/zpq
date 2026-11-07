@@ -344,6 +344,12 @@ pub const Func = enum {
     /// `lpad(s, n, pad)` / `rpad(s, n, pad)`: `s` cut or padded with `pad` to `n` characters.
     lpad,
     rpad,
+    /// `split_part(s, sep, n)`: the `n`th field of `s` split by the constant `sep` (1-based; a negative `n` counts from the
+    /// end; an empty `sep` splits into characters); empty where there is none.
+    split_part,
+    /// `regexp_extract(s, pattern [, group [, options]])`: the text of one group of the first match, empty where there is
+    /// none. The pattern, group and options are constants.
+    regexp_extract,
     /// `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))`, one arm per target (a
     /// DECIMAL's precision and scale are the two literal arguments after the value). The integer ones round a DECIMAL
     /// half away from zero and a DOUBLE half to even; one that does not fit is a `ConversionOutOfRange`.
@@ -424,6 +430,8 @@ pub const Call = struct {
     part: ?DatePart = null,
     /// `regexp_replace`'s pattern and replacement, compiled from its literal arguments; shared read-only by workers.
     replace: ?*const regex.Replace = null,
+    /// `regexp_extract`'s pattern, group and options, compiled likewise.
+    extract: ?*const regex.Extract = null,
     /// The SQL integer type `abs` overflows at, or a cast's target: the type of the argument the i64 lane has lost.
     int: ?IntType = null,
 };
@@ -630,7 +638,7 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
+                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
                 .coalesce, .least, .greatest => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;

@@ -1094,6 +1094,45 @@ const Compiler = struct {
 
 /// `regexp_replace(text, pattern, replacement[, options])`: the first match (each, with `g`) replaced by the
 /// replacement, where `\0`-`\9` insert a group and `\\` a backslash; a text without a match is returned as it is.
+/// DuckDB's option letters (regexp_util.cpp), the last of a pair winning. `m`, `n` and `p` are about `.` and `\n`, not
+/// RE2's multi-line `(?m)`; `k` belongs to regexp_extract's name lists, which zpq does not have.
+fn parseOptions(options: []const u8) Error!struct { flags: Regex.Flags, global: bool } {
+    var flags: Regex.Flags = .{};
+    var global = false;
+    for (options) |o| switch (o) {
+        'g' => global = true,
+        'i' => flags.case_insensitive = true,
+        'c' => flags.case_insensitive = false,
+        's' => flags.dot_nl = true,
+        'm', 'n', 'p' => flags.dot_nl = false,
+        'l' => flags.literal = true,
+        ' ', '\t', '\n' => {},
+        else => return error.InvalidRegex,
+    };
+    return .{ .flags = flags, .global = global };
+}
+
+/// `regexp_extract(s, pattern [, group [, options]])`: the text of `group` in the first match, empty where there is no
+/// match, the group took no part, or the pattern has fewer groups (group 0 is the whole match).
+pub const Extract = struct {
+    re: Regex,
+    group: u32,
+
+    pub fn compile(arena: std.mem.Allocator, pattern: []const u8, group: u32, options: []const u8) Error!Extract {
+        return .{ .re = try Regex.compile(arena, pattern, (try parseOptions(options)).flags), .group = group };
+    }
+
+    /// The extracted text, a slice of `text` (or empty).
+    pub fn apply(e: *const Extract, s: *Scratch, text: []const u8) Error![]const u8 {
+        try s.match.resize(s.gpa, 2 * e.re.groups);
+        const caps = s.match.items;
+        if (!try e.re.find(s, text, 0, caps)) return "";
+        if (e.group >= e.re.groups) return "";
+        const start = caps[2 * e.group] orelse return "";
+        return text[start..caps[2 * e.group + 1].?];
+    }
+};
+
 pub const Replace = struct {
     re: Regex,
     pieces: []const Piece,
@@ -1107,20 +1146,9 @@ pub const Replace = struct {
         replacement: []const u8,
         options: []const u8,
     ) Error!Replace {
-        var flags: Regex.Flags = .{};
-        var global = false;
-        // DuckDB's option letters (regexp_util.cpp), the last of a pair winning. `m`, `n` and `p` are about `.` and
-        // `\n`, not RE2's multi-line `(?m)`; `k` belongs to regexp_extract.
-        for (options) |o| switch (o) {
-            'g' => global = true,
-            'i' => flags.case_insensitive = true,
-            'c' => flags.case_insensitive = false,
-            's' => flags.dot_nl = true,
-            'm', 'n', 'p' => flags.dot_nl = false,
-            'l' => flags.literal = true,
-            ' ', '\t', '\n' => {},
-            else => return error.InvalidRegex,
-        };
+        const parsed = try parseOptions(options);
+        const flags = parsed.flags;
+        const global = parsed.global;
         const re = try Regex.compile(arena, pattern, flags);
         var pieces: std.ArrayList(Piece) = .empty;
         var start: usize = 0;

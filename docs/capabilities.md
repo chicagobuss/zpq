@@ -72,7 +72,11 @@ integer part and the larger scale, or a DOUBLE where that passes 38 digits. `%` 
 WHERE predicate, are refused by name. The string functions count and cut text in characters (UTF-8 code points, as DuckDB does: a combining mark is a
 character); `upper` and `lower` map one code point to one with DuckDB's own table, so `ß` upper-cases to `ẞ` and
 there is no final-sigma form. Their other arguments are constants (a column there is refused; an empty `lpad`/`rpad`
-pad is an error only where padding is needed, as in DuckDB). `trim`, `ltrim` and `rtrim` strip Unicode's space
+pad is an error only where padding is needed, as in DuckDB). `split_part(s, sep, n)` takes the `n`th field (1-based, a
+negative `n` from the end, an empty `sep` splitting into characters, `''` where there is none) and
+`regexp_extract(s, pattern [, group [, options]])` one group of the first match (`''` where there is none, group 0 the
+whole match, groups 0 to 9, DuckDB's option letters; the form with a list of group names is refused), the pattern, group
+and separator being constants. `trim`, `ltrim` and `rtrim` strip Unicode's space
 separators (U+0020, U+00A0, U+1680, U+2000 to U+200A, U+202F, U+205F, U+3000), not tabs or line breaks, as DuckDB's do.
 A computed date or time (`make_date`, the casts, `date_trunc`, `epoch_ms`, `coalesce` of timestamps) is the DATE or
 TIMESTAMP a column of it would be, in its unit and time zone, wherever it leaves: a Parquet type, CSV text, a group key,

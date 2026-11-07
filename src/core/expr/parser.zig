@@ -761,6 +761,8 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "replace")) return .replace;
     if (asciiEqIgnoreCase(name, "lpad")) return .lpad;
     if (asciiEqIgnoreCase(name, "rpad")) return .rpad;
+    if (asciiEqIgnoreCase(name, "split_part")) return .split_part;
+    if (asciiEqIgnoreCase(name, "regexp_extract")) return .regexp_extract;
     if (asciiEqIgnoreCase(name, "floor")) return .floor;
     if (asciiEqIgnoreCase(name, "ceil") or asciiEqIgnoreCase(name, "ceiling")) return .ceil;
     if (asciiEqIgnoreCase(name, "sqrt")) return .sqrt;
@@ -878,6 +880,24 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
         .lpad, .rpad => {
             if (args.len != 3) return error.WrongArity;
             if (args[0].typeOf() != .str or !isIntLiteral(args[1].*) or !isStrLiteral(args[2].*)) return error.TypeMismatch;
+            return .str;
+        },
+        .split_part => {
+            if (args.len != 3) return error.WrongArity;
+            if (args[0].typeOf() != .str or !isStrLiteral(args[1].*) or !isIntLiteral(args[2].*)) return error.TypeMismatch;
+            return .str;
+        },
+        // The group is a number 0 to 9 (DuckDB's bound), the options a text; the form with a list of group names, and a
+        // pattern or group that is not a constant, are not here.
+        .regexp_extract => {
+            if (args.len < 2 or args.len > 4) return error.WrongArity;
+            if (args[0].typeOf() != .str or !isStrLiteral(args[1].*)) return error.TypeMismatch;
+            if (args.len >= 3) {
+                if (!isIntLiteral(args[2].*)) return error.TypeMismatch;
+                const g = args[2].literal.i64;
+                if (g < 0 or g > 9) return error.TypeMismatch;
+            }
+            if (args.len == 4 and !isStrLiteral(args[3].*)) return error.TypeMismatch;
             return .str;
         },
         .floor, .ceil => {
@@ -1443,6 +1463,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 } else args[0].temporal(),
                 .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,
                 .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
+                .split_part, .regexp_extract => null,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => null,
                 .floor, .ceil, .sqrt, .round, .least, .greatest => null,
             },
@@ -1469,6 +1490,12 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 const r = try arena.create(regex.Replace);
                 const a = args;
                 r.* = try .compile(arena, a[1].literal.str, a[2].literal.str, if (a.len > 3) a[3].literal.str else "");
+                break :blk r;
+            } else null,
+            .extract = if (func == .regexp_extract) blk: {
+                const r = try arena.create(regex.Extract);
+                const group: u32 = if (args.len >= 3) @intCast(args[2].literal.i64) else 0;
+                r.* = try .compile(arena, args[1].literal.str, group, if (args.len == 4) args[3].literal.str else "");
                 break :blk r;
             } else null,
         },

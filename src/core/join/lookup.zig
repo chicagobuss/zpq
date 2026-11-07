@@ -59,7 +59,9 @@ pub const Payload = struct {
 };
 
 /// Per-slot codes, two bytes each when the dictionary has fewer than 2^16 values.
+/// Each slot's code in a payload's dictionary, at the narrowest width the dictionary allows.
 pub const Codes = union(enum) {
+    u8: []u8,
     u16: []u16,
     u32: []u32,
 
@@ -71,7 +73,7 @@ pub const Codes = union(enum) {
 
     fn set(c: Codes, s: u32, code: u32) void {
         switch (c) {
-            .u16 => |v| v[s] = @intCast(code),
+            inline .u8, .u16 => |v| v[s] = @intCast(code),
             .u32 => |v| v[s] = code,
         }
     }
@@ -638,8 +640,12 @@ fn parallel(n: usize, threads: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx)
     for (errs) |e| if (e) |err| return err;
 }
 
-/// Unify payload `p`'s local dictionaries in row-group order: global codes number values by first appearance.
-fn unify(comptime T: type, a: std.mem.Allocator, parts: []Part, p: usize) !Dict {
+/// Unify payload `p`'s local dictionaries in row-group order: global codes number values by first appearance. The
+/// dictionary goes in `a`, and each part's local-to-global map in that part's arena (`arenas`, freed with the build's
+/// other scratch). The map that dedupes, and the list as it grows, live in
+/// `scratch` and go when this returns: in `a`, an arena held for the query, every table a growing map outgrew would
+/// stay charged (171 MB for a 1.08M-entry dictionary, against its 8.6 MB).
+fn unify(comptime T: type, a: std.mem.Allocator, scratch: std.mem.Allocator, arenas: []std.heap.ArenaAllocator, parts: []Part, p: usize) !Dict {
     const Ctx2 = if (T == []const u8) std.hash_map.StringContext else struct {
         pub fn hash(_: @This(), v: T) u64 {
             return std.hash.Wyhash.hash(0, std.mem.asBytes(&v));
@@ -649,9 +655,10 @@ fn unify(comptime T: type, a: std.mem.Allocator, parts: []Part, p: usize) !Dict 
         }
     };
     var map: std.HashMapUnmanaged(T, u32, Ctx2, 80) = .empty;
-    defer map.deinit(a);
+    defer map.deinit(scratch);
     var dict: std.ArrayList(T) = .empty;
-    for (parts) |*part| {
+    defer dict.deinit(scratch);
+    for (parts, arenas) |*part, *arena| {
         const l = &part.local[p];
         const local = @field(l.dict, switch (T) {
             i32 => "i32",
@@ -659,23 +666,24 @@ fn unify(comptime T: type, a: std.mem.Allocator, parts: []Part, p: usize) !Dict 
             f64 => "f64",
             else => "string",
         });
-        l.global = try a.alloc(u32, local.len);
+        l.global = try arena.allocator().alloc(u32, local.len);
         for (local, l.global) |v, *g| {
-            const gop = try map.getOrPut(a, v);
+            const gop = try map.getOrPut(scratch, v);
             if (!gop.found_existing) {
                 const owned = if (T == []const u8) try a.dupe(u8, v) else v;
                 gop.key_ptr.* = owned;
                 gop.value_ptr.* = @intCast(dict.items.len);
-                try dict.append(a, owned);
+                try dict.append(scratch, owned);
             }
             g.* = gop.value_ptr.*;
         }
     }
+    const out = try a.dupe(T, dict.items);
     return switch (T) {
-        i32 => .{ .i32 = dict.items },
-        i64 => .{ .i64 = dict.items },
-        f64 => .{ .f64 = dict.items },
-        else => .{ .string = dict.items },
+        i32 => .{ .i32 = out },
+        i64 => .{ .i64 = out },
+        f64 => .{ .f64 = out },
+        else => .{ .string = out },
     };
 }
 
@@ -802,12 +810,17 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
             .BYTE_ARRAY => .{ .string = &.{} },
             else => .{ .i64 = &.{} },
         } else switch (parts[0].local[p].dict) {
-            .i32 => try unify(i32, a, parts, p),
-            .i64 => try unify(i64, a, parts, p),
-            .f64 => try unify(f64, a, parts, p),
-            .string => try unify([]const u8, a, parts, p),
+            .i32 => try unify(i32, a, gpa, arenas, parts, p),
+            .i64 => try unify(i64, a, gpa, arenas, parts, p),
+            .f64 => try unify(f64, a, gpa, arenas, parts, p),
+            .string => try unify([]const u8, a, gpa, arenas, parts, p),
         };
-        cs.* = if (dict.len() <= std.math.maxInt(u16)) .{ .u16 = try a.alloc(u16, n) } else .{ .u32 = try a.alloc(u32, n) };
+        cs.* = if (dict.len() <= 1 << 8)
+            .{ .u8 = try a.alloc(u8, n) }
+        else if (dict.len() <= 1 << 16)
+            .{ .u16 = try a.alloc(u16, n) }
+        else
+            .{ .u32 = try a.alloc(u32, n) };
         out.* = .{ .name = element.name, .element = element, .codes = cs.*, .dict = dict };
     }
     j.payloads = payloads;

@@ -101,6 +101,80 @@ pub const Explained = struct {
 /// joins, the inner tables of a chain (`--explain` shows them).
 pub const Leaf = struct { fk: []const u8, join: *lookup.Join, semis: []const Leaf = &.{} };
 
+/// The builds' memory: an arena for their many small pieces, and an exact allocation of its own for each large array (a
+/// key map, a payload's codes). In an arena alone each new block is half again the previous one plus the request, so a
+/// few large arrays snowball: SF30 orders' 80 MB of map and codes held 152 MB. Used from one thread; all of it goes at
+/// `deinit`.
+const Store = struct {
+    arena: std.heap.ArenaAllocator,
+    child: std.mem.Allocator,
+    large: std.ArrayList(Large) = .empty,
+
+    const Large = struct { ptr: [*]u8, len: usize, alignment: std.mem.Alignment };
+    /// A request of at least this many bytes takes an allocation of its own.
+    const large_bytes = 1 << 20;
+
+    fn init(child: std.mem.Allocator) Store {
+        return .{ .arena = .init(child), .child = child };
+    }
+
+    fn deinit(s: *Store) void {
+        for (s.large.items) |l| s.child.rawFree(l.ptr[0..l.len], l.alignment, @returnAddress());
+        s.large.deinit(s.child);
+        s.arena.deinit();
+    }
+
+    /// What the store holds: the arena's blocks and the large arrays.
+    fn capacity(s: *const Store) usize {
+        var n = s.arena.queryCapacity();
+        for (s.large.items) |l| n += l.len;
+        return n;
+    }
+
+    fn allocator(s: *Store) std.mem.Allocator {
+        return .{ .ptr = s, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn find(s: *const Store, ptr: [*]u8) ?usize {
+        for (s.large.items, 0..) |l, i| if (l.ptr == ptr) return i;
+        return null;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const s: *Store = @ptrCast(@alignCast(ctx));
+        if (len < large_bytes) return s.arena.allocator().rawAlloc(len, alignment, ret);
+        s.large.ensureUnusedCapacity(s.child, 1) catch return null;
+        const ptr = s.child.rawAlloc(len, alignment, ret) orelse return null;
+        s.large.appendAssumeCapacity(.{ .ptr = ptr, .len = len, .alignment = alignment });
+        return ptr;
+    }
+
+    // A piece stays where it was allocated, whatever it grows to.
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
+        const s: *Store = @ptrCast(@alignCast(ctx));
+        const i = s.find(memory.ptr) orelse return s.arena.allocator().rawResize(memory, alignment, new_len, ret);
+        if (!s.child.rawResize(memory, alignment, new_len, ret)) return false;
+        s.large.items[i].len = new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+        const s: *Store = @ptrCast(@alignCast(ctx));
+        const i = s.find(memory.ptr) orelse return s.arena.allocator().rawRemap(memory, alignment, new_len, ret);
+        const ptr = s.child.rawRemap(memory, alignment, new_len, ret) orelse return null;
+        s.large.items[i].ptr = ptr;
+        s.large.items[i].len = new_len;
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const s: *Store = @ptrCast(@alignCast(ctx));
+        const i = s.find(memory.ptr) orelse return s.arena.allocator().rawFree(memory, alignment, ret);
+        s.child.rawFree(memory, alignment, ret);
+        _ = s.large.swapRemove(i);
+    }
+};
+
 pub const Prepared = struct {
     /// The probe's own join: its build columns bind as virtual leaves, its group-join folds.
     main: Leaf,
@@ -118,7 +192,7 @@ pub const Prepared = struct {
     /// builds' structures and dictionaries in `store`, their decode scratch beside it, the group-join's slots and
     /// partials. A build that does not fit refuses while it builds, not after.
     charge: core_memory.Charged = undefined,
-    store: std.heap.ArenaAllocator = undefined,
+    store: Store = undefined,
     /// The build files' mappings, held for the query: virtual leaves bind by the payloads' names, which the build
     /// footers own.
     maps: std.ArrayList(local_fs.Mapped) = .empty,
@@ -330,7 +404,7 @@ fn build(p: *Prepared, arena: std.mem.Allocator, fk: []const u8, b: syntax.Build
         Diag.setColumn(diag, b.key);
         return err;
     };
-    const before = p.store.queryCapacity();
+    const before = p.store.capacity();
     const j = lookup.build(p.store.allocator(), p.charge.allocator(), file.map.bytes, meta, .{
         .kind = kind,
         .build_name = b.path,
@@ -350,7 +424,7 @@ fn build(p: *Prepared, arena: std.mem.Allocator, fk: []const u8, b: syntax.Build
         Diag.setInput(diag, b.path, err);
         return err;
     };
-    j.bytes = p.store.queryCapacity() - before;
+    j.bytes = p.store.capacity() - before;
     p.charged += j.bytes;
     return .{ .fk = fk, .join = j, .semis = semis };
 }
@@ -389,4 +463,25 @@ pub fn prepare(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: types.Que
     p.semis = semis;
     p.dims = dims;
     return p;
+}
+
+test "a build store gives each large array its own allocation and frees it all" {
+    var s: Store = .init(std.testing.allocator);
+    defer s.deinit();
+    const a = s.allocator();
+    const small = try a.alloc(u8, 100);
+    _ = small;
+    const big = try a.alloc(u64, Store.large_bytes / 8);
+    try std.testing.expectEqual(@as(usize, 1), s.large.items.len);
+    const bigger = try a.alloc(u32, Store.large_bytes);
+    // Exact: the arena's block plus the two arrays, not a block half again their size.
+    try std.testing.expectEqual(s.arena.queryCapacity() + Store.large_bytes + 4 * Store.large_bytes, s.capacity());
+    a.free(big);
+    try std.testing.expectEqual(@as(usize, 1), s.large.items.len);
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(bigger.ptr)), @as(*anyopaque, @ptrCast(s.large.items[0].ptr)));
+    // A list that outgrows the threshold keeps working through resize, remap and free.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(a);
+    for (0..3 * Store.large_bytes) |i| try list.append(a, @truncate(i));
+    try std.testing.expectEqual(@as(u8, @truncate(3 * Store.large_bytes - 1)), list.items[list.items.len - 1]);
 }

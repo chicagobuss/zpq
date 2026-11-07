@@ -725,3 +725,45 @@ test "csv write: strings parsed into dictionary codes write the bytes values wri
         try testing.expect(cm.dictionary_page_offset != null);
     }
 }
+
+test "csv write: per-chunk state is charged in full, and a budget too small for a write is refused by name (review P2-6)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    const in = try tmpPath(&b1, &tmp, "many.csv");
+    const out = try tmpPath(&b2, &tmp, "many.parquet");
+    // 64 columns over 1-KiB chunks: thousands of chunks, each with state per column, which the ledger must hold.
+    var text: std.ArrayList(u8) = .empty;
+    for (0..64) |c| try text.print(a, "{s}c{d}", .{ if (c == 0) "" else ",", c });
+    try text.append(a, '\n');
+    for (0..8_000) |r| {
+        for (0..64) |c| try text.print(a, "{s}{d}", .{ if (c == 0) "" else ",", r + c });
+        try text.append(a, '\n');
+    }
+    try writeFile(in, text.items);
+    // What the ledger is charged for covers every byte the source's per-chunk state takes.
+    var failure: csv_write.Failure = .{};
+    const p = try csv_write.plan(a, text.items, .{}, &failure);
+    var counting = std.testing.FailingAllocator.init(a, .{});
+    const source = try csv_write.Source.init(counting.allocator(), &p, 1 << 10);
+    try testing.expect(source.count > 2_000);
+    try testing.expect(counting.allocated_bytes <= source.metaBytes());
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    var report: csv_write.Report = .{};
+    const opts: csv_write.Options = .{ .chunk_bytes = 1 << 10 };
+    // A budget too small for the write is a refusal by name, and leaves nothing.
+    try testing.expectError(
+        error.ExceededMemoryBudget,
+        csv_write.run(ctx, .{ .inputs = &.{in}, .parallelism = 1, .max_memory = 4 << 20 }, in, out, opts, &report, a),
+    );
+    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(testing.io, out, .{}));
+    // The same file at a budget that holds it writes every row.
+    report = .{};
+    const roomy: engine_types.QueryArgs = .{ .inputs = &.{in}, .parallelism = 1, .max_memory = 256 << 20 };
+    const r = try csv_write.run(ctx, roomy, in, out, opts, &report, a);
+    try testing.expectEqual(@as(i64, 8_000), r.rows_matched);
+}

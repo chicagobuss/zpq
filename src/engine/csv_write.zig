@@ -391,6 +391,15 @@ pub const Source = struct {
         return s;
     }
 
+    /// What `init` allocated per chunk and column, for the write's ledger.
+    pub fn metaBytes(s: *const Source) usize {
+        const per_chunk = @sizeOf(csv_scan.ChunkStats) + @sizeOf(std.Io.Event) + @sizeOf(Failure) + @sizeOf(bool) +
+            @sizeOf(?anyerror) + s.elems.len * @sizeOf(u128);
+        // Per column: its schema element, and its one-name path.
+        const per_column = @sizeOf(schema.SchemaElement) + @sizeOf([]const []const u8) + @sizeOf([]const u8);
+        return s.count *| per_chunk +| s.elems.len * per_column;
+    }
+
     fn bound(s: *const Source, i: usize) usize {
         return @min(s.plan.bytes.len, s.plan.data_start + i * s.chunk);
     }
@@ -487,7 +496,9 @@ pub const Source = struct {
         // Strings stay slices of the mapping, which outlives the write; the reader's chunk pages do not.
         const own_strings = bytes.ptr != p.bytes.ptr;
         var scanner = csv_scan.Scanner.init(bytes, span.lo, bytes.len == p.bytes.len, p.dialect);
-        const scratch_alloc = std.heap.smp_allocator;
+        // Unescaping copies a field into scratch as long as its longest escaped field: on the piece's arena, so the
+        // ledger holds it (a classifying pass has no piece, and writes nothing).
+        const scratch_alloc = a;
         var scratch: std.ArrayList(u8) = .empty;
         defer scratch.deinit(scratch_alloc);
         var col: usize = 0;
@@ -871,7 +882,11 @@ pub fn run(
     // A path, or the caller's own unpublished file, starts again from empty; a pipe may have passed bytes on.
     const restartable = args.output_fd == null or args.output_restartable;
     while (true) {
-        var source = try Source.init(arena, &p, chunk);
+        // Each pass's per-chunk state is its own: a narrowed or widened pass frees the last one's.
+        var pass_state = std.heap.ArenaAllocator.init(ctx.gpa);
+        defer pass_state.deinit();
+        const pass = pass_state.allocator();
+        var source = try Source.init(pass, &p, chunk);
         report.chunks = source.count;
         source.opts = opts;
         var narrowed = args;
@@ -890,7 +905,7 @@ pub fn run(
             if (e != error.CsvTypeChanged or opts.strict or !restartable) return e;
             if (args.output_fd) |fd| try local_fs.truncateToStart(fd);
             // Widen to what every value holds, then start again.
-            const seen = try classifyFile(ctx, arena, &p, chunk, workers, failure);
+            const seen = try classifyFile(ctx, pass, &p, chunk, workers, failure);
             for (p.types, seen, p.pinned, widened) |*t, s, pinned, *wd| if (!pinned) {
                 const j = t.join(s);
                 wd.* = wd.* or !std.meta.eql(j, t.*);
@@ -1060,6 +1075,11 @@ fn writeOnce(
 
     var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     defer if (args.profiler) |pr| pr.noteLedger(ledger.peak.load(.monotonic), args.max_memory);
+    // Per-chunk state, the source's and the window's slots, grows with the file, not the budget (a wide file of
+    // many chunks holds megabytes of it): it is the write's too, charged before anything else draws.
+    const per_chunk = source.metaBytes() +| source.count *| @sizeOf(window_mod.Slot);
+    _ = ledger.drawExact(per_chunk) orelse return error.ExceededMemoryBudget;
+    defer ledger.release(per_chunk);
     // Torn down (its threads joined, its buffer unmapped) once every piece reading it has been written.
     const reader = try startReader(ctx, arena, args, source, mapped, &ledger, report);
     defer if (reader) |rd| rd.destroy();

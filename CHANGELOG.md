@@ -91,6 +91,14 @@
   and `1e3` as integers rounded half away from zero, `inf`/`nan`), checked against DuckDB on 64,000 generated strings;
   a text that is no number is a `ConversionInvalid` error for `CAST`. A text to DECIMAL, DATE or TIMESTAMP is still
   refused by name.
+- **`CAST(x AS VARCHAR)` of a number, BOOLEAN, DECIMAL, DATE or TIMESTAMP in SQL** (also `TEXT`, `STRING`, `VARCHAR(n)`,
+  `x::VARCHAR` and `TRY_CAST`), in a SELECT, an aggregate argument (`min`, `max`, `count(DISTINCT ...)`) or a GROUP BY key,
+  prints the value as DuckDB 2.0 does: a DOUBLE by its shortest digits (`1e+16`, `5e-324`, `nan`, `-0.0`), a DECIMAL at its
+  scale, a year before 1 as `(BC)`, a fraction cut of trailing zeros, `+00` after a UTC-adjusted time. A FLOAT column prints
+  as DuckDB's own formatter does, which settles on non-shortest digits for ties such as `-521345.625`; zpq ports that
+  formatter step for step. Checked against DuckDB on 600,000 generated DOUBLEs and FLOATs and 90,000 values of every other
+  type. A cast of an expression computed from a FLOAT (DuckDB computes it in single precision) and of an INT96 timestamp
+  is refused by name. It was `type mismatch in expression` for every non-text argument.
 - **Numeric casts in SQL.** `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))` and `x::TYPE`
   over a number, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB, including its rounding (a DECIMAL
   half away from zero, a DOUBLE to an integer half to even) and its conversion error for a value that does not fit.

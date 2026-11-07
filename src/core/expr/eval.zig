@@ -30,6 +30,7 @@ const decimal_mod = @import("../parquet/decimal.zig");
 const selection = @import("../filter/selection.zig");
 const calendar = @import("calendar.zig");
 const text_cast = @import("text_cast.zig");
+const text_format = @import("text_format.zig");
 const regex = @import("regex.zig");
 const case_map = @import("case_map.zig");
 
@@ -2376,8 +2377,57 @@ fn evalCastDecimal(arena: std.mem.Allocator, batch: *const Batch, column_lookup:
     }
 }
 
-/// `CAST(s AS VARCHAR)`: the argument's texts as they are, a bare column read as decoded, codes and all.
+/// `CAST(x AS VARCHAR)` of a number, BOOLEAN, DECIMAL, DATE or TIMESTAMP: each row's text as DuckDB prints it
+/// (`text_format.zig`), NULL where the argument is, a row the query does not consume left empty.
+fn evalFormat(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, arg: ast.Expr) Error!Batch.Column {
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    const n: usize = switch (col) {
+        inline .i64, .f64, .i128 => |v| blk: {
+            if (v.max_rep > 0) return error.NestedNotSupported;
+            break :blk v.values.len;
+        },
+        else => return error.TypeMismatch,
+    };
+    var bytes: std.ArrayList(u8) = .empty;
+    const ends = try arena.alloc(usize, n);
+    const temporal = arg.temporal();
+    const utc = arg.isUtc();
+    const is_bool = arg.isBoolean();
+    const is_float = arg == .col_ref and arg.col_ref.physical_type == .FLOAT;
+    const scale: u8 = if (arg.typeOf() == .dec) arg.decSpec().?.scale else 0;
+    for (0..n) |i| {
+        if (!quietRow(batch, col, i)) switch (col) {
+            .i64 => |v| if (is_bool)
+                try text_format.writeBool(&bytes, arena, v.values[i] != 0)
+            else if (temporal) |unit|
+                if (unit == .date) try text_format.writeDate(&bytes, arena, v.values[i]) else try text_format.writeTimestamp(&bytes, arena, unit, utc, v.values[i])
+            else
+                try text_format.writeInt(&bytes, arena, v.values[i]),
+            .f64 => |v| if (is_float)
+                try text_format.writeFloat(&bytes, arena, f32, @floatCast(v.values[i]))
+            else
+                try text_format.writeFloat(&bytes, arena, f64, v.values[i]),
+            .i128 => |v| try text_format.writeDecimal(&bytes, arena, v.values[i], scale),
+            else => unreachable,
+        };
+        ends[i] = bytes.items.len;
+    }
+    const views = try arena.alloc([]const u8, n);
+    var start: usize = 0;
+    for (views, ends) |*view, end| {
+        view.* = bytes.items[start..end];
+        start = end;
+    }
+    return switch (col) {
+        inline .i64, .f64, .i128 => |v| .{ .string = .{ .values = views, .def_levels = v.def_levels, .max_def = v.max_def, .has_nulls = v.has_nulls } },
+        else => unreachable,
+    };
+}
+
+/// `CAST(s AS VARCHAR)`: the argument's texts as they are, a bare column read as decoded, codes and all; any other
+/// argument is printed (`evalFormat`).
 fn evalCastText(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, arg: ast.Expr) Error!Batch.Column {
+    if (arg.typeOf() != .str) return evalFormat(arena, batch, column_lookup, arg);
     const col = if (arg == .col_ref)
         batch.cols[column_lookup[arg.col_ref.col_idx] orelse return error.BadColumn]
     else

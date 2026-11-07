@@ -1012,10 +1012,14 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             if (p < 1 or p > ast.Dec.max_precision or sc < 0 or sc > p) return error.TypeMismatch;
             return .dec;
         },
-        // Only text casts to text: zpq has no number, date or bytes-escaping spelling to match DuckDB's.
+        // Text as it is; a number, BOOLEAN, DECIMAL, DATE or TIMESTAMP as DuckDB prints it. An INT96 timestamp has no
+        // DuckDB type to print by.
         .cast_text => {
             if (args.len != 1) return error.WrongArity;
-            if (args[0].typeOf() != .str) return error.TypeMismatch;
+            if (args[0].* == .col_ref and args[0].col_ref.physical_type == .INT96) return error.TypeMismatch;
+            // DuckDB computes with a FLOAT in single precision and prints it by its own digits; zpq computes a DOUBLE, so
+            // only the bare column is printed that way.
+            if (args[0].* != .col_ref and args[0].involvesFloat()) return error.TypeMismatch;
             return .str;
         },
     }

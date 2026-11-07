@@ -58,6 +58,13 @@ a TIMESTAMP in it, as DuckDB's does), a text read as TINYINT, SMALLINT, INTEGER,
 `TRY_CAST` exactly as DuckDB reads it (surrounding whitespace, one `+`, `0x` and `0b` integers, a `_` between digits, a
 decimal point and an exponent in an integer, rounded half away from zero; `inf`, `infinity` and `nan` in any case; text
 that is no such number is `ConversionInvalid`, NULL for `TRY_CAST`; a text to DECIMAL, DATE or TIMESTAMP is refused by name),
+`CAST(x AS VARCHAR)` (also `TEXT`, `STRING`, `VARCHAR(n)` and `x::VARCHAR`) of an integer, BOOLEAN, DECIMAL (at its scale),
+DOUBLE, FLOAT column, DATE or TIMESTAMP as DuckDB 2.0 prints it (a DOUBLE by its shortest round-trip digits, fixed from
+`0.0001` to `1000000000000000.0` and `1e+16` beyond, `nan`, `inf`, `-0.0`; a FLOAT the way DuckDB's formatter settles on
+its digits, which is not always the shortest; a year before 1 as `0001-12-31 (BC)`; a TIMESTAMP with its fraction cut of
+trailing zeros in the unit's own 3, 6 or 9 digits, a UTC-adjusted one with `+00`), in a SELECT, an aggregate argument or a
+GROUP BY key; an expression computed from a FLOAT, which DuckDB evaluates in single precision, and an INT96 timestamp are
+refused by name,
 `CAST(t AS DATE)` and
 `CAST(x AS TIMESTAMP)` (also `::` and `DATETIME`) between a DATE and a TIMESTAMP of any unit (a time's day is its floor,
 before 1970 too; a TIMESTAMP_NS reaches microseconds to the nearest, a tie away from zero, in `date_trunc` and

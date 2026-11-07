@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 
 def main():
     out = [pathlib.Path(p) for p in sys.argv[1:]]
-    fact, dim, dup, long_string, ts_f, ts_d, u_f, u_d, dec_f, dec_d, uniq = out
+    fact, dim, dup, long_string, ts_f, ts_d, u_f, u_d, dec_f, dec_d, uniq, rdec_f, rdec_d = out
     pq.write_table(pa.table({
         "id": range(48),
         "fk": pa.array([None if i % 11 == 0 else i % 6 for i in range(48)], type=pa.int64()),
@@ -39,6 +39,14 @@ def main():
                                            type=pa.decimal128(9, 2))}), dec_f)
     pq.write_table(pa.table({"dk": pa.array([decimal.Decimal("1.0"), decimal.Decimal("1.5")], type=pa.decimal128(9, 1))}),
                    dec_d)
+    # Review JR-1: a dictionary DECIMAL that a residual compares and SUM folds.
+    pq.write_table(pa.table({
+        "fk": pa.array([0, 0, 0, 0], type=pa.int64()),
+        "p": pa.array([decimal.Decimal(".01"), decimal.Decimal(".02"), None, decimal.Decimal("3.00")],
+                      type=pa.decimal128(18, 2)),
+    }), rdec_f, use_dictionary=True, store_decimal_as_integer=True)
+    pq.write_table(pa.table({"pk": pa.array([0], type=pa.int64()), "w": pa.array([0], type=pa.int32())}), rdec_d,
+                   use_dictionary=True)
 
 
 if __name__ == "__main__":

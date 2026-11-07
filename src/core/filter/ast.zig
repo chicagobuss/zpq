@@ -120,6 +120,9 @@ pub fn reads(f: Filter, ci: usize) bool {
             if (reads(child, ci)) break true;
         } else false,
         .expr => |e| e.readsColumn(ci),
+        // A lookup carrying a residual reads the residual's columns too (`Residual.reads`): a probe column it compares
+        // is filter input, decoded with its values, not a code stream only a fold reads.
+        .lookup => |l| l.col_idx == ci or if (l.residual) |r| std.mem.indexOfScalar(usize, r.reads, ci) != null else false,
         inline else => |l| l.col_idx == ci,
     };
 }
@@ -510,6 +513,8 @@ pub const Residual = struct {
 pub fn leafColumn(f: Filter) ?usize {
     return switch (f) {
         .and_filter, .or_filter, .expr => null,
+        // With a residual it reads more than its key.
+        .lookup => |l| if (l.residual == null) l.col_idx else null,
         inline else => |leaf| leaf.col_idx,
     };
 }

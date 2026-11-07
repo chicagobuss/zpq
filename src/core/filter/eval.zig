@@ -821,13 +821,45 @@ pub fn evalResidual(r: *const ast.Residual, batch: *const Batch, sel: *selection
     try evaluate(r.filter, &ext, sel, lookup, arena);
 }
 
+/// `batch` with each coded DECIMAL column `x` reads given its exact integers row by row, from the dictionary's
+/// (`dict_unscaled`) through the codes: a column decoded for an exact fold carries them only per entry, and the
+/// sides' arithmetic reads them per row (`expr_eval.exactColumn`). The batch itself when no such column is read.
+fn withRowExact(x: ast.ExprCompare, batch: *const Batch, column_lookup: []const ?usize, arena: std.mem.Allocator) Error!Batch {
+    var cols: ?[]Batch.Column = null;
+    for (column_lookup, 0..) |pos_opt, ci| {
+        const pos = pos_opt orelse continue;
+        if (!x.readsColumn(ci)) continue;
+        switch (batch.cols[pos]) {
+            inline .f64, .i32, .i64 => |c, tag| {
+                if (c.unscaled != null) continue;
+                const du = c.dict_unscaled orelse continue;
+                const codes = c.codes orelse continue;
+                const u = try arena.alloc(i128, codes.len);
+                for (u, codes, 0..) |*o, k, r| {
+                    const is_null = if (c.def_levels) |dl| dl[r] < c.max_def else false;
+                    o.* = if (is_null or c.dict.len == 0) 0 else du.at(k);
+                }
+                if (cols == null) cols = try arena.dupe(Batch.Column, batch.cols);
+                var out = c;
+                out.unscaled = .{ .i128 = u };
+                cols.?[pos] = @unionInit(Batch.Column, @tagName(tag), out);
+            },
+            else => {},
+        }
+    }
+    var out = batch.*;
+    if (cols) |cs| out.cols = cs;
+    return out;
+}
+
 /// `x.left op x.right` over the selected rows (`ast.ExprCompare`), both sides evaluated over those rows only, so a
 /// fault (`1 / 0`) in a row an earlier conjunct dropped is none. A NULL on either side drops the row. The two sides
 /// meet in DuckDB's common type: DOUBLE when either is DOUBLE, FLOAT when the floating sides are all FLOAT, else the
 /// common DECIMAL when either is DECIMAL, else an integer wide enough for UINT64 and BIGINT alike.
 fn evalExprCompare(x: ast.ExprCompare, batch: *const Batch, sel: *selection.SelectionVector, column_lookup: []const ?usize, arena: std.mem.Allocator) Error!void {
     if (try compareColumns(x, batch, sel, column_lookup)) return;
-    const wanted = batch.restrictedTo(sel);
+    const exact = try withRowExact(x, batch, column_lookup, arena);
+    const wanted = exact.restrictedTo(sel);
     const l = try expr_eval.evalGroupKeyExpr(arena, &wanted, column_lookup, x.left.*);
     const r = try expr_eval.evalGroupKeyExpr(arena, &wanted, column_lookup, x.right.*);
     const ls = Side.of(x.left.*);
@@ -1658,4 +1690,37 @@ test "an AND ranked cheapest first selects what its written order selects, and f
         sv = try selection.SelectionVector.init(a, n);
         try testing.expectError(err, evaluate(try ast.join(a, true, written), &batch, &sv, &lookup, a));
     }
+}
+
+test "an expression side reads a coded DECIMAL's exact integers row by row, from its dictionary's" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // One column, decoded for an exact fold: its f64 view, its codes, and the dictionary's exact integers only.
+    const dict = [_]f64{ 0.01, 3.0 };
+    const dict_exact = [_]i64{ 1, 300 };
+    const codes = [_]u32{ 1, 0, 0, 1 };
+    const view = [_]f64{ 3.0, 0.01, 0.0, 3.0 };
+    const def = [_]u32{ 1, 1, 0, 1 };
+    const cols = [_]Batch.Column{.{ .f64 = .{
+        .values = &view,
+        .codes = &codes,
+        .dict = &dict,
+        .dict_unscaled = .{ .i64 = &dict_exact },
+        .def_levels = &def,
+        .max_def = 1,
+        .has_nulls = true,
+    } }};
+    const batch: Batch = .{ .cols = &cols, .num_rows = 4 };
+    const lookup = [_]?usize{0};
+    var p: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .dec, .dec = .{ .precision = 18, .scale = 2 } } };
+    var zero: expr_ast.Expr = .{ .literal = .{ .i64 = 0 } };
+    const x: ast.ExprCompare = .{ .op = .Gt, .left = &p, .right = &zero };
+    const out = try withRowExact(x, &batch, &lookup, a);
+    const u = out.cols[0].f64.unscaled.?.i128;
+    try std.testing.expectEqualSlices(i128, &.{ 300, 1, 0, 300 }, u);
+    // A column with no dictionary integers is left as it is.
+    const plain = [_]Batch.Column{.{ .f64 = .{ .values = &view } }};
+    const kept = try withRowExact(x, &.{ .cols = &plain, .num_rows = 4 }, &lookup, a);
+    try std.testing.expect(kept.cols[0].f64.unscaled == null);
 }

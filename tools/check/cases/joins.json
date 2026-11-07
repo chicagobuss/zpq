@@ -87,7 +87,9 @@
     "review-u-d",
     "review-dec-f",
     "review-dec-d",
-    "review-uniq"
+    "review-uniq",
+    "review-rdec-f",
+    "review-rdec-d"
    ]
   }
  ],
@@ -4062,6 +4064,236 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.amt > d.w"
+   }
+  },
+  {
+   "id": "review:jr1:decimal-residual-and-sum",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(f.p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' f JOIN '{fixture:review-rdec-d}' d ON f.fk = d.pk WHERE f.p > d.w"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 1,
+     "max_memory": "256K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(f.p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' f JOIN '{fixture:review-rdec-d}' d ON f.fk = d.pk WHERE f.p > d.w"
+   }
+  },
+  {
+   "id": "review:jr1:decimal-residual-or-grouped-sum",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, sum(f.p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' f JOIN '{fixture:review-rdec-d}' d ON f.fk = d.pk WHERE f.p > d.w OR f.p < 0 GROUP BY f.fk ORDER BY f.fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 1,
+     "max_memory": "256K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, sum(f.p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' f JOIN '{fixture:review-rdec-d}' d ON f.fk = d.pk WHERE f.p > d.w OR f.p < 0 GROUP BY f.fk ORDER BY f.fk"
+   }
+  },
+  {
+   "id": "review:jr1:single-table-columns",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p > fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 1,
+     "max_memory": "256K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p > fk"
+   }
+  },
+  {
+   "id": "review:jr1:single-table-arithmetic",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p * 1 > 0"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 1,
+     "max_memory": "256K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p * 1 > 0"
+   }
+  },
+  {
+   "id": "review:jr1:single-table-or",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p > fk OR p < 0"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 1,
+     "max_memory": "256K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p > fk OR p < 0"
    }
   }
  ]

@@ -76,6 +76,10 @@
   within a window bounded by `--max-memory` and one device queue. For a column behind a filter, it asks only for the
   pages the filter keeps. Cached files are left alone. On a Ryzen 9 9950X, ClickBench run uncached is 7% faster
   across all 43 queries (Q08 22%, Q21 3–11%), and cached queries are unchanged.
+- **Uncached reads under a small `--max-memory` keep their speed.** The local reader now sizes its read window from
+  what the memory budget has free when it starts, not from the whole budget. A cold scan of lineitem SF10 at
+  `--max-memory 64MB` went from 10.2 to 0.73 s. A query whose other work already holds most of the budget now reads
+  its input when uncached instead of refusing, so it answers the same with the file cached or not.
 - **Grouped `COUNT(DISTINCT)` is faster again.** Grouping on the distinct pairs now uses a partition count sized to
   each worker's share of L2, instead of one sized from the input's row count. A `COUNT(DISTINCT)` beside a count cut
   (`ORDER BY count(*) DESC LIMIT n`) now runs its distinct pass on per-group sets merged in parallel when one group the

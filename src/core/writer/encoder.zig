@@ -226,6 +226,9 @@ pub const Plan = struct {
     /// Per page, the row it ends at (exclusive); the last is the chunk's row count.
     ends: []const usize,
     stats: ?schema.Statistics,
+    /// `stats` are left to the pages: a values chunk's are its pages' merged in `finish` (`mergePageStats`), so its
+    /// values are scanned for bounds once, per page, not again over the whole chunk.
+    stats_from_pages: bool = false,
     /// The compressed dictionary page with its header, and its uncompressed length with that header.
     dict_page: []const u8 = &.{},
     dict_page_uncompressed: usize = 0,
@@ -272,6 +275,7 @@ pub const Plan = struct {
         const def_levels = if (self.def_levels) |d| d[lo..hi] else null;
         const rows: i64 = @intCast(hi - lo);
         var page_stats: ?schema.Statistics = null;
+        var bounds: ?BytesBounds = null;
         const payload: []const u8 = switch (self.kind) {
             .values, .nested => blk: {
                 const fixed = self.in.schema_elem.type == .FIXED_LEN_BYTE_ARRAY;
@@ -289,8 +293,12 @@ pub const Plan = struct {
                     try defLevelPrefix(arena, def_levels, self.max_def, rows)
                 else
                     &.{};
-                if (self.kind == .values)
-                    page_stats = computeStats(arena, sub, def_levels, self.max_def, self.in.schema_elem);
+                if (self.kind == .values) {
+                    if (sub == .string) {
+                        bounds = bytesBounds(sub.string.values, def_levels, self.max_def);
+                        if (bounds) |b| page_stats = bytesStats(arena, b, boundCut(self.in.schema_elem.*));
+                    } else page_stats = computeStats(arena, sub, def_levels, self.max_def, self.in.schema_elem);
+                }
                 break :blk try std.mem.concat(arena, u8, &.{ rep_prefix, def_prefix, values_bytes });
             },
             .dict => |d| blk: {
@@ -332,6 +340,8 @@ pub const Plan = struct {
         const bytes = try std.mem.concat(arena, u8, &.{ header, compressed });
         const st = page_stats orelse schema.Statistics{};
         return .{
+            .stats = page_stats,
+            .bounds = bounds,
             .bytes = bytes,
             .uncompressed = header.len + payload.len,
             .info = .{
@@ -414,7 +424,10 @@ pub const Plan = struct {
                 .data_page_offset = @intCast(self.dict_page.len),
                 .dictionary_page_offset = if (has_dict) 0 else null,
                 .index_page_offset = null,
-                .statistics = try ownStats(arena, self.stats),
+                .statistics = try ownStats(arena, if (self.stats_from_pages)
+                    mergePageStats(arena, self.in, pages)
+                else
+                    self.stats),
                 .encoding_stats = enc_stats,
             },
             .pages = infos,
@@ -489,6 +502,112 @@ fn pageLimit() usize {
 
 var test_page_limit: usize = std.math.maxInt(i32);
 
+/// A values chunk's statistics from its pages' (`Plan.page`): what `computeStats` over the whole chunk gives, field for
+/// field. Bounds merge as values: integers and booleans read back from their PLAIN bytes, floats too (a page's zero
+/// bounds are already the -0.0/+0.0 the chunk's would be, and NaN is in neither), byte arrays from their uncut bounds,
+/// cut once here.
+fn mergePageStats(arena: std.mem.Allocator, in: ColumnInput, pages: []const BuiltPage) ?schema.Statistics {
+    var any = false;
+    var null_count: i64 = 0;
+    var nan_count: i64 = 0;
+    for (pages) |pg| if (pg.stats) |st| {
+        any = true;
+        null_count += st.null_count orelse 0;
+        nan_count += st.nan_count orelse 0;
+    };
+    if (!any) return null;
+    const unsigned = schema.isUnsignedInt(in.schema_elem.*);
+    return switch (in.values) {
+        .string => {
+            var b: BytesBounds = .{ .lo = null, .hi = null, .null_count = null_count };
+            for (pages) |pg| if (pg.bounds) |pb| if (pb.lo) |lo| {
+                if (b.lo == null or std.mem.lessThan(u8, lo, b.lo.?)) b.lo = lo;
+                if (b.hi == null or std.mem.lessThan(u8, b.hi.?, pb.hi.?)) b.hi = pb.hi;
+            };
+            return bytesStats(arena, b, boundCut(in.schema_elem.*));
+        },
+        .i32 => if (unsigned)
+            mergeTyped(arena, u32, pages, null_count, true)
+        else
+            mergeTyped(arena, i32, pages, null_count, false),
+        .i64 => if (unsigned)
+            mergeTyped(arena, u64, pages, null_count, true)
+        else
+            mergeTyped(arena, i64, pages, null_count, false),
+        .f32 => mergeFloat(arena, f32, pages, null_count, nan_count),
+        .f64 => mergeFloat(arena, f64, pages, null_count, nan_count),
+        .boolean => mergeTyped(arena, u8, pages, null_count, false),
+        .i128 => unreachable,
+    };
+}
+
+/// Integer (and boolean, as its 0/1 byte) bounds merged as `statsTyped` (`statsBool`) writes them; an unsigned
+/// column's deprecated pair stays unset.
+fn mergeTyped(
+    arena: std.mem.Allocator,
+    comptime T: type,
+    pages: []const BuiltPage,
+    null_count: i64,
+    unsigned: bool,
+) ?schema.Statistics {
+    var lo: ?T = null;
+    var hi: ?T = null;
+    for (pages) |pg| if (pg.stats) |st| if (st.min_value) |mn| {
+        const a = std.mem.readInt(T, mn[0..@sizeOf(T)], .little);
+        const z = std.mem.readInt(T, st.max_value.?[0..@sizeOf(T)], .little);
+        lo = if (lo) |l| @min(l, a) else a;
+        hi = if (hi) |h| @max(h, z) else z;
+    };
+    if (lo == null) return .{ .null_count = null_count };
+    const min_buf = arena.alloc(u8, @sizeOf(T)) catch return null;
+    const max_buf = arena.alloc(u8, @sizeOf(T)) catch return null;
+    std.mem.writeInt(T, min_buf[0..@sizeOf(T)], lo.?, .little);
+    std.mem.writeInt(T, max_buf[0..@sizeOf(T)], hi.?, .little);
+    return .{
+        .min = if (unsigned) null else min_buf,
+        .max = if (unsigned) null else max_buf,
+        .min_value = min_buf,
+        .max_value = max_buf,
+        .is_min_value_exact = true,
+        .is_max_value_exact = true,
+        .null_count = null_count,
+    };
+}
+
+/// Float bounds merged as `statsTypedFloat` writes them.
+fn mergeFloat(
+    arena: std.mem.Allocator,
+    comptime T: type,
+    pages: []const BuiltPage,
+    null_count: i64,
+    nan_count: i64,
+) ?schema.Statistics {
+    const Bits = @Int(.unsigned, @bitSizeOf(T));
+    var lo: ?T = null;
+    var hi: ?T = null;
+    for (pages) |pg| if (pg.stats) |st| if (st.min_value) |mn| {
+        const a: T = @bitCast(std.mem.readInt(Bits, mn[0..@sizeOf(T)], .little));
+        const z: T = @bitCast(std.mem.readInt(Bits, st.max_value.?[0..@sizeOf(T)], .little));
+        if (lo == null or a < lo.?) lo = a;
+        if (hi == null or z > hi.?) hi = z;
+    };
+    if (lo == null) return .{ .null_count = null_count, .nan_count = nan_count };
+    const min_buf = arena.alloc(u8, @sizeOf(T)) catch return null;
+    const max_buf = arena.alloc(u8, @sizeOf(T)) catch return null;
+    std.mem.writeInt(Bits, min_buf[0..@sizeOf(T)], @bitCast(if (lo.? == 0) @as(T, -0.0) else lo.?), .little);
+    std.mem.writeInt(Bits, max_buf[0..@sizeOf(T)], @bitCast(if (hi.? == 0) @as(T, 0.0) else hi.?), .little);
+    return .{
+        .min = min_buf,
+        .max = max_buf,
+        .min_value = min_buf,
+        .max_value = max_buf,
+        .is_min_value_exact = true,
+        .is_max_value_exact = true,
+        .null_count = null_count,
+        .nan_count = nan_count,
+    };
+}
+
 /// `stats` with its bounds copied onto `arena`: a finished chunk holds nothing of the memory its plan and pages were
 /// built on, which may be reused as soon as it is finished.
 fn ownStats(arena: std.mem.Allocator, stats: ?schema.Statistics) Error!?schema.Statistics {
@@ -505,6 +624,10 @@ pub const BuiltPage = struct {
     bytes: []const u8,
     uncompressed: usize,
     info: PageInfo,
+    /// A values page's statistics, and a byte array page's uncut bounds: the chunk's are these merged
+    /// (`mergePageStats`), not a second scan of its values.
+    stats: ?schema.Statistics = null,
+    bounds: ?BytesBounds = null,
 };
 
 /// Decide how `in` is written (see `Plan`). A dictionary chunk has its dictionary page built here.
@@ -663,14 +786,15 @@ fn planValues(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
         .PLAIN;
     const values_encoding = selected_encoding;
 
-    // Statistics over the whole chunk. Pass `arena` so byte-array min/max strings can be dupe'd onto a stable arena
-    // (the source values may live on a row-group-scoped arena that's freed before the file footer is written;
-    // borrowing the slice into the footer would dangle).
+    // Statistics over the whole chunk: a nested chunk's here; a flat one's from its pages (`finish`). Pass `arena` so
+    // byte-array min/max strings can be dupe'd onto a stable arena (the source values may live on a row-group-scoped
+    // arena that's freed before the file footer is written; borrowing the slice into the footer would dangle).
     return .{
         .in = in,
         .kind = if (nested) .nested else .values,
         .ends = ends,
-        .stats = computeStats(arena, in.values, src_def_levels, src_max_def, in.schema_elem),
+        .stats = if (nested) computeStats(arena, in.values, src_def_levels, src_max_def, in.schema_elem) else null,
+        .stats_from_pages = !nested,
         .values_encoding = values_encoding,
         .num_values = num_values,
         .def_levels = if (nested) null else src_def_levels,
@@ -2210,6 +2334,15 @@ fn statsBytes(
     max_def: u32,
     cut: BoundCut,
 ) ?schema.Statistics {
+    return bytesStats(arena, bytesBounds(values, def_levels, max_def) orelse return null, cut);
+}
+
+/// A byte array column's least and greatest present values, uncut (slices of the values), and its NULLs: what
+/// `bytesStats` writes, kept apart so a chunk's bounds can be its pages' merged before any cut (a cut bound is not
+/// ordered as its value is: a UTF-8 cut may be shorter than a byte cut of a lesser value).
+const BytesBounds = struct { lo: ?[]const u8, hi: ?[]const u8, null_count: i64 };
+
+fn bytesBounds(values: []const []const u8, def_levels: ?[]const u32, max_def: u32) ?BytesBounds {
     if (values.len == 0) return null;
     var first_idx: ?usize = null;
     var null_count: i64 = 0;
@@ -2221,7 +2354,7 @@ fn statsBytes(
         null_count += 1;
     }
     // All-null column: see statsTyped above.
-    const fi = first_idx orelse return .{ .null_count = null_count };
+    const fi = first_idx orelse return .{ .lo = null, .hi = null, .null_count = null_count };
     var lo: []const u8 = values[fi];
     var hi: []const u8 = values[fi];
     // Compared by 16-byte big-endian prefix first (a lesser prefix is a lesser string); bytes only on a tie.
@@ -2244,6 +2377,13 @@ fn statsBytes(
             hi_key = k;
         }
     }
+    return .{ .lo = lo, .hi = hi, .null_count = null_count };
+}
+
+fn bytesStats(arena: std.mem.Allocator, b: BytesBounds, cut: BoundCut) ?schema.Statistics {
+    const null_count = b.null_count;
+    const lo = b.lo orelse return .{ .null_count = null_count };
+    const hi = b.hi.?;
     // Caller's arena is the file-footer-lifetime arena; the values
     // slices typically borrow from a row-group-scoped arena. Dupe so
     // the footer write later sees stable bytes.
@@ -4091,5 +4231,114 @@ test "parquet version statistics retain byte ordering on tied prefixes" {
         defer a.free(st.max_value.?);
         try testing.expectEqualStrings(pair[0], st.min_value.?);
         try testing.expectEqualStrings(pair[1], st.max_value.?);
+    }
+}
+
+fn expectSameStats(want: ?schema.Statistics, got: ?schema.Statistics) !void {
+    try testing.expectEqual(want == null, got == null);
+    const w = want orelse return;
+    const g = got.?;
+    inline for (.{ "max", "min", "max_value", "min_value" }) |f| {
+        try testing.expectEqual(@field(w, f) == null, @field(g, f) == null);
+        if (@field(w, f)) |v| try testing.expectEqualSlices(u8, v, @field(g, f).?);
+    }
+    inline for (.{ "null_count", "distinct_count", "nan_count", "is_max_value_exact", "is_min_value_exact" }) |f| {
+        try testing.expectEqual(@field(w, f), @field(g, f));
+    }
+}
+
+test "a chunk's statistics merged from its pages are the ones a scan of the whole chunk gives" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var rng = std.Random.DefaultPrng.init(0x5747);
+    const r = rng.random();
+    const n = 1000;
+    // NULLs scattered, and a run of them covering whole pages (31 rows each).
+    const defs = try a.alloc(u32, n);
+    for (defs, 0..) |*d, i| d.* = if (i % 7 == 3 or (i >= 400 and i < 500)) 0 else 1;
+    const all_null = try a.alloc(u32, n);
+    @memset(all_null, 0);
+    const base: schema.SchemaElement = .{
+        .type = .INT64,
+        .type_length = null,
+        .repetition_type = .OPTIONAL,
+        .name = "c",
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    const i64s = try a.alloc(i64, n);
+    for (i64s) |*v| v.* = r.int(i64);
+    const u32s = try a.alloc(i32, n);
+    for (u32s, 0..) |*v, i| {
+        v.* = if (i % 3 == 0) @bitCast(0x8000_0000 | r.int(u32)) else r.intRangeAtMost(i32, 0, 1000);
+    }
+    const f64s = try a.alloc(f64, n);
+    for (f64s, 0..) |*v, i| v.* = switch (i % 11) {
+        0 => std.math.nan(f64),
+        1 => -0.0,
+        2 => 0.0,
+        else => if (i >= 600 and i < 700) std.math.nan(f64) else r.float(f64) * 2 - 1,
+    };
+    const f32s = try a.alloc(f32, n);
+    for (f32s, f64s) |*v, x| v.* = @floatCast(x);
+    const zeros = try a.alloc(f64, n);
+    for (zeros, 0..) |*v, i| v.* = if (i % 2 == 0) -0.0 else 0.0;
+    const bools = try a.alloc(bool, n);
+    for (bools, 0..) |*v, i| v.* = i < 300;
+    // Long strings sharing a 62-byte prefix, valid and invalid UTF-8 (cut at a character or at 64 bytes), and all-0xFF
+    // values whose cut max cannot grow.
+    const strs = try a.alloc([]const u8, n);
+    const prefix: [62]u8 = @splat('p');
+    const ffs: [80]u8 = @splat(0xff);
+    for (strs, 0..) |*v, i| v.* = switch (i % 5) {
+        0 => try std.fmt.allocPrint(a, "{s}\xc3\xa9{d:0>8}", .{ &prefix, r.int(u32) }),
+        1 => try std.fmt.allocPrint(a, "{s}\xff\xfe{d:0>8}", .{ &prefix, r.int(u32) }),
+        2 => &ffs,
+        3 => try std.fmt.allocPrint(a, "{d}", .{r.int(u16)}),
+        else => "",
+    };
+    const Case = struct { col: filter_eval.Batch.Column, elem: schema.SchemaElement };
+    var u32_elem = base;
+    u32_elem.type = .INT32;
+    u32_elem.logical_type = .{ .INTEGER = .{ .bitWidth = 32, .isSigned = false } };
+    var f64_elem = base;
+    f64_elem.type = .DOUBLE;
+    var f32_elem = base;
+    f32_elem.type = .FLOAT;
+    var bool_elem = base;
+    bool_elem.type = .BOOLEAN;
+    var str_elem = base;
+    str_elem.type = .BYTE_ARRAY;
+    str_elem.logical_type = .STRING;
+    var bytes_elem = base;
+    bytes_elem.type = .BYTE_ARRAY;
+    const opt = struct {
+        fn of(comptime T: type, values: []const T, levels: []const u32) filter_eval.ColumnT(T) {
+            return .{ .values = values, .def_levels = levels, .max_def = 1, .has_nulls = true };
+        }
+    }.of;
+    const cases = [_]Case{
+        .{ .col = .{ .i64 = opt(i64, i64s, defs) }, .elem = base },
+        .{ .col = .{ .i64 = opt(i64, i64s, all_null) }, .elem = base },
+        .{ .col = .{ .i32 = opt(i32, u32s, defs) }, .elem = u32_elem },
+        .{ .col = .{ .f64 = opt(f64, f64s, defs) }, .elem = f64_elem },
+        .{ .col = .{ .f64 = .{ .values = zeros } }, .elem = f64_elem },
+        .{ .col = .{ .f32 = opt(f32, f32s, defs) }, .elem = f32_elem },
+        .{ .col = .{ .boolean = opt(bool, bools, defs) }, .elem = bool_elem },
+        .{ .col = .{ .string = opt([]const u8, strs, defs) }, .elem = str_elem },
+        .{ .col = .{ .string = .{ .values = strs } }, .elem = bytes_elem },
+    };
+    for (&cases) |*c| {
+        var in = splitInput(c.col, &c.elem, .UNCOMPRESSED);
+        in.page_rows = 31;
+        in.page_bytes = 1 << 20;
+        in.distinct = true; // values, not a dictionary: the path whose statistics come from pages
+        const enc = try encodeColumn(a, in);
+        try testing.expect(enc.pages.len > 10);
+        const defs_of = sourceDefLevels(c.col);
+        try expectSameStats(computeStats(a, c.col, defs_of, sourceMaxDef(c.col), &c.elem), enc.meta.statistics);
     }
 }

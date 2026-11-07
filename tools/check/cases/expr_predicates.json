@@ -409,7 +409,7 @@
    "cli": [
     "query",
     "--query",
-    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE z > 0 AND x / z > 3"
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE z > 0 AND b / z > 3"
    ],
    "axes": [
     {
@@ -430,7 +430,7 @@
    ],
    "oracle": {
     "compare": "ordered",
-    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE z > 0 AND x / z > 3"
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE z > 0 AND b / z > 3"
    }
   },
   {
@@ -1004,6 +1004,66 @@
    }
   },
   {
+   "id": "expr:review:ep5-control-no-overflow",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE b - a < 0"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE b - a < 0"
+   }
+  },
+  {
+   "id": "expr:review:ep5-control-adds-zero",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE a + 0 > b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE a + 0 > b"
+   }
+  },
+  {
    "id": "expr:refuse:date-against-timestamp",
    "fixture": "exprfix",
    "cli": [
@@ -1127,6 +1187,69 @@
    "refuse": {
     "error": "exit 1",
     "diag": "does not fit the DECIMAL type both sides convert to"
+   }
+  },
+  {
+   "id": "expr:review:refuse:ep5-int32-addition",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE a + 1 > b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "integer overflow in +"
+   }
+  },
+  {
+   "id": "expr:review:refuse:ep5-int32-multiplication",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE a * 2 > b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "integer overflow in *"
+   }
+  },
+  {
+   "id": "expr:review:refuse:ep5-int32-subtraction",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE a - (0 - 1) > b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "integer overflow in -"
    }
   }
  ]

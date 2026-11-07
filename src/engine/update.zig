@@ -18,12 +18,14 @@ const filter_parser = @import("../core/filter/parser.zig");
 const syntax = @import("../core/expr/syntax.zig");
 const filter_eval = @import("../core/filter/eval.zig");
 const filter_prune = @import("../core/filter/prune.zig");
+const membership = @import("../core/filter/membership.zig");
 const selection = @import("../core/filter/selection.zig");
 const consumer_column = @import("../core/consumer/column.zig");
 const page_edit = @import("../core/writer/page_edit.zig");
 const patch = @import("../core/writer/thrift_patch.zig");
 const streaming = @import("../core/writer/streaming.zig");
 const local_fs = @import("../local_fs.zig");
+const memory = @import("../core/memory.zig");
 const OutputPublication = @import("../output_publication.zig").OutputPublication;
 const FdSink = @import("write.zig").FdSink;
 
@@ -42,6 +44,8 @@ pub const Request = struct {
     where: syntax.Predicate,
     sets: []const Set,
     fsync: bool = true,
+    /// The query's memory budget (`--max-memory`, or what the host has).
+    max_memory: usize = std.math.maxInt(usize),
 };
 
 pub const Summary = struct {
@@ -97,6 +101,9 @@ const ChunkEdit = struct {
     rg: usize,
     col: usize,
     assignment: *const Assignment,
+    /// The chunk's bytes in the file.
+    start: u64,
+    len: u64,
     /// Per data page of the chunk (in order), its edit, or null.
     pages: []?page_edit.Edited,
     compressed_delta: i64 = 0,
@@ -109,19 +116,46 @@ const ChunkEdit = struct {
 };
 
 pub fn run(gpa: std.mem.Allocator, io: std.Io, req: Request, problem: *Problem) !Summary {
+    // Everything UPDATE holds is drawn from the query's budget, as a SELECT's is; a refusal is the budget's error.
+    var budget: memory.SharedBudget = .{ .limit = req.max_memory };
+    var charged: memory.Charged = .{ .child = gpa, .budget = &budget };
+    return runCharged(gpa, charged.allocator(), io, req, problem) catch |err| return charged.refusal(err);
+}
+
+/// `footers` holds the file's parsed footer, outside the budget as a SELECT's footers are; everything else is
+/// drawn through `gpa`, the charged allocator.
+fn runCharged(footers: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, req: Request, problem: *Problem) !Summary {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
+    var footer_state = std.heap.ArenaAllocator.init(footers);
+    defer footer_state.deinit();
     var summary: Summary = .{};
 
     if (std.mem.startsWith(u8, req.target, "s3://") or (req.output != null and std.mem.startsWith(u8, req.output.?, "s3://"))) {
         problem.set("UPDATE needs a local file; S3 objects cannot be renamed over", .{});
         return error.UpdateRefused;
     }
+    // One UPDATE of a file at a time: a second one waits for no one, it refuses, and once the first has renamed its
+    // result over the path the file this one would read is no longer the one there (checked before publishing).
+    const lock_fd = local_fs.openRead(req.target) catch |err| {
+        if (err == error.FileNotFound and std.mem.indexOfAny(u8, req.target, "*?[") != null) {
+            problem.set("UPDATE takes one file, not a pattern: {s}", .{req.target});
+            return error.UpdateRefused;
+        }
+        return err;
+    };
+    defer local_fs.close(lock_fd);
+    if (std.posix.errno(std.posix.system.flock(lock_fd, std.posix.LOCK.EX | std.posix.LOCK.NB)) != .SUCCESS) {
+        problem.set("another UPDATE of {s} is running", .{req.target});
+        return error.UpdateRefused;
+    }
     const map = try local_fs.mapFile(req.target);
     defer map.unmap();
+    const locked = try local_fs.fdStamp(lock_fd);
+    if (locked.dev != map.stamp.dev or locked.ino != map.stamp.ino) return error.InputChanged;
     const file: []const u8 = map.bytes;
-    var meta = metadata.open(a, file) catch |err| {
+    var meta = metadata.open(footer_state.allocator(), file) catch |err| {
         if (err == error.EncryptedFile) {
             problem.set("UPDATE of an encrypted file is not supported", .{});
             return error.UpdateRefused;
@@ -130,6 +164,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, req: Request, problem: *Problem) 
     };
 
     const filter = try filter_parser.bindSyntax(a, req.where, &meta, null);
+    // Bloom filters, then dictionaries, rule row groups out of an `=` as they do for a SELECT: `load` records what they
+    // prove on the chunks, which `pruneRowGroup` reads.
+    const mapped: membership.MappedSource = .{ .files = &.{file} };
+    _ = try membership.load(a, gpa, filter, @as(*const [1]schema.FileMetaData, &meta), mapped.source(), .{});
     const assignments = try bindSets(a, &meta, req.sets, problem);
 
     // The rows each row group's WHERE matches, ascending.
@@ -190,15 +228,37 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, req: Request, problem: *Problem) 
             return x.src_off < y.src_off;
         }
     }.lt);
-    const layout = try Layout.init(a, replacements.items);
+    var layout = try Layout.init(a, replacements.items);
 
-    // The data region: every byte up to the last chunk's end, as it lies, but the pages replaced.
-    var data_end: u64 = 0;
-    for (meta.row_groups.items) |rg| for (rg.columns.items) |c| {
-        const cm = c.meta_data orelse continue;
-        const start: u64 = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
-        data_end = @max(data_end, start + @as(u64, @intCast(cm.total_compressed_size)));
-    };
+    // Everything up to the footer stays where it lies, page indexes and Bloom filters included, overwritten only where
+    // an edited chunk's entries changed and at their own length, so all of it stays shared. A chunk one of whose pages
+    // grew past its own length is copied whole after it (`Reloc`) instead of moving every byte after it. When an
+    // entry cannot be kept at its length, every byte up to the last chunk's end moves instead, and the indexes and
+    // filters are written after it.
+    const footer_len = std.mem.readInt(u32, file[file.len - 8 ..][0..4], .little);
+    const footer_start: u64 = file.len - 8 - footer_len;
+    layout.relocs = try relocations(a, edits.items, layout, footer_start);
+    const kept = try entriesInPlace(a, file, &meta, edits.items, layout, footer_start);
+    if (kept) |extra| {
+        const relocs = layout.relocs;
+        try replacements.appendSlice(a, extra);
+        std.mem.sort(Replacement, replacements.items, {}, struct {
+            fn lt(_: void, x: Replacement, y: Replacement) bool {
+                return x.src_off < y.src_off;
+            }
+        }.lt);
+        layout = try Layout.init(a, replacements.items);
+        layout.relocs = relocs;
+    } else layout.relocs = &.{};
+    var copy_end: u64 = footer_start;
+    if (kept == null) {
+        copy_end = 0;
+        for (meta.row_groups.items) |rg| for (rg.columns.items) |c| {
+            const cm = c.meta_data orelse continue;
+            const start: u64 = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
+            copy_end = @max(copy_end, start + @as(u64, @intCast(cm.total_compressed_size)));
+        };
+    }
 
     var publication: OutputPublication = .{ .fsync = req.fsync };
     defer publication.abort();
@@ -209,27 +269,40 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, req: Request, problem: *Problem) 
     var fd_sink: FdSink = .{ .fd = out_fd, .share = share };
     var out: streaming.SinkOut = .{ .sink = fd_sink.sink() };
 
-    var pos: u64 = 0;
-    for (layout.reps) |rep| {
-        summary.kernel_bytes += try out.copyRange(map.fd, pos, file[@intCast(pos)..@intCast(rep.src_off)]);
-        summary.copied_bytes += rep.src_off - pos;
-        try out.write(rep.bytes);
-        pos = rep.src_off + rep.src_len;
+    // A moved chunk's old bytes stay where they were, unreferenced, and its replacements go with it.
+    try copyWithReplacements(&out, map.fd, file, layout, 0, copy_end, true, &summary);
+    for (layout.relocs) |r| {
+        try out.pad(@intCast(@as(u64, @intCast(r.dst)) - out.pos()));
+        try copyWithReplacements(&out, map.fd, file, layout, @intCast(r.src), @intCast(r.src + r.len), false, &summary);
+        std.debug.assert(out.pos() == r.dst + r.new_len);
     }
-    summary.kernel_bytes += try out.copyRange(map.fd, pos, file[@intCast(pos)..@intCast(data_end)]);
-    summary.copied_bytes += data_end - pos;
 
-    const placed = try placeIndexesAndFilters(a, &out, file, &meta, edits.items, layout);
+    const placed: Placed = if (kept != null) .{ .keep = true } else try placeIndexesAndFilters(a, &out, file, &meta, edits.items, layout);
+    // The footer goes where its first bytes keep the source footer's offset modulo the block, and the bytes it shares
+    // with it (everything before the first row group edited) are range-copied from it.
     const footer = try patchFooter(a, file, &meta, edits.items, layout, placed);
-    try out.write(footer);
+    const old_footer = file[@intCast(footer_start)..][0..footer_len];
+    const common = std.mem.indexOfDiff(u8, footer, old_footer) orelse footer.len;
+    if (common >= fastpath_block) {
+        try out.pad(@intCast((fastpath_block + footer_start % fastpath_block - out.pos() % fastpath_block) % fastpath_block));
+        summary.kernel_bytes += try out.copyRange(map.fd, footer_start, old_footer[0..common]);
+        summary.copied_bytes += common;
+        try out.write(footer[common..]);
+    } else try out.write(footer);
     var tail: [8]u8 = undefined;
     std.mem.writeInt(u32, tail[0..4], std.math.cast(u32, footer.len) orelse return error.FooterTooLarge, .little);
     @memcpy(tail[4..8], "PAR1");
     try out.write(&tail);
     summary.bytes_out = out.pos();
 
-    // The file must be what was read: a write under it since would be lost by the rename.
+    // The file must be what was read, and still the file its path names: a write under it, or another file renamed
+    // over it or its removal since, would be lost to the rename.
+    if (@import("builtin").is_test) if (before_publish) |hook| hook(req.target);
     try map.intact(req.target);
+    if (in_place) {
+        const now = local_fs.pathStamp(req.target) catch return error.InputChanged;
+        if (!std.meta.eql(now, map.stamp)) return error.InputChanged;
+    }
     try publication.commit(io);
     return summary;
 }
@@ -250,6 +323,12 @@ fn bindSets(a: std.mem.Allocator, meta: *const schema.FileMetaData, sets: []cons
         const levels = meta.getColumnLevels(path);
         if (levels.max_rep > 0) {
             problem.set("SET {s}: UPDATE of a repeated (LIST/MAP) column is not supported", .{s.column});
+            return error.UpdateRefused;
+        }
+        // A leaf under a group shares the group's definition levels with its siblings: setting one alone could
+        // contradict them (a NULL struct with a value in one field), which readers resolve differently.
+        if (path.len > 1) {
+            problem.set("SET {s}: UPDATE of a field inside a STRUCT is not supported", .{s.column});
             return error.UpdateRefused;
         }
         const physical = elem.type orelse return error.BadMetadata;
@@ -284,10 +363,10 @@ fn valueOf(a: std.mem.Allocator, f: filter_ast.Filter, col: usize, elem: schema.
         inline .int32, .int64, .uint64, .float, .double, .string, .boolean => |leaf, tag| {
             if (leaf.col_idx != col or leaf.op != .Eq or !leaf.stored) return null;
             return switch (tag) {
-                .int32 => if (physical == .INT32) .{ .i32 = leaf.value } else null,
+                .int32 => if (physical == .INT32 and inRange(elem, leaf.value)) .{ .i32 = leaf.value } else null,
                 .int64 => if (physical == .INT64) .{ .i64 = leaf.value } else null,
                 .uint64 => switch (physical) {
-                    .INT32 => if (std.math.cast(u32, leaf.value)) |v| .{ .i32 = @bitCast(v) } else null,
+                    .INT32 => if (std.math.cast(u32, leaf.value)) |v| (if (std.math.cast(i32, v) == null or inRange(elem, @intCast(v))) .{ .i32 = @bitCast(v) } else null) else null,
                     .INT64 => .{ .i64 = @bitCast(leaf.value) },
                     else => null,
                 },
@@ -318,6 +397,13 @@ fn valueOf(a: std.mem.Allocator, f: filter_ast.Filter, col: usize, elem: schema.
         },
         else => return null,
     }
+}
+
+/// Whether `v` lies in the range an 8- or 16-bit integer annotation allows (`IntRange`): the INT32 that holds a
+/// TINYINT 128 would read back as -128.
+fn inRange(elem: schema.SchemaElement, v: i32) bool {
+    const r = @import("../core/parquet/column.zig").IntRange.of(elem) orelse return true;
+    return v >= r.min and v <= r.max;
 }
 
 /// Big-endian two's complement of `v` in `width` bytes, or the fewest that hold it when `width` is 0. Borrowed from a
@@ -381,6 +467,8 @@ fn editChunk(
         .rg = rgi,
         .col = as.col,
         .assignment = as,
+        .start = start,
+        .len = @intCast(cm.total_compressed_size),
         .pages = try a.alloc(?page_edit.Edited, data_pages.len),
         .def_hist_delta = try a.alloc(i64, max_def + 1),
     };
@@ -442,6 +530,8 @@ const Layout = struct {
     reps: []const Replacement,
     /// `after[i]`: the size change of replacements 0..i together.
     after: []const i64,
+    /// Chunks copied whole to the end of the file (`relocate`); everything else stays where it lies.
+    relocs: []const Reloc = &.{},
 
     fn init(a: std.mem.Allocator, reps: []const Replacement) !Layout {
         const after = try a.alloc(i64, reps.len);
@@ -464,9 +554,18 @@ const Layout = struct {
         return lo;
     }
 
-    fn moved(self: Layout, off: i64) i64 {
+    /// The size change of the replacements before `off`.
+    fn shiftBefore(self: Layout, off: i64) i64 {
         const n = self.before(off);
-        return off + if (n == 0) 0 else self.after[n - 1];
+        return if (n == 0) 0 else self.after[n - 1];
+    }
+
+    fn moved(self: Layout, off: i64) i64 {
+        for (self.relocs) |r| if (off >= r.src and off < r.src + r.len)
+            return r.dst + (off - r.src) + self.shiftBefore(off) - self.shiftBefore(r.src);
+        // Moved chunks leave nothing else moving, and their replacements change no other offset.
+        if (self.relocs.len != 0) return off;
+        return off + self.shiftBefore(off);
     }
 
     fn replacementAt(self: Layout, off: u64) ?Replacement {
@@ -475,15 +574,27 @@ const Layout = struct {
         if (n < self.reps.len and self.reps[n].src_off == off) return self.reps[n];
         return null;
     }
+
+    fn relocated(self: Layout, off: u64) bool {
+        for (self.relocs) |r| if (off >= r.src and off < r.src + r.len) return true;
+        return false;
+    }
 };
+
+/// A chunk that grew, copied whole after the file's data and indexes, at its source offset modulo the block: every
+/// page before or after its rewritten ones still shares its blocks, and no other chunk moves.
+const Reloc = struct { src: i64, len: i64, dst: i64, new_len: i64 };
 
 const Span = struct { offset: i64, length: i32 };
 
 /// Each chunk's page index and Bloom filter as placed in the output, by row group and column.
 const Placed = struct {
-    column_index: [][]?Span,
-    offset_index: [][]?Span,
-    bloom: [][]?Span,
+    column_index: [][]?Span = &.{},
+    offset_index: [][]?Span = &.{},
+    bloom: [][]?Span = &.{},
+    /// Every page index and Bloom filter stayed where the source has it (`entriesInPlace`): the footer's pointers to
+    /// them stand.
+    keep: bool = false,
 };
 
 fn editOf(edits: []const ChunkEdit, rg: usize, col: usize) ?*const ChunkEdit {
@@ -499,6 +610,106 @@ fn sourceBytes(file: []const u8, off: ?i64, len: ?i32) ?[]const u8 {
     const n: usize = @intCast(l);
     if (start > file.len or n > file.len - start) return null;
     return file[start..][0..n];
+}
+
+/// `file[lo..hi]` as it lies but the replacements inside it, which `skip_relocated` leaves out for chunks that moved.
+fn copyWithReplacements(
+    out: *streaming.SinkOut,
+    fd: ?local_fs.fd_t,
+    file: []const u8,
+    layout: Layout,
+    lo: u64,
+    hi: u64,
+    skip_relocated: bool,
+    summary: *Summary,
+) !void {
+    var pos = lo;
+    for (layout.reps[layout.before(@intCast(lo))..]) |rep| {
+        if (rep.src_off >= hi) break;
+        if (skip_relocated and layout.relocated(rep.src_off)) continue;
+        summary.kernel_bytes += try out.copyRange(fd, pos, file[@intCast(pos)..@intCast(rep.src_off)]);
+        summary.copied_bytes += rep.src_off - pos;
+        try out.write(rep.bytes);
+        pos = rep.src_off + rep.src_len;
+    }
+    summary.kernel_bytes += try out.copyRange(fd, pos, file[@intCast(pos)..@intCast(hi)]);
+    summary.copied_bytes += hi - pos;
+}
+
+/// The chunks whose pages grew, each placed after the last at its source offset modulo the block.
+fn relocations(a: std.mem.Allocator, edits: []const ChunkEdit, layout: Layout, footer_start: u64) ![]const Reloc {
+    var out: std.ArrayList(Reloc) = .empty;
+    var pos: u64 = footer_start;
+    const block = fastpath_block;
+    for (edits) |e| {
+        var grew = false;
+        for (layout.reps) |r| if (r.src_off >= e.start and r.src_off < e.start + e.len and r.bytes.len != r.src_len) {
+            grew = true;
+        };
+        if (!grew) continue;
+        const dst = pos + (block + e.start % block - pos % block) % block;
+        const new_len: u64 = @intCast(@as(i64, @intCast(e.len)) + e.compressed_delta);
+        try out.append(a, .{ .src = @intCast(e.start), .len = @intCast(e.len), .dst = @intCast(dst), .new_len = @intCast(new_len) });
+        pos = dst + new_len;
+    }
+    return out.items;
+}
+
+/// When no page moved, the overwrites that keep every edited chunk's page index and Bloom filter where it lies: each
+/// patched entry the length of the one it replaces. Null when that cannot be: a page moved, an entry changed length,
+/// or an edited chunk's ColumnIndex or Bloom filter cannot be read, which then must be dropped, not kept.
+fn entriesInPlace(
+    a: std.mem.Allocator,
+    file: []const u8,
+    meta: *const schema.FileMetaData,
+    edits: []const ChunkEdit,
+    layout: Layout,
+    footer_start: u64,
+) !?[]Replacement {
+    for (layout.reps) |r| if (r.bytes.len != r.src_len and !layout.relocated(r.src_off)) return null;
+    var out: std.ArrayList(Replacement) = .empty;
+    for (edits) |*e| {
+        const rg = &meta.row_groups.items[e.rg];
+        const c = rg.columns.items[e.col];
+        const cm = c.meta_data.?;
+        const entries = [_]struct { off: ?i64, raw: ?[]const u8, kind: enum { column_index, offset_index, bloom } }{
+            .{ .off = c.column_index_offset, .raw = sourceBytes(file, c.column_index_offset, c.column_index_length), .kind = .column_index },
+            .{ .off = c.offset_index_offset, .raw = sourceBytes(file, c.offset_index_offset, c.offset_index_length), .kind = .offset_index },
+            .{ .off = cm.bloom_filter_offset, .raw = bloomBytes(file, cm), .kind = .bloom },
+        };
+        for (entries) |entry| {
+            const off = entry.off orelse continue;
+            const raw = entry.raw orelse return null;
+            const bytes = switch (entry.kind) {
+                .column_index => (try patchColumnIndex(a, raw, meta, rg, e)) orelse return null,
+                .offset_index => try patchOffsetIndex(a, raw, e, layout),
+                .bloom => try insertIntoBloom(a, raw, e.assignment.value),
+            };
+            if (bytes.len != raw.len) return null;
+            const start: u64 = @intCast(off);
+            if (start + raw.len > footer_start) return null;
+            // Only the bytes that differ are written (a Bloom filter's one 32-byte block): the rest stays shared.
+            const lo = std.mem.indexOfDiff(u8, bytes, raw) orelse continue;
+            var hi = bytes.len;
+            while (hi > lo and bytes[hi - 1] == raw[hi - 1]) hi -= 1;
+            try out.append(a, .{ .src_off = start + lo, .src_len = hi - lo, .bytes = bytes[lo..hi] });
+        }
+    }
+    // Two edits of one chunk (two SET columns are two chunks) never patch the same entry; any overlap means a file
+    // whose entries share bytes, which is not one to overwrite in place.
+    std.mem.sort(Replacement, out.items, {}, struct {
+        fn lt(_: void, x: Replacement, y: Replacement) bool {
+            return x.src_off < y.src_off;
+        }
+    }.lt);
+    if (out.items.len > 1) for (out.items[1..], out.items[0 .. out.items.len - 1]) |r, prev| {
+        if (prev.src_off + prev.src_len > r.src_off) return null;
+    };
+    for (out.items) |r| {
+        for (layout.reps) |p| if (r.src_off < p.src_off + p.src_len and p.src_off < r.src_off + r.src_len) return null;
+        if (layout.relocated(r.src_off)) return null;
+    }
+    return out.items;
 }
 
 /// Every ColumnIndex (by column, then row group), then every OffsetIndex, then every Bloom filter, after the data.
@@ -528,7 +739,7 @@ fn placeIndexesAndFilters(
         if (ci >= rg.columns.items.len) continue;
         const c = rg.columns.items[ci];
         const raw = sourceBytes(file, c.column_index_offset, c.column_index_length) orelse continue;
-        const bytes = if (editOf(edits, ri, ci)) |e| try patchColumnIndex(a, raw, meta, &rg, e) else raw;
+        const bytes = if (editOf(edits, ri, ci)) |e| (try patchColumnIndex(a, raw, meta, &rg, e)) orelse continue else raw;
         placed.column_index[ri][ci] = .{ .offset = @intCast(out.pos()), .length = @intCast(bytes.len) };
         try out.write(bytes);
     };
@@ -646,11 +857,13 @@ fn readI64s(a: std.mem.Allocator, raw: []const u8) ![]i64 {
 
 /// An edited chunk's ColumnIndex: its edited pages' entries from their new statistics, the boundary order kept only
 /// where it still holds, and the definition-level histograms moved by the edit.
-fn patchColumnIndex(a: std.mem.Allocator, raw: []const u8, meta: *const schema.FileMetaData, rg: *const schema.RowGroup, e: *const ChunkEdit) ![]const u8 {
+fn patchColumnIndex(a: std.mem.Allocator, raw: []const u8, meta: *const schema.FileMetaData, rg: *const schema.RowGroup, e: *const ChunkEdit) !?[]const u8 {
     var r = thrift.Reader.init(raw);
-    var ci = try schema.ColumnIndex.read(a, &r);
+    // An index whose entries are not one per page cannot be moved with the edit, and kept as it was it could prune the
+    // new value away: the caller drops it.
+    var ci = schema.ColumnIndex.read(a, &r) catch return null;
     const n = e.pages.len;
-    if (ci.null_pages.items.len != n or ci.min_values.items.len != n or ci.max_values.items.len != n) return raw;
+    if (ci.null_pages.items.len != n or ci.min_values.items.len != n or ci.max_values.items.len != n) return null;
     for (e.pages, 0..) |p, k| if (p) |ed| {
         const all_null = ed.nulls_after == ed.rows;
         ci.null_pages.items[k] = all_null;
@@ -685,7 +898,7 @@ fn patchColumnIndex(a: std.mem.Allocator, raw: []const u8, meta: *const schema.F
             try b.putI64List(7, hist);
         } else b.drop(7);
     }
-    return b.encode();
+    return try b.encode();
 }
 
 /// Whether the non-null pages' bounds still run in the declared direction.
@@ -790,7 +1003,7 @@ fn patchColumnChunk(
     var b = patch.Builder.init(a);
     try b.keep(fields);
     if (patch.find(fields, 2)) |f| try b.putInt(2, i64, layout.moved(try patch.int(i64, f)));
-    inline for (.{ .{ "offset_index", 4, 5 }, .{ "column_index", 6, 7 } }) |spec| {
+    if (!placed.keep) inline for (.{ .{ "offset_index", 4, 5 }, .{ "column_index", 6, 7 } }) |spec| {
         if (@field(placed, spec[0])[ri][ci]) |s| {
             try b.putInt(spec[1], i64, s.offset);
             try b.putInt(spec[2], i32, s.length);
@@ -798,8 +1011,9 @@ fn patchColumnChunk(
             b.drop(spec[1]);
             b.drop(spec[2]);
         }
-    }
-    if (patch.find(fields, 3)) |f| try b.putStruct(3, try patchColumnMeta(a, f.raw, meta, rg, ci, edit, layout, placed.bloom[ri][ci]));
+    };
+    const filter: ?Span = if (placed.keep) null else placed.bloom[ri][ci];
+    if (patch.find(fields, 3)) |f| try b.putStruct(3, try patchColumnMeta(a, f.raw, meta, rg, ci, edit, layout, filter, placed.keep));
     return b.encode();
 }
 
@@ -812,6 +1026,7 @@ fn patchColumnMeta(
     edit: ?*const ChunkEdit,
     layout: Layout,
     filter: ?Span,
+    keep_filter: bool,
 ) ![]const u8 {
     const fields = try patch.fieldsOf(a, raw);
     var b = patch.Builder.init(a);
@@ -819,7 +1034,7 @@ fn patchColumnMeta(
     inline for (.{ 9, 10, 11 }) |id| {
         if (patch.find(fields, id)) |f| try b.putInt(id, i64, layout.moved(try patch.int(i64, f)));
     }
-    if (filter) |s| {
+    if (keep_filter) {} else if (filter) |s| {
         try b.putInt(14, i64, s.offset);
         try b.putInt(15, i32, s.length);
     } else {
@@ -950,6 +1165,17 @@ test "UPDATE rewrites only the pages it changes, keeps every other byte at its o
         }
     };
     try std.testing.expectEqual(@as(usize, s.pages_rewritten), edited_pages);
+    // No page grew, so nothing moved: the file is the source's length and every chunk's page index stays where it was,
+    // its bytes the source's but for the edited chunks' ColumnIndex entries.
+    try std.testing.expectEqual(src_bytes.len - footerLen(src_bytes), got.len - footerLen(got));
+    for (before.row_groups.items, after.row_groups.items) |rb, ra| for (rb.columns.items, ra.columns.items) |cb, ca| {
+        try std.testing.expectEqual(cb.column_index_offset, ca.column_index_offset);
+        try std.testing.expectEqual(cb.offset_index_offset, ca.offset_index_offset);
+        try std.testing.expectEqual(cb.offset_index_length, ca.offset_index_length);
+        const o: usize = @intCast(cb.offset_index_offset.?);
+        const l: usize = @intCast(cb.offset_index_length.?);
+        try std.testing.expectEqualSlices(u8, src_bytes[o..][0..l], got[o..][0..l]);
+    };
 
     // Every value equals the source's, but the rows matched: f 42 and k NULL there.
     const src: @import("../core/consumer/types.zig").RGSrc = .{ .bytes = got, .byte_origin = 0 };
@@ -987,3 +1213,129 @@ test "UPDATE rewrites only the pages it changes, keeps every other byte at its o
 }
 
 const fastpath_block = @import("../core/writer/fastpath.zig").share_block;
+
+/// Tests only: runs just before an UPDATE checks its target and publishes, to change the target under it.
+var before_publish: ?*const fn ([]const u8) void = null;
+
+fn footerLen(bytes: []const u8) usize {
+    return std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
+}
+
+test "UPDATE refuses a target replaced or removed while it ran, and a second UPDATE of the same file" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = "ci/fixtures/parquet/filtered_records_ordered.parquet";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src_bytes = try local_fs.readFile(a, fixture);
+    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/t.parquet", .{tmp.sub_path});
+    const sets = [_]Set{.{ .column = "f", .assignment = try filter_parser.parseSyntax(a, "f = 42") }};
+    const req: Request = .{ .target = target, .where = try filter_parser.parseSyntax(a, "rid = 100"), .sets = &sets };
+    const Hooks = struct {
+        var replacement: []const u8 = "";
+        fn replace(path: []const u8) void {
+            var buf: [256]u8 = undefined;
+            const other = std.fmt.bufPrint(&buf, "{s}.other", .{path}) catch unreachable;
+            const fd = local_fs.createFile(other) catch unreachable;
+            local_fs.writeAll(fd, replacement) catch unreachable;
+            local_fs.close(fd);
+            local_fs.rename(other, path) catch unreachable;
+        }
+        fn remove(path: []const u8) void {
+            local_fs.removeFile(path);
+        }
+    };
+    Hooks.replacement = "another writer's file";
+    defer before_publish = null;
+    for ([_]*const fn ([]const u8) void{ Hooks.replace, Hooks.remove }) |hook| {
+        const fd = try local_fs.createFile(target);
+        try local_fs.writeAll(fd, src_bytes);
+        local_fs.close(fd);
+        before_publish = hook;
+        var problem: Problem = .{};
+        try std.testing.expectError(error.InputChanged, run(gpa, io, req, &problem));
+        // Whatever the other writer left at the path stays: the replacement, or nothing.
+        if (hook == Hooks.replace) {
+            try std.testing.expectEqualStrings(Hooks.replacement, try local_fs.readFile(a, target));
+        } else try std.testing.expectError(error.FileNotFound, local_fs.openRead(target));
+    }
+    before_publish = null;
+
+    const fd = try local_fs.createFile(target);
+    try local_fs.writeAll(fd, src_bytes);
+    local_fs.close(fd);
+    const held = try local_fs.openRead(target);
+    defer local_fs.close(held);
+    try std.testing.expect(std.posix.errno(std.posix.system.flock(held, std.posix.LOCK.EX | std.posix.LOCK.NB)) == .SUCCESS);
+    var problem: Problem = .{};
+    try std.testing.expectError(error.UpdateRefused, run(gpa, io, req, &problem));
+    try std.testing.expect(std.mem.indexOf(u8, problem.text(), "another UPDATE") != null);
+    try std.testing.expectEqualSlices(u8, src_bytes, try local_fs.readFile(a, target));
+}
+
+test "UPDATE that grows a page moves only its chunk, at its offset modulo the block, and nothing else" {
+    // REQ-060-D: a dictionary append grew the dictionary page, every byte after it moved, and the page indexes,
+    // Blooms and footer after the data (61 MB of a 2.7 GB file) were written instead of shared.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = "ci/fixtures/parquet/bloom_keys.parquet";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src_bytes = try local_fs.readFile(a, fixture);
+    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/t.parquet", .{tmp.sub_path});
+    const fd = try local_fs.createFile(target);
+    try local_fs.writeAll(fd, src_bytes);
+    local_fs.close(fd);
+    const sets = [_]Set{.{ .column = "cat", .assignment = try filter_parser.parseSyntax(a, "cat = 'a value no dictionary holds yet, long enough to grow its page'") }};
+    var problem: Problem = .{};
+    const s = try run(gpa, io, .{ .target = target, .where = try filter_parser.parseSyntax(a, "id = 1234"), .sets = &sets }, &problem);
+    try std.testing.expectEqual(@as(u64, 1), s.values_changed);
+    const got = try local_fs.readFile(a, target);
+    const before = try metadata.open(a, src_bytes);
+    const after = try metadata.open(a, got);
+    const old_footer_start = src_bytes.len - 8 - footerLen(src_bytes);
+    var moved: usize = 0;
+    for (before.row_groups.items, after.row_groups.items) |rb, ra| for (rb.columns.items, ra.columns.items, 0..) |cb, ca, ci| {
+        const mb = cb.meta_data.?;
+        const ma = ca.meta_data.?;
+        const sb: u64 = @intCast(mb.dictionary_page_offset orelse mb.data_page_offset);
+        const sa: u64 = @intCast(ma.dictionary_page_offset orelse ma.data_page_offset);
+        try std.testing.expectEqual(cb.offset_index_offset, ca.offset_index_offset);
+        try std.testing.expectEqual(cb.column_index_offset, ca.column_index_offset);
+        try std.testing.expectEqual(mb.bloom_filter_offset, ma.bloom_filter_offset);
+        if (sb == sa) {
+            try std.testing.expectEqual(mb.total_compressed_size, ma.total_compressed_size);
+            continue;
+        }
+        moved += 1;
+        try std.testing.expectEqual(@as(usize, 2), ci);
+        try std.testing.expect(sa >= old_footer_start);
+        try std.testing.expectEqual(sb % fastpath_block, sa % fastpath_block);
+        try std.testing.expect(ma.total_compressed_size > mb.total_compressed_size);
+    };
+    try std.testing.expectEqual(@as(usize, 1), moved);
+    // The values: the matched row holds the new one, every other the source's.
+    const src: @import("../core/consumer/types.zig").RGSrc = .{ .bytes = got, .byte_origin = 0 };
+    const ref: @import("../core/consumer/types.zig").RGSrc = .{ .bytes = src_bytes, .byte_origin = 0 };
+    var found = false;
+    for (before.row_groups.items, after.row_groups.items) |*rb, *ra| {
+        const ids = (try consumer_column.decodeWriteColumn(a, ra, &after, src, 0, .{}, null)).i64;
+        const new = (try consumer_column.decodeWriteColumn(a, ra, &after, src, 2, .{}, null)).string;
+        const old = (try consumer_column.decodeWriteColumn(a, rb, &before, ref, 2, .{}, null)).string;
+        for (ids.values, 0..) |id, i| {
+            if (id == 1234) {
+                found = true;
+                try std.testing.expectEqualStrings("a value no dictionary holds yet, long enough to grow its page", new.values[i]);
+            } else try std.testing.expectEqualStrings(old.values[i], new.values[i]);
+        }
+    }
+    try std.testing.expect(found);
+}

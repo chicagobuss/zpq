@@ -307,9 +307,13 @@ PageHeader field 20 (binary, short form, before the STOP byte), sized so the pag
 the ColumnIndex entry (a boundary order the edit breaks becomes UNORDERED), the OffsetIndex sizes, the chunk's null
 count and bounds (widened, never narrowed; a bound whose value was edited away is no longer marked exact), size
 statistics and level histograms. The new value goes into the chunk's Bloom filter, whose old values stay (a false
-positive is allowed), and a row group's `sorting_columns` is dropped when an edited column is one of its keys. Page
-indexes are written after the row groups, then the Bloom filters, then the footer, every footer field the source wrote
-kept (key-value metadata among them). In place, the result is staged beside the file, synced and renamed over it,
+positive is allowed), and a row group's `sorting_columns` is dropped when an edited column is one of its keys. A rewritten
+page keeps its own length whenever it fits there, so nothing after it moves: the page indexes, Bloom filters and
+everything else up to the footer stay where they lie, shared, overwritten only in the bytes an edit changed. A chunk
+one of whose pages outgrows its length is copied whole after them, at its offset modulo 4 KiB, so its other pages stay
+shared and no other chunk moves. (When an index entry cannot keep its length, every byte after the edit moves instead
+and the page indexes and filters are written after the row groups.) The footer keeps every field the source wrote
+(key-value metadata among them), and the bytes it shares with the source's are copied from it. In place, the result is staged beside the file, synced and renamed over it,
 keeping its mode, and refused if the file changed while it ran; `-o` writes it elsewhere and leaves the file as it was.
 
 - The literal is cast as a WHERE comparison casts it, and must be a value the column's type holds exactly.
@@ -317,7 +321,10 @@ keeping its mode, and refused if the file changed while it ran; `-o` writes it e
 - Any number of rows may match; the cost grows with the pages they touch. A statement that changes no value writes
   nothing.
 - Refused, exit 2, naming the reason: repeated (LIST/MAP) columns, INT96 and FLOAT16 columns, encrypted files, S3
-  targets, a page zpq cannot rewrite exactly, and every option but `-o`, `--fsync`/`--no-fsync` and `--summary=json`.
+  targets, a page zpq cannot rewrite exactly, STRUCT fields (a leaf under a group), a value outside an 8- or 16-bit
+  integer type's range, a glob, a second UPDATE of the same file while one runs, and every option but `-o`, `--fsync`/`--no-fsync`, `--max-memory` and
+  `--summary=json`. A file replaced, removed or rewritten while an UPDATE runs is refused (`InputChanged`), and
+  `--max-memory` bounds what it holds as it bounds a SELECT.
 - On ext4 and other filesystems that share no blocks, the copy is written in full: time and transient disk grow with
   the file. On btrfs or XFS with reflink they grow with the pages touched.
 

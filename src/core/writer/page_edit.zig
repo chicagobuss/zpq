@@ -14,6 +14,7 @@ const hybrid_rle = @import("../parquet/encoding/hybrid_rle.zig");
 const filter_eval = @import("../filter/eval.zig");
 const patch = @import("thrift_patch.zig");
 const fastpath = @import("fastpath.zig");
+const decimal_mod = @import("../parquet/decimal.zig");
 
 /// The PageHeader field the pad is written as: above the 2.14.0 IDL's highest PageHeader field (8), and at most 15
 /// above any per-type header field (5, 7, 8), so its tag is one byte.
@@ -149,15 +150,17 @@ pub const Built = struct {
     uncompressed: usize,
 };
 
-/// The rewritten page as it will lie in the file: `built` with a pad sized so the page is `src_len` plus a multiple
-/// of `fastpath.share_block` long (possibly less than `src_len`), the least such length that holds it.
+/// The rewritten page as it will lie in the file: `built` with a pad sized so the page is `src_len` long when it fits
+/// there, else `src_len` plus the fewest whole `fastpath.share_block`s that hold it. It never shrinks: a page that
+/// keeps its length moves nothing after it.
 pub fn finish(arena: std.mem.Allocator, built: Built, src_len: usize) Error![]u8 {
     const delta = pad_field_id - built.last_id;
     if (delta <= 0 or delta > 15) return error.PadFieldUnreachable;
     const block = fastpath.share_block;
     const bare = built.head.len + 1 + built.body.len;
-    // The least length >= bare that is congruent to src_len modulo the block.
-    var target = bare + (block + (src_len % block) - (bare % block)) % block;
+    // The source's own length when the page fits in it, so nothing after it moves and every later offset, page
+    // index entry and Bloom filter stays as it is; else the least length past it congruent modulo the block.
+    var target = if (bare <= src_len) src_len else bare + (block + (src_len % block) - (bare % block)) % block;
     while (padPayload(target - bare) == null) target += block;
     const n = padPayload(target - bare).?;
     const out = try arena.alloc(u8, target);
@@ -488,6 +491,11 @@ fn editTyped(
     });
     e.stats = encoder.computeStats(arena, col, defs, max_def, chunk.elem) orelse .{ .null_count = @intCast(e.nulls_after) };
     if (e.stats.null_count == null) e.stats.null_count = @intCast(e.nulls_after);
+    // A DECIMAL in bytes orders as its signed unscaled integer, not as its bytes: the byte order would put 3.00 below
+    // -2.00 and prune the rows an edit wrote.
+    if (T == []const u8) if (decimal_mod.kindFromSchema(chunk.elem)) |kind| {
+        e.stats = decimalStats(page_values, defs, max_def, kind, @intCast(e.nulls_after));
+    };
 
     const encoded_values: []const u8 = if (coded) blk: {
         var present_codes: std.ArrayList(u32) = .empty;
@@ -499,6 +507,31 @@ fn editTyped(
 
     e.built = try buildDataPage(arena, chunk, page, defs, max_def, encoded_values, @intCast(e.nulls_after), e.stats);
     return e;
+}
+
+/// The bounds of a page of DECIMAL bytes in signed unscaled order, each the value's own bytes.
+fn decimalStats(values: []const []const u8, defs: ?[]const u32, max_def: u32, kind: decimal_mod.Kind, nulls: i64) schema.Statistics {
+    var st: schema.Statistics = .{ .null_count = nulls };
+    var lo: ?i128 = null;
+    var hi: ?i128 = null;
+    for (values, 0..) |v, i| {
+        if (!present(defs, max_def, i)) continue;
+        // A value the decimal cannot be read as leaves the page without bounds rather than with incorrect ones.
+        const x = decimal_mod.statToI128(v, kind) orelse return .{ .null_count = nulls };
+        if (lo == null or x < lo.?) {
+            lo = x;
+            st.min_value = v;
+        }
+        if (hi == null or x > hi.?) {
+            hi = x;
+            st.max_value = v;
+        }
+    }
+    if (lo != null) {
+        st.is_min_value_exact = true;
+        st.is_max_value_exact = true;
+    }
+    return st;
 }
 
 fn zero(comptime T: type) T {
@@ -536,9 +569,9 @@ fn encodeAs(
         // A BOOLEAN page in RLE: the hybrid stream of its bits after a 4-byte length.
         .RLE => switch (col) {
             .boolean => |c| blk: {
-                var bits: std.ArrayList(u32) = .empty;
-                for (c.values, 0..) |b, i| if (present(defs, max_def, i)) try bits.append(arena, @intFromBool(b));
-                const rle = try hybrid_rle.encode(arena, bits.items, 1);
+                var bits: std.ArrayList(bool) = .empty;
+                for (c.values, 0..) |b, i| if (present(defs, max_def, i)) try bits.append(arena, b);
+                const rle = try bitPackedBools(arena, bits.items);
                 const out = try arena.alloc(u8, 4 + rle.len);
                 std.mem.writeInt(u32, out[0..4], @intCast(rle.len), .little);
                 @memcpy(out[4..], rle);
@@ -548,6 +581,23 @@ fn encodeAs(
         },
         else => error.UnsupportedPage,
     };
+}
+
+/// Booleans as one bit-packed run of the RLE/bit-packing hybrid (header `groups << 1 | 1`, then the bits, eight to a
+/// byte, low bit first): what Arrow writes for mixed values, and the one form of the hybrid parquet-go 0.32 decodes
+/// exactly for booleans, whose RLE runs it reads as whole bytes.
+fn bitPackedBools(arena: std.mem.Allocator, bits: []const bool) ![]u8 {
+    const groups = (bits.len + 7) / 8;
+    var header: [10]u8 = undefined;
+    const hl = writeVarint(&header, groups << 1 | 1);
+    const out = try arena.alloc(u8, hl + groups);
+    @memcpy(out[0..hl], header[0..hl]);
+    const body = out[hl..];
+    @memset(body, 0);
+    for (bits, 0..) |b, i| {
+        if (b) body[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+    }
+    return out;
 }
 
 /// BYTE_STREAM_SPLIT: byte k of every present value, for each k in turn.
@@ -659,7 +709,8 @@ test "page pad: every source length is met modulo the block, in short form, and 
     for ([_]usize{ 303, 305, 432, 433, 434, 304, 303 + block }) |src_len| {
         const out = try finish(a, .{ .head = &head, .last_id = 5, .body = &body, .uncompressed = 0 }, src_len);
         try std.testing.expectEqual(src_len % block, out.len % block);
-        try std.testing.expect(out.len >= 303);
+        try std.testing.expect(out.len >= src_len);
+        if (src_len != 304 and src_len != 433) try std.testing.expectEqual(src_len, out.len);
         try std.testing.expect(out.len < 303 + 2 * block);
         try std.testing.expectEqualSlices(u8, &body, out[out.len - body.len ..]);
         // The header parses as a struct whose fields are the head's and, past it, the pad: tag (20 - 5) << 4 | 8.
@@ -677,4 +728,30 @@ test "page pad: every source length is met modulo the block, in short form, and 
     }
     try std.testing.expectEqual(@as(usize, 304 + block), (try finish(a, .{ .head = &head, .last_id = 5, .body = &body, .uncompressed = 0 }, 304)).len);
     try std.testing.expectError(error.PadFieldUnreachable, finish(a, .{ .head = &head, .last_id = 4, .body = &body, .uncompressed = 0 }, 400));
+}
+
+test "page edit: RLE booleans are one bit-packed run, and DECIMAL bytes order numerically" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // 35 values, a run of 32 trues then alternation: parquet-go 0.32 misread RLE runs of booleans (review UPD-5).
+    var bits: [35]bool = undefined;
+    for (&bits, 0..) |*b, i| b.* = i < 32 or i % 2 == 1;
+    const enc = try bitPackedBools(a, &bits);
+    try std.testing.expectEqual(@as(u8, (5 << 1) | 1), enc[0]);
+    var dec = hybrid_rle.HybridRleDecoder.init(enc, 1);
+    var got: [40]u32 = undefined;
+    const n = try dec.decode(&got);
+    try std.testing.expect(n >= bits.len);
+    for (bits, got[0..bits.len]) |want, g| try std.testing.expectEqual(@as(u32, @intFromBool(want)), g);
+
+    // DECIMAL(9,2) in 4 big-endian bytes: 3.00 sorts above -2.00 and -1.00 (review UPD-4).
+    const kind: decimal_mod.Kind = .{ .scale = 2, .precision = 9, .physical = .FIXED_LEN_BYTE_ARRAY, .byte_width = 4 };
+    const v300 = [_]u8{ 0, 0, 1, 0x2C };
+    const vm200 = [_]u8{ 0xFF, 0xFF, 0xFF, 0x38 };
+    const vm100 = [_]u8{ 0xFF, 0xFF, 0xFF, 0x9C };
+    const values = [_][]const u8{ &v300, &vm200, &vm100 };
+    const st = decimalStats(&values, null, 0, kind, 0);
+    try std.testing.expectEqualSlices(u8, &vm200, st.min_value.?);
+    try std.testing.expectEqualSlices(u8, &v300, st.max_value.?);
 }

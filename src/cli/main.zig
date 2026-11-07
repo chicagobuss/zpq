@@ -578,10 +578,10 @@ fn runQuery(
             defer zpq.core.expr.sql_parser.diagnostic_fn = null;
             if (try zpq.core.expr.sql_parser.parseSqlUpdate(arena, q_str)) |up| {
                 if (format != null or limit != null or explain or codec != null or bloom_filters.items.len > 0 or profile_out.wanted()) {
-                    diagnosticPrint("zpq query: UPDATE takes -o, --fsync/--no-fsync and --summary=json only\n", .{});
+                    diagnosticPrint("zpq query: UPDATE takes -o, --fsync/--no-fsync, --max-memory and --summary=json only\n", .{});
                     return error.BadArgs;
                 }
-                return runUpdate(io, gpa, arena, up, output, fsync, summary);
+                return runUpdate(io, gpa, arena, up, output, fsync, summary, max_memory orelse zpq.core.system.discoverAvailableMemory(env));
             }
             // A two-table join binds its column names against both footers; the engine reads the build.
             var schemas: engine.join.LocalSchemas = .{ .arena = arena };
@@ -834,6 +834,7 @@ fn runUpdate(
     output: ?[]const u8,
     fsync: bool,
     summary: bool,
+    max_memory: usize,
 ) !void {
     const started = nowMonoNs();
     if (output) |o| if (std.mem.eql(u8, o, "-")) {
@@ -849,6 +850,7 @@ fn runUpdate(
         .where = up.where,
         .sets = sets,
         .fsync = fsync,
+        .max_memory = max_memory,
     }, &problem) catch |err| {
         if (problem.len > 0) {
             diagnosticPrint("zpq query: {s}\n", .{problem.text()});
@@ -982,9 +984,8 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "MissingFromClause",           "MissingTableName",            "UnsupportedFromClause",        "UnsupportedAggType",       "UnsupportedCoalesce",  "UnsupportedColumnType",
         "UnlabelledColumn",            "INT96ReencodeNotSupported",   "NestedReencodeNotSupported",   "NestedFilterNotSupported", "ModuloNotSupported",   "ExpressionInPredicate",
         "NestedColumnSelected",        "NestedAggregateNotSupported", "NestedGroupKeyNotSupported",   "UnsupportedDatePart",      "InvalidRegex",         "UnsupportedRegex",
-        "RegexTooBig",                 "TypedLiteralColumn",          "BadInterval",                  "IntervalNotSupported",
-        "TemporalOutOfRange",             "ConstantTooDeep",              "IlikePatternNotAscii",         "PostAggNotSupported",
-        "UpdateWithoutWhere",           "UnparseError",
+        "RegexTooBig",                 "TypedLiteralColumn",          "BadInterval",                  "IntervalNotSupported",     "TemporalOutOfRange",   "ConstantTooDeep",
+        "IlikePatternNotAscii",        "PostAggNotSupported",         "UpdateWithoutWhere",           "UnparseError",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

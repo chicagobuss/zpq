@@ -78,7 +78,11 @@ negative `n` from the end, an empty `sep` splitting into characters, `''` where 
 error) and `date_diff(part, start, end)` / `datediff` (BIGINT boundaries of the unit between two dates or timestamps:
 a month between 01-31 and 02-01, a week the day count over 7 truncated, a TIMESTAMP_NS rounded to microseconds first,
 NULL for an infinite time; `year` to `microsecond` plus `decade`, `century` and `millennium`, a constant) are the date
-functions beside them, and
+functions beside them, as is `strftime(t, format)` of a DATE or TIMESTAMP (the format a constant of DuckDB's
+specifiers: `%Y %y %m %d %H %I %M %S %j` and their `%-` unpadded forms, `%f %g %n %p %a %A %b %B %h %w %u %U %W %V %G
+%Z %z %c %x %X %T %%`; years print four digits from 0000 to 9999 and as many as they have beyond; infinite times print
+`infinity`; `%Z` is empty for a TIMESTAMP and `UTC` for one with a time zone, which is read in UTC; an empty or unknown
+format, such as `%e`, and a TIMESTAMP_NS or INT96 argument are refused), and
 `regexp_extract(s, pattern [, group [, options]])` one group of the first match (`''` where there is none, group 0 the
 whole match, groups 0 to 9, DuckDB's option letters; the form with a list of group names is refused), the pattern, group
 and separator being constants. `trim`, `ltrim` and `rtrim` strip Unicode's space

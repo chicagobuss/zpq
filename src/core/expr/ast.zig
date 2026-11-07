@@ -25,6 +25,7 @@ const std = @import("std");
 const schema = @import("../schema.zig");
 const filter_ast = @import("../filter/ast.zig");
 const regex = @import("regex.zig");
+const calendar = @import("calendar.zig");
 
 /// Binary operators. Numeric ops (`add`/`sub`/`mul`/`div`/`mod`/`intdiv`) work on
 /// `i64` or `f64`; `concat` works on `str` and is the SQL `||`
@@ -347,6 +348,8 @@ pub const Func = enum {
     /// `split_part(s, sep, n)`: the `n`th field of `s` split by the constant `sep` (1-based; a negative `n` counts from the
     /// end; an empty `sep` splits into characters); empty where there is none.
     split_part,
+    /// `strftime(t, format)`: a DATE or TIMESTAMP as text by a constant format of DuckDB's specifiers; NULL for NULL.
+    strftime,
     /// `date_diff(part, start, end)` (also `datediff`): the number of `part` boundaries between two dates or timestamps (a
     /// BIGINT, negative when `end` is before `start`); NULL where either is NULL or infinite.
     date_diff,
@@ -467,6 +470,8 @@ pub const Call = struct {
     replace: ?*const regex.Replace = null,
     /// `regexp_extract`'s pattern, group and options, compiled likewise.
     extract: ?*const regex.Extract = null,
+    /// `strftime`'s format, compiled from its literal second argument.
+    format: ?*const calendar.Format = null,
     /// The SQL integer type `abs` overflows at, or a cast's target: the type of the argument the i64 lane has lost.
     int: ?IntType = null,
 };
@@ -673,7 +678,7 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
+                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
                 // Infinite times give NULL whatever the columns say.
                 .date_diff => true,

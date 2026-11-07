@@ -6,6 +6,9 @@
   expression, and `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `isodow` and
   `dayofyear` of a date or timestamp, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB (a DECIMAL keeps
   DECIMAL(p, 0) after `floor`, an integer floors to a DOUBLE, `least` skips NULLs, `sqrt` of a negative is NaN).
+- **`strftime` in SQL.** `strftime(t, format)` of a DATE or TIMESTAMP (a constant format of DuckDB's specifiers) runs in a
+  SELECT, an aggregate argument or a GROUP BY key and matches DuckDB, including its year padding, week fields and
+  `infinity`. An unknown specifier, an empty format and a TIMESTAMP_NS argument are refused by name.
 - **Three-argument `make_date` and `date_diff` in SQL.** `make_date(year, month, day)` and `date_diff(part, start, end)`
   (also `datediff`) run over dates and timestamps of any unit, in a SELECT, an aggregate argument or a GROUP BY key, and
   match DuckDB, including its boundary counting (a month between 01-31 and 02-01), its weeks and its error for a date

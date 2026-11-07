@@ -1360,6 +1360,7 @@ fn evalCall(
         .make_date => return if (c.args.len == 3) evalMakeDate3(arena, batch, column_lookup, c) else evalTemporal(arena, batch, column_lookup, c),
         .epoch_ms, .date_trunc, .date_part => return evalTemporal(arena, batch, column_lookup, c),
         .date_diff => return evalDateDiff(arena, batch, column_lookup, c),
+        .strftime => return evalStrftime(arena, batch, column_lookup, c),
         .regexp_replace => return evalRegexpReplace(arena, batch, column_lookup, c, false),
         .cast_text => return evalCastText(arena, batch, column_lookup, c.args[0].*),
         .abs => return evalAbs(arena, batch, column_lookup, c),
@@ -2059,6 +2060,30 @@ fn evalMakeDate3(arena: std.mem.Allocator, batch: *const Batch, column_lookup: [
     return .{ .i64 = .{ .values = out, .def_levels = def, .max_def = if (needs_def) 1 else 0, .has_nulls = any_null } };
 }
 
+/// `strftime(t, format)`: each time as text by the compiled format; NULL for NULL, and a row the query does not consume is
+/// left empty, so a time it cannot print raises no error.
+fn evalStrftime(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, c.args[0].*);
+    const in = switch (col) {
+        .i64 => |v| v,
+        else => return error.TypeMismatch,
+    };
+    if (in.max_rep > 0) return error.NestedNotSupported;
+    const t = c.args[0].temporal().?;
+    const n = in.values.len;
+    var bytes: std.ArrayList(u8) = .empty;
+    // Offsets, as the buffer moves while it grows.
+    const ends = try arena.alloc([2]usize, n);
+    for (in.values, ends, 0..) |v, *e, i| {
+        const start = bytes.items.len;
+        if (!(rowIsNull(col, i) or (batch.sel != null and !batch.sel.?.isActive(i)))) try c.format.?.render(arena, &bytes, t, v);
+        e.* = .{ start, bytes.items.len };
+    }
+    const values = try arena.alloc([]const u8, n);
+    for (ends, values) |e, *out| out.* = bytes.items[e[0]..e[1]];
+    return .{ .string = .{ .values = values, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+}
+
 /// `date_diff(part, start, end)`: BIGINT boundaries between two times of any unit, NULL where either is NULL or infinite.
 fn evalDateDiff(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
     const a = try evalGroupKeyExpr(arena, batch, column_lookup, c.args[1].*);
@@ -2352,7 +2377,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest => unreachable,
     }
     return .{ .i64 = .{
         .values = out,

@@ -23,6 +23,7 @@ const decimal_mod = @import("../parquet/decimal.zig");
 const filter_ast = @import("../filter/ast.zig");
 const filter_parser = @import("../filter/parser.zig");
 const regex = @import("regex.zig");
+const calendar = @import("calendar.zig");
 const Diag = @import("../diag.zig").Diag;
 
 pub const Error = error{
@@ -762,6 +763,7 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "lpad")) return .lpad;
     if (asciiEqIgnoreCase(name, "rpad")) return .rpad;
     if (asciiEqIgnoreCase(name, "split_part")) return .split_part;
+    if (asciiEqIgnoreCase(name, "strftime")) return .strftime;
     if (asciiEqIgnoreCase(name, "date_diff") or asciiEqIgnoreCase(name, "datediff")) return .date_diff;
     if (asciiEqIgnoreCase(name, "regexp_extract")) return .regexp_extract;
     if (asciiEqIgnoreCase(name, "floor")) return .floor;
@@ -823,6 +825,13 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             if (args.len != 1) return error.WrongArity;
             if (!integerArgument(args[0].*, file)) return error.TypeMismatch;
             return .i64;
+        },
+        // A DATE or a TIMESTAMP (not TIMESTAMP_NS, whose DuckDB fields are inconsistent) by a constant format.
+        .strftime => {
+            if (args.len != 2) return error.WrongArity;
+            const t = args[0].temporal() orelse return error.TypeMismatch;
+            if (t == .ts_ns or !isStrLiteral(args[1].*)) return error.TypeMismatch;
+            return .str;
         },
         .date_diff => {
             if (args.len != 3) return error.WrongArity;
@@ -1476,7 +1485,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 } else args[0].temporal(),
                 .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,
                 .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
-                .split_part, .regexp_extract, .date_diff => null,
+                .split_part, .regexp_extract, .date_diff, .strftime => null,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => null,
                 .floor, .ceil, .sqrt, .round, .least, .greatest => null,
             },
@@ -1505,6 +1514,14 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 const a = args;
                 r.* = try .compile(arena, a[1].literal.str, a[2].literal.str, if (a.len > 3) a[3].literal.str else "");
                 break :blk r;
+            } else null,
+            .format = if (func == .strftime) blk: {
+                const f = try arena.create(calendar.Format);
+                f.* = calendar.Format.compile(arena, args[1].literal.str, args[0].isUtc()) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.InvalidFormat => error.TypeMismatch,
+                };
+                break :blk f;
             } else null,
             .extract = if (func == .regexp_extract) blk: {
                 const r = try arena.create(regex.Extract);

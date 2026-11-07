@@ -113,6 +113,161 @@ pub fn diff(unit: ast.DiffPart, ta_in: ast.Temporal, a_in: i64, tb_in: ast.Tempo
     return std.math.cast(i64, r) orelse error.TimestampOutOfRange;
 }
 
+/// A `strftime` format compiled once from its constant text: the literal runs and the fields between them, DuckDB's
+/// specifiers (`%Y %y %m %d %H %I %M %S %j` with the `%-` forms that do not pad, `%f %g %n %p %a %A %b %B %w %u %U %W %V
+/// %G %Z %z %c %x %X %T %h %%`). Anything else, an empty text and a lone `%` are refused, as DuckDB refuses them.
+pub const Format = struct {
+    pieces: []const Piece,
+
+    pub const Spec = enum {
+        year, year2, month, day, hour, hour12, minute, second, micro, milli, nano, doy, wday_abbr, wday_name, mon_abbr, mon_name,
+        wday0, wday1, week_sun, week_mon, week_iso, year_iso, ampm, tz_name, tz_offset,
+    };
+    pub const Field = struct { spec: Spec, pad: bool = true };
+    pub const Piece = union(enum) { text: []const u8, field: Field };
+
+    pub fn compile(arena: std.mem.Allocator, text: []const u8, utc: bool) error{ OutOfMemory, InvalidFormat }!Format {
+        if (text.len == 0) return error.InvalidFormat;
+        var pieces: std.ArrayList(Piece) = .empty;
+        var lit_start: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) {
+            if (text[i] != '%') {
+                i += 1;
+                continue;
+            }
+            if (i > lit_start) try pieces.append(arena, .{ .text = text[lit_start..i] });
+            if (i + 1 >= text.len) return error.InvalidFormat;
+            var c = text[i + 1];
+            var pad = true;
+            var width: usize = 2;
+            if (c == '-') {
+                if (i + 2 >= text.len) return error.InvalidFormat;
+                pad = false;
+                c = text[i + 2];
+                width = 3;
+                if (std.mem.indexOfScalar(u8, "mdHIMSyj", c) == null) return error.InvalidFormat;
+            }
+            const spec: Spec = switch (c) {
+                'Y' => .year,
+                'y' => .year2,
+                'm' => .month,
+                'd' => .day,
+                'H' => .hour,
+                'I' => .hour12,
+                'M' => .minute,
+                'S' => .second,
+                'f' => .micro,
+                'g' => .milli,
+                'n' => .nano,
+                'j' => .doy,
+                'a' => .wday_abbr,
+                'A' => .wday_name,
+                'b', 'h' => .mon_abbr,
+                'B' => .mon_name,
+                'w' => .wday0,
+                'u' => .wday1,
+                'U' => .week_sun,
+                'W' => .week_mon,
+                'V' => .week_iso,
+                'G' => .year_iso,
+                'p' => .ampm,
+                'Z' => .tz_name,
+                'z' => .tz_offset,
+                '%' => {
+                    try pieces.append(arena, .{ .text = "%" });
+                    i += width;
+                    lit_start = i;
+                    continue;
+                },
+                'c', 'x', 'X', 'T' => {
+                    // A date, a time, or both: the fields spelled out.
+                    const seq: []const Piece = switch (c) {
+                        'x' => &.{ .{ .field = .{ .spec = .year } }, .{ .text = "-" }, .{ .field = .{ .spec = .month } }, .{ .text = "-" }, .{ .field = .{ .spec = .day } } },
+                        'c' => &.{ .{ .field = .{ .spec = .year } }, .{ .text = "-" }, .{ .field = .{ .spec = .month } }, .{ .text = "-" }, .{ .field = .{ .spec = .day } }, .{ .text = " " }, .{ .field = .{ .spec = .hour } }, .{ .text = ":" }, .{ .field = .{ .spec = .minute } }, .{ .text = ":" }, .{ .field = .{ .spec = .second } } },
+                        else => &.{ .{ .field = .{ .spec = .hour } }, .{ .text = ":" }, .{ .field = .{ .spec = .minute } }, .{ .text = ":" }, .{ .field = .{ .spec = .second } } },
+                    };
+                    try pieces.appendSlice(arena, seq);
+                    i += width;
+                    lit_start = i;
+                    continue;
+                },
+                else => return error.InvalidFormat,
+            };
+            // `%Z` is the zone's name: empty for a TIMESTAMP, UTC for one with a time zone.
+            if (spec == .tz_name) {
+                if (utc) try pieces.append(arena, .{ .text = "UTC" });
+            } else try pieces.append(arena, .{ .field = .{ .spec = spec, .pad = pad } });
+            i += width;
+            lit_start = i;
+        }
+        if (text.len > lit_start) try pieces.append(arena, .{ .text = text[lit_start..] });
+        return .{ .pieces = pieces.items };
+    }
+
+    /// Append the time `v` in unit `t` to `out`. DuckDB's infinite DATE and TIMESTAMP print as `infinity` and `-infinity`.
+    pub fn render(f: Format, gpa: std.mem.Allocator, out: *std.ArrayList(u8), t: ast.Temporal, v: i64) (Error || std.mem.Allocator.Error)!void {
+        const ts_infinity = std.math.maxInt(i64);
+        const infinite: ?i8 = if (t == .date)
+            (if (v == std.math.maxInt(i32)) @as(?i8, 1) else if (v == -std.math.maxInt(i32)) @as(?i8, -1) else null)
+        else
+            (if (v == ts_infinity) @as(?i8, 1) else if (v == -ts_infinity) @as(?i8, -1) else null);
+        if (infinite) |sign| return out.appendSlice(gpa, if (sign > 0) "infinity" else "-infinity");
+        const x = try split(t, v);
+        const c = civilFromDays(x.days);
+        const wday: i64 = @mod(x.days + 4, 7); // 0 is Sunday; 1970-01-01 was a Thursday
+        const doy: i64 = x.days - daysFromCivil(c.y, 1, 1);
+        const hour = @divFloor(x.of_day, us_per_hour);
+        for (f.pieces) |piece| switch (piece) {
+            .text => |s| try out.appendSlice(gpa, s),
+            .field => |fl| switch (fl.spec) {
+                .year => try year(gpa, out, c.y),
+                .year2 => try number(gpa, out, @mod(@as(i64, @intCast(@abs(c.y))), 100), 2, fl.pad),
+                .month => try number(gpa, out, c.m, 2, fl.pad),
+                .day => try number(gpa, out, c.d, 2, fl.pad),
+                .hour => try number(gpa, out, hour, 2, fl.pad),
+                .hour12 => try number(gpa, out, if (@mod(hour, 12) == 0) 12 else @mod(hour, 12), 2, fl.pad),
+                .minute => try number(gpa, out, @divFloor(@mod(x.of_day, us_per_hour), us_per_min), 2, fl.pad),
+                .second => try number(gpa, out, @divFloor(@mod(x.of_day, us_per_min), us_per_s), 2, fl.pad),
+                .micro => try number(gpa, out, @mod(x.of_day, us_per_s), 6, true),
+                .milli => try number(gpa, out, @divFloor(@mod(x.of_day, us_per_s), std.time.us_per_ms), 3, true),
+                .nano => try number(gpa, out, @mod(x.of_day, us_per_s) * 1000, 9, true),
+                .doy => try number(gpa, out, doy + 1, 3, fl.pad),
+                .wday_abbr => try out.appendSlice(gpa, weekdays[@intCast(wday)][0..3]),
+                .wday_name => try out.appendSlice(gpa, weekdays[@intCast(wday)]),
+                .mon_abbr => try out.appendSlice(gpa, months[@intCast(c.m - 1)][0..3]),
+                .mon_name => try out.appendSlice(gpa, months[@intCast(c.m - 1)]),
+                .wday0 => try number(gpa, out, wday, 1, true),
+                .wday1 => try number(gpa, out, if (wday == 0) 7 else wday, 1, true),
+                .week_sun => try number(gpa, out, @divFloor(doy + 7 - wday, 7), 2, true),
+                .week_mon => try number(gpa, out, @divFloor(doy + 7 - @mod(wday + 6, 7), 7), 2, true),
+                .week_iso => try number(gpa, out, try part(.week, t, v), 2, true),
+                .year_iso => try year(gpa, out, civilFromDays(x.days - @mod(wday + 6, 7) + 3).y),
+                .ampm => try out.appendSlice(gpa, if (hour < 12) "AM" else "PM"),
+                .tz_name => unreachable,
+                .tz_offset => try out.appendSlice(gpa, "+00"),
+            },
+        };
+    }
+
+    const weekdays = [_][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+    const months = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+
+    /// `n` in at least `width` digits (zero padded when `pad`); a negative one keeps its sign.
+    fn number(gpa: std.mem.Allocator, out: *std.ArrayList(u8), n: i64, width: usize, pad: bool) !void {
+        var buf: [24]u8 = undefined;
+        const digits = std.fmt.bufPrint(&buf, "{d}", .{@abs(n)}) catch unreachable;
+        if (n < 0) try out.append(gpa, '-');
+        if (pad) for (digits.len..width) |_| try out.append(gpa, '0');
+        try out.appendSlice(gpa, digits);
+    }
+
+    /// A year as DuckDB prints it: four digits from 0000 to 9999, as many as it has beyond them, `-1` below.
+    fn year(gpa: std.mem.Allocator, out: *std.ArrayList(u8), y: i64) !void {
+        try number(gpa, out, y, 4, y >= 0 and y <= 9999);
+    }
+};
+
 /// A time split into its day and the microseconds into it; a DATE has none. DuckDB's infinite DATEs (`make_date` of
 /// ±maxInt(i32)) have no calendar fields, so they are refused rather than answered as a finite day.
 const Split = struct { days: i64, of_day: i64 };
@@ -281,5 +436,58 @@ test "date_diff counts boundaries crossed, not periods elapsed, and is NULL for 
     // Infinity, either side and either kind of time.
     try T.expectEqual(@as(?i64, null), try diff(.day, .date, std.math.maxInt(i32), .date, d(2020, 1, 1)));
     try T.expectEqual(@as(?i64, null), try diff(.day, .ts_us, 0, .ts_us, std.math.maxInt(i64)));
+}
+
+test "strftime formats as DuckDB 2.0.0 does" {
+    const T = std.testing;
+    var arena = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ts = makeDate(2024, 3, 5) catch unreachable;
+    const us: i64 = ts * 86_400_000_000 + (7 * 3600 + 8 * 60 + 9) * 1_000_000 + 12_345;
+    const cases = [_][2][]const u8{
+        .{ "%Y|%y|%m|%-m|%d|%-d|%H|%-H|%I|%-I|%p", "2024|24|03|3|05|5|07|7|07|7|AM" },
+        .{ "%M|%-M|%S|%-S|%f|%g|%n|%j|%-j", "08|8|09|9|012345|012|012345000|065|65" },
+        .{ "%a|%A|%b|%B|%h|%w|%u|%U|%W|%V|%G", "Tue|Tuesday|Mar|March|Mar|2|2|09|10|10|2024" },
+        .{ "%c|%x|%X|%T|%z|%Z|%%|%-d/%-m/%-y", "2024-03-05 07:08:09|2024-03-05|07:08:09|07:08:09|+00||%|5/3/24" },
+        .{ "é日%Yx", "é日2024x" },
+    };
+    for (cases) |c| {
+        const f = try Format.compile(a, c[0], false);
+        var out: std.ArrayList(u8) = .empty;
+        try f.render(a, &out, .ts_us, us);
+        try T.expectEqualStrings(c[1], out.items);
+    }
+    // The zone's name is UTC only for a TIMESTAMP WITH TIME ZONE.
+    var out: std.ArrayList(u8) = .empty;
+    try (try Format.compile(a, "%Z|%H", true)).render(a, &out, .ts_us, us);
+    try T.expectEqualStrings("UTC|07", out.items);
+    // 12-hour clock around midnight and noon, and the week fields at a year's edges.
+    const edge = [_]struct { f: []const u8, d: [3]i64, want: []const u8 }{
+        .{ .f = "%I|%p", .d = .{ 2024, 3, 5 }, .want = "12|AM" },
+        .{ .f = "%U|%W|%V|%G|%j|%u|%w", .d = .{ 2024, 12, 30 }, .want = "52|53|01|2025|365|1|1" },
+        .{ .f = "%U|%W|%V|%G|%u|%w", .d = .{ 2021, 1, 3 }, .want = "01|00|53|2020|7|0" },
+        .{ .f = "%U|%W|%V|%G", .d = .{ 2020, 12, 31 }, .want = "52|52|53|2020" },
+        .{ .f = "%Y|%y|%G|%j|%a|%U|%V", .d = .{ 5, 1, 2 }, .want = "0005|05|0004|002|Sun|01|53" },
+        .{ .f = "%Y|%y|%G", .d = .{ 10000, 1, 1 }, .want = "10000|00|9999" },
+        .{ .f = "%Y|%y|%m|%d|%G|%j", .d = .{ -1, 3, 5 }, .want = "-1|01|03|05|-1|064" },
+        .{ .f = "%Y|%y|%G", .d = .{ 0, 1, 1 }, .want = "0000|00|-1" },
+    };
+    for (edge) |e| {
+        var o: std.ArrayList(u8) = .empty;
+        const days = try makeDate(e.d[0], e.d[1], e.d[2]);
+        try (try Format.compile(a, e.f, false)).render(a, &o, .date, days);
+        try T.expectEqualStrings(e.want, o.items);
+    }
+    var noon: std.ArrayList(u8) = .empty;
+    try (try Format.compile(a, "%I|%p|%I", false)).render(a, &noon, .ts_us, ts * 86_400_000_000 + 12 * 3_600_000_000);
+    try T.expectEqualStrings("12|PM|12", noon.items);
+    var inf: std.ArrayList(u8) = .empty;
+    try (try Format.compile(a, "%Y", false)).render(a, &inf, .date, std.math.maxInt(i32));
+    try (try Format.compile(a, "%Y", false)).render(a, &inf, .ts_us, -std.math.maxInt(i64));
+    try T.expectEqualStrings("infinity-infinity", inf.items);
+    // What DuckDB refuses.
+    for ([_][]const u8{ "", "%", "a%-", "%e", "%Q", "%D", "%F", "%R", "%s", "%-Y", "%-" }) |bad|
+        try T.expectError(error.InvalidFormat, Format.compile(a, bad, false));
 }
 

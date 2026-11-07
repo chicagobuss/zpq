@@ -198,6 +198,9 @@ pub const AggRowGroup = struct {
     /// Original global row of this row group's first row, including pruned rows. Zero until the scan sets the
     /// file prefix. A slice adds its own offset; this is not the packed first-position tag.
     row_base: u64 = 0,
+    /// Whether a streamed filter string the fold also reads may keep its first pass for the second (`plan.fusion`).
+    /// Off once a worker's keep outgrew its cap: the filter keeps too many rows for it to pay.
+    fuse: bool = true,
 };
 
 /// Borrowed owner view of one decoded window. `input_rows` are indexes into that window. The shared adapter

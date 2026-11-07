@@ -283,22 +283,67 @@ fn mandatoryLike(f: filter_ast.Filter, ci: usize) ?filter_ast.LikeMatch {
     }
 }
 
-/// The LIKE a filter-only flat BYTE_ARRAY chunk is checked against while its pages decode, so the bytes of a row it
-/// fails are never copied out of the page. The row stays in the batch as an empty string, which the filter then rejects
-/// as it would the string; no fold reads the column, so no one sees the difference. Null when the chunk's dictionary
-/// covers it (the predicate is already one compare per entry), when the fold reads the column, or when the LIKE is not
-/// one every kept row satisfies.
-pub fn prefilterLike(in: AggRowGroup, target: AggTarget, ci: usize) ?filter_ast.LikeMatch {
+/// Every use of `ci` by the fold reads the bare value of a row the filter kept, so a row it dropped may hold any value.
+/// A per-aggregate FILTER, an expression over the column and a record projection can see or fail on those rows.
+fn onlyBareFoldUses(target: AggTarget, ci: usize) bool {
+    switch (target) {
+        .scalar => |s| for (s.calls) |call| {
+            if (call.where) |w| if (filterMentions(w, ci)) return false;
+            if (call.arg) |arg| if (exprMentions(arg, ci) and !bareColumn(arg, ci)) return false;
+        },
+        .grouped => |g| {
+            if (g.records != null) return false;
+            for (g.keys) |k| if (exprMentions(k, ci) and !bareColumn(k, ci)) return false;
+            for (g.calls) |call| {
+                if (call.where) |w| if (filterMentions(w, ci)) return false;
+                if (call.arg) |arg| if (exprMentions(arg, ci) and !bareColumn(arg, ci)) return false;
+            }
+        },
+    }
+    return true;
+}
+
+/// How a streamed byte-array filter column is read so that its bytes are copied out of a page only if something can
+/// still want them. The skipped rows stay in the batch as empty strings, which the filter rejects as it rejects the
+/// strings; no fold reads a row the filter rejected.
+pub const Fusion = struct {
+    /// A LIKE every kept row satisfies: the values that fail it are not copied.
+    like: ?filter_ast.LikeMatch,
+    /// The fold reads the column too. The first pass keeps the values it copies and the second pass replays them,
+    /// so the chunk is decompressed once, as the whole-row-group decode does, and its pages are the gated plan's.
+    shared: bool,
+};
+
+/// The fusion of column `ci` in this row group, or null when its read stays as it is (whole, or streamed whole). A
+/// string the fold never reads needs a mandatory LIKE. A string it also reads must be read twice by the sliced plan
+/// (it has a first pass, or a deferred column), and be either deferred, so only the rows the cheaper conjuncts kept
+/// are copied, or LIKE-checked, so only the matches are; with a bare use, and a dictionary that does not cover it.
+pub fn fusion(in: AggRowGroup, target: AggTarget, ci: usize) ?Fusion {
     const filter = in.filter orelse return null;
     if (ci >= in.read.len or !in.read[ci] or ci >= in.rg.columns.items.len) return null;
     const cm = in.rg.columns.items[ci].meta_data orelse return null;
     if (cm.type != .BYTE_ARRAY) return null;
     if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) return null;
     if (!reusableByteEncodings(cm.encodings.items)) return null;
-    if (columnFeedsFold(target, ci)) return null;
-    const like = mandatoryLike(filter, ci) orelse return null;
-    if (@import("../filter/membership.zig").dictionaryCoversChunk(&cm)) return null;
-    return like;
+    if (!filterMentions(filter, ci)) return null;
+    if (@import("../filter/membership.zig").dictionaryLikely(&cm)) return null;
+    const like = mandatoryLike(filter, ci);
+    if (!columnFeedsFold(target, ci)) return if (like) |l| .{ .like = l, .shared = false } else null;
+    if (!in.fuse or in.subgroup != null or ci >= in.consumed.len or !in.consumed[ci]) return null;
+    if (!onlyBareFoldUses(target, ci) or target.codedKey(ci)) return null;
+    var buf: [32 << 10]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    const found = payloadColumns(a, in, target) catch return null;
+    const indexes = a.alloc(?PageIndex, in.read.len) catch return null;
+    @memset(indexes, null);
+    const gated = GatedFilter.init(a, in, target, indexes) catch return null;
+    // One pass reads each column once. (Without page indexes, more columns defer than with them: if this says none
+    // does, none does.)
+    if (found == null and gated == null) return null;
+    const deferred = if (gated) |g| g.deferred[ci] else false;
+    if (like == null and !deferred) return null;
+    return .{ .like = like, .shared = true };
 }
 
 /// Filter-only or hash-only flat BYTE_ARRAY: the scan reads it a cache-sized window at a time instead of
@@ -309,6 +354,7 @@ pub fn streamByteArray(in: AggRowGroup, target: AggTarget, ci: usize) bool {
     if (cm.type != .BYTE_ARRAY) return false;
     if (in.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0) return false;
     if (!reusableByteEncodings(cm.encodings.items)) return false;
+    if (fusion(in, target, ci) != null) return true;
     const filtered = if (in.filter) |f| filterMentions(f, ci) else false;
     // A filter-only string with a dictionary is compared once per dictionary entry from its codes, a few bytes a row:
     // streaming it reads every value instead, and saves no faulted string bytes. Its pages say whether the dictionary

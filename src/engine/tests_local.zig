@@ -1639,3 +1639,63 @@ test "every write path records a row group's uncompressed bytes as its total_byt
         }
     }
 }
+
+test "a streamed string the fold also reads is kept by the first pass and replayed by the second, the answer unchanged" {
+    const fixture = "ci/fixtures/parquet/count_certificate_plain.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const slice_reader = @import("../core/consumer/slice_reader.zig");
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // `v > ...` completes first, so `s` is deferred and read only at its survivors; min(s) and max(s) read it bare, so
+    // the plan reads it in a first pass and a second. With strlen(s) the use is not bare, and the string reads whole.
+    const Case = struct { like: []const u8, replays: bool, overflows: bool };
+    for ([_]Case{
+        .{ .like = "%7777%", .replays = true, .overflows = false }, // a few rows: kept, replayed
+        .{ .like = "%1%", .replays = false, .overflows = true }, // a third of them: over the cap, read again
+    }) |case| {
+        var filter_buf: [96]u8 = undefined;
+        const filter = try std.fmt.bufPrint(&filter_buf, "v > -100000 AND s LIKE '{s}'", .{case.like});
+        const replays_before = slice_reader.test_replays.load(.monotonic);
+        const overflows_before = slice_reader.test_overflows.load(.monotonic);
+        const fused = try sortedGroupText(gpa, ctx, .{
+            .inputs = &.{fixture},
+            .filter = filter,
+            .aggregate = "min(s) AS lo, max(s) AS hi, count(*) AS c",
+            .group_by = "f",
+            .parallelism = 1,
+        });
+        defer gpa.free(fused);
+        try std.testing.expectEqual(case.replays, slice_reader.test_replays.load(.monotonic) != replays_before);
+        // One worker: its first row group hits the cap, and its later groups read the string whole.
+        try std.testing.expectEqual(
+            @as(usize, @intFromBool(case.overflows)),
+            slice_reader.test_overflows.load(.monotonic) - overflows_before,
+        );
+        const replays_mid = slice_reader.test_replays.load(.monotonic);
+        const overflows_mid = slice_reader.test_overflows.load(.monotonic);
+        const whole = try sortedGroupText(gpa, ctx, .{
+            .inputs = &.{fixture},
+            .filter = filter,
+            .aggregate = "min(s) AS lo, max(s) AS hi, count(*) AS c, sum(strlen(s)) AS l",
+            .group_by = "f",
+            .parallelism = 1,
+        });
+        defer gpa.free(whole);
+        // A use that is not the bare value leaves the string to the whole-row-group decode: nothing kept, nothing replayed.
+        try std.testing.expectEqual(replays_mid, slice_reader.test_replays.load(.monotonic));
+        try std.testing.expectEqual(overflows_mid, slice_reader.test_overflows.load(.monotonic));
+        // Each group row of `whole` is `lo,hi,c,l,`: without its last field it is a row of `fused`.
+        var want: std.ArrayList(u8) = .empty;
+        defer want.deinit(gpa);
+        var rows = std.mem.splitScalar(u8, whole, ';');
+        while (rows.next()) |row| {
+            if (row.len == 0) continue;
+            const body = row[0 .. row.len - 1];
+            try want.appendSlice(gpa, body[0 .. std.mem.lastIndexOfScalar(u8, body, ',').? + 1]);
+            try want.append(gpa, ';');
+        }
+        try std.testing.expect(fused.len > 0);
+        try std.testing.expectEqualStrings(want.items, fused);
+    }
+}
+

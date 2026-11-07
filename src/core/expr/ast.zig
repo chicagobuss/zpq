@@ -398,7 +398,7 @@ pub const Call = struct {
     part: ?DatePart = null,
     /// `regexp_replace`'s pattern and replacement, compiled from its literal arguments; shared read-only by workers.
     replace: ?*const regex.Replace = null,
-    /// `abs`'s argument column's SQL integer type, when the argument is a bare integer column.
+    /// The SQL integer type `abs` overflows at, or a cast's target: the type of the argument the i64 lane has lost.
     int: ?IntType = null,
 };
 

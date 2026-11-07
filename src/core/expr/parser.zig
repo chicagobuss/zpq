@@ -1234,6 +1234,110 @@ pub fn bindNumber(text: []const u8, floating: bool) Error!ast.Expr {
     return .{ .literal = .{ .f64 = value } };
 }
 
+/// The type two branches of one result share: the same type, or the wider of two signed ones, as DuckDB's common type.
+/// Mixed signedness is no type this proves.
+fn commonInt(a: ?ast.IntType, b: ?ast.IntType) ?ast.IntType {
+    const x = a orelse return null;
+    const y = b orelse return null;
+    if (x == y) return x;
+    const signed = @backingInt(ast.IntType.i128);
+    if (@backingInt(x) > signed or @backingInt(y) > signed) return null;
+    return if (@backingInt(x) > @backingInt(y)) x else y;
+}
+
+/// The integer type of the values one result draws from several expressions (`coalesce`, `least`, a CASE's branches).
+/// A literal takes the type of the others when its value fits it, as DuckDB resolves `coalesce(tinyint_col, 0)`; the
+/// others join by `commonInt`, and a literal that does not fit widens them.
+const IntBranches = struct {
+    file: *const schema.FileMetaData,
+    ty: ?ast.IntType = null,
+    typed: bool = false,
+    lit_min: i128 = std.math.maxInt(i128),
+    lit_max: i128 = std.math.minInt(i128),
+    failed: bool = false,
+
+    fn add(self: *IntBranches, e: ast.Expr) void {
+        switch (e) {
+            .literal => |l| switch (l) {
+                .i64 => |v| {
+                    self.lit_min = @min(self.lit_min, v);
+                    self.lit_max = @max(self.lit_max, v);
+                },
+                else => self.failed = true,
+            },
+            else => {
+                const t = intTypeOf(self.file, e);
+                self.ty = if (self.typed) commonInt(self.ty, t) else t;
+                self.typed = true;
+                if (self.ty == null) self.failed = true;
+            },
+        }
+    }
+
+    fn result(self: IntBranches) ?ast.IntType {
+        if (self.failed) return null;
+        if (self.lit_min > self.lit_max) return self.ty;
+        if (!self.typed) return commonInt(ast.IntType.ofValue(self.lit_min), ast.IntType.ofValue(self.lit_max));
+        var t = self.ty.?;
+        if (!t.holds(self.lit_min)) t = commonInt(t, ast.IntType.ofValue(self.lit_min)) orelse return null;
+        if (!t.holds(self.lit_max)) t = commonInt(t, ast.IntType.ofValue(self.lit_max)) orelse return null;
+        return t;
+    }
+};
+
+/// The SQL integer type of an integer-valued expression as DuckDB resolves it, or null where zpq cannot prove it. Row
+/// arithmetic runs in i64 whatever the operands' widths, so the type is not in the values: it comes from the columns'
+/// schema elements, the casts' targets and the literals' magnitudes, joined by DuckDB's rules.
+fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
+    switch (e) {
+        .literal => |l| return switch (l) {
+            .i64 => |v| ast.IntType.ofValue(v),
+            else => null,
+        },
+        .col_ref => |c| {
+            const elem = metadata.leafSchemaElement(file, c.col_idx) orelse return null;
+            return ast.IntType.ofElement(elem);
+        },
+        .binop => |b| {
+            if (b.op != .add and b.op != .sub and b.op != .mul) return null;
+            // A literal takes the other operand's type when it fits (`tinyint_col + 0` is a TINYINT).
+            const lit_l = if (b.left.* == .literal and b.left.literal == .i64) b.left.literal.i64 else null;
+            const lit_r = if (b.right.* == .literal and b.right.literal == .i64) b.right.literal.i64 else null;
+            if (lit_l == null or lit_r == null) {
+                if (lit_r) |v| {
+                    const t = intTypeOf(file, b.left.*) orelse return null;
+                    return if (t.holds(v)) t else ast.IntType.combine(t, ast.IntType.ofValue(v));
+                }
+                if (lit_l) |v| {
+                    const t = intTypeOf(file, b.right.*) orelse return null;
+                    return if (t.holds(v)) t else ast.IntType.combine(ast.IntType.ofValue(v), t);
+                }
+            }
+            const l = intTypeOf(file, b.left.*) orelse return null;
+            const r = intTypeOf(file, b.right.*) orelse return null;
+            return ast.IntType.combine(l, r);
+        },
+        .call => |c| switch (c.func) {
+            .abs, .cast_i8, .cast_i16, .cast_i32, .cast_i64 => return c.int,
+            .strlen, .length, .date_part => return .i64,
+            .round => return intTypeOf(file, c.args[0].*),
+            .coalesce, .least, .greatest => {
+                var br: IntBranches = .{ .file = file };
+                for (c.args) |a| br.add(a.*);
+                return br.result();
+            },
+            else => return null,
+        },
+        .case_ => |c| {
+            // A NULL branch has no type of its own.
+            var br: IntBranches = .{ .file = file };
+            for (c.whens) |w| if (w.then) |v| br.add(v.*);
+            if (c.else_) |v| br.add(v.*);
+            return br.result();
+        },
+    }
+}
+
 pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func: ast.Func, args: []const *ast.Expr) Error!ast.Expr {
     for (args) |arg| try rejectUnsigned64Operand(arg.*);
     const result_type = try resolveCallType(func, args, file);
@@ -1248,6 +1352,11 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
         dec = args[0].decSpec().?;
         for (args[1..]) |a| dec = ast.Dec.common(dec.?, a.decSpec().?);
     }
+    // `abs` overflows at its argument's SQL type, which the i64 lane has lost: refused where zpq cannot prove it.
+    const abs_int: ?ast.IntType = if (func == .abs and args[0].typeOf() == .i64)
+        intTypeOf(file, args[0].*) orelse return error.TypeMismatch
+    else
+        null;
     var deepest: u32 = 0;
     for (args) |a| deepest = @max(deepest, a.depth());
     const depth = 1 + deepest;
@@ -1272,10 +1381,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 .floor, .ceil, .sqrt, .round, .least, .greatest => null,
             },
             .int = switch (func) {
-                .abs => if (args[0].* == .col_ref) blk: {
-                    const elem = metadata.leafSchemaElement(file, args[0].col_ref.col_idx) orelse break :blk null;
-                    break :blk ast.IntType.ofElement(elem);
-                } else null,
+                .abs => if (args[0].typeOf() == .i64) abs_int else null,
                 .cast_i8 => .i8,
                 .cast_i16 => .i16,
                 .cast_i32 => .i32,

@@ -734,6 +734,28 @@ pub const Expr = union(enum) {
         };
     }
 
+    /// Whether the expression's value is a FLOAT in DuckDB, as far as zpq can tell: it reads a FLOAT column and no cast
+    /// turns that into another type. zpq computes such an expression as a DOUBLE; an answer that depends on the
+    /// difference (a quantile's interpolation, the type of a returned value) is refused.
+    pub fn involvesFloat(self: Expr) bool {
+        return switch (self) {
+            .literal => false,
+            .col_ref => |c| c.physical_type == .FLOAT,
+            .binop => |b| b.left.involvesFloat() or b.right.involvesFloat(),
+            .call => |c| switch (c.func) {
+                .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_text, .cast_date, .cast_timestamp => false,
+                else => for (c.args) |a| {
+                    if (a.involvesFloat()) break true;
+                } else false,
+            },
+            .case_ => |c| blk: {
+                if (c.else_) |e| if (e.involvesFloat()) break :blk true;
+                for (c.whens) |w| if (w.then) |t| if (t.involvesFloat()) break :blk true;
+                break :blk false;
+            },
+        };
+    }
+
     pub fn mayBeNull(self: Expr) bool {
         return switch (self) {
             .literal => false,

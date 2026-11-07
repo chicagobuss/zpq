@@ -221,7 +221,7 @@ fn applyGrouped(
         .arg_max, .arg_min => return error.UnsupportedAggType,
         .approx_count_distinct => {
             const kind = hll.kindOfColRef(call.arg.?.col_ref) orelse return error.UnsupportedAggType;
-            hll.insert(try state.blob.sketch(persist, ctx.winner_charge), hll.hashRow(kind, values.?, r));
+            hll.insert(try state.blob.sketch(persist, ctx.winner_charge), try hll.hashRow(kind, values.?, r));
         },
         .var_samp, .var_pop, .stddev_samp, .stddev_pop => state.moments.add(
             scalar.momentAt(values.?, r, u64_col, scalar.momentScale(call)) orelse return error.UnsupportedAggType,

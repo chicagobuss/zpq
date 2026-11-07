@@ -46,8 +46,9 @@ pub fn hashBytes(bytes: []const u8) u64 {
 
 /// How DuckDB hashes a column's values, by the physical width its type has there (not the Parquet one): every integer
 /// up to 32 bits, a DATE and a DECIMAL of up to 9 digits as the 32 bits of the value; BIGINT, the timestamps (in their
-/// own unit), and a DECIMAL of up to 18 digits as 64; a wider DECIMAL as a HUGEINT.
-pub const Kind = enum { w32, w64, w128, f32, f64, boolean, string };
+/// own unit), and a DECIMAL of up to 18 digits as 64; a wider DECIMAL as a HUGEINT. A millisecond timestamp (plain or
+/// UTC-adjusted) is read by DuckDB as its microsecond TIMESTAMP, so it hashes its count times 1000.
+pub const Kind = enum { w32, w64, ts_ms, w128, f32, f64, boolean, string };
 
 /// The `Kind` of `arg`'s values, or null for a column whose DuckDB type this does not reproduce (a TIME, a UUID, an
 /// INTERVAL, an INT96 timestamp, a half float) or an argument that is no column.
@@ -82,7 +83,7 @@ pub fn kindOfColRef(c: expr_ast.ColRef) ?Kind {
         .i64 => switch (c.physical_type) {
             .BOOLEAN => .boolean,
             .INT32 => .w32,
-            .INT64 => .w64,
+            .INT64 => if (c.temporal == .ts_ms) .ts_ms else .w64,
             else => null,
         },
     };
@@ -90,8 +91,13 @@ pub fn kindOfColRef(c: expr_ast.ColRef) ?Kind {
 
 /// The hash of row `r` of `col`, which is not NULL. Floats hash their bits after DuckDB's normalization (every zero
 /// positive, every NaN the quiet one).
-pub inline fn hashRow(kind: Kind, col: filter_eval.Batch.Column, r: usize) u64 {
+pub inline fn hashRow(kind: Kind, col: filter_eval.Batch.Column, r: usize) error{ConversionOutOfRange}!u64 {
     switch (kind) {
+        .ts_ms => {
+            // DuckDB stops at a count its microseconds do not hold ("Could not convert Timestamp(MS) to Timestamp(US)").
+            const us = std.math.mul(i64, @intCast(wide(col, r)), 1000) catch return error.ConversionOutOfRange;
+            return murmur64(@bitCast(us));
+        },
         .w32 => return murmur64(@as(u32, @truncate(@as(u128, @bitCast(wide(col, r)))))),
         .w64 => return murmur64(@as(u64, @truncate(@as(u128, @bitCast(wide(col, r)))))),
         .w128 => {
@@ -205,28 +211,34 @@ test "hashes are DuckDB 2.0.0's `hash()`" {
     try T.expectEqual(@as(u64, 6774767090898797280), murmur64(@bitCast(@as(i64, -5))));
     const ints = [_]i64{ 1, -1, 255, -5 };
     const col: filter_eval.Batch.Column = .{ .i64 = .{ .values = &ints } };
-    try T.expectEqual(@as(u64, 4717996019076358352), hashRow(.w32, col, 0));
-    try T.expectEqual(@as(u64, 4739667815145166545), hashRow(.w32, col, 1));
-    try T.expectEqual(@as(u64, 13381090676719377747), hashRow(.w32, col, 2));
-    try T.expectEqual(@as(u64, 6774767090898797280), hashRow(.w64, col, 3));
+    try T.expectEqual(@as(u64, 4717996019076358352), try hashRow(.w32, col, 0));
+    try T.expectEqual(@as(u64, 4739667815145166545), try hashRow(.w32, col, 1));
+    try T.expectEqual(@as(u64, 13381090676719377747), try hashRow(.w32, col, 2));
+    try T.expectEqual(@as(u64, 6774767090898797280), try hashRow(.w64, col, 3));
+    // A millisecond timestamp hashes as the microseconds DuckDB reads it as; one its microseconds cannot hold is an error.
+    const ms = [_]i64{ 5, -3, std.math.maxInt(i64) / 1000 + 1 };
+    const ms_col: filter_eval.Batch.Column = .{ .i64 = .{ .values = &ms } };
+    try T.expectEqual(murmur64(5000), try hashRow(.ts_ms, ms_col, 0));
+    try T.expectEqual(murmur64(@bitCast(@as(i64, -3000))), try hashRow(.ts_ms, ms_col, 1));
+    try T.expectError(error.ConversionOutOfRange, hashRow(.ts_ms, ms_col, 2));
     // A HUGEINT (a DECIMAL past 18 digits): the hash of the low half xor the hash of the high.
     const wide_vals = [_]i128{ 123456789012345678901234567890, -3, -12345 };
     const wide_col: filter_eval.Batch.Column = .{ .i128 = .{ .values = &wide_vals } };
-    try T.expectEqual(@as(u64, 14671742139295629465), hashRow(.w128, wide_col, 0));
-    try T.expectEqual(@as(u64, 7369585739780452761), hashRow(.w128, wide_col, 1));
-    try T.expectEqual(@as(u64, 8365155709346026511), hashRow(.w128, wide_col, 2));
+    try T.expectEqual(@as(u64, 14671742139295629465), try hashRow(.w128, wide_col, 0));
+    try T.expectEqual(@as(u64, 7369585739780452761), try hashRow(.w128, wide_col, 1));
+    try T.expectEqual(@as(u64, 8365155709346026511), try hashRow(.w128, wide_col, 2));
     // Floats: bits after the zero and NaN normalization.
     const dbl = [_]f64{ 1.5, 0.0, -0.0, std.math.nan(f64) };
     const dcol: filter_eval.Batch.Column = .{ .f64 = .{ .values = &dbl } };
-    try T.expectEqual(@as(u64, 1706605666616485939), hashRow(.f64, dcol, 0));
-    try T.expectEqual(@as(u64, 0), hashRow(.f64, dcol, 1));
-    try T.expectEqual(@as(u64, 0), hashRow(.f64, dcol, 2));
-    try T.expectEqual(@as(u64, 9170934016072976158), hashRow(.f64, dcol, 3));
+    try T.expectEqual(@as(u64, 1706605666616485939), try hashRow(.f64, dcol, 0));
+    try T.expectEqual(@as(u64, 0), try hashRow(.f64, dcol, 1));
+    try T.expectEqual(@as(u64, 0), try hashRow(.f64, dcol, 2));
+    try T.expectEqual(@as(u64, 9170934016072976158), try hashRow(.f64, dcol, 3));
     const fl = [_]f32{1.5};
-    try T.expectEqual(@as(u64, 877323241837685928), hashRow(.f32, .{ .f32 = .{ .values = &fl } }, 0));
+    try T.expectEqual(@as(u64, 877323241837685928), try hashRow(.f32, .{ .f32 = .{ .values = &fl } }, 0));
     const bools = [_]bool{ true, false };
-    try T.expectEqual(@as(u64, 4717996019076358352), hashRow(.boolean, .{ .boolean = .{ .values = &bools } }, 0));
-    try T.expectEqual(@as(u64, 0), hashRow(.boolean, .{ .boolean = .{ .values = &bools } }, 1));
+    try T.expectEqual(@as(u64, 4717996019076358352), try hashRow(.boolean, .{ .boolean = .{ .values = &bools } }, 0));
+    try T.expectEqual(@as(u64, 0), try hashRow(.boolean, .{ .boolean = .{ .values = &bools } }, 1));
     // Strings: empty, under, at, over eight bytes, an inlined twelve and a longer one.
     try T.expectEqual(@as(u64, 5104928228550385088), hashBytes(""));
     try T.expectEqual(@as(u64, 12561829011207016135), hashBytes("a"));

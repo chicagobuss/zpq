@@ -1242,6 +1242,13 @@ pub const PreparedAggInput = struct {
                     try in.evalArg(arena, batch, column_lookup, arg, !(agg_coded.floatSum(call) and arg.mayBeNull()))
                 else
                     try expr_eval.evalExpr(arena, &batch.restrictedTo(in.selection()), column_lookup, arg);
+                // A function only the generic fold runs reads values: a computed argument that passes a dictionary through
+                // (`coalesce(s, s)` over a coded column) is expanded first.
+                if (call.func.extended()) switch (in.values.?) {
+                    inline else => |c| if (c.codesOnly()) {
+                        in.values = try agg_coded.materialize(arena, in.values.?);
+                    },
+                };
                 // A computed value may be NULL (`strlen` of a NULL): skipped, as a bare column's NULLs are.
                 if (columnHasNulls(in.values.?)) {
                     if (in.own_sel == null) in.own_sel = try in.outer_sel.cloneAlloc(arena);
@@ -1734,9 +1741,14 @@ pub fn forEachArgRow(
     const arg2 = call.arg2 orelse return error.BadAggArg;
     var flat: filter_eval.Batch = batch.*;
     var batch_in = batch;
+    // Every column either argument reads that the decoder left as codes and a dictionary is expanded first, a bare column
+    // or one under a computed argument (`coalesce(s, s)`).
     var cols: ?[]filter_eval.Batch.Column = null;
-    for ([2]expr_ast.Expr{ arg1, arg2 }) |e| if (e == .col_ref) {
-        const pos = column_lookup[e.col_ref.col_idx] orelse return error.BadColumn;
+    const refs = try arena.alloc(bool, column_lookup.len);
+    @memset(refs, false);
+    arg1.collectColumns(refs);
+    arg2.collectColumns(refs);
+    for (refs, column_lookup) |wanted, at| if (wanted) if (at) |pos| {
         if (switch (batch.cols[pos]) {
             inline else => |c| c.codesOnly(),
         }) {
@@ -1832,7 +1844,7 @@ fn foldHll(
     const sketch = try state.blob.sketch(persist, charge);
     var r: usize = 0;
     while (r < sel.len) : (r += 1) {
-        if (sel.isActive(r)) hll.insert(sketch, hll.hashRow(kind, col, r));
+        if (sel.isActive(r)) hll.insert(sketch, try hll.hashRow(kind, col, r));
     }
 }
 

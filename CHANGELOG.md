@@ -30,6 +30,12 @@
   expression, and `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `isodow` and
   `dayofyear` of a date or timestamp, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB (a DECIMAL keeps
   DECIMAL(p, 0) after `floor`, an integer floors to a DOUBLE, `least` skips NULLs, `sqrt` of a negative is NaN).
+- **Aggregate review fixes.** `approx_count_distinct` of a TIMESTAMP_MS column hashes it as the microsecond timestamp DuckDB
+  reads it as (it hashed the raw milliseconds: 978 where DuckDB answers 991). Grouped `arg_max` and `arg_min` merge their
+  partials in input order, so the first row of a tie wins at every `-j` (a later row won at `-j4` and up). A computed
+  argument over a dictionary-coded column (`arg_max(coalesce(s, s), id)`) no longer aborts. A FLOAT computed from a
+  column (`quantile_cont(coalesce(fl, fl), q)`, `arg_max(fl + fl, id)`), which would answer DOUBLE where DuckDB's is
+  FLOAT, is refused by name.
 - **`arg_max` and `arg_min` in SQL.** `arg_max(arg, val)`, `arg_min(arg, val)` and their aliases `max_by`, `min_by`,
   `argmax`, `argmin` over integers, dates and times, DOUBLEs, FLOATs and text (ordered by those or a DECIMAL), scalar or
   per group, with a FILTER, answer in the type of `arg` what DuckDB does, with the first row of the scan winning a tie

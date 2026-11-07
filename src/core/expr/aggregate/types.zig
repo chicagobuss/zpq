@@ -395,7 +395,7 @@ pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShap
         .quantile_cont => blk: {
             const e = arg orelse return error.BadAggArg;
             if (e.temporal() != null or e.isBoolean() or e.typeOf() == .str or e.typeOf() == .dec) return error.UnsupportedAggType;
-            if (e == .col_ref and e.col_ref.physical_type == .FLOAT) return error.UnsupportedAggType;
+            if (e.involvesFloat()) return error.UnsupportedAggType;
             break :blk .f64;
         },
         // The argument's own type, as min and max have it: an integer or date or time, a DOUBLE, text. A DECIMAL, a
@@ -404,6 +404,8 @@ pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShap
             const e = arg orelse return error.BadAggArg;
             if (e.isBoolean() or e.typeOf() == .dec) return error.UnsupportedAggType;
             if (e == .col_ref and e.col_ref.unsigned_64) return error.UnsupportedAggType;
+            // A FLOAT computed from a column would come back typed DOUBLE; a bare column keeps its type.
+            if (e != .col_ref and e.involvesFloat()) return error.UnsupportedAggType;
             break :blk switch (e.typeOf()) {
                 .i64 => .i64,
                 .f64 => .f64,

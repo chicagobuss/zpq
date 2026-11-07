@@ -129,10 +129,10 @@ varies with its threads. A text argument only; the other types, a non-constant s
 texts are held in memory, with four bytes each, against `--max-memory`), `median(x)` and `quantile_cont(x, q)` of an integer or DOUBLE
 (a DOUBLE; NULLs skipped, NULL over none; the values sorted with NaN last and the position `(n - 1) * q` interpolated
 exactly as DuckDB's x86-64 build does, so the answer is its own bit for bit and the same at every `-j`; the quantile is
-a constant from 0 to 1. A FLOAT, DECIMAL, date, BOOLEAN or text argument, a negative or non-constant quantile, and
+a constant from 0 to 1. A FLOAT (a column, or an expression that reads one), DECIMAL, date, BOOLEAN or text argument, a negative or non-constant quantile, and
 `DISTINCT` are refused by name. The values are held in memory, 8 bytes each, against `--max-memory`), `approx_count_distinct(col)` (DuckDB's HyperLogLog
 register for register, so the estimate is DuckDB's own and the same at every `-j`; a BIGINT, 0 over no values; a bare
-column of an integer, DECIMAL, DOUBLE/FLOAT, DATE, timestamp of any unit, BOOLEAN or text type: an expression, a TIME,
+column of an integer, DECIMAL, DOUBLE/FLOAT, DATE, timestamp of any unit (a millisecond one hashes as the microsecond TIMESTAMP DuckDB reads it as), BOOLEAN or text type: an expression, a TIME,
 UUID or INTERVAL column and an INT96 timestamp are refused, as DuckDB hashes them at a width zpq does not read; each
 group's sketch is 1 KB, held against `--max-memory`), conditional `agg(...) FILTER (WHERE ...)`, and
 `GROUP BY`. In SQL, GROUP BY keys may be expressions (bound by value, not spelling), SELECT positions or aliases (a

@@ -53,6 +53,18 @@
    "copy": "COPY (SELECT k AS pk, 'u' || k || repeat('x', (k % 7)::INT) AS uname, 'kind' || (k % 13) AS ukind, (k % 5)::BIGINT AS pgrp FROM range(1, 8001) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048, DICTIONARY_SIZE_LIMIT 1)"
   },
   {
+   "name": "empty_dim",
+   "copy": "COPY (SELECT 1::BIGINT AS epk, 'k' AS ekind, 1::BIGINT AS egrp, 1::INTEGER AS ew WHERE false) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
+   "name": "empty_grp",
+   "copy": "COPY (SELECT 1::BIGINT AS zgk, 'g' AS zname WHERE false) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
+   "name": "empty_fact",
+   "copy": "COPY (SELECT 1::BIGINT AS zfk, 1.0::DOUBLE AS zamt WHERE false) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
    "script": "tools/check/prepare_join_gate.py",
    "files": [
     "join-gate",
@@ -1372,6 +1384,316 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT u.ug, count(*) AS n FROM '{fixture:review-fact}' f, '{fixture:review-dim}' d, '{fixture:review-uniq}' u, '{fixture:nullorder_dim}' e WHERE f.fk = d.pk AND d.grp = u.upk AND f.q = e.pk GROUP BY u.ug ORDER BY u.ug"
+   }
+  },
+  {
+   "id": "join:empty:zero-row-groups-filtered",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:empty_dim}' e WHERE f.fk = e.epk AND e.ew > 0"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:empty_dim}' e WHERE f.fk = e.epk AND e.ew > 0"
+   }
+  },
+  {
+   "id": "join:empty:zero-row-groups-grouped",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT ekind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:empty_dim}' e WHERE f.fk = e.epk AND e.ew > 0 AND e.ekind <> 'x' GROUP BY ekind ORDER BY ekind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT ekind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:empty_dim}' e WHERE f.fk = e.epk AND e.ew > 0 AND e.ekind <> 'x' GROUP BY ekind ORDER BY ekind"
+   }
+  },
+  {
+   "id": "join:empty:zero-row-groups-left",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT ekind, count(*) AS n FROM '{fixture:fact}' f LEFT JOIN '{fixture:empty_dim}' e ON f.fk = e.epk AND e.ew > 1 GROUP BY ekind ORDER BY ekind NULLS FIRST"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT ekind, count(*) AS n FROM '{fixture:fact}' f LEFT JOIN '{fixture:empty_dim}' e ON f.fk = e.epk AND e.ew > 1 GROUP BY ekind ORDER BY ekind NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:empty:zero-row-groups-in",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f WHERE f.fk IN (SELECT epk FROM '{fixture:empty_dim}' WHERE egrp = 2)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:fact}' f WHERE f.fk IN (SELECT epk FROM '{fixture:empty_dim}' WHERE egrp = 2)"
+   }
+  },
+  {
+   "id": "join:empty:zero-row-groups-not-in",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f WHERE f.fk NOT IN (SELECT epk FROM '{fixture:empty_dim}' WHERE egrp = 2)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f WHERE f.fk NOT IN (SELECT epk FROM '{fixture:empty_dim}' WHERE egrp = 2)"
+   }
+  },
+  {
+   "id": "join:empty:snowflake-through-empty",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT zname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:empty_grp}' g WHERE f.fk = d.pk AND d.grp = g.zgk AND g.zname <> 'x' GROUP BY zname ORDER BY zname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT zname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:empty_grp}' g WHERE f.fk = d.pk AND d.grp = g.zgk AND g.zname <> 'x' GROUP BY zname ORDER BY zname"
+   }
+  },
+  {
+   "id": "join:empty:star-dimension-empty",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT kind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:empty_dim}' e, '{fixture:dim}' d WHERE f.sfk = e.epk AND f.fk = d.pk AND e.egrp > 0 GROUP BY kind ORDER BY kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT kind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:empty_dim}' e, '{fixture:dim}' d WHERE f.sfk = e.epk AND f.fk = d.pk AND e.egrp > 0 GROUP BY kind ORDER BY kind"
+   }
+  },
+  {
+   "id": "join:empty:all-rows-filtered",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT kind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND d.w < 0 GROUP BY kind ORDER BY kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT kind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND d.w < 0 GROUP BY kind ORDER BY kind"
+   }
+  },
+  {
+   "id": "join:empty:no-payload-all-filtered",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND d.w < 0"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND d.w < 0"
+   }
+  },
+  {
+   "id": "join:empty:empty-probe",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT kind, count(*) AS n FROM '{fixture:empty_fact}' z, '{fixture:dim}' d WHERE z.zfk = d.pk AND d.w > 0 GROUP BY kind ORDER BY kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT kind, count(*) AS n FROM '{fixture:empty_fact}' z, '{fixture:dim}' d WHERE z.zfk = d.pk AND d.w > 0 GROUP BY kind ORDER BY kind"
    }
   },
   {

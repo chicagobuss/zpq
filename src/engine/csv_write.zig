@@ -348,8 +348,10 @@ pub const Projection = struct {
     /// Per field: whether a query reads it, and its position among the parsed columns (`Plan.slot`).
     fetch: []const bool,
     lookup: []const ?usize,
-    /// Per field: read by a computed output.
+    /// Per field: read by a computed output; read by the filter or a computed output (what needs a scaled
+    /// DECIMAL view, beside the unscaled integers a passthrough writes).
     computed_refs: []const bool,
+    evaluated: []const bool,
     /// The outputs' schema and paths (`consumer.initOutputAggregator`), and per output the parsed column it passes
     /// through (null: computed), for a DECIMAL's precision from the data.
     out_elems: []schema.SchemaElement,
@@ -410,6 +412,19 @@ pub const Projection = struct {
             error.InvalidBoundPlan => error.CsvQueryNotSupported,
             else => e,
         };
+        // `--columns` names the columns written and their order, under a filter as without one (the Parquet planner
+        // keeps its bitmap in file order).
+        var specs = pp.output_specs;
+        if (args.columns) |cols| if (args.select == null and args.plan_source == null) {
+            const ordered = try a.alloc(consumer.OutputCol, cols.len);
+            for (cols, ordered) |name, *o| {
+                const ci = for (all.fields, 0..) |f, i| {
+                    if (std.mem.eql(u8, f, name)) break i;
+                } else return error.UnknownColumn;
+                o.* = .{ .passthrough = .{ .ci = ci } };
+            }
+            specs = ordered;
+        };
         const lookup = try a.alloc(?usize, n);
         var pos: usize = 0;
         for (lookup, pp.fetch) |*l, f| {
@@ -418,23 +433,32 @@ pub const Projection = struct {
         }
         const refs = try a.alloc(bool, n);
         @memset(refs, false);
-        for (pp.output_specs) |spec| switch (spec) {
+        for (specs) |spec| switch (spec) {
             .computed => |c| c.expr.collectColumns(refs),
             .passthrough => {},
         };
-        const template = try consumer.initOutputAggregator(a, meta, pp.output_specs);
-        const source = try a.alloc(?usize, pp.output_specs.len);
-        for (source, pp.output_specs) |*src, spec| src.* = switch (spec) {
+        const evaluated = try a.dupe(bool, refs);
+        if (pp.filter) |f| {
+            var cols: std.ArrayList(usize) = .empty;
+            try f.collectColumns(&cols, a);
+            for (cols.items) |ci| if (ci < n) {
+                evaluated[ci] = true;
+            };
+        }
+        const template = try consumer.initOutputAggregator(a, meta, specs);
+        const source = try a.alloc(?usize, specs.len);
+        for (source, specs) |*src, spec| src.* = switch (spec) {
             .passthrough => |pt| lookup[pt.ci],
             .computed => null,
         };
         return .{
             .meta = meta,
             .filter = pp.filter,
-            .output_specs = pp.output_specs,
+            .output_specs = specs,
             .fetch = pp.fetch,
             .lookup = lookup,
             .computed_refs = refs,
+            .evaluated = evaluated,
             .out_elems = template.schema_elems,
             .out_paths = template.paths,
             .source = source,
@@ -478,10 +502,28 @@ pub const Projection = struct {
                 },
                 else => unreachable,
             };
-            var view = try decimal_mod.scaledF64FromI128(scratch, unscaled, t.scale);
+            pass[ci] = .{ .i128 = unscaled };
+            // A DECIMAL only passed through is written from its integers, exactly; one a filter or an expression
+            // reads gets its scaled view too, as a Parquet DECIMAL decodes to one (`decimal.decodeColumnAsF64`). Past
+            // 18 digits it converts value by value from i128, as a FIXED_LEN_BYTE_ARRAY DECIMAL's does.
+            if (!pr.evaluated[ci]) {
+                cols[k] = .{ .i128 = unscaled };
+                continue;
+            }
+            var view = if (raw == .i64)
+                try decimal_mod.scaledF64FromI128(scratch, unscaled, t.scale)
+            else blk: {
+                const v = try scratch.alloc(f64, unscaled.values.len);
+                for (v, unscaled.values) |*d, u| d.* = decimal_mod.applyScaleI128(u, t.scale);
+                break :blk filter_eval.ColumnT(f64){
+                    .values = v,
+                    .def_levels = unscaled.def_levels,
+                    .max_def = unscaled.max_def,
+                    .has_nulls = unscaled.has_nulls,
+                };
+            };
             view.unscaled = .{ .i128 = unscaled.values };
             cols[k] = .{ .f64 = view };
-            pass[ci] = .{ .i128 = unscaled };
         }
         const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = rows };
         var sel = try filter_selection.SelectionVector.init(scratch, rows);
@@ -1076,19 +1118,39 @@ pub fn run(
         else => return e,
     };
     defer mapped.unmap();
+    var workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
+    var chunk = chunkBytes(opts, args, workers, mapped.bytes.len);
     // A filter or computed SELECT is bound to every field, then only the fields it reads are parsed.
     var all: ?Plan = null;
+    // Per field, the type its sample gave, where a failed binding settled the file's types (`Projection.bind`).
+    var sampled: ?[]const Type = null;
     var p = if (Projection.needed(args)) blk: {
         var every = opts;
         every.columns = null;
         all = try plan(arena, mapped.bytes, every, failure);
-        const first = try Projection.bind(arena, args, &all.?, null);
+        const first = Projection.bind(arena, args, &all.?, null) catch |e| retry: {
+            // The sample's types are provisional (a field NULL in the sample, or holding a later wider value): a query
+            // that does not bind to them may bind to the file's. Every field's type is settled from the whole file, as
+            // a restart settles it, and the query bound again; one that still does not bind is invalid for the file.
+            // Strict mode keeps the sample's types, as it refuses a later value instead of widening.
+            if (e == error.CsvQueryNotSupported or e == error.OutOfMemory or opts.strict) return e;
+            const before = try arena.dupe(Type, all.?.types);
+            const seen = try classifyFile(ctx, arena, &all.?, chunk, workers, failure);
+            for (all.?.types, seen, all.?.pinned) |*t, f, pinned| if (!pinned) {
+                t.* = t.join(f);
+            };
+            sampled = before;
+            break :retry try Projection.bind(arena, args, &all.?, null);
+        };
         var parsed = opts;
         parsed.columns = try first.fetchedNames(arena, all.?.fields);
-        break :blk try plan(arena, mapped.bytes, parsed, failure);
+        var fetched = try plan(arena, mapped.bytes, parsed, failure);
+        // Settled types hold every value already: the parse takes them, not the sample's again.
+        if (sampled != null) for (fetched.slot, 0..) |slot, ci| if (slot) |o| {
+            fetched.types[o] = all.?.types[ci];
+        };
+        break :blk fetched;
     } else try plan(arena, mapped.bytes, opts, failure);
-    var workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
-    var chunk = chunkBytes(opts, args, workers, mapped.bytes.len);
     // Everything the report holds is allocated before the output exists: once it is finished, nothing may fail.
     // The fields are named first, for a refusal's column.
     const fields = try report_alloc.alloc([]const u8, p.fields.len);
@@ -1099,6 +1161,9 @@ pub fn run(
     report.names = names;
     const widened = try report_alloc.alloc(bool, p.names.len);
     @memset(widened, false);
+    if (sampled) |before| for (p.slot, 0..) |slot, ci| if (slot) |o| {
+        widened[o] = !std.meta.eql(before[ci], p.types[o]);
+    };
     report.widened = widened;
     const types = try report_alloc.alloc(Type, p.names.len);
     // A path, or the caller's own unpublished file, starts again from empty; a pipe may have passed bytes on.

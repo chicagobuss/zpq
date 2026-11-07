@@ -772,3 +772,24 @@ test "csv write: per-chunk state is charged in full, and a budget too small for 
     const r = try csv_write.run(ctx, roomy, in, out, opts, &report, a);
     try testing.expectEqual(@as(i64, 8_000), r.rows_matched);
 }
+
+test "csv query: a DECIMAL past 18 digits filters, passes through and computes without narrowing (review CSVF-1)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    const csv = try tmpPath(&b1, &tmp, "wide.csv");
+    const out = try tmpPath(&b2, &tmp, "wide.parquet");
+    try writeFile(csv, "id,d\n0,123456789012345678.25\n1,\n2,-123456789012345678.25\n");
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    const Case = struct { filter: ?[]const u8, select: ?[]const u8, rows: i64 };
+    for ([_]Case{
+        .{ .filter = "id >= 0", .select = null, .rows = 3 },
+        .{ .filter = "d > 0", .select = null, .rows = 1 },
+        .{ .filter = "id < 0", .select = null, .rows = 0 },
+        .{ .filter = null, .select = "id, d * 2 AS d2", .rows = 3 },
+    }) |c| for ([_]usize{ 1, 4 }) |j| {
+        const r = try runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .filter = c.filter, .select = c.select, .parallelism = j });
+        try testing.expectEqual(c.rows, r.write.rows_matched);
+    };
+}

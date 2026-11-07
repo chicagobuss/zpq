@@ -90,6 +90,24 @@ def main(out):
     late("late_wide_decimal.csv", b"id,x", lambda i: b"%d,%d.25" % (i, i),
          b"%d,12345678901234567.89" % LATE, [LATE, "x", "12345678901234567.89"])
 
+    # DECIMALs past 18 digits, which filters and expressions over a CSV read without narrowing (review CSVF-1).
+    write(out, "wide_decimal.csv", lines([b"id,d", b"0,123456789012345678.25", b"1,", b"2,-123456789012345678.25"]),
+          cases, {})
+    write(out, "wide_scale.csv", lines([b"id,d", b"0,0.1" + b"0" * 36, b"1,", b"2,-0." + b"0" * 36 + b"1"]), cases, {})
+
+    # A field whose type only the rows past zpq's 4 MiB sample settle: padded rows put row 19,000 past it. A query
+    # binds to the file's types, not the sample's (review CSVF-2), and a wide DECIMAL widens there (CSVF-1).
+    pad = b"p" * 256
+
+    def padded(name, value, late):
+        rows = [b"id,x,pad"] + [b"%d,%s,%s" % (i, late if i == 19000 else value(i), pad) for i in range(20003)]
+        write(out, name, lines(rows), cases, {})
+
+    padded("late_null_padded.csv", lambda i: b"", b"12")
+    padded("late_text_padded.csv", lambda i: b"%d" % i, b"abc")
+    padded("late_bool_padded.csv", lambda i: b"true" if i % 2 else b"false", b"maybe")
+    padded("late_wide_padded.csv", lambda i: b"%d.25" % i, b"123456789012345678.25")
+
     # Values whose text a numeric type would change.
     write(out, "lossy_numbers.csv", lines([
         b'zip,amount,big,code',

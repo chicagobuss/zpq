@@ -19,7 +19,8 @@ then scatter the prepared plan.
     fanout.py --function zpq-worker --workers 32 --input s3://b/lineitem/ --aggregate "sum(x) AS s" ...
 
 The same module is a coordinator Lambda handler (`fanout.handler`); the event names the worker function and the
-query, as the CLI flags do (see `handler`). Pure stdlib, plus boto3 to invoke Lambda.
+query, as the CLI flags do (see `handler`). Pure stdlib, plus botocore's SigV4 (in the Lambda Python runtime) to
+sign invokes. A passed `client` is the boto3-shaped double the tests use.
 """
 import argparse
 import base64
@@ -27,9 +28,14 @@ import concurrent.futures as cf
 import decimal
 import json
 import math
+import queue
 import re
+import socket
+import ssl
 import sys
+import threading
 import time
+from urllib.parse import quote, urlsplit
 
 PLAN_VERSION = 1
 PARTIAL_VERSION = 1
@@ -219,26 +225,279 @@ def _worker_stat(resp, stats):
     return item
 
 
-def lambda_invoker(function, region=None, pool=256, client=None):
-    """invoke(payload) -> (response, stats) through boto3 `lambda.invoke`, every call to exactly `function`
-    (qualifier included). When that is a published version, `invoke.capability_key` is its identity for the
-    capability cache; otherwise it is None and every query negotiates. `client` reuses a Lambda client; with none
-    given, the process-wide client for `(region, pool)` is used."""
-    if client is None:
-        client = cached_client(region, pool)
+def lambda_endpoint(function, region):
+    """`(url, region)` of the Invoke API for `function`. A qualifier (`name:7`, an alias, or the qualifier on an
+    ARN) is the `Qualifier` query, so a pinned version stays pinned."""
+    head, sep, tail = function.rpartition(":function:")
+    if sep:
+        parts = head.split(":")
+        if len(parts) >= 5 and parts[3]:
+            region = parts[3]
+        function = tail
+    name, _, qualifier = function.partition(":")
+    url = f"https://lambda.{region}.amazonaws.com/2015-03-31/functions/{quote(name, safe='')}/invocations"
+    if qualifier:
+        url += "?Qualifier=" + quote(qualifier, safe="")
+    return url, region
+
+
+def _billed_from_body(resp):
+    """Duration the worker reports, rounded up to the millisecond Lambda bills, for when the invoke did not ask for
+    the REPORT line. Init duration is not in `total_ms`, so a cold start is a few tens of milliseconds short."""
+    total = resp.get("total_ms") if isinstance(resp, dict) else None
+    if not isinstance(total, (int, float, decimal.Decimal)):
+        return {}
+    ms = float(total)
+    return {"duration_ms": ms, "billed_ms": math.ceil(ms)}
+
+
+def _read_invoke(status, headers, body):
+    """The Invoke API answers 200 with the function's body, and names a handled or unhandled failure in
+    `X-Amz-Function-Error`. Anything else failed before the function ran."""
+    if status != 200:
+        raise WorkerFailed(f"invoke HTTP {status}: {body[:200]!r}")
+    try:
+        resp = loads(body)
+    except json.JSONDecodeError as e:
+        raise WorkerFailed(f"invoke returned non-JSON: {body[:200]!r}") from e
+    if hasattr(headers, "items"):
+        pairs = headers.items()
+    else:
+        pairs = headers
+    err = None
+    for k, v in pairs:
+        if str(k).lower() == "x-amz-function-error":
+            err = v
+    return resp, {"function_error": err, **_billed_from_body(resp)}
+
+
+# One connection pool per host, for the life of the process. A warm coordinator keeps its TLS connections.
+_POOLS = {}
+_CREDS = None
+
+
+def _read_http(sock):
+    """One HTTP/1.1 response. Lambda's Invoke API sends Content-Length. Returns status, header pairs, body, and
+    whether the connection must be dropped."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise OSError("connection closed before headers")
+        buf += chunk
+        if len(buf) > 1 << 20:
+            raise WorkerFailed("invoke response headers too large")
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    lines = head.split(b"\r\n")
+    try:
+        status = int(lines[0].split(b" ", 2)[1])
+    except (IndexError, ValueError) as e:
+        raise WorkerFailed(f"invoke bad status line: {lines[0][:80]!r}") from e
+    headers, length, close = [], None, False
+    for line in lines[1:]:
+        key, _, value = line.partition(b":")
+        headers.append((key.decode("latin1"), value.strip().decode("latin1")))
+        low = key.lower()
+        if low == b"content-length":
+            length = int(value.strip())
+        elif low == b"connection" and value.strip().lower() == b"close":
+            close = True
+    if length is None:
+        raise WorkerFailed("invoke response had no Content-Length")
+    while len(rest) < length:
+        chunk = sock.recv(length - len(rest))
+        if not chunk:
+            raise OSError("connection closed mid-body")
+        rest += chunk
+    if len(rest) > length:
+        close = True  # bytes past the body belong to a later response; don't reuse this socket
+    return status, headers, rest[:length], close
+
+
+class _ConnPool:
+    """Keep-alive connections. Checkout never holds the lock across a handshake, so a fan of N opens N connections
+    at once instead of one after another. urllib3's pool held the GIL for about 1.5 ms per call once N was large,
+    which put the last invoke of 128 ~150 ms behind the first."""
+
+    def __init__(self, host, port, tls, size):
+        self.host, self.port, self.tls, self.size = host, port, tls, size
+        self.idle = queue.LifoQueue()
+        self.n = 0
+        self.lock = threading.Lock()
+        self.ssl = ssl.create_default_context() if tls else None
+
+    def open(self):
+        sock = socket.create_connection((self.host, self.port), timeout=10)
+        sock.settimeout(900)
+        if self.ssl is not None:
+            sock = self.ssl.wrap_socket(sock, server_hostname=self.host)
+        return sock
+
+    def checkout(self):
+        try:
+            return self.idle.get_nowait()
+        except queue.Empty:
+            pass
+        with self.lock:
+            if self.n < self.size:
+                self.n += 1
+                create = True
+            else:
+                create = False
+        if not create:
+            return self.idle.get(timeout=900)
+        try:
+            return self.open()
+        except Exception:
+            with self.lock:
+                self.n -= 1
+            raise
+
+    def checkin(self, sock):
+        self.idle.put(sock)
+
+    def drop(self, sock):
+        try:
+            sock.close()
+        except OSError:
+            pass
+        with self.lock:
+            self.n -= 1
+
+    def close(self):
+        while True:
+            try:
+                self.drop(self.idle.get_nowait())
+            except queue.Empty:
+                return
+
+    def post(self, path, header_pairs, body):
+        lines = [f"POST {path} HTTP/1.1"]
+        have_length = False
+        for key, value in header_pairs:
+            lines.append(f"{key}: {value}")
+            if key.lower() == "content-length":
+                have_length = True
+        if not have_length:
+            lines.append(f"Content-Length: {len(body)}")
+        lines.append("Connection: keep-alive")
+        raw = ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+        sock = self.checkout()
+        try:
+            return self._exchange(sock, raw)
+        except OSError:
+            # A sandbox that sat frozen comes back to dead connections. One new connection. The first request may
+            # already be running on the worker; its answer is the one we discard, and the retry's is the one merged.
+            self.drop(sock)
+            try:
+                sock = self.open()
+            except OSError as e:
+                raise WorkerFailed(f"invoke connection failed: {e}") from e
+            with self.lock:
+                self.n += 1
+            try:
+                return self._exchange(sock, raw)
+            except OSError as e:
+                self.drop(sock)
+                raise WorkerFailed(f"invoke connection failed: {e}") from e
+
+    def _exchange(self, sock, raw):
+        sock.sendall(raw)
+        status, headers, payload, close = _read_http(sock)
+        if close:
+            self.drop(sock)
+        else:
+            self.checkin(sock)
+        return status, headers, payload
+
+
+def _pool(host, port, tls, size):
+    key = (host, port, tls)
+    found = _POOLS.get(key)
+    if found is None or found.size < size:
+        if found is not None:
+            found.close()
+        found = _ConnPool(host, port, tls, size)
+        _POOLS[key] = found
+    return found
+
+
+def _credentials():
+    """The default credential chain (the Lambda execution role, or the profile in the environment)."""
+    global _CREDS
+    if _CREDS is None:
+        from botocore.session import Session
+        found = Session().get_credentials()
+        if found is None:
+            raise WorkerFailed("no AWS credentials for invoke")
+        _CREDS = found
+    return _CREDS
+
+
+class SignedInvoke:
+    """`invoke(payload) -> (response, stats)` as one signed POST on a reused connection.
+
+    No `LogType=Tail`: that asks Lambda for the log tail after the function returns, and at N=128 those extra
+    reads sit on the coordinator's critical path (the wait past the worker's own duration grows with N). The
+    stats fall back to the `total_ms` the worker already returns."""
+
+    def __init__(self, function, region, pool, credentials=None, endpoint=None):
+        self.url, self.region = lambda_endpoint(function, region)
+        if endpoint:
+            # A test server. The path and query stay what Invoke would see.
+            path = self.url.split(".amazonaws.com", 1)[1]
+            self.url = endpoint.rstrip("/") + path
+        self.credentials = credentials
+        parts = urlsplit(self.url)
+        self._path = parts.path + (("?" + parts.query) if parts.query else "")
+        self._pool = _pool(parts.hostname, parts.port or (443 if parts.scheme == "https" else 80),
+                           parts.scheme == "https", pool)
+        # Import once, on the calling thread. Doing it inside __call__ would make the first scatter's threads
+        # take the import lock one by one.
+        from botocore.auth import SigV4Auth
+        from botocore.awsrequest import AWSRequest
+        self._sign, self._request = SigV4Auth, AWSRequest
+        pinned = pinned_version(function, self.region)
+        self.capability_key = ("lambda",) + pinned if pinned else None
+
+    def __call__(self, payload):
+        body = dumps(payload).encode()
+        creds = self.credentials or _credentials()
+        frozen = creds.get_frozen_credentials() if hasattr(creds, "get_frozen_credentials") else creds
+        req = self._request(method="POST", url=self.url, data=body, headers={"Content-Type": "application/json"})
+        self._sign(frozen, "lambda", self.region).add_auth(req)
+        status, headers, data = self._pool.post(self._path, list(req.headers.items()), body)
+        return _read_invoke(status, headers, data)
+
+
+def _boto_invoker(function, region, client):
+    """The same contract through a boto3-shaped client, for the tests. Production does not pass one: boto3's
+    invoke holds the GIL long enough that the last of 128 calls starts after the first has been running."""
 
     def invoke(payload):
-        r = client.invoke(FunctionName=function, Payload=json.dumps(payload).encode(), LogType="Tail")
-        resp = loads(r["Payload"].read())
-        stats = {"function_error": r.get("FunctionError")}
-        m = REPORT_RE.search(base64.b64decode(r.get("LogResult", "")).decode(errors="replace"))
-        if m:
-            stats.update(duration_ms=float(m.group(1)), billed_ms=int(m.group(2)), memory_mb=int(m.group(3)),
-                         max_memory_mb=int(m.group(4)), init_ms=float(m.group(5)) if m.group(5) else None)
+        r = client.invoke(FunctionName=function, Payload=dumps(payload).encode())
+        raw = r["Payload"].read()
+        resp = loads(raw)
+        stats = {"function_error": r.get("FunctionError"), **_billed_from_body(resp)}
+        log = r.get("LogResult")
+        if log:
+            m = REPORT_RE.search(base64.b64decode(log).decode(errors="replace"))
+            if m:
+                stats.update(duration_ms=float(m.group(1)), billed_ms=int(m.group(2)), memory_mb=int(m.group(3)),
+                             max_memory_mb=int(m.group(4)), init_ms=float(m.group(5)) if m.group(5) else None)
         return resp, stats
     pinned = pinned_version(function, region or client.meta.region_name)
     invoke.capability_key = ("lambda",) + pinned if pinned else None
     return invoke
+
+
+def lambda_invoker(function, region=None, pool=256, client=None):
+    """invoke(payload) -> (response, stats), every call to exactly `function` (qualifier included). When that is a
+    published version, `invoke.capability_key` is its identity for the capability cache; otherwise it is None and
+    every query negotiates. `client` selects the boto3-shaped path; with none, the signed keep-alive path is used."""
+    if client is not None:
+        return _boto_invoker(function, region, client)
+    return SignedInvoke(function, region or "us-west-2", pool)
 
 
 def loads(raw):

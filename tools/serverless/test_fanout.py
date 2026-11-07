@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 
@@ -104,7 +105,7 @@ class FakeLambdaClient:
         self.rt, self.calls = rt, []
         self.meta = types.SimpleNamespace(region_name=region)
 
-    def invoke(self, FunctionName, Payload, LogType):  # noqa: N803 (boto3's names)
+    def invoke(self, FunctionName, Payload, LogType=None):  # noqa: N803 (boto3's names)
         payload = json.loads(Payload)
         self.calls.append((FunctionName, payload.get("operation")))
         resp, _ = self.rt.invoke(payload)
@@ -452,6 +453,95 @@ class Refusals(unittest.TestCase):
             for left, right in zip(parts, parts[1:]):
                 self.assertEqual(left[1], right[0])
                 self.assertEqual(left[2], right[2])
+
+
+class SignedInvokeTest(unittest.TestCase):
+    def test_endpoint_keeps_a_pinned_qualifier(self):
+        url, region = fanout.lambda_endpoint("zpq-w", "us-west-2")
+        self.assertEqual(url, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/zpq-w/invocations")
+        self.assertEqual(region, "us-west-2")
+        url, region = fanout.lambda_endpoint("arn:aws:lambda:eu-west-1:123456789012:function:zpq-w:7", None)
+        self.assertEqual(region, "eu-west-1")
+        self.assertTrue(url.endswith("/functions/zpq-w/invocations?Qualifier=7"), url)
+
+    def test_a_non_200_and_a_function_error_are_told_apart(self):
+        with self.assertRaises(fanout.WorkerFailed):
+            fanout._read_invoke(429, {}, b"slow")
+        resp, stats = fanout._read_invoke(200, {"X-Amz-Function-Error": "Unhandled"},
+                                           b'{"error":"boom","total_ms":12.2}')
+        self.assertEqual(resp["error"], "boom")
+        self.assertEqual(stats["function_error"], "Unhandled")
+        self.assertEqual(stats["billed_ms"], 13)
+        self.assertEqual(stats["duration_ms"], 12.2)
+
+    def test_a_hundred_and_twenty_eight_local_invokes_stay_under_the_old_spread(self):
+        """boto3 held the GIL for about 1.5 ms per invoke, so the last of 128 started ~150 ms late. A keep-alive
+        server that answers immediately should take a fraction of a millisecond each, and the whole fan well under
+        that 150 ms."""
+        import socket
+        from botocore.credentials import Credentials
+
+        def serve(sock):
+            f = sock.makefile("rb")
+            try:
+                while True:
+                    if not f.readline():
+                        break
+                    n = 0
+                    while True:
+                        h = f.readline()
+                        if h in (b"\r\n", b"\n", b""):
+                            break
+                        if h.lower().startswith(b"content-length:"):
+                            n = int(h.split(b":", 1)[1])
+                    got = f.read(n) if n else b""
+                    if b"slow" in got:
+                        time.sleep(0.04)  # hold the request open so the fan's sends overlap, as a worker does
+                    body = b'{"agg":{"c":1},"total_ms":1}'
+                    sock.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n%s"
+                                 % (len(body), body))
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(256)
+        port = listener.getsockname()[1]
+
+        def accept():
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                threading.Thread(target=serve, args=(conn,), daemon=True).start()
+
+        threading.Thread(target=accept, daemon=True).start()
+        try:
+            inv = fanout.SignedInvoke(
+                "zpq-w", "us-west-2", 64, credentials=Credentials("example-access-key", "s" * 40),
+                endpoint=f"http://127.0.0.1:{port}")
+            inv({"n": 0})  # the pool's first connection
+            t0 = time.perf_counter()
+            for i in range(32):
+                resp, stats = inv({"n": i})
+            each = (time.perf_counter() - t0) / 32 * 1000
+            self.assertLess(each, 2, f"one kept-alive invoke took {each:.2f} ms")
+            self.assertEqual(resp["agg"]["c"], 1)
+            self.assertEqual(stats["billed_ms"], 1)
+            out, scatter_ms = fanout.scatter(inv, [{"slow": 1, "n": i} for i in range(128)])
+            self.assertEqual(len(out), 128)
+            # Pool of 64, so 128 calls are two waves of the 40 ms hold (80 ms). The old invoker added ~150 ms of
+            # start skew on top of that and landed near 230 ms; serial issue would take seconds.
+            self.assertLess(scatter_ms, 220, f"128 overlapped invokes took {scatter_ms:.0f} ms")
+        finally:
+            pool = fanout._POOLS.pop((inv._pool.host, inv._pool.port, inv._pool.tls), None)
+            if pool is not None:
+                pool.close()
+            listener.close()
 
 
 def main():

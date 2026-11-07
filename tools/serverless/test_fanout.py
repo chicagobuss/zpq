@@ -460,9 +460,14 @@ class SignedInvokeTest(unittest.TestCase):
         url, region = fanout.lambda_endpoint("zpq-w", "us-west-2")
         self.assertEqual(url, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/zpq-w/invocations")
         self.assertEqual(region, "us-west-2")
+        url, region = fanout.lambda_endpoint("zpq-w:7", "us-west-2")
+        self.assertEqual(url, "https://lambda.us-west-2.amazonaws.com/2015-03-31/functions/zpq-w/invocations?Qualifier=7")
+        self.assertEqual(region, "us-west-2")
         url, region = fanout.lambda_endpoint("arn:aws:lambda:eu-west-1:123456789012:function:zpq-w:7", None)
         self.assertEqual(region, "eu-west-1")
-        self.assertTrue(url.endswith("/functions/zpq-w/invocations?Qualifier=7"), url)
+        self.assertIn(
+            "/functions/arn%3Aaws%3Alambda%3Aeu-west-1%3A123456789012%3Afunction%3Azpq-w/invocations?Qualifier=7",
+            url)
 
     def test_a_non_200_and_a_function_error_are_told_apart(self):
         with self.assertRaises(fanout.WorkerFailed):
@@ -542,6 +547,227 @@ class SignedInvokeTest(unittest.TestCase):
             if pool is not None:
                 pool.close()
             listener.close()
+
+
+def _http_frame(body=b'{"agg":{"_a0":1},"total_ms":1}', close=False):
+    conn = b"close" if close else b"keep-alive"
+    return b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: " + conn + b"\r\n\r\n" + body
+
+
+class _Sock:
+    """An in-memory socket. `on_read` runs once, on the first recv, so a test can advance a clock while the
+    response is being read."""
+
+    def __init__(self, data=None, on_read=None):
+        self.data = _http_frame() if data is None else data
+        self.sent, self.closed, self.on_read = [], False, on_read
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def recv(self, n):
+        if self.on_read:
+            self.on_read()
+            self.on_read = None
+        out, self.data = self.data[:n], self.data[n:]
+        return out
+
+    def close(self):
+        self.closed = True
+
+
+class _ShortQueue(queue.LifoQueue):
+    """The production checkout waits 900s. A regression that forgets to wake a waiter should fail this queue's
+    0.2s wait, not hang the suite."""
+
+    def __init__(self):
+        super().__init__()
+        self.waiting = threading.Event()
+
+    def get(self, block=True, timeout=None):
+        if block:
+            self.waiting.set()
+            timeout = 0.2
+        return super().get(block, timeout)
+
+
+def _wire(raw):
+    head, body = raw.split(b"\r\n\r\n", 1)
+    lines = head.decode().split("\r\n")
+    headers = dict((k.lower(), v.strip()) for k, v in (line.split(":", 1) for line in lines[1:]))
+    return lines[0], headers, body
+
+
+class InvokeFixTest(unittest.TestCase):
+    """The review's reproducers: account-bearing names, a closed connection's waiters, a leaked pool slot,
+    a retry's stale signature, and an omitted region. No AWS calls."""
+
+    def tearDown(self):
+        for pool in fanout._POOLS.values():
+            pool.close()
+        fanout._POOLS.clear()
+
+    def test_full_and_partial_arns_keep_the_account(self):
+        from urllib.parse import urlsplit
+        from botocore.serialize import create_serializer
+        from botocore.session import Session
+
+        model = Session().get_service_model("lambda")
+        op = model.operation_model("Invoke")
+        serializer = create_serializer(model.metadata["protocol"])
+        arn = "arn:aws:lambda:eu-west-1:222222222222:function:zpq-w"
+        expected = serializer.serialize_to_request({"FunctionName": arn, "Qualifier": "7", "Payload": b"{}"}, op)
+        actual, region = fanout.lambda_endpoint(arn + ":7", "us-west-2")
+        other, _ = fanout.lambda_endpoint(arn.replace("222222222222", "333333333333") + ":7", "us-west-2")
+        partial, partial_region = fanout.lambda_endpoint("222222222222:function:zpq-w:7", "eu-west-1")
+        self.assertEqual(region, "eu-west-1")
+        self.assertEqual(urlsplit(actual).path, expected["url_path"])
+        self.assertNotEqual(actual, other)
+        self.assertIn("222222222222%3Afunction%3Azpq-w", partial)
+        self.assertIn("Qualifier=7", partial)
+        self.assertEqual(partial_region, "eu-west-1")
+        self.assertNotIn("/functions/zpq-w/", partial)
+
+    def test_a_close_response_wakes_a_queued_checkout(self):
+        import concurrent.futures as cf
+        from unittest import mock
+
+        release, reading = threading.Event(), threading.Event()
+
+        def hold():
+            reading.set()
+            self.assertTrue(release.wait(2))
+
+        sockets = [_Sock(_http_frame(close=True), hold), _Sock(_http_frame(close=True))]
+        pool = fanout._ConnPool("offline", 443, False, 1)
+        pool.idle = _ShortQueue()
+        with mock.patch.object(pool, "open", side_effect=sockets) as opened, cf.ThreadPoolExecutor(2) as ex:
+            first = ex.submit(pool.post, "/", [("Host", "offline")], b"{}")
+            self.assertTrue(reading.wait(2))
+            second = ex.submit(pool.post, "/", [("Host", "offline")], b"{}")
+            self.assertTrue(pool.idle.waiting.wait(2))
+            release.set()
+            self.assertEqual(first.result(2)[0], 200)
+            result = second.result(2)
+        self.assertEqual(result[0], 200)
+        self.assertEqual(opened.call_count, 2)
+        self.assertEqual(pool.n, 0)
+        pool.close()
+
+    def test_a_failed_open_wakes_a_queued_checkout(self):
+        import concurrent.futures as cf
+        from unittest import mock
+
+        started, release = threading.Event(), threading.Event()
+        made = []
+
+        def opening():
+            made.append(1)
+            if len(made) == 1:
+                started.set()
+                self.assertTrue(release.wait(2))
+                raise OSError("handshake failed")
+            return _Sock(_http_frame())
+
+        pool = fanout._ConnPool("offline", 443, False, 1)
+        pool.idle = _ShortQueue()
+        with mock.patch.object(pool, "open", side_effect=opening), cf.ThreadPoolExecutor(2) as ex:
+            first = ex.submit(pool.checkout)
+            self.assertTrue(started.wait(2))
+            second = ex.submit(pool.checkout)
+            self.assertTrue(pool.idle.waiting.wait(2))
+            release.set()
+            with self.assertRaises(OSError):
+                first.result(2)
+            sock = second.result(2)
+        self.assertFalse(sock.closed)
+        self.assertEqual(pool.n, 1)
+        pool.drop(sock)
+        self.assertEqual(pool.n, 0)
+
+    def test_protocol_failure_releases_the_pool_slot(self):
+        from unittest import mock
+
+        bodies = (
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}",
+            b"HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n",
+        )
+        for raw in bodies:
+            sock = _Sock(raw)
+            pool = fanout._ConnPool("offline", 443, False, 1)
+            with mock.patch.object(pool, "open", return_value=sock):
+                with self.assertRaises((fanout.WorkerFailed, ValueError)):
+                    pool.post("/", [("Host", "offline")], b"{}")
+            self.assertEqual(pool.n, 0, raw)
+            self.assertTrue(sock.closed)
+            leftover = []
+            while True:
+                try:
+                    leftover.append(pool.idle.get_nowait())
+                except queue.Empty:
+                    break
+            self.assertTrue(leftover)
+            self.assertTrue(all(item is fanout._SLOT for item in leftover))
+            pool.close()
+
+        # The retry's own framing error has to give the slot back too. The first socket dies mid-headers.
+        first, second = _Sock(b""), _Sock(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}")
+        pool = fanout._ConnPool("offline", 443, False, 1)
+        with mock.patch.object(pool, "open", side_effect=[first, second]):
+            with self.assertRaises(fanout.WorkerFailed):
+                pool.post("/", [("Host", "offline")], b"{}")
+        self.assertEqual(pool.n, 0)
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
+        pool.close()
+
+    def test_retry_refreshes_the_timestamp_and_credentials(self):
+        import datetime as dt
+        from unittest import mock
+        from botocore.credentials import ReadOnlyCredentials
+
+        now = [dt.datetime(2026, 11, 7, 12, 0)]
+
+        class Rotating:
+            def __init__(self):
+                self.calls = 0
+
+            def get_frozen_credentials(self):
+                self.calls += 1
+                return ReadOnlyCredentials("KEY" + str(self.calls), "s" * 40, "TOKEN" + str(self.calls))
+
+        def age():
+            now[0] += dt.timedelta(seconds=910)
+
+        creds = Rotating()
+        sockets = [_Sock(b"", age), _Sock()]
+        pool = fanout._ConnPool("lambda.us-west-2.amazonaws.com", 443, False, 1)
+        with mock.patch.object(fanout, "_pool", return_value=pool), \
+                mock.patch.object(pool, "open", side_effect=sockets), \
+                mock.patch("botocore.auth.get_current_datetime", side_effect=lambda: now[0]):
+            inv = fanout.SignedInvoke("zpq-w:7", "us-west-2", 1, credentials=creds)
+            inv({"n": 1})
+        first = _wire(sockets[0].sent[0])[1]
+        second = _wire(sockets[1].sent[0])[1]
+        self.assertEqual(first["x-amz-date"], "20261107T120000Z")
+        self.assertEqual(first["x-amz-security-token"], "TOKEN1")
+        self.assertEqual(second["x-amz-date"], now[0].strftime("%Y%m%dT%H%M%SZ"))
+        self.assertEqual(second["x-amz-security-token"], "TOKEN2")
+        self.assertEqual(creds.calls, 2)
+        self.assertEqual(sockets[0].sent[0].split(b"\r\n\r\n", 1)[1], sockets[1].sent[0].split(b"\r\n\r\n", 1)[1])
+        pool.close()
+
+    def test_default_region_matches_sdk_configuration(self):
+        from unittest import mock
+        from botocore.session import Session
+
+        env = {"AWS_REGION": "eu-west-1", "AWS_DEFAULT_REGION": "eu-west-1", "AWS_EC2_METADATA_DISABLED": "true"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(fanout, "_pool", return_value=mock.Mock(host="offline")):
+            expected = Session().get_config_variable("region")
+            inv = fanout.lambda_invoker("zpq-w")
+        self.assertEqual(expected, "eu-west-1")
+        self.assertEqual(inv.region, expected)
+        self.assertEqual(inv.url, "https://lambda.eu-west-1.amazonaws.com/2015-03-31/functions/zpq-w/invocations")
 
 
 def main():

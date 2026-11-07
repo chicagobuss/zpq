@@ -225,16 +225,46 @@ def _worker_stat(resp, stats):
     return item
 
 
-def lambda_endpoint(function, region):
-    """`(url, region)` of the Invoke API for `function`. A qualifier (`name:7`, an alias, or the qualifier on an
-    ARN) is the `Qualifier` query, so a pinned version stays pinned."""
-    head, sep, tail = function.rpartition(":function:")
+def _default_region():
+    """The region the AWS SDK would use: the environment, then the shared config. Never a hard-coded region."""
+    from botocore.session import Session
+    region = Session().get_config_variable("region")
+    if not region:
+        raise WorkerFailed("no AWS region for invoke; pass a region or set one in the SDK configuration")
+    return region
+
+
+def _function_target(function):
+    """`(name, qualifier, region)` for an Invoke.
+
+    `name` keeps an account-bearing ARN or partial ARN. Stripping the account makes two accounts' functions of
+    the same name one URL, and a name-only Invoke then runs in the caller's account. A trailing qualifier
+    (`name:7`, an alias, or the qualifier on an ARN) is the `Qualifier` query, not part of the name. `region`
+    is the full ARN's region, otherwise None."""
+    if function.startswith("arn:"):
+        parts = function.split(":")
+        # arn:partition:lambda:region:account:function:name[:qualifier]
+        if len(parts) < 7 or parts[5] != "function":
+            raise WorkerFailed(f"invoke function ARN is not a Lambda function: {function}")
+        qualifier = ":".join(parts[7:]) or None
+        return ":".join(parts[:7]), qualifier, parts[3] or None
+    account, sep, tail = function.rpartition(":function:")
     if sep:
-        parts = head.split(":")
-        if len(parts) >= 5 and parts[3]:
-            region = parts[3]
-        function = tail
-    name, _, qualifier = function.partition(":")
+        fname, qsep, qual = tail.partition(":")
+        return f"{account}:function:{fname}", (qual if qsep else None), None
+    fname, qsep, qual = function.partition(":")
+    return fname, (qual if qsep else None), None
+
+
+def lambda_endpoint(function, region):
+    """`(url, region)` of the Invoke API for `function`. The path is the function name the SDK would send,
+    account included, and a qualifier stays a `Qualifier` query so a pinned version stays pinned. An omitted
+    region is the SDK's configured region, unless a full ARN already names one."""
+    name, qualifier, arn_region = _function_target(function)
+    if arn_region:
+        region = arn_region
+    if not region:
+        region = _default_region()
     url = f"https://lambda.{region}.amazonaws.com/2015-03-31/functions/{quote(name, safe='')}/invocations"
     if qualifier:
         url += "?Qualifier=" + quote(qualifier, safe="")
@@ -274,6 +304,9 @@ def _read_invoke(status, headers, body):
 # One connection pool per host, for the life of the process. A warm coordinator keeps its TLS connections.
 _POOLS = {}
 _CREDS = None
+# A waiter blocked on an idle socket has to be told when a slot was freed and no socket was returned. The queue
+# cannot say "create one"; this token is that nudge, and checkout never treats it as a connection.
+_SLOT = object()
 
 
 def _read_http(sock):
@@ -333,45 +366,70 @@ class _ConnPool:
             sock = self.ssl.wrap_socket(sock, server_hostname=self.host)
         return sock
 
-    def checkout(self):
-        try:
-            return self.idle.get_nowait()
-        except queue.Empty:
-            pass
+    def _wake(self):
+        """Unblock one checkout that is waiting on an idle socket. The slot is already free."""
+        self.idle.put(_SLOT)
+
+    def _reserve(self):
         with self.lock:
             if self.n < self.size:
                 self.n += 1
-                create = True
-            else:
-                create = False
-        if not create:
-            return self.idle.get(timeout=900)
-        try:
-            return self.open()
-        except Exception:
-            with self.lock:
-                self.n -= 1
-            raise
+                return True
+            return False
+
+    def _idle_socket(self):
+        """A checked-in connection, or None. Wake tokens are skipped: they only say a slot opened."""
+        while True:
+            try:
+                item = self.idle.get_nowait()
+            except queue.Empty:
+                return None
+            if item is not _SLOT:
+                return item
+
+    def checkout(self):
+        while True:
+            sock = self._idle_socket()
+            if sock is not None:
+                return sock
+            if self._reserve():
+                try:
+                    return self.open()
+                except Exception:
+                    with self.lock:
+                        self.n -= 1
+                    self._wake()
+                    raise
+            try:
+                item = self.idle.get(timeout=900)
+            except queue.Empty:
+                raise
+            if item is not _SLOT:
+                return item
 
     def checkin(self, sock):
         self.idle.put(sock)
 
-    def drop(self, sock):
+    def drop(self, sock, wake=True):
         try:
             sock.close()
         except OSError:
             pass
         with self.lock:
             self.n -= 1
+        if wake:
+            self._wake()
 
     def close(self):
         while True:
             try:
-                self.drop(self.idle.get_nowait())
+                item = self.idle.get_nowait()
             except queue.Empty:
                 return
+            if item is not _SLOT:
+                self.drop(item)
 
-    def post(self, path, header_pairs, body):
+    def _frame(self, path, header_pairs, body):
         lines = [f"POST {path} HTTP/1.1"]
         have_length = False
         for key, value in header_pairs:
@@ -381,25 +439,42 @@ class _ConnPool:
         if not have_length:
             lines.append(f"Content-Length: {len(body)}")
         lines.append("Connection: keep-alive")
-        raw = ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+        return ("\r\n".join(lines) + "\r\n\r\n").encode() + body
+
+    def post(self, path, header_pairs, body):
+        """POST `body` and return `(status, headers, payload)`. `header_pairs` may be a callable; it runs once
+        per physical send, after checkout, so a retry can sign again. A dead connection is retried once. Any
+        other failure returns the socket's slot to the pool."""
+        def frame():
+            pairs = header_pairs() if callable(header_pairs) else header_pairs
+            return self._frame(path, pairs, body)
+
         sock = self.checkout()
         try:
-            return self._exchange(sock, raw)
+            return self._exchange(sock, frame())
         except OSError:
-            # A sandbox that sat frozen comes back to dead connections. One new connection. The first request may
+            # This thread reuses the slot it just freed. Waking a waiter here too would open a second connection
+            # for the one slot. A sandbox that sat frozen comes back to dead connections. The first request may
             # already be running on the worker; its answer is the one we discard, and the retry's is the one merged.
+            self.drop(sock, wake=False)
+        except Exception:
             self.drop(sock)
-            try:
-                sock = self.open()
-            except OSError as e:
-                raise WorkerFailed(f"invoke connection failed: {e}") from e
-            with self.lock:
-                self.n += 1
-            try:
-                return self._exchange(sock, raw)
-            except OSError as e:
-                self.drop(sock)
-                raise WorkerFailed(f"invoke connection failed: {e}") from e
+            raise
+        try:
+            sock = self.open()
+        except OSError as e:
+            self._wake()
+            raise WorkerFailed(f"invoke connection failed: {e}") from e
+        with self.lock:
+            self.n += 1
+        try:
+            return self._exchange(sock, frame())
+        except OSError as e:
+            self.drop(sock)
+            raise WorkerFailed(f"invoke connection failed: {e}") from e
+        except Exception:
+            self.drop(sock)
+            raise
 
     def _exchange(self, sock, raw):
         sock.sendall(raw)
@@ -460,8 +535,9 @@ class SignedInvoke:
         pinned = pinned_version(function, self.region)
         self.capability_key = ("lambda",) + pinned if pinned else None
 
-    def __call__(self, payload):
-        body = dumps(payload).encode()
+    def _signed_headers(self, body):
+        """Headers for one physical send, signed now. A retry after a long checkout or a dead connection must not
+        reuse the previous attempt's date or frozen token."""
         creds = self.credentials or _credentials()
         frozen = creds.get_frozen_credentials() if hasattr(creds, "get_frozen_credentials") else creds
         # Host has to be on the request before it is signed. Without it the front end answers 400 and never checks
@@ -469,7 +545,11 @@ class SignedInvoke:
         req = self._request(method="POST", url=self.url, data=body, headers={
             "Host": self._pool.host, "Content-Type": "application/json"})
         self._sign(frozen, "lambda", self.region).add_auth(req)
-        status, headers, data = self._pool.post(self._path, list(req.headers.items()), body)
+        return list(req.headers.items())
+
+    def __call__(self, payload):
+        body = dumps(payload).encode()
+        status, headers, data = self._pool.post(self._path, lambda: self._signed_headers(body), body)
         return _read_invoke(status, headers, data)
 
 
@@ -500,7 +580,7 @@ def lambda_invoker(function, region=None, pool=256, client=None):
     every query negotiates. `client` selects the boto3-shaped path; with none, the signed keep-alive path is used."""
     if client is not None:
         return _boto_invoker(function, region, client)
-    return SignedInvoke(function, region or "us-west-2", pool)
+    return SignedInvoke(function, region, pool)
 
 
 def loads(raw):

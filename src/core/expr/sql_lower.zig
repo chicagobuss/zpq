@@ -228,12 +228,28 @@ pub const Lower = struct {
     }
 
     /// What a cast to a number or a DATE is called to the binder, and a DECIMAL's precision and scale.
-    const CastTarget = struct { name: []const u8, precision: u8 = 0, scale: u8 = 0 };
+    const CastTarget = struct { name: []const u8, precision: u8 = 0, scale: u8 = 0, lenient: bool = false };
+
+    /// The marker the `TRY_CAST` rewrite (`sql_parser.tryCasts`) puts before a cast's type name: `TRY_CAST(x AS INT)` is read as
+    /// `CAST(x AS zpq_try_INT)`.
+    const try_marker = "zpq_try_";
+
+    fn withoutMarker(t: []const u8) struct { text: []const u8, lenient: bool } {
+        if (t.len > try_marker.len and std.ascii.eqlIgnoreCase(t[0..try_marker.len], try_marker))
+            return .{ .text = t[try_marker.len..], .lenient = true };
+        return .{ .text = t, .lenient = false };
+    }
 
     /// `CAST(x AS type)` for the types zpq casts to: the integers, DOUBLE, DECIMAL(p, s), DATE and TIMESTAMP, by every
     /// spelling DuckDB has for them. Anything else (FLOAT, UBIGINT, TIMESTAMPTZ, ...) is no cast zpq makes, and refuses.
     fn numericTarget(type_name: ?[*:0]const u8) ?CastTarget {
-        const t = std.mem.span(type_name orelse return null);
+        const marked = withoutMarker(std.mem.span(type_name orelse return null));
+        var target = numericTargetOf(marked.text) orelse return null;
+        target.lenient = marked.lenient;
+        return target;
+    }
+
+    fn numericTargetOf(t: []const u8) ?CastTarget {
         const open = std.mem.indexOfScalar(u8, t, '(') orelse t.len;
         var buf: [32]u8 = undefined;
         const base = std.mem.trim(u8, t[0..open], " ");
@@ -275,17 +291,18 @@ pub const Lower = struct {
         const decimal = target.precision != 0;
         const args = try self.arena.alloc(*const syntax.Expr, if (decimal) 3 else 1);
         args[0] = try self.ptr(node.u.cast.expr orelse return error.SqlParseError, depth + 1);
+        const call_name = if (target.lenient) try std.fmt.allocPrint(self.arena, "try_{s}", .{target.name}) else target.name;
         if (decimal) for ([_]u8{ target.precision, target.scale }, 1..) |v, i| {
             const digits = try self.arena.create(syntax.Expr);
             digits.* = .{ .number = .{ .token = try std.fmt.allocPrint(self.arena, "{d}", .{v}), .floating = false } };
             args[i] = digits;
         };
-        return .{ .call = .{ .name = target.name, .args = args } };
+        return .{ .call = .{ .name = call_name, .args = args } };
     }
 
     /// DuckDB's names for its one string type that a cast takes; a length (`VARCHAR(10)`) DuckDB ignores, so zpq does.
     fn textType(type_name: ?[*:0]const u8) bool {
-        const t = std.mem.span(type_name orelse return false);
+        const t = withoutMarker(std.mem.span(type_name orelse return false)).text;
         const base = std.mem.trim(u8, t[0 .. std.mem.indexOfScalar(u8, t, '(') orelse t.len], " ");
         for ([_][]const u8{ "VARCHAR", "TEXT", "STRING" }) |n| if (std.ascii.eqlIgnoreCase(base, n)) return true;
         return false;

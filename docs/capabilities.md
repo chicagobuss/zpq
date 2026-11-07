@@ -52,7 +52,13 @@ the minimum of an integer column's SQL type, `abs(-2147483648)` of an INTEGER, i
 `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))` and `x::TYPE` of a number (a DECIMAL
 rounds half away from zero to an integer or to fewer places, a DOUBLE half to even to an integer and as `round(x * 10^s)`
 to a DECIMAL; a value that does not fit stops the query with a conversion error, as DuckDB does, but only in rows that
-are read and not NULL; the result is written as INT64 for every integer type), `CAST(t AS DATE)` and
+are read and not NULL; the result is written as INT64 for every integer type), `TRY_CAST(x AS type)` of every cast
+here (NULL where `CAST` would stop the query, so the result can be NULL; a TIMESTAMP_MS before 290309-12-22 (BC) stays
+a TIMESTAMP in it, as DuckDB's does), a text read as TINYINT, SMALLINT, INTEGER, BIGINT or DOUBLE by `CAST` or
+`TRY_CAST` exactly as DuckDB reads it (surrounding whitespace, one `+`, `0x` and `0b` integers, a `_` between digits, a
+decimal point and an exponent in an integer, rounded half away from zero; `inf`, `infinity` and `nan` in any case; text
+that is no such number is `ConversionInvalid`, NULL for `TRY_CAST`; a text to DECIMAL, DATE or TIMESTAMP is refused by name),
+`CAST(t AS DATE)` and
 `CAST(x AS TIMESTAMP)` (also `::` and `DATETIME`) between a DATE and a TIMESTAMP of any unit (a time's day is its floor,
 before 1970 too; a TIMESTAMP_NS reaches microseconds to the nearest, a tie away from zero, in `date_trunc` and
 `date_part` as in a cast; a DATE past the TIMESTAMP range, a TIMESTAMP_MS past the range of microseconds (as a DATE

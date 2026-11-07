@@ -29,6 +29,7 @@ const schema = @import("../schema.zig");
 const decimal_mod = @import("../parquet/decimal.zig");
 const selection = @import("../filter/selection.zig");
 const calendar = @import("calendar.zig");
+const text_cast = @import("text_cast.zig");
 const regex = @import("regex.zig");
 const case_map = @import("case_map.zig");
 
@@ -58,6 +59,8 @@ pub const Error = error{
     /// A side of a WHERE comparison of two expressions does not fit the DECIMAL type both convert to
     /// (`filter_eval.commonDec`), as DuckDB's conversion fails.
     ComparisonValueOutOfRange,
+    /// A text that is no number of the type it is cast to.
+    ConversionInvalid,
     /// A DECIMAL column reached exact evaluation without its unscaled values (see `ColumnT.unscaled`).
     DecimalUnavailable,
     /// A CASE condition over a repeated (nested) column.
@@ -1935,19 +1938,62 @@ fn evalLeastGreatest(arena: std.mem.Allocator, batch: *const Batch, column_looku
     }
 }
 
+/// The rows a `TRY_CAST` turns NULL: it copies the argument's definition levels the first time a row fails, then clears that
+/// row's. A `CAST` (not lenient) never marks one.
+const CastNulls = struct {
+    arena: std.mem.Allocator,
+    n: usize,
+    base: ?[]const u32,
+    def: ?[]u32 = null,
+
+    fn mark(self: *CastNulls, i: usize) Error!void {
+        if (self.def == null) {
+            const d = try self.arena.alloc(u32, self.n);
+            if (self.base) |b| @memcpy(d, b[0..self.n]) else @memset(d, 1);
+            self.def = d;
+        }
+        self.def.?[i] = 0;
+    }
+
+    fn levels(self: CastNulls, base_max_def: u32) u32 {
+        return if (self.def != null) 1 else base_max_def;
+    }
+
+    fn defLevels(self: CastNulls) ?[]const u32 {
+        return self.def orelse self.base;
+    }
+
+    fn hasNulls(self: CastNulls, base_has: bool) bool {
+        return self.def != null or base_has;
+    }
+};
+
+/// A failed conversion of the row `i`: NULL for `TRY_CAST`, the error otherwise, but only in a row that is read and not NULL.
+inline fn castFails(c: ast.Call, nulls: *CastNulls, batch: *const Batch, col: Batch.Column, i: usize, err: Error) Error!i64 {
+    if (c.lenient) {
+        try nulls.mark(i);
+        return 0;
+    }
+    if (quietRow(batch, col, i)) return 0;
+    return err;
+}
+
 /// `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))`, converted as DuckDB does: an
 /// integer to another by range, a DECIMAL to an integer or to fewer places half away from zero, a DOUBLE to an integer
-/// half to even and to a DECIMAL as `round(x * 10^s)` in double. A value that does not
-/// fit is `ConversionOutOfRange`, but only in a row the batch wants and the data does not make NULL.
+/// half to even and to a DECIMAL as `round(x * 10^s)` in double; a text by DuckDB's reading of it (`text_cast.zig`). A value
+/// that does not fit is `ConversionOutOfRange` (`ConversionInvalid` for a text), but only in a row the batch wants and the
+/// data does not make NULL; `TRY_CAST` makes such a row NULL instead.
 fn evalCast(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
     const arg = c.args[0].*;
     if (arg.typeOf() == .dec) return evalCastDecimal(arena, batch, column_lookup, c, arg);
     const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg);
     const target_dec: ast.Dec = c.dec orelse .{ .precision = 38, .scale = 0 };
     switch (col) {
+        .string => |in| return evalCastFromText(arena, batch, c, col, in),
         .i64 => |in| {
             if (in.max_rep > 0) return error.NestedNotSupported;
             const n = in.values.len;
+            var nulls: CastNulls = .{ .arena = arena, .n = n, .base = in.def_levels };
             switch (c.func) {
                 .cast_i64 => return col,
                 .cast_i8, .cast_i16, .cast_i32 => {
@@ -1956,9 +2002,9 @@ fn evalCast(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
                     for (in.values, out, 0..) |v, *o, i| {
                         o.* = v;
                         if (t.holds(v)) continue;
-                        if (quietRow(batch, col, i)) o.* = 0 else return error.ConversionOutOfRange;
+                        o.* = try castFails(c, &nulls, batch, col, i, error.ConversionOutOfRange);
                     }
-                    return .{ .i64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+                    return .{ .i64 = .{ .values = out, .def_levels = nulls.defLevels(), .max_def = nulls.levels(in.max_def), .has_nulls = nulls.hasNulls(in.has_nulls) } };
                 },
                 .cast_double => {
                     const out = try arena.alloc(f64, n);
@@ -1969,9 +2015,10 @@ fn evalCast(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
                     const unit = arg.temporal().?;
                     const out = try arena.alloc(i64, n);
                     for (in.values, out, 0..) |v, *o, i| {
-                        o.* = temporalCast(c.func == .cast_date, unit, arg.isUtc(), v) catch if (quietRow(batch, col, i)) 0 else return error.ConversionOutOfRange;
+                        o.* = temporalCast(c.func == .cast_date, unit, arg.isUtc(), !c.lenient, v) catch
+                            try castFails(c, &nulls, batch, col, i, error.ConversionOutOfRange);
                     }
-                    return .{ .i64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+                    return .{ .i64 = .{ .values = out, .def_levels = nulls.defLevels(), .max_def = nulls.levels(in.max_def), .has_nulls = nulls.hasNulls(in.has_nulls) } };
                 },
                 .cast_dec => {
                     const out = try arena.alloc(i128, n);
@@ -1981,9 +2028,9 @@ fn evalCast(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
                         const scaled = std.math.mul(i128, v, factor) catch null;
                         if (scaled != null and @abs(scaled.?) < @as(u128, @intCast(bound))) {
                             o.* = scaled.?;
-                        } else if (quietRow(batch, col, i)) o.* = 0 else return error.ConversionOutOfRange;
+                        } else o.* = try castFails(c, &nulls, batch, col, i, error.ConversionOutOfRange);
                     }
-                    return .{ .i128 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+                    return .{ .i128 = .{ .values = out, .def_levels = nulls.defLevels(), .max_def = nulls.levels(in.max_def), .has_nulls = nulls.hasNulls(in.has_nulls) } };
                 },
                 else => unreachable,
             }
@@ -1991,15 +2038,16 @@ fn evalCast(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
         .f64 => |in| {
             if (in.max_rep > 0) return error.NestedNotSupported;
             const n = in.values.len;
+            var nulls: CastNulls = .{ .arena = arena, .n = n, .base = in.def_levels };
             switch (c.func) {
                 .cast_double => return col,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64 => {
                     const t = c.int.?;
                     const out = try arena.alloc(i64, n);
                     for (in.values, out, 0..) |v, *o, i| {
-                        o.* = doubleAsInt(t, v) catch if (quietRow(batch, col, i)) 0 else return error.ConversionOutOfRange;
+                        o.* = doubleAsInt(t, v) catch try castFails(c, &nulls, batch, col, i, error.ConversionOutOfRange);
                     }
-                    return .{ .i64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+                    return .{ .i64 = .{ .values = out, .def_levels = nulls.defLevels(), .max_def = nulls.levels(in.max_def), .has_nulls = nulls.hasNulls(in.has_nulls) } };
                 },
                 .cast_dec => {
                     const out = try arena.alloc(i128, n);
@@ -2010,15 +2058,80 @@ fn evalCast(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
                         // 2^126 is far above any 38-digit bound and keeps the integer conversion defined.
                         if (std.math.isFinite(scaled) and @abs(scaled) < 0x1p126 and @abs(@as(i128, @intFromFloat(scaled))) < @as(u128, @intCast(bound))) {
                             o.* = @intFromFloat(scaled);
-                        } else if (quietRow(batch, col, i)) o.* = 0 else return error.ConversionOutOfRange;
+                        } else o.* = @intCast(try castFails(c, &nulls, batch, col, i, error.ConversionOutOfRange));
                     }
-                    return .{ .i128 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+                    return .{ .i128 = .{ .values = out, .def_levels = nulls.defLevels(), .max_def = nulls.levels(in.max_def), .has_nulls = nulls.hasNulls(in.has_nulls) } };
                 },
                 else => unreachable,
             }
         },
         else => return error.TypeMismatch,
     }
+}
+
+/// `evalCast` of a text: each distinct text read once (a dictionary-coded column's entries, memoized by code), a text that is no
+/// number of the target type a NULL for `TRY_CAST` and `ConversionInvalid` otherwise, in a row that is read and not NULL.
+fn evalCastFromText(arena: std.mem.Allocator, batch: *const Batch, c: ast.Call, col: Batch.Column, in: anytype) Error!Batch.Column {
+    if (in.max_rep > 0) return error.NestedNotSupported;
+    // A column decoded to lengths alone (for `= ''`) has no texts to read.
+    if (in.codes == null and in.values.len != in.rowCount()) return error.LengthsOnlyColumn;
+    const n = in.rowCount();
+    var nulls: CastNulls = .{ .arena = arena, .n = n, .base = in.def_levels };
+    const is_double = c.func == .cast_double;
+    const t = c.int orelse .i64;
+    const outs: []f64 = if (is_double) try arena.alloc(f64, n) else &.{};
+    const outi: []i64 = if (is_double) &.{} else try arena.alloc(i64, n);
+    // Per dictionary entry: 0 unread, 1 read, 2 not a number of the type.
+    const state: []u8 = if (in.codes != null) try arena.alloc(u8, in.dict.len) else &.{};
+    @memset(state, 0);
+    const memo_i: []i64 = if (in.codes != null and !is_double) try arena.alloc(i64, in.dict.len) else &.{};
+    const memo_d: []f64 = if (in.codes != null and is_double) try arena.alloc(f64, in.dict.len) else &.{};
+    var scratch: std.ArrayList(u8) = .empty;
+    for (0..n) |i| {
+        if (is_double) outs[i] = 0 else outi[i] = 0;
+        if (quietRow(batch, col, i)) continue;
+        const text = if (in.codes) |codes| in.dict[codes[i]] else in.values[i];
+        // Read once per distinct entry when the column is coded.
+        var ok = false;
+        var vi: i64 = 0;
+        var vd: f64 = 0;
+        if (in.codes) |codes| {
+            const k = codes[i];
+            if (state[k] == 0) {
+                if (is_double) {
+                    if (text_cast.parseDouble(&scratch, arena, text)) |v| {
+                        memo_d[k] = v;
+                        state[k] = 1;
+                    } else state[k] = 2;
+                } else {
+                    if (text_cast.parseInt(text)) |v| {
+                        memo_i[k] = v;
+                        state[k] = 1;
+                    } else state[k] = 2;
+                }
+            }
+            ok = state[k] == 1;
+            if (ok) {
+                if (is_double) vd = memo_d[k] else vi = memo_i[k];
+            }
+        } else if (is_double) {
+            if (text_cast.parseDouble(&scratch, arena, text)) |v| {
+                ok = true;
+                vd = v;
+            }
+        } else if (text_cast.parseInt(text)) |v| {
+            ok = true;
+            vi = v;
+        }
+        if (ok and !is_double and !t.holds(vi)) ok = false;
+        if (!ok) {
+            _ = try castFails(c, &nulls, batch, col, i, error.ConversionInvalid);
+            continue;
+        }
+        if (is_double) outs[i] = vd else outi[i] = vi;
+    }
+    if (is_double) return .{ .f64 = .{ .values = outs, .def_levels = nulls.defLevels(), .max_def = nulls.levels(in.max_def), .has_nulls = nulls.hasNulls(in.has_nulls) } };
+    return .{ .i64 = .{ .values = outi, .def_levels = nulls.defLevels(), .max_def = nulls.levels(in.max_def), .has_nulls = nulls.hasNulls(in.has_nulls) } };
 }
 
 /// A row nobody reads: unwanted by the batch's selection, or NULL in the data.
@@ -2138,7 +2251,7 @@ const ts_min_us: i64 = -9_223_372_022_400_000_000;
 /// `unit` is the argument's, `utc` its time-zone flag: a UTC-adjusted nanosecond (DuckDB's TIMESTAMPTZ_NS) floors to
 /// its day from the nanosecond itself, a plain TIMESTAMP_NS from the microsecond nearest it. A TIMESTAMP_MS reaches
 /// microseconds first, an error past an i64 of them (the millisecond count of a day 2^31 from the epoch).
-fn temporalCast(to_date: bool, unit: ast.Temporal, utc: bool, v: i64) error{ConversionOutOfRange}!i64 {
+fn temporalCast(to_date: bool, unit: ast.Temporal, utc: bool, check_min: bool, v: i64) error{ConversionOutOfRange}!i64 {
     const ts_infinity: i64 = std.math.maxInt(i64);
     const date_infinity: i64 = std.math.maxInt(i32);
     if (unit == .date) {
@@ -2156,53 +2269,55 @@ fn temporalCast(to_date: bool, unit: ast.Temporal, utc: bool, v: i64) error{Conv
         .ts_ns => roundDivAway(v, 1000),
         .date => unreachable,
     };
-    if (unit == .ts_ms and !to_date and us < ts_min_us) return error.ConversionOutOfRange;
+    if (check_min and unit == .ts_ms and !to_date and us < ts_min_us) return error.ConversionOutOfRange;
     return if (to_date) @divFloor(us, us_per_day) else us;
 }
 
 test "casting between DATE and TIMESTAMP matches DuckDB 2.0.0" {
     const T = std.testing;
     // TIMESTAMP to DATE floors: the last microsecond of 1969 is 1969-12-31, the epoch is 1970-01-01.
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_us, false, -1));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_us, false, 0));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_us, false, us_per_day - 1));
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_us, false, -us_per_day));
-    try T.expectEqual(@as(i64, -2), try temporalCast(true, .ts_us, false, -us_per_day - 1));
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ms, false, -1));
-    try T.expectEqual(@as(i64, 1), try temporalCast(true, .ts_ms, false, ms_per_day));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_us, false, true, -1));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_us, false, true, 0));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_us, false, true, us_per_day - 1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_us, false, true, -us_per_day));
+    try T.expectEqual(@as(i64, -2), try temporalCast(true, .ts_us, false, true, -us_per_day - 1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ms, false, true, -1));
+    try T.expectEqual(@as(i64, 1), try temporalCast(true, .ts_ms, false, true, ms_per_day));
     // A TIMESTAMP_NS reaches microseconds half away from zero first: -1 ns is the epoch, -500 ns the microsecond before.
-    try T.expectEqual(@as(i64, 0), try temporalCast(false, .ts_ns, false, -1));
-    try T.expectEqual(@as(i64, -1), try temporalCast(false, .ts_ns, false, -999));
-    try T.expectEqual(@as(i64, -1), try temporalCast(false, .ts_ns, false, -500));
-    try T.expectEqual(@as(i64, 0), try temporalCast(false, .ts_ns, false, -499));
-    try T.expectEqual(@as(i64, 1), try temporalCast(false, .ts_ns, false, 500));
-    try T.expectEqual(@as(i64, 1), try temporalCast(false, .ts_ns, false, 999));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, false, -1));
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ns, false, -500));
+    try T.expectEqual(@as(i64, 0), try temporalCast(false, .ts_ns, false, true, -1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(false, .ts_ns, false, true, -999));
+    try T.expectEqual(@as(i64, -1), try temporalCast(false, .ts_ns, false, true, -500));
+    try T.expectEqual(@as(i64, 0), try temporalCast(false, .ts_ns, false, true, -499));
+    try T.expectEqual(@as(i64, 1), try temporalCast(false, .ts_ns, false, true, 500));
+    try T.expectEqual(@as(i64, 1), try temporalCast(false, .ts_ns, false, true, 999));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, false, true, -1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ns, false, true, -500));
     // DATE and TIMESTAMP_MS to TIMESTAMP are exact; one past the TIMESTAMP range is an error.
-    try T.expectEqual(@as(i64, 19782 * us_per_day), try temporalCast(false, .date, false, 19782));
-    try T.expectEqual(@as(i64, -999_000), try temporalCast(false, .ts_ms, false, -999));
-    try T.expectEqual(@as(i64, 106751991 * us_per_day), try temporalCast(false, .date, false, 106751991));
-    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .date, false, 106751992));
-    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .ts_ms, false, std.math.maxInt(i64) - 1));
+    try T.expectEqual(@as(i64, 19782 * us_per_day), try temporalCast(false, .date, false, true, 19782));
+    try T.expectEqual(@as(i64, -999_000), try temporalCast(false, .ts_ms, false, true, -999));
+    try T.expectEqual(@as(i64, 106751991 * us_per_day), try temporalCast(false, .date, false, true, 106751991));
+    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .date, false, true, 106751992));
+    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .ts_ms, false, true, std.math.maxInt(i64) - 1));
     // Infinity maps to infinity, both ways and in every unit.
-    try T.expectEqual(@as(i64, std.math.maxInt(i64)), try temporalCast(false, .date, false, std.math.maxInt(i32)));
-    try T.expectEqual(@as(i64, -std.math.maxInt(i32)), try temporalCast(true, .ts_ns, false, -std.math.maxInt(i64)));
-    try T.expectEqual(@as(i64, std.math.maxInt(i64)), try temporalCast(false, .ts_ms, false, std.math.maxInt(i64)));
+    try T.expectEqual(@as(i64, std.math.maxInt(i64)), try temporalCast(false, .date, false, true, std.math.maxInt(i32)));
+    try T.expectEqual(@as(i64, -std.math.maxInt(i32)), try temporalCast(true, .ts_ns, false, true, -std.math.maxInt(i64)));
+    try T.expectEqual(@as(i64, std.math.maxInt(i64)), try temporalCast(false, .ts_ms, false, true, std.math.maxInt(i64)));
     // Identity casts.
-    try T.expectEqual(@as(i64, -165), try temporalCast(true, .date, false, -165));
-    try T.expectEqual(@as(i64, -47524859999999), try temporalCast(false, .ts_us, false, -47524859999999));
+    try T.expectEqual(@as(i64, -165), try temporalCast(true, .date, false, true, -165));
+    try T.expectEqual(@as(i64, -47524859999999), try temporalCast(false, .ts_us, false, true, -47524859999999));
     // A TIMESTAMP_MS past the microsecond range is an error to a DATE too, not a wrapped day count; a TIMESTAMP only
     // from 290309-12-22 (BC), where a DATE floors on.
-    try T.expectError(error.ConversionOutOfRange, temporalCast(true, .ts_ms, false, 185542587187200000));
-    try T.expectEqual(@as(i64, 106751991), try temporalCast(true, .ts_ms, false, 9223372036854775));
-    try T.expectEqual(@as(i64, -106751992), try temporalCast(true, .ts_ms, false, -9223372036854775));
-    try T.expectEqual(ts_min_us, try temporalCast(false, .ts_ms, false, -9223372022400000));
-    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .ts_ms, false, -9223372022400001));
+    try T.expectError(error.ConversionOutOfRange, temporalCast(true, .ts_ms, false, true, 185542587187200000));
+    try T.expectEqual(@as(i64, 106751991), try temporalCast(true, .ts_ms, false, true, 9223372036854775));
+    try T.expectEqual(@as(i64, -106751992), try temporalCast(true, .ts_ms, false, true, -9223372036854775));
+    try T.expectEqual(ts_min_us, try temporalCast(false, .ts_ms, false, true, -9223372022400000));
+    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .ts_ms, false, true, -9223372022400001));
+    // TRY_CAST keeps it: DuckDB's TRY path has no lower bound there (the plain cast does).
+    try T.expectEqual(@as(i64, -9223372022400001000), try temporalCast(false, .ts_ms, false, false, -9223372022400001));
     // UTC-adjusted nanoseconds floor to their day: one before the epoch is the day before, not the epoch's.
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ns, true, -1));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, false, -1));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, true, ns_per_day - 1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ns, true, true, -1));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, false, true, -1));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, true, true, ns_per_day - 1));
 }
 
 /// `evalCast` of an exact DECIMAL argument, read at its own scale.
@@ -2213,6 +2328,7 @@ fn evalCastDecimal(arena: std.mem.Allocator, batch: *const Batch, column_lookup:
     const v = rows.v;
     const def = rows.def;
     const levels: u32 = if (def != null) 1 else 0;
+    var nulls: CastNulls = .{ .arena = arena, .n = n, .base = def };
     switch (c.func) {
         .cast_double => {
             const out = try arena.alloc(f64, n);
@@ -2227,11 +2343,14 @@ fn evalCastDecimal(arena: std.mem.Allocator, batch: *const Batch, column_lookup:
                 const q = divRoundHalfAway(x, divisor);
                 if (t.holds(q)) {
                     r.* = @intCast(q);
+                } else if (c.lenient) {
+                    try nulls.mark(i);
+                    r.* = 0;
                 } else if (quietDecimalRow(batch, rows.nulls, i)) {
                     r.* = 0;
                 } else return error.ConversionOutOfRange;
             }
-            return .{ .i64 = .{ .values = out, .def_levels = def, .max_def = levels, .has_nulls = def != null } };
+            return .{ .i64 = .{ .values = out, .def_levels = nulls.defLevels(), .max_def = nulls.levels(levels), .has_nulls = nulls.hasNulls(def != null) } };
         },
         .cast_dec => {
             const target = c.dec.?;
@@ -2244,11 +2363,14 @@ fn evalCastDecimal(arena: std.mem.Allocator, batch: *const Batch, column_lookup:
                     divRoundHalfAway(x, ast.pow10(spec.scale - target.scale));
                 if (scaled != null and @abs(scaled.?) < bound) {
                     r.* = scaled.?;
+                } else if (c.lenient) {
+                    try nulls.mark(i);
+                    r.* = 0;
                 } else if (quietDecimalRow(batch, rows.nulls, i)) {
                     r.* = 0;
                 } else return error.ConversionOutOfRange;
             }
-            return .{ .i128 = .{ .values = out, .def_levels = def, .max_def = levels, .has_nulls = def != null } };
+            return .{ .i128 = .{ .values = out, .def_levels = nulls.defLevels(), .max_def = nulls.levels(levels), .has_nulls = nulls.hasNulls(def != null) } };
         },
         else => return error.TypeMismatch,
     }

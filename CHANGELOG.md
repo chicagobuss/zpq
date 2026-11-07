@@ -85,6 +85,12 @@
   TIMESTAMP range is a conversion error). A computed `date_trunc`, `epoch_ms`, cast or `coalesce` of timestamps used to
   leave as a plain INT64 in Parquet; it is now the TIMESTAMP it is (its unit, UTC-adjusted or not) in a row, a group key
   and a `min` or `max`, as a computed DATE already was.
+- **`TRY_CAST`, and text read as a number, in SQL.** `TRY_CAST(x AS type)` (any cast zpq makes) is NULL where `CAST` would
+  stop the query, in a SELECT, an aggregate argument or a GROUP BY key. `CAST` and `TRY_CAST` of a text to TINYINT,
+  SMALLINT, INTEGER, BIGINT or DOUBLE read it as DuckDB 2.0 does (whitespace, `+`, `0x`/`0b`, `_` between digits, `1.5`
+  and `1e3` as integers rounded half away from zero, `inf`/`nan`), checked against DuckDB on 64,000 generated strings;
+  a text that is no number is a `ConversionInvalid` error for `CAST`. A text to DECIMAL, DATE or TIMESTAMP is still
+  refused by name.
 - **Numeric casts in SQL.** `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))` and `x::TYPE`
   over a number, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB, including its rounding (a DECIMAL
   half away from zero, a DOUBLE to an integer half to even) and its conversion error for a value that does not fit.

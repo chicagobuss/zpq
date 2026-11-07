@@ -270,6 +270,7 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             "zpq query: a value in a WHERE comparison does not fit the DECIMAL type both sides convert to\n",
             .{},
         ),
+        error.ConversionInvalid => diagnosticPrint("zpq query: a CAST text is no number of the type it casts to (TRY_CAST makes it NULL)\n", .{}),
         error.InsufficientPadding => diagnosticPrint("zpq query: lpad/rpad needs padding and its pad text is empty\n", .{}),
         error.PostAggTypeUnknown => diagnosticPrint(
             "zpq query: arithmetic on the min or max of an expression or of a FLOAT column is not supported: its\n" ++

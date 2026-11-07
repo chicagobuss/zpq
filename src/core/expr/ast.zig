@@ -478,6 +478,8 @@ pub const Call = struct {
     format: ?*const calendar.Format = null,
     /// The SQL integer type `abs` overflows at, or a cast's target: the type of the argument the i64 lane has lost.
     int: ?IntType = null,
+    /// A `TRY_CAST`: a value that does not convert is NULL, not an error.
+    lenient: bool = false,
 };
 
 /// Searched `CASE WHEN cond THEN value ... [ELSE value] END`: per row, the first WHEN whose condition is TRUE gives
@@ -772,7 +774,8 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
+                .strlen, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
+                .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp => c.lenient or c.args[0].mayBeNull(),
                 // Any of the three can be NULL (a literal year over a nullable month).
                 .make_date => for (c.args) |a| {
                     if (a.mayBeNull()) break true;

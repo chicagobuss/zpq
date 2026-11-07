@@ -752,6 +752,90 @@ fn rightOperandEnd(sql: []const u8, from: usize) ?usize {
     }
 }
 
+/// `sql` with `TRY_CAST(x AS type)` written as `CAST(x AS zpq_try_type)`: the grammar has no `TRY_CAST`, and the marker on the
+/// type name is how the lowering knows the cast is lenient. Quoted text is untouched; a `TRY_CAST` with no `AS` of its own
+/// stays in the text for the grammar to refuse.
+fn tryCasts(allocator: std.mem.Allocator, sql: []const u8) ![:0]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < sql.len) {
+        const ch = sql[i];
+        if (ch == '\'' or ch == '"') {
+            const end = quotedForward(sql, i) orelse sql.len;
+            try out.appendSlice(allocator, sql[i..end]);
+            i = end;
+            continue;
+        }
+        const word = "try_cast";
+        const boundary_before = i == 0 or !(std.ascii.isAlphanumeric(sql[i - 1]) or sql[i - 1] == '_' or sql[i - 1] == '$');
+        if (boundary_before and i + word.len <= sql.len and std.ascii.eqlIgnoreCase(sql[i .. i + word.len], word)) {
+            var open = i + word.len;
+            while (open < sql.len and std.ascii.isWhitespace(sql[open])) open += 1;
+            if (open < sql.len and sql[open] == '(') {
+                if (castAs(sql, open)) |as_end| {
+                    try out.appendSlice(allocator, "CAST");
+                    try out.appendSlice(allocator, sql[i + word.len .. as_end]);
+                    try out.appendSlice(allocator, " zpq_try_");
+                    i = as_end;
+                    while (i < sql.len and std.ascii.isWhitespace(sql[i])) i += 1;
+                    continue;
+                }
+            }
+        }
+        try out.append(allocator, ch);
+        i += 1;
+    }
+    return out.toOwnedSliceSentinel(allocator, 0);
+}
+
+/// Where the last top-level `AS` of the call whose `(` is `sql[open]` ends, or null if the call has none or never closes.
+fn castAs(sql: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    var k = open;
+    var found: ?usize = null;
+    while (k < sql.len) {
+        switch (sql[k]) {
+            '\'', '"' => {
+                k = quotedForward(sql, k) orelse return null;
+                continue;
+            },
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if (depth == 0) return found;
+            },
+            'a', 'A' => if (depth == 1 and k + 2 <= sql.len and std.ascii.eqlIgnoreCase(sql[k .. k + 2], "as") and
+                k > open and !(std.ascii.isAlphanumeric(sql[k - 1]) or sql[k - 1] == '_') and
+                (k + 2 == sql.len or !(std.ascii.isAlphanumeric(sql[k + 2]) or sql[k + 2] == '_')))
+            {
+                found = k + 2;
+            },
+            else => {},
+        }
+        k += 1;
+    }
+    return null;
+}
+
+test "TRY_CAST is written as a CAST to a marked type" {
+    const T = std.testing;
+    const cases = [_][2][]const u8{
+        .{ "SELECT try_cast(x AS INT) FROM t", "SELECT CAST(x AS zpq_try_INT) FROM t" },
+        .{ "SELECT TRY_CAST ( a + 1 AS DOUBLE PRECISION ) AS y", "SELECT CAST ( a + 1 AS zpq_try_DOUBLE PRECISION ) AS y" },
+        .{ "SELECT try_cast(CAST(x AS INT) AS DECIMAL(10, 2))", "SELECT CAST(CAST(x AS INT) AS zpq_try_DECIMAL(10, 2))" },
+        .{ "SELECT try_cast(try_cast(x AS INT) AS DOUBLE)", "SELECT CAST(CAST(x AS zpq_try_INT) AS zpq_try_DOUBLE)" },
+        .{ "SELECT 'try_cast(x AS INT)', \"try_cast\" FROM t", "SELECT 'try_cast(x AS INT)', \"try_cast\" FROM t" },
+        .{ "SELECT try_cast(x) FROM t", "SELECT try_cast(x) FROM t" },
+        .{ "SELECT my_try_cast(x AS INT)", "SELECT my_try_cast(x AS INT)" },
+    };
+    for (cases) |pair| {
+        const got = try tryCasts(T.allocator, pair[0]);
+        defer T.allocator.free(got);
+        try T.expectEqualStrings(pair[1], got);
+    }
+}
+
 /// `sql` with DuckDB's integer division `a // b` written as the call `"//"(a, b)`, DuckDB's own name for it and a form
 /// the grammar reads. `//` has the level of `*`, `/` and `%`, read left to right: its left operand is the chain of
 /// operands before it back to a looser operator, its right one the single operand after it (a signed number, a name, a
@@ -1196,7 +1280,9 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
     defer allocator.free(extracted);
     const keyworded = try substringKeywords(allocator, extracted);
     defer allocator.free(keyworded);
-    const sql_c = try integerDivision(allocator, keyworded, 0);
+    const casted = try tryCasts(allocator, keyworded);
+    defer allocator.free(casted);
+    const sql_c = try integerDivision(allocator, casted, 0);
     defer allocator.free(sql_c);
 
     // lp_parse() silently stops at the first ';', so trailing statements/clauses

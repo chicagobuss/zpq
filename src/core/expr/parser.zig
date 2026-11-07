@@ -336,7 +336,7 @@ fn bindSyntaxAt(arena: std.mem.Allocator, node: syntax.Expr, file: *const schema
                 out.* = try arena.create(ast.Expr);
                 out.*.* = try bindSyntaxAt(arena, arg.*, file, diag, depth + 1);
             }
-            break :blk bindCall(arena, file, func, args);
+            break :blk bindNamedCall(arena, file, c.name, func, args);
         },
         .cast_text => |inner| blk: {
             const args = try arena.alloc(*ast.Expr, 1);
@@ -628,7 +628,7 @@ fn parseCall(
         }
     }
 
-    return if (bound) bindCall(arena, file, func, args.items) else .{ .call = .{ .name = name, .args = try syntaxArgs(arena, args.items) } };
+    return if (bound) bindNamedCall(arena, file, name, func, args.items) else .{ .call = .{ .name = name, .args = try syntaxArgs(arena, args.items) } };
 }
 
 /// The unit a DATE or TIMESTAMP column's integers count; INT96 decodes to nanoseconds.
@@ -782,15 +782,16 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "round")) return .round;
     if (asciiEqIgnoreCase(name, "least")) return .least;
     if (asciiEqIgnoreCase(name, "greatest")) return .greatest;
-    // The names `CAST` lowers to; `$` is no part of a name a query can write unquoted.
-    if (asciiEqIgnoreCase(name, "cast$tinyint")) return .cast_i8;
-    if (asciiEqIgnoreCase(name, "cast$smallint")) return .cast_i16;
-    if (asciiEqIgnoreCase(name, "cast$integer")) return .cast_i32;
-    if (asciiEqIgnoreCase(name, "cast$bigint")) return .cast_i64;
-    if (asciiEqIgnoreCase(name, "cast$double")) return .cast_double;
-    if (asciiEqIgnoreCase(name, "cast$decimal")) return .cast_dec;
-    if (asciiEqIgnoreCase(name, "cast$date")) return .cast_date;
-    if (asciiEqIgnoreCase(name, "cast$timestamp")) return .cast_timestamp;
+    // The names `CAST` and `TRY_CAST` lower to; `$` is no part of a name a query can write unquoted.
+    const cast_name = if (isTryCast(name)) name[4..] else name;
+    if (asciiEqIgnoreCase(cast_name, "cast$tinyint")) return .cast_i8;
+    if (asciiEqIgnoreCase(cast_name, "cast$smallint")) return .cast_i16;
+    if (asciiEqIgnoreCase(cast_name, "cast$integer")) return .cast_i32;
+    if (asciiEqIgnoreCase(cast_name, "cast$bigint")) return .cast_i64;
+    if (asciiEqIgnoreCase(cast_name, "cast$double")) return .cast_double;
+    if (asciiEqIgnoreCase(cast_name, "cast$decimal")) return .cast_dec;
+    if (asciiEqIgnoreCase(cast_name, "cast$date")) return .cast_date;
+    if (asciiEqIgnoreCase(cast_name, "cast$timestamp")) return .cast_timestamp;
     return null;
 }
 
@@ -985,11 +986,12 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             }
             return t;
         },
-        // A number to a number: the value is the only argument, and a DECIMAL's precision and scale follow it.
+        // A number, or a text read as one, to a number: the value is the only argument, and a DECIMAL's precision and scale
+        // follow it.
         .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double => {
             if (args.len != 1) return error.WrongArity;
             const a = args[0];
-            if (a.typeOf() == .str or a.temporal() != null or a.isBoolean()) return error.TypeMismatch;
+            if (a.temporal() != null or a.isBoolean()) return error.TypeMismatch;
             return if (func == .cast_double) .f64 else .i64;
         },
         // A DATE or TIMESTAMP to the other (or itself): the argument must stand for a time, in whatever unit.
@@ -1534,6 +1536,17 @@ fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
             return br.result();
         },
     }
+}
+
+/// `bindCall` of the function `name` spells; a `TRY_CAST` (`try_cast$integer`...) is the cast, lenient.
+fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, name: []const u8, func: ast.Func, args: []const *ast.Expr) Error!ast.Expr {
+    var e = try bindCall(arena, file, func, args);
+    if (isTryCast(name)) e.call.lenient = true;
+    return e;
+}
+
+pub fn isTryCast(name: []const u8) bool {
+    return name.len > 9 and asciiEqIgnoreCase(name[0..9], "try_cast$");
 }
 
 pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func: ast.Func, args: []const *ast.Expr) Error!ast.Expr {

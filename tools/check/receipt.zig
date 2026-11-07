@@ -389,7 +389,9 @@ fn header(arena: Allocator, io: std.Io, gpa: Allocator, duckdb: []const u8, arti
         .cases_sha256 = run(arena, io, &.{ "git", "rev-parse", "HEAD:tools/check" }) orelse "unknown",
         .fixtures = try std.fmt.allocPrint(arena, "parquet-testing {s}; {s}", .{
             run(arena, io, &.{ "git", "-C", "data/parquet-testing", "rev-parse", "HEAD" }) orelse "absent",
-            run(arena, io, &.{ "sh", "-c", "cd data && ls -l --time-style=+ *.parquet 2>/dev/null | awk '{print $6\"=\"$5}' | tr '\\n' ' '" }) orelse "",
+            // `name=bytes ` per file, as GNU `ls --time-style=+` gave; BSD ls has no such flag, so the list came out empty.
+            run(arena, io, &.{ "sh", "-c", "cd data && for f in *.parquet; do [ -e \"$f\" ] || continue; " ++
+                "printf '%s=%s ' \"$f\" \"$(wc -c < \"$f\" | tr -d ' ')\"; done 2>/dev/null" }) orelse "",
         }),
         .cpu_lacks = cpuLacks(arena, io),
     };

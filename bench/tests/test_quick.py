@@ -58,6 +58,9 @@ class Quick(unittest.TestCase):
             repr(answer if hot_answer is None else hot_answer) + ")\n"
             "sys.stderr.write(" + repr(stderr) + ")\nsys.exit(" + str(rc) + ")\n")
         path.chmod(0o755)
+        # macOS 13 assesses a fresh executable on its first exec, ~0.4 s, which the sub-second budgets below cannot spare.
+        # `--version` exits before the counter, so warming the file here changes nothing a test counts.
+        subprocess.run([str(path), "--version"], capture_output=True, check=True)
         self.cfg["hosts"]["local"][name] = {
             "path": str(path), "sha": sha, "sha256": quick.digest(path), "target": "test",
             "cpu": "baseline", "optimize": "ReleaseFast", "strip": True, "toolchain": "0.17.0"}

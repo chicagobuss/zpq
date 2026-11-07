@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Re-encoded files read faster than the original.** Dictionary data pages are sized by their packed index bytes
+  rather than a fixed row count, and integer pages choose PLAIN or DELTA_BINARY_PACKED by compressing a sample of the
+  first page both ways. A Snappy re-encode of the 14.8 GB ClickBench file is 13% smaller than the original and reads
+  15% faster in DuckDB 2.0 and Polars 2.1 and 8% faster in PyArrow 26 (Ryzen 9 9950X, full-column reads). Values don't
+  change; file bytes do.
 - **Two-key GROUP BY counts and sums are faster at the default thread count.** An exact `GROUP BY a, b` with
   `count(*)` or an integer `sum` now runs on one worker per L2 cache when more workers would push it off the dense plan
   or crowd its tables out of cache. On a Ryzen 9 9950X, `SELECT a, b, count(*), sum(v) ... GROUP BY a, b` over a

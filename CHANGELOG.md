@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **String filters read dictionaries, not rows.** A filter on a dictionary-encoded string column (`=`, `<>`, `IN`) now
+  compares each dictionary entry once and selects rows by code, whether or not the file has a page index. On a Ryzen 9
+  9950X, PDS-H-shaped filters such as `l_shipmode IN ('MAIL', 'SHIP')` with a date range are 1.8–6.3× faster.
+- **`LIKE '%text%'` is faster.** The substring search's tail now runs in vectors too: ClickBench Q20 is 11% faster.
 - **zpq builds with any Zig 0.17.x patch release,** not only 0.17.0, so 0.17.1 can be adopted when it ships.
 - **The Lambda fan-out coordinator (`tools/serverless/fanout.py`) is faster.** 0.5.1's coordinator asked the worker for its
   capabilities and prepared the plan from every input's footer, one after the other, before any worker started, which

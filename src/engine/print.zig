@@ -669,6 +669,7 @@ const ParquetPrint = struct {
     fn finish(self: *ParquetPrint, rows: usize) !void {
         try self.flushPending();
         var out: streaming.SinkOut = .{ .sink = self.sink(), .offset = @intCast(self.out_offset) };
+        try page_index.placeCarried(&out, self.rgs.items);
         try fastpath.placeFilters(&out, self.rgs.items);
         self.out_offset = out.offset;
         const meta: schema.FileMetaData = .{

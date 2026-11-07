@@ -116,27 +116,43 @@ fn serialize(arena: std.mem.Allocator, value: anytype) ![]const u8 {
     return w.bytes();
 }
 
-/// Write `chunk`'s ColumnIndex and OffsetIndex straight after it, for writers that place chunks at their final offset
-/// one at a time; sets the chunk's pointers to them.
-pub fn writeInline(
+/// Hold `chunk`'s ColumnIndex and OffsetIndex, from its encoded `pages`, for `placeCarried`; the chunk must already be
+/// at its final offset.
+pub fn attach(
     arena: std.mem.Allocator,
-    out: *streaming.SinkOut,
     chunk: *schema.ColumnChunk,
     pages: []const encoder.PageInfo,
     elem: *const schema.SchemaElement,
 ) !void {
     if (pages.len == 0) return;
     const start: u64 = @intCast(chunkStart(chunk));
-    if (try columnIndex(arena, pages, elem)) |ci| {
-        const bytes = try serialize(arena, &ci);
-        chunk.column_index_offset = @intCast(out.pos());
-        chunk.column_index_length = @intCast(bytes.len);
-        try out.write(bytes);
-    }
-    const bytes = try serialize(arena, &(try offsetIndex(arena, pages, start)));
-    chunk.offset_index_offset = @intCast(out.pos());
-    chunk.offset_index_length = @intCast(bytes.len);
-    try out.write(bytes);
+    if (try columnIndex(arena, pages, elem)) |ci| chunk.column_index_out = try serialize(arena, &ci);
+    chunk.offset_index_out = try serialize(arena, &(try offsetIndex(arena, pages, start)));
+}
+
+/// Write every page index the chunks of `rgs` hold (`column_index_out`, `offset_index_out`) after the row groups:
+/// every ColumnIndex, column by column and row group by row group within one, then every OffsetIndex in the same
+/// order, as other writers lay them out. Some readers (parquet-go) read each kind as one range from the first
+/// chunk's, so one placed beside its chunk breaks them for a file of more than one row group.
+pub fn placeCarried(out: anytype, rgs: []schema.RowGroup) !void {
+    var cols: usize = 0;
+    for (rgs) |rg| cols = @max(cols, rg.columns.items.len);
+    for (0..cols) |ci| for (rgs) |*rg| {
+        if (ci >= rg.columns.items.len) continue;
+        const c = &rg.columns.items[ci];
+        if (c.column_index_out.len == 0) continue;
+        c.column_index_offset = @intCast(out.pos());
+        c.column_index_length = @intCast(c.column_index_out.len);
+        try out.write(c.column_index_out);
+    };
+    for (0..cols) |ci| for (rgs) |*rg| {
+        if (ci >= rg.columns.items.len) continue;
+        const c = &rg.columns.items[ci];
+        if (c.offset_index_out.len == 0) continue;
+        c.offset_index_offset = @intCast(out.pos());
+        c.offset_index_length = @intCast(c.offset_index_out.len);
+        try out.write(c.offset_index_out);
+    };
 }
 
 /// Where a chunk's bytes start in the file: its dictionary page, else its first data page.
@@ -170,30 +186,11 @@ pub const Deferred = struct {
         try self.entries.append(arena, .{ .rg = rg, .col = col, .pages = pages, .elem = elem });
     }
 
-    /// Write every ColumnIndex, column by column and row group by row group within one, then every OffsetIndex in
-    /// the same order, and point `rgs`' chunks at them.
+    /// Build each entry's page index onto its chunk, then write every chunk's of `rgs` (`placeCarried`): the copied
+    /// row groups' among the encoded ones', in one order.
     pub fn write(self: *Deferred, arena: std.mem.Allocator, out: *streaming.SinkOut, rgs: []schema.RowGroup) !void {
-        const items = self.entries.items;
-        std.mem.sort(Entry, items, {}, struct {
-            fn lt(_: void, a: Entry, b: Entry) bool {
-                return if (a.col != b.col) a.col < b.col else a.rg < b.rg;
-            }
-        }.lt);
-        for (items) |e| {
-            const chunk = &rgs[e.rg].columns.items[e.col];
-            const ci = (try columnIndex(arena, e.pages, e.elem)) orelse continue;
-            const bytes = try serialize(arena, &ci);
-            chunk.column_index_offset = @intCast(out.pos());
-            chunk.column_index_length = @intCast(bytes.len);
-            try out.write(bytes);
-        }
-        for (items) |e| {
-            const chunk = &rgs[e.rg].columns.items[e.col];
-            const bytes = try serialize(arena, &(try offsetIndex(arena, e.pages, @intCast(chunkStart(chunk)))));
-            chunk.offset_index_offset = @intCast(out.pos());
-            chunk.offset_index_length = @intCast(bytes.len);
-            try out.write(bytes);
-        }
+        for (self.entries.items) |e| try attach(arena, &rgs[e.rg].columns.items[e.col], e.pages, e.elem);
+        try placeCarried(out, rgs);
     }
 };
 

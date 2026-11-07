@@ -99,6 +99,7 @@ pub fn copyRG(
                     timings,
                     emit_page_index,
                     if (rc.done) |d| d[ci] else null,
+                    out_arena,
                 );
                 try requestedFilter(out_arena, &written, rg, ci, src, bloom_write, new_cols.items.len);
                 try new_cols.append(out_arena, written);
@@ -116,7 +117,7 @@ pub fn copyRG(
             const at = try timedRun(&out, src, range.start, slice, timings);
             const delta = offsetDelta(at, range.start);
             // Carry the page index forward, written right after this chunk's data.
-            var copied = try carryChunk(out_arena, &out, src, src_chunk, delta, emit_page_index);
+            var copied = carryChunk(out_arena, src, src_chunk, delta, emit_page_index);
             try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write, new_cols.items.len);
             try new_cols.append(out_arena, copied);
             rg_total += m.total_uncompressed_size;
@@ -153,7 +154,7 @@ pub fn copyRG(
     // chunk are appended after the RG data block, in column order.
     for (rg.columns.items, 0..) |*chunk, ci| {
         const safe = fastpath.writerSafeChunk(out_arena, src.bytes, chunk, bloom_write.meta);
-        var copied = try carryChunk(out_arena, &out, src, &safe, delta, emit_page_index);
+        var copied = carryChunk(out_arena, src, &safe, delta, emit_page_index);
         try requestedFilter(out_arena, &copied, rg, ci, src, bloom_write, cols.items.len);
         try cols.append(out_arena, copied);
     }
@@ -480,18 +481,17 @@ const TimedCopyOut = struct {
     }
 };
 
-/// A copied chunk's metadata, offsets moved by `delta`, with its page index carried into `out` when the output
-/// keeps one.
+/// A copied chunk's metadata, offsets moved by `delta`, with its page index held for the end of the file
+/// (`page_index.placeCarried`) when the output keeps one.
 fn carryChunk(
     out_arena: std.mem.Allocator,
-    out: *streaming.SinkOut,
     src: RGSrc,
     chunk: *const schema.ColumnChunk,
     delta: i64,
     emit_page_index: bool,
-) !schema.ColumnChunk {
+) schema.ColumnChunk {
     return if (emit_page_index)
-        fastpath.rebaseChunk(out_arena, out, src.bytes, chunk, delta)
+        fastpath.rebaseChunk(out_arena, src.bytes, chunk, delta)
     else
         fastpath.copiedChunk(src.bytes, chunk, delta);
 }
@@ -954,6 +954,8 @@ fn copyChunkRecompressed(
     emit_page_index: bool,
     /// This chunk recompressed ahead of time (`Recompress.done`), else null to recompress it here.
     precomputed: ?RecompressedChunk,
+    /// Where the carried page index lives until the footer is written.
+    keep: std.mem.Allocator,
 ) !schema.ColumnChunk {
     var scratch_state = std.heap.ArenaAllocator.init(rc.scratch);
     defer scratch_state.deinit();
@@ -1031,18 +1033,14 @@ fn copyChunkRecompressed(
         loc.offset = new_start + @as(i64, @intCast(p.dst_off));
         loc.compressed_page_size = @intCast(p.dst_len);
     }
-    var oi_w = thrift.Writer.init(scratch);
+    var oi_w = thrift.Writer.init(keep);
     oi.write(&oi_w) catch return chunk;
 
     if (src_chunk.column_index_offset) |co| if (src_chunk.column_index_length) |cl| {
-        if (originSlice(src, co, cl)) |ci_bytes| if (fastpath.reserializeColumnIndex(scratch, ci_bytes)) |ci_ser| {
-            chunk.column_index_offset = @intCast(out.pos());
-            chunk.column_index_length = @intCast(ci_ser.len);
-            try out.write(ci_ser);
+        if (originSlice(src, co, cl)) |ci_bytes| if (fastpath.reserializeColumnIndex(keep, ci_bytes)) |ci_ser| {
+            chunk.column_index_out = ci_ser;
         };
     };
-    chunk.offset_index_offset = @intCast(out.pos());
-    chunk.offset_index_length = @intCast(oi_w.bytes().len);
-    try out.write(oi_w.bytes());
+    chunk.offset_index_out = oi_w.bytes();
     return chunk;
 }

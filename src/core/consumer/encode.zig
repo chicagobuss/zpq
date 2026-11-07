@@ -475,12 +475,8 @@ const ChunkPlacer = struct {
             // Placed after the last row group, so it must outlive this row group's arena and the encoder's.
             .bloom_out = if (enc.bloom.len > 0) try self.out_arena.dupe(u8, enc.bloom) else &.{},
         };
-        // Straight to a file the chunk's page index can follow it, where its pages' offsets are final.
-        if (self.emit_page_index) {
-            var so: streaming.SinkOut = .{ .sink = self.sink, .offset = @intCast(self.out_offset.*) };
-            try page_index.writeInline(self.out_arena, &so, &chunk, enc.pages, elem);
-            self.out_offset.* = so.offset;
-        }
+        // Straight to a file the chunk's pages' offsets are final: its page index is held for the end of the file.
+        if (self.emit_page_index) try page_index.attach(self.out_arena, &chunk, enc.pages, elem);
         try self.columns.append(self.out_arena, chunk);
     }
 };

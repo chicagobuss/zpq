@@ -1027,6 +1027,67 @@ test "regression: inputs whose legacy DECIMAL scales differ are refused on every
     try std.testing.expectEqual(@as(i128, 48), r.aggregate.output.aggs[0].value.i);
 }
 
+test "a byte copy writes every ColumnIndex, then every OffsetIndex, after its row groups" {
+    // parquet-go reads each kind as one range from the first chunk's: an index beside its chunk breaks it.
+    const dir = "ci/fixtures/parquet/";
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const in = dir ++ "filtered_records_ordered.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, in, .{}) catch return error.SkipZigTest;
+    var path_buf: [96]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    const shapes = [_]QueryArgs{
+        .{ .inputs = &.{in}, .output = out },
+        .{ .inputs = &.{in}, .output = out, .columns = &.{ "rid", "k" } },
+        .{ .inputs = &.{ in, in }, .output = out },
+    };
+    for (shapes) |args| {
+        var r = try runQuery(ctx, args);
+        r.deinit(gpa);
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const got = try local_fs.readFile(a, out);
+        const meta = try metadata.open(a, got);
+        try std.testing.expect(meta.row_groups.items.len > 1);
+        // The indexes start where the last chunk ends, in one run: every ColumnIndex column by column and row group
+        // by row group, then every OffsetIndex in the same order.
+        var data_end: usize = 0;
+        for (meta.row_groups.items) |rg| for (rg.columns.items) |c| {
+            const m = c.meta_data.?;
+            const s: usize = @intCast(m.dictionary_page_offset orelse m.data_page_offset);
+            data_end = @max(data_end, s + @as(usize, @intCast(m.total_compressed_size)));
+        };
+        var at = data_end;
+        const cols = meta.row_groups.items[0].columns.items.len;
+        for ([_]bool{ true, false }) |column_index| for (0..cols) |ci| for (meta.row_groups.items) |rg| {
+            const c = rg.columns.items[ci];
+            const off = if (column_index) c.column_index_offset else c.offset_index_offset;
+            const len: ?i64 = if (column_index)
+                (if (c.column_index_length) |l| l else null)
+            else
+                (if (c.offset_index_length) |l| l else null);
+            try std.testing.expectEqual(@as(?i64, @intCast(at)), off);
+            at += @intCast(len.?);
+        };
+        // Each OffsetIndex still names its chunk's pages.
+        for (meta.row_groups.items) |rg| for (rg.columns.items) |c| {
+            const io: usize = @intCast(c.offset_index_offset.?);
+            var reader = thrift.Reader.init(got[io..][0..@intCast(c.offset_index_length.?)]);
+            const index = try schema.OffsetIndex.read(a, &reader);
+            const m = c.meta_data.?;
+            const s = m.dictionary_page_offset orelse m.data_page_offset;
+            for (index.page_locations.items) |pl| {
+                try std.testing.expect(pl.offset >= s and pl.offset + pl.compressed_page_size <= s + m.total_compressed_size);
+                var hr = thrift.Reader.init(got[@intCast(pl.offset)..]);
+                _ = try schema.PageHeader.read(&hr);
+            }
+        };
+    }
+}
+
 test "a byte-copy concatenation names the input and column whose schema differs" {
     const dir = "ci/fixtures/parquet/";
     std.Io.Dir.cwd().access(std.testing.io, dir ++ "legacy_decimal_s2.parquet", .{}) catch return error.SkipZigTest;

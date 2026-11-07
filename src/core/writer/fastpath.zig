@@ -23,7 +23,9 @@
 //!   - The page index (offset/column index) is **carried forward**: the
 //!     ColumnIndex copies through unchanged and the OffsetIndex page
 //!     locations are rebased by the same shift applied to the chunk data,
-//!     so page-level pruning survives a compaction. It is dropped only
+//!     so page-level pruning survives a compaction. Like the re-encode path's, it is written after the row groups
+//!     (`page_index.placeCarried`): every ColumnIndex, then every OffsetIndex, each section contiguous, which
+//!     readers that fetch a section in one range (parquet-go) require. It is dropped only
 //!     when page-header removal changes the layout, the source has none, or
 //!     its index bytes were not fetched (the
 //!     S3 fast path may hold just the column-chunk + footer ranges).
@@ -41,6 +43,7 @@ const writer_statistics = @import("../parquet/writer_statistics.zig");
 const thrift = @import("../thrift.zig");
 const bloom = @import("../parquet/bloom.zig");
 const page_header = @import("page_header.zig");
+const page_index = @import("page_index.zig");
 
 const MAGIC: [4]u8 = .{ 'P', 'A', 'R', '1' };
 
@@ -142,7 +145,7 @@ const BufferOut = struct {
     arena: std.mem.Allocator,
     bytes: std.ArrayList(u8) = .empty,
 
-    fn pos(self: *const BufferOut) usize {
+    pub fn pos(self: *const BufferOut) usize {
         return self.bytes.items.len;
     }
 
@@ -198,6 +201,7 @@ pub fn assemble(
         total_rows += rg.num_rows;
     };
 
+    try page_index.placeCarried(out, new_row_groups.items);
     try placeFilters(out, new_row_groups.items);
 
     // The schema is shared by reference unless projecting, which needs a reduced list.
@@ -287,7 +291,7 @@ fn copyRowGroup(
     // indexes follow the group's data.
     for (src.columns.items) |*chunk| {
         const safe = writerSafeChunk(arena, input, chunk, meta);
-        cols.appendAssumeCapacity(try rebaseChunk(arena, out, input, &safe, delta));
+        cols.appendAssumeCapacity(rebaseChunk(arena, input, &safe, delta));
     }
     return .{
         .columns = cols,
@@ -359,7 +363,7 @@ pub fn copyPolicyChunk(
     if (cm.writer_stats == .trust) {
         const placed = try copyRun(out, null, true, range.start, input[range.start..][0..range.len]);
         const moved = offsetDelta(placed.at, range.start);
-        return if (emit_index) try rebaseChunk(a, out, input, src, moved) else copiedChunk(input, src, moved);
+        return if (emit_index) rebaseChunk(a, input, src, moved) else copiedChunk(input, src, moved);
     }
     // Rewritten headers change the chunk's bytes: it is written, never shared, so it is not aligned either.
     const start = out.pos();
@@ -402,13 +406,7 @@ pub fn copyPolicyChunk(
     const raw = std.math.add(i64, cm.total_uncompressed_size, header_delta) catch return error.InvalidColumnOffsets;
     if (raw < 0) return error.InvalidColumnOffsets;
     chunk.meta_data.?.total_uncompressed_size = raw;
-    if (emit_index and !layout_changed) {
-        const idx = try carryPageIndex(a, out, input, src, delta);
-        chunk.offset_index_offset = idx.offset_index_offset;
-        chunk.offset_index_length = idx.offset_index_length;
-        chunk.column_index_offset = idx.column_index_offset;
-        chunk.column_index_length = idx.column_index_length;
-    }
+    if (emit_index and !layout_changed) carryPageIndex(a, input, src, delta, &chunk);
     return chunk;
 }
 
@@ -462,22 +460,17 @@ pub fn writerSafeChunk(
 }
 
 /// `src` with every offset shifted by `delta`, the distance its data
-/// moved, its page index carried forward into `out`, and its Bloom filter
+/// moved, its page index held for `page_index.placeCarried`, and its Bloom filter
 /// held for `placeFilters`. Inner slices (encodings, paths, stats, the
 /// filter) are borrowed from the source.
 pub fn rebaseChunk(
     arena: std.mem.Allocator,
-    out: anytype,
     input: []const u8,
     src: *const schema.ColumnChunk,
     delta: i64,
-) !schema.ColumnChunk {
+) schema.ColumnChunk {
     var chunk = copiedChunk(input, src, delta);
-    const idx = try carryPageIndex(arena, out, input, src, delta);
-    chunk.offset_index_offset = idx.offset_index_offset;
-    chunk.offset_index_length = idx.offset_index_length;
-    chunk.column_index_offset = idx.column_index_offset;
-    chunk.column_index_length = idx.column_index_length;
+    carryPageIndex(arena, input, src, delta, &chunk);
     return chunk;
 }
 
@@ -540,6 +533,8 @@ pub fn shiftChunk(src: *const schema.ColumnChunk, delta: i64) schema.ColumnChunk
     }
     chunk.absent = &.{};
     chunk.bloom_out = &.{};
+    chunk.column_index_out = &.{};
+    chunk.offset_index_out = &.{};
     chunk.offset_index_offset = null;
     chunk.offset_index_length = null;
     chunk.column_index_offset = null;
@@ -622,55 +617,30 @@ pub fn chunkRange(m: *const schema.ColumnMetaData, input_len: usize) ?ByteRange 
     return .{ .start = start, .len = len };
 }
 
-/// Page-index pointers for one output chunk.
-pub const PageIndexPtrs = struct {
-    offset_index_offset: ?i64 = null,
-    offset_index_length: ?i32 = null,
-    column_index_offset: ?i64 = null,
-    column_index_length: ?i32 = null,
-};
-
-/// Carry a source chunk's page index forward into `out`, returning the
-/// new (output-relative) pointers. ColumnIndex holds only per-page
-/// values (no file offsets) so it copies through unchanged; OffsetIndex
-/// page-location offsets are absolute, so each is rebased by `delta` —
-/// the exact shift applied to that chunk's data bytes.
+/// Hold a source chunk's page index for `page_index.placeCarried`, which writes every output chunk's after the row
+/// groups. ColumnIndex holds only per-page values (no file offsets) so it copies through unchanged; OffsetIndex
+/// page-location offsets are absolute, so each is rebased by `delta`, the exact shift applied to that chunk's data.
 ///
-/// Best-effort: returns null pointers when the source carries no index,
-/// when the index bytes weren't fetched (the S3 fast path may hold only
-/// column-chunk + footer ranges, leaving index blocks outside `input`),
-/// or when the source index fails to parse. Dropping the index is always
-/// safe — readers fall back to row-group-level pruning.
+/// Best-effort: holds nothing when the source carries no index, when the index bytes weren't fetched (the S3 fast
+/// path may hold only column-chunk + footer ranges, leaving index blocks outside `input`), or when the source index
+/// fails to parse. Dropping the index is always safe: readers fall back to row-group-level pruning.
 fn carryPageIndex(
     arena: std.mem.Allocator,
-    out: anytype,
     input: []const u8,
     src: *const schema.ColumnChunk,
     delta: i64,
-) !PageIndexPtrs {
-    var ptrs = PageIndexPtrs{};
-
+    chunk: *schema.ColumnChunk,
+) void {
     if (src.column_index_offset) |co| if (src.column_index_length) |cl| {
         if (sliceInBounds(input, co, cl)) |bytes| {
-            if (reserializeColumnIndex(arena, bytes)) |ser| {
-                ptrs.column_index_offset = @intCast(out.pos());
-                ptrs.column_index_length = @intCast(ser.len);
-                try out.write(ser);
-            }
+            if (reserializeColumnIndex(arena, bytes)) |ser| chunk.column_index_out = ser;
         }
     };
-
     if (src.offset_index_offset) |oo| if (src.offset_index_length) |ol| {
         if (sliceInBounds(input, oo, ol)) |bytes| {
-            if (reserializeOffsetIndexShifted(arena, bytes, delta)) |ser| {
-                ptrs.offset_index_offset = @intCast(out.pos());
-                ptrs.offset_index_length = @intCast(ser.len);
-                try out.write(ser);
-            }
+            if (reserializeOffsetIndexShifted(arena, bytes, delta)) |ser| chunk.offset_index_out = ser;
         }
     };
-
-    return ptrs;
 }
 
 /// Sub-slice `input[offset..offset+length]`, or null if the range falls

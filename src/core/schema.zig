@@ -1110,6 +1110,10 @@ pub const ColumnChunk = struct {
     /// Runtime only, write side: the Bloom filter (header and bitset) an output chunk carries, copied from its source
     /// or built for it. `fastpath.placeFilters` writes it after the row groups and points fields 14/15 at it.
     bloom_out: []const u8 = &.{},
+    /// Runtime only, write side: the ColumnIndex and OffsetIndex an output chunk carries, serialized, the offsets in
+    /// the OffsetIndex final. `page_index.placeCarried` writes them after the row groups and points fields 4-7 at them.
+    column_index_out: []const u8 = &.{},
+    offset_index_out: []const u8 = &.{},
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnChunk {
         const saved_id = reader.last_field_id;

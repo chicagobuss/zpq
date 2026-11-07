@@ -401,6 +401,7 @@ fn copyFixture(a: std.mem.Allocator, path: []const u8, kept: ?[]const bool) !str
         try rgs.append(a, copied.rg.?);
     }
     var out: streaming.SinkOut = .{ .sink = msink.sink(), .offset = @intCast(out_offset) };
+    try page_index.placeCarried(&out, rgs.items);
     try fastpath.placeFilters(&out, rgs.items);
     try testing.expectEqual(msink.buffer.items.len, out.offset);
     try testing.expect(timings.copied_bytes > 0);

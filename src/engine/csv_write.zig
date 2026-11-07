@@ -26,6 +26,7 @@ const system = @import("../core/system.zig");
 const thrift = @import("../core/thrift.zig");
 const page_index = @import("../core/writer/page_index.zig");
 const streaming = @import("../core/writer/streaming.zig");
+const encoder = @import("../core/writer/encoder.zig");
 const fastpath = @import("../core/writer/fastpath.zig");
 const Diag = @import("../core/diag.zig").Diag;
 const local_fs = @import("../local_fs.zig");
@@ -621,19 +622,38 @@ fn hasHighBit(bytes: []const u8) bool {
 /// A string column's rows as codes into the piece's own dictionary while its values repeat: each distinct string is
 /// hashed and kept once (copied once, where it must be), a row takes four bytes, and the encoder builds the chunk's
 /// dictionary from the codes (`encoder.planCoded`) without hashing a value, to the bytes hashing the values writes.
-/// Only a column that repeats a lot pays: its rows are hashed here instead of in the encoder, and its dictionary is
-/// merged with the other pieces' (`consumer.joinRows`), so one whose dictionary outgrows a sixteenth of its rows, or
-/// the encoder's 1 MiB dictionary page, goes back to values for the rest of the piece.
+/// Coding pays only for a column the encoder will dictionary-encode (`encoder.tryEncodeDictBytes`): one whose
+/// values are hashed here and then again there pays twice. So a column goes back to values for the rest of the piece
+/// once its own data says the encoder would refuse it, by the encoder's own limits on the present values seen
+/// (`encoder.stringDictMaxEntries`, `encoder.stringDictMaxBytes`): its dictionary past what one dictionary page holds
+/// (`encoder.dictPageMaxBytes`; a merge only adds entries, so that is final), or past either limit while its newest
+/// values still grow it faster than the limit grows (`judge`).
 const Coder = struct {
     map: std.StringHashMapUnmanaged(u32) = .empty,
     dict: std.ArrayList([]const u8) = .empty,
+    /// The dictionary's PLAIN bytes, and the present values' and their PLAIN bytes, as the encoder counts them.
     bytes: usize = 0,
+    present: usize = 0,
+    plain: usize = 0,
+    /// Present values at the next judgment, and what was counted at the last one.
+    next_judged: usize = encoder.dict_min_present,
+    last: struct { present: usize = 0, plain: usize = 0, entries: usize = 0, bytes: usize = 0 } = .{},
 
-    /// Entries a dictionary is judged at: a column is coded until its dictionary holds this many.
-    const judged_entries = 256;
-    /// At most one entry per this many rows.
-    const repeats = 16;
-    const max_bytes = 1 << 20;
+    /// At doubling counts of present values: whether the column should go back to values. A dictionary grows
+    /// concavely in the values it has seen (each new value is less likely to be new), so one within both limits
+    /// whose newest values also arrive within them stays within them. One past a limit while its newest values still
+    /// arrive past it is the one the encoder would refuse unless its values stop being new; it is given up.
+    fn judge(c: *Coder) bool {
+        const entries = c.dict.items.len;
+        // The limits are a quarter of the count and of the PLAIN bytes; the same as rates over the newest window.
+        const entries_over = entries > encoder.stringDictMaxEntries(c.present) and
+            4 * (entries - c.last.entries) > c.present - c.last.present;
+        const bytes_over = c.bytes > encoder.stringDictMaxBytes(c.plain) and
+            4 * (c.bytes - c.last.bytes) > c.plain - c.last.plain;
+        c.last = .{ .present = c.present, .plain = c.plain, .entries = entries, .bytes = c.bytes };
+        c.next_judged = 2 * c.present;
+        return entries_over or bytes_over;
+    }
 };
 
 /// Typed output columns being filled from one chunk's fields.
@@ -765,8 +785,9 @@ const Builder = struct {
                     }
                     try x.codes.append(a, gop.value_ptr.*);
                     if (x.max_def > 0) try x.def_levels.append(a, 1);
-                    if (!gop.found_existing and c.dict.items.len >= Coder.judged_entries and
-                        (Coder.repeats * c.dict.items.len > x.codes.items.len or c.bytes > Coder.max_bytes))
+                    c.present += 1;
+                    c.plain += 4 + s.len;
+                    if (c.bytes > encoder.dictPageMaxBytes() or (c.present >= c.next_judged and c.judge()))
                         try uncode(a, x, c);
                     return true;
                 }

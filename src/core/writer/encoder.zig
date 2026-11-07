@@ -1095,8 +1095,10 @@ fn distinctEntries(comptime T: type, arena: std.mem.Allocator, entries: []const 
 /// other string encoding where it applies: smaller, the fastest to read in every reader we measured, and it lets
 /// readers prune row groups by `=` and `IN`.
 const string_dict_floor_bytes = 1 << 20;
+/// Fewer present values than this take no string dictionary: not worth its page.
+pub const dict_min_present = 64;
 
-fn stringDictMaxEntries(num_present: usize) usize {
+pub fn stringDictMaxEntries(num_present: usize) usize {
     return num_present / 4;
 }
 
@@ -1107,7 +1109,7 @@ fn stringDictMaxEntries(num_present: usize) usize {
 /// to PLAIN or a delta layout, which every reader we measured decodes slower. The row-group limit bounds a quarter of
 /// it in practice; the page cap bounds it for a row group of any size, so a column too large for a dictionary stops
 /// interning there and takes the values path, and no dictionary is built that the page limit would then refuse.
-fn stringDictMaxBytes(plain_total: usize) usize {
+pub fn stringDictMaxBytes(plain_total: usize) usize {
     return @min(dictPageMaxBytes(), @max(string_dict_floor_bytes, plain_total / 4));
 }
 
@@ -1115,7 +1117,7 @@ fn stringDictMaxBytes(plain_total: usize) usize {
 /// does to it: Snappy, the widest bound, grows incompressible bytes by a sixth and 32 bytes. Keeps the PLAIN length
 /// (which `encodePlainBytes` refuses past u32) and the compressed length inside `pageLimit`, so a dictionary that
 /// passes the intern loop is always a dictionary `planDictionary` writes.
-fn dictPageMaxBytes() usize {
+pub fn dictPageMaxBytes() usize {
     return (pageLimit() -| 32) / 7 * 6;
 }
 
@@ -1132,7 +1134,7 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
     const len_prefix: usize = if (fixed) 0 else 4;
 
     const num_present = countPresent(values.len, def_levels, max_def);
-    if (num_present < 64) return null;
+    if (num_present < dict_min_present) return null;
     var plain_total: usize = 0;
     for (values, 0..) |v, i| {
         if (isPresent(def_levels, max_def, i)) plain_total += len_prefix + v.len;

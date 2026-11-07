@@ -466,8 +466,8 @@ pub const BufRange = struct {
 
 /// The rows of `ranges`, in order, as one column (`bufRows` of each, joined on `arena`). Ranges of buffers coded by
 /// one dictionary stay codes. String ranges each coded by its own dictionary become codes into their merged one when
-/// the dictionaries together hold at most a sixteenth of the rows: each entry is hashed once, not each row, which
-/// pays only where entries are that much fewer than rows. Otherwise values, a coded range's taken
+/// their entries together are within the encoder's dictionary cap (`encoder.stringDictMaxEntries`), so the chunk
+/// stays a dictionary; each entry is hashed once, not each row. Otherwise values, a coded range's taken
 /// from its dictionary. Levels run at the deepest range's `max_def`, a range without levels present throughout.
 /// Which of these a column comes out as never changes its encoding: coded and plain columns, with or without
 /// all-present levels, encode to the same bytes.
@@ -492,7 +492,10 @@ pub fn joinRows(arena: std.mem.Allocator, ranges: []const BufRange) !filter_eval
                 entries += b.dict.len;
             }
             var out: filter_eval.ColumnT(T) = .{ .values = &.{}, .max_def = max_def, .has_nulls = max_def > 0 };
-            const merge = if (comptime T == []const u8) !one_dict and all_coded and entries <= total / 16 else false;
+            const merge = if (comptime T == []const u8)
+                !one_dict and all_coded and entries <= encoder.stringDictMaxEntries(total)
+            else
+                false;
             if (merge) {
                 if (comptime T == []const u8) {
                     const m = try mergedCodes(arena, ranges, total, entries);

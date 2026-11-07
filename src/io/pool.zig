@@ -896,7 +896,7 @@ fn peerOf(conn: *const tls.Connection) !tls.Ipv4 {
 test "new connections take the host's addresses in turn, and skip one that refuses" {
     // Linux answers on all of 127.0.0.0/8; macOS only on 127.0.0.1, so the other addresses this test listens on and
     // connects to do not exist there.
-    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "listen-queue behavior");
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "loopback addresses past 127.0.0.1");
     const io = testing.io;
     const a = try TestListener.open();
     defer a.close();

@@ -15,8 +15,12 @@ pub const OutputPublication = struct {
     target_buffer: [std.fs.max_path_bytes]u8 = undefined,
     buffer: [std.fs.max_path_bytes]u8 = undefined,
     len: usize = 0,
-    /// Tests only: runs between the sync and the rename of `commitReplacing`, to change the target in that window.
+    /// Tests only: runs after the sync (`hook_at` .sync) or the close (.close), before the rename, to change the target
+    /// in that window.
     before_rename: ?*const fn ([]const u8) void = null,
+    hook_at: enum { sync, close } = .close,
+    /// Tests only: the error `commitReplacing`'s exchange back fails with.
+    fail_rollback: ?anyerror = null,
 
     pub fn path(self: *const OutputPublication) []const u8 {
         return self.buffer[0..self.len];
@@ -70,11 +74,11 @@ pub const OutputPublication = struct {
     /// if the target is still that file at the rename, after the sync. The staged file and the target are exchanged
     /// atomically and the file exchanged out is checked; another one (a file renamed over the target meanwhile, or the
     /// same one rewritten) is exchanged back and `error.InputChanged` returned, and a removed target is not recreated.
-    /// Where the filesystem cannot exchange, the target is checked just before a plain rename instead.
+    /// Where the filesystem cannot exchange, the target is checked just before a plain rename instead. If exchanging
+    /// back fails, nothing is removed: `error.RollbackFailed`, the other file kept at `path()`, this result at the target.
     pub fn commitReplacing(self: *OutputPublication, io: std.Io, expected: local_fs.Stamp) !void {
         const target = self.target orelse return;
         try self.seal(io);
-        if (@import("builtin").is_test) if (self.before_rename) |hook| hook(target);
         local_fs.exchange(self.path(), target) catch |err| switch (err) {
             error.NotFound => return error.InputChanged,
             error.Unsupported => {
@@ -90,11 +94,21 @@ pub const OutputPublication = struct {
         const out = local_fs.pathStamp(self.path()) catch null;
         if (out == null or !std.meta.eql(out.?, expected)) {
             // Put the other file back; the staged result stays at the staging name for `abort` to remove.
-            local_fs.exchange(self.path(), target) catch return error.RenameFailed;
+            self.exchangeBack(target) catch {
+                // The other file is at the staging name and this result at the target. Nothing may be removed now: the
+                // staging name is kept (`abort` leaves it) and named in the error's message (`path`).
+                self.target = null;
+                return error.RollbackFailed;
+            };
             return error.InputChanged;
         }
         local_fs.removeFile(self.path());
         self.target = null;
+    }
+
+    fn exchangeBack(self: *OutputPublication, target: []const u8) !void {
+        if (@import("builtin").is_test) if (self.fail_rollback) |err| return err;
+        return local_fs.exchange(self.path(), target);
     }
 
     /// Mode, sync and close: the staged file is complete and durable.
@@ -106,8 +120,10 @@ pub const OutputPublication = struct {
         }
         // Keep ownership until sync succeeds, so abort also closes the fd on a writeback error.
         if (self.fsync) try local_fs.syncData(fd);
+        if (@import("builtin").is_test) if (self.hook_at == .sync) if (self.before_rename) |hook| hook(self.target.?);
         self.fd = null;
         try local_fs.closeChecked(fd);
+        if (@import("builtin").is_test) if (self.hook_at == .close) if (self.before_rename) |hook| hook(self.target.?);
     }
 
     pub fn abort(self: *OutputPublication) void {

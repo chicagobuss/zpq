@@ -854,7 +854,8 @@ fn runUpdate(
     }, &problem) catch |err| {
         if (problem.len > 0) {
             diagnosticPrint("zpq query: {s}\n", .{problem.text()});
-            return error.BadArgs;
+            // A refusal is a usage error (exit 2); a publication that failed half-way is not, and says where things are.
+            return if (err == error.RollbackFailed) err else error.BadArgs;
         }
         return err;
     };

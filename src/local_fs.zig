@@ -115,7 +115,7 @@ pub fn rename(from: []const u8, to: []const u8) error{ NameTooLong, RenameFailed
 
 /// Swap what `a` and `b` name, atomically (`renameat2(RENAME_EXCHANGE)`). `error.NotFound` when either is missing;
 /// `error.Unsupported` where the filesystem or the kernel cannot exchange (then nothing moved).
-pub fn exchange(a: []const u8, b: []const u8) error{ NameTooLong, NotFound, Unsupported, RenameFailed }!void {
+pub fn exchange(a: []const u8, b: []const u8) error{ NameTooLong, NotFound, Unsupported, NoSpaceLeft, InputOutput, RenameFailed }!void {
     if (builtin.os.tag != .linux) return error.Unsupported;
     const linux = std.os.linux;
     const a_z = posix.toPosixPath(a) catch return error.NameTooLong;
@@ -124,6 +124,8 @@ pub fn exchange(a: []const u8, b: []const u8) error{ NameTooLong, NotFound, Unsu
         .SUCCESS => {},
         .NOENT => error.NotFound,
         .INVAL, .NOSYS, .OPNOTSUPP => error.Unsupported,
+        .NOSPC, .DQUOT => error.NoSpaceLeft,
+        .IO => error.InputOutput,
         else => error.RenameFailed,
     };
 }

@@ -348,7 +348,8 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
 /// A column chunk that failed to decode, by where (`Diag.detail.decode`) and why, the error's name last for a script.
 fn querySetupError(err: anyerror, diag: *const Diag) bool {
     switch (err) {
-        error.BadArgs, error.NoMatches, error.SqlNotCompiledIn => {},
+        // RollbackFailed: UPDATE printed where the files are.
+        error.BadArgs, error.NoMatches, error.SqlNotCompiledIn, error.RollbackFailed => {},
         error.NoInputs => diagnosticPrint("zpq query: no input files specified\n", .{}),
         error.Unsigned64OutOfRange => diagnosticPrint(
             "zpq query: an unsigned 64-bit value of 2^63 or more cannot be used in\n" ++

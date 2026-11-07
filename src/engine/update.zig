@@ -301,8 +301,18 @@ fn runCharged(footers: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, re
     // renamed over its path, or its removal, in the exchange that publishes over it (`commitReplacing`).
     try map.intact(req.target);
     if (in_place) {
-        if (@import("builtin").is_test) publication.before_rename = before_publish;
-        try publication.commitReplacing(io, map.stamp);
+        if (@import("builtin").is_test) {
+            publication.before_rename = before_publish;
+            publication.hook_at = if (publish_hook_at_sync) .sync else .close;
+            publication.fail_rollback = fail_rollback;
+        }
+        publication.commitReplacing(io, map.stamp) catch |err| {
+            if (err == error.RollbackFailed) problem.set(
+                "{s} was replaced while UPDATE ran and could not be put back: that file is now {s}, and {s} holds this UPDATE's result",
+                .{ req.target, publication.path(), req.target },
+            );
+            return err;
+        };
     } else try publication.commit(io);
     return summary;
 }
@@ -1217,6 +1227,10 @@ const fastpath_block = @import("../core/writer/fastpath.zig").share_block;
 /// Tests only: runs after an UPDATE's result is synced and before it is renamed over its target, to change the target in
 /// that window.
 var before_publish: ?*const fn ([]const u8) void = null;
+/// Tests only: the error the exchange that puts a replaced target back fails with.
+var fail_rollback: ?anyerror = null;
+/// Tests only: `before_publish` runs right after the sync instead of after the close.
+var publish_hook_at_sync = false;
 
 fn footerLen(bytes: []const u8) usize {
     return std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
@@ -1252,7 +1266,9 @@ test "UPDATE refuses a target replaced or removed while it ran, even after its s
     };
     Hooks.replacement = "another writer's file";
     defer before_publish = null;
-    for ([_]*const fn ([]const u8) void{ Hooks.replace, Hooks.remove }) |hook| {
+    defer publish_hook_at_sync = false;
+    for ([_]bool{ true, false }) |at_sync| for ([_]*const fn ([]const u8) void{ Hooks.replace, Hooks.remove }) |hook| {
+        publish_hook_at_sync = at_sync;
         const fd = try local_fs.createFile(target);
         try local_fs.writeAll(fd, src_bytes);
         local_fs.close(fd);
@@ -1266,7 +1282,7 @@ test "UPDATE refuses a target replaced or removed while it ran, even after its s
         // Nor is the staged result left behind.
         const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
         for (try local_fs.listFiles(a, io, dir)) |name| try std.testing.expect(std.mem.indexOf(u8, name, "zpq-tmp") == null);
-    }
+    };
     before_publish = null;
 
     const fd = try local_fs.createFile(target);
@@ -1342,4 +1358,58 @@ test "UPDATE that grows a page moves only its chunk, at its offset modulo the bl
         }
     }
     try std.testing.expect(found);
+}
+
+test "UPDATE keeps a replaced target when putting it back fails, and says where it is" {
+    // REVIEW v6: ENOSPC or EIO on the exchange back made the abort unlink the other writer's file.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = "ci/fixtures/parquet/filtered_records_ordered.parquet";
+    std.Io.Dir.cwd().access(io, fixture, .{}) catch return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const src_bytes = try local_fs.readFile(a, fixture);
+    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/t.parquet", .{tmp.sub_path});
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const sets = [_]Set{.{ .column = "f", .assignment = try filter_parser.parseSyntax(a, "f = 42") }};
+    const req: Request = .{ .target = target, .where = try filter_parser.parseSyntax(a, "rid = 100"), .sets = &sets };
+    const Hooks = struct {
+        const other = "another writer's file, committed while UPDATE synced";
+        fn replace(path: []const u8) void {
+            var buf: [256]u8 = undefined;
+            const name = std.fmt.bufPrint(&buf, "{s}.other", .{path}) catch unreachable;
+            const fd = local_fs.createFile(name) catch unreachable;
+            local_fs.writeAll(fd, other) catch unreachable;
+            local_fs.close(fd);
+            local_fs.rename(name, path) catch unreachable;
+        }
+    };
+    defer {
+        before_publish = null;
+        fail_rollback = null;
+        publish_hook_at_sync = false;
+    }
+    for ([_]bool{ true, false }) |at_sync| for ([_]anyerror{ error.NoSpaceLeft, error.InputOutput }) |fault| {
+        publish_hook_at_sync = at_sync;
+        for (try local_fs.listFiles(a, io, dir)) |name| local_fs.removeFile(try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, name }));
+        const fd = try local_fs.createFile(target);
+        try local_fs.writeAll(fd, src_bytes);
+        local_fs.close(fd);
+        before_publish = Hooks.replace;
+        fail_rollback = fault;
+        var problem: Problem = .{};
+        try std.testing.expectError(error.RollbackFailed, run(gpa, io, req, &problem));
+        // The other writer's bytes still exist, at the name the message gives; the target holds this UPDATE's result.
+        const kept = for (try local_fs.listFiles(a, io, dir)) |name| {
+            if (std.mem.indexOf(u8, name, "zpq-tmp") != null) break name;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, problem.text(), kept) != null);
+        try std.testing.expectEqualStrings(Hooks.other, try local_fs.readFile(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, kept })));
+        const result = try local_fs.readFile(a, target);
+        _ = try metadata.open(a, result);
+        try std.testing.expect(!std.mem.eql(u8, result, src_bytes));
+    };
 }

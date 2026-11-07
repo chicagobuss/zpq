@@ -192,10 +192,8 @@ pub const Prepared = struct {
     /// builds' structures and dictionaries in `store`, their decode scratch beside it, the group-join's slots and
     /// partials. A build that does not fit refuses while it builds, not after.
     charge: core_memory.Charged = undefined,
-    store: Store = undefined,
-    /// The build files' mappings, held for the query: virtual leaves bind by the payloads' names, which the build
-    /// footers own.
-    maps: std.ArrayList(local_fs.Mapped) = .empty,
+    /// The top-level builds, each with what it holds (`Task`): released together.
+    tasks: []Task = &.{},
     order: expr_ast.ResultOrder,
     inner: plans.Source = undefined,
 
@@ -282,10 +280,8 @@ pub const Prepared = struct {
     }
 
     fn releaseBuilds(self: *Prepared) void {
-        self.store.deinit();
-        self.store = .init(self.charge.allocator());
-        for (self.maps.items) |m| m.unmap();
-        self.maps = .empty;
+        for (self.tasks) |*t| t.release();
+        self.tasks = &.{};
     }
 };
 
@@ -378,21 +374,56 @@ fn semiKind(s: syntax.Semi) lookup.Kind {
     return if (s.anti) .anti else if (s.unique) .inner else .semi;
 }
 
+/// One top-level build (the main join, a SEMI join of the probe, a star's dimension) and everything it holds: its
+/// arena, its store, the build files' mappings. The builds are independent, so each runs on a thread of its own
+/// beside the others (a chain's inner builds run inside their outer build's task, before it). The mappings are held
+/// for the query: virtual leaves bind by the payloads' names, which the build footers own.
+const Task = struct {
+    p: *Prepared,
+    threads: usize,
+    fk: []const u8,
+    build: syntax.Build,
+    kind: lookup.Kind,
+    arena: std.heap.ArenaAllocator,
+    store: Store,
+    maps: std.ArrayList(local_fs.Mapped) = .empty,
+    charged: usize = 0,
+    diag: Diag = .{},
+    leaf: Leaf = undefined,
+    err: ?anyerror = null,
+
+    fn run(t: *Task) void {
+        t.leaf = build(t, t.fk, t.build, t.kind) catch |err| {
+            t.err = err;
+            return;
+        };
+    }
+
+    fn release(t: *Task) void {
+        t.store.deinit();
+        for (t.maps.items) |m| m.unmap();
+        t.arena.deinit();
+    }
+};
+
 /// Read one build side (its own SEMI joins first) into the lookup conjunct on `fk`, charged to the ledger as it is
-/// built.
-fn build(p: *Prepared, arena: std.mem.Allocator, fk: []const u8, b: syntax.Build, kind: lookup.Kind, threads: usize, diag: ?*Diag) !Leaf {
-    try p.maps.ensureUnusedCapacity(arena, 1);
+/// read.
+fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind) !Leaf {
+    const arena = t.arena.allocator();
+    const p = t.p;
+    const diag = &t.diag;
+    try t.maps.ensureUnusedCapacity(arena, 1);
     const file = open(arena, b.path) catch |err| {
         Diag.setInput(diag, b.path, err);
         return err;
     };
-    p.maps.appendAssumeCapacity(file.map);
+    t.maps.appendAssumeCapacity(file.map);
     const meta = try arena.create(schema.FileMetaData);
     meta.* = file.meta;
     var filter: ?filter_ast.Filter = if (b.filter) |f| try filters.bindSyntax(arena, f, meta, diag) else null;
     const semis = try arena.alloc(Leaf, b.semis.len);
     for (b.semis, semis) |s, *inner| {
-        inner.* = try build(p, arena, s.fk, s.build, semiKind(s), threads, diag);
+        inner.* = try build(t, s.fk, s.build, semiKind(s));
         filter = try withLookup(arena, filter, try leafOf(meta, inner.*, diag));
     }
     const payload = try arena.alloc(usize, b.columns.len);
@@ -404,15 +435,15 @@ fn build(p: *Prepared, arena: std.mem.Allocator, fk: []const u8, b: syntax.Build
         Diag.setColumn(diag, b.key);
         return err;
     };
-    const before = p.store.capacity();
-    const j = lookup.build(p.store.allocator(), p.charge.allocator(), file.map.bytes, meta, .{
+    const before = t.store.capacity();
+    const j = lookup.build(t.store.allocator(), p.charge.allocator(), file.map.bytes, meta, .{
         .kind = kind,
         .build_name = b.path,
         .key_name = b.key,
         .key = key,
         .payload = payload,
         .filter = filter,
-        .threads = threads,
+        .threads = t.threads,
         .budget = p.ledger.available(),
     }) catch |err| {
         Diag.setInput(diag, b.path, null);
@@ -424,8 +455,8 @@ fn build(p: *Prepared, arena: std.mem.Allocator, fk: []const u8, b: syntax.Build
         Diag.setInput(diag, b.path, err);
         return err;
     };
-    j.bytes = p.store.capacity() - before;
-    p.charged += j.bytes;
+    j.bytes = t.store.capacity() - before;
+    t.charged += j.bytes;
     return .{ .fk = fk, .join = j, .semis = semis };
 }
 
@@ -441,28 +472,76 @@ pub fn prepare(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: types.Que
     const p = try arena.create(Prepared);
     p.* = .{ .main = undefined, .semis = &.{}, .ledger = ledger, .gpa = gpa, .order = args.result_order };
     p.charge = .{ .child = gpa, .budget = ledger };
-    p.store = .init(p.charge.allocator());
     // No group-join exists before the probe binds.
     errdefer p.releaseBuilds();
-    const kind: lookup.Kind = switch (sj.kind) {
+    // The main build, the probe's SEMI joins, then a star's dimensions: one task each.
+    const tasks = try arena.alloc(Task, 1 + sj.semis.len + sj.dims.len);
+    const task: Task = .{
+        .p = p,
+        .threads = threads,
+        .fk = undefined,
+        .build = undefined,
+        .kind = undefined,
+        .arena = .init(gpa),
+        .store = .init(p.charge.allocator()),
+    };
+    // A copy of an arena or a store that has allocated nothing is a fresh one.
+    for (tasks) |*t| t.* = task;
+    tasks[0].fk = sj.fk;
+    tasks[0].build = sj.build;
+    tasks[0].kind = switch (sj.kind) {
         inline else => |k| @field(lookup.Kind, @tagName(k)),
     };
-    const main = try build(p, arena, sj.fk, sj.build, kind, threads, args.diag);
-    main.join.main = true;
-    main.join.publishes = true;
+    for (sj.semis, tasks[1..][0..sj.semis.len]) |s, *t| {
+        t.fk = s.fk;
+        t.build = s.build;
+        t.kind = semiKind(s);
+    }
+    for (sj.dims, tasks[1 + sj.semis.len ..]) |d, *t| {
+        t.fk = d.fk;
+        t.build = d.build;
+        t.kind = if (d.left) .left else .inner;
+    }
+    p.tasks = tasks;
+    runTasks(tasks);
+    // The first failing build's error, in the order the query names them, whatever the scheduling.
+    for (tasks) |*t| if (t.err) |err| {
+        if (args.diag) |d| {
+            d.column = t.diag.column;
+            d.input = t.diag.input;
+            d.cause = t.diag.cause;
+            d.detail = t.diag.detail;
+        }
+        return err;
+    };
+    for (tasks) |t| p.charged += t.charged;
+    p.main = tasks[0].leaf;
+    p.main.join.main = true;
+    p.main.join.publishes = true;
     const semis = try arena.alloc(Leaf, sj.semis.len);
-    for (sj.semis, semis) |s, *out| out.* = try build(p, arena, s.fk, s.build, semiKind(s), threads, args.diag);
+    for (semis, tasks[1..][0..sj.semis.len]) |*out, t| out.* = t.leaf;
     // A star's dimensions publish after the main build, each with its own slots.
     const dims = try arena.alloc(Leaf, sj.dims.len);
-    for (sj.dims, dims, 1..) |d, *out, slot| {
-        out.* = try build(p, arena, d.fk, d.build, if (d.left) .left else .inner, threads, args.diag);
+    for (dims, tasks[1 + sj.semis.len ..], 1..) |*out, t, slot| {
+        out.* = t.leaf;
         out.join.publishes = true;
         out.join.slot_index = slot;
     }
-    p.main = main;
     p.semis = semis;
     p.dims = dims;
     return p;
+}
+
+/// Every task at once, the first on this thread; a thread that cannot start runs its task here instead. Each build
+/// parallelizes over its row groups as well, so a large build and a small one share the cores rather than queue.
+fn runTasks(tasks: []Task) void {
+    var threads: [64]?std.Thread = @splat(null);
+    for (tasks[1..], 0..) |*t, i| {
+        if (i < threads.len) threads[i] = std.Thread.spawn(.{}, Task.run, .{t}) catch null;
+        if (i >= threads.len or threads[i] == null) t.run();
+    }
+    tasks[0].run();
+    for (threads) |th| if (th) |x| x.join();
 }
 
 test "a build store gives each large array its own allocation and frees it all" {

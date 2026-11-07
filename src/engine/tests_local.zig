@@ -1719,3 +1719,67 @@ test "a LIKE the empty string satisfies does not blank the rows it rejects" {
     }
 }
 
+test "a NULL that survives the filter comes back NULL from the replay, whatever the parallelism" {
+    const slice_reader = @import("../core/consumer/slice_reader.zig");
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // pyarrow 26, PLAIN optional strings, no page index: `fusion_null_survivor` is three rows (v = 0, 1, 1; s = NULL,
+    // 100 a's, 100 b's); the other two have 6000 rows in six row groups with v = k % 11 and s NULL on every 29th row,
+    // `fusion_null_mixed` with dictionary pages that fall back to PLAIN. `v = 0 AND s IS NULL` keeps only NULLs, so
+    // every MIN, MAX and DISTINCT over s is empty. A NULL the replay returned as "" made them "" and 1 (PF-1).
+    const Fixture = struct { name: []const u8, rows: []const u8 };
+    const aggregate = "min(s) AS lo, max(s) AS hi, count(*) AS n, count(s) AS nn, count(DISTINCT s) AS d";
+    for ([_]Fixture{
+        .{ .name = "fusion_null_survivor", .rows = "0,null,null,1,0,0,;" },
+        .{ .name = "fusion_null_sparse", .rows = "0,null,null,19,0,0,;" },
+        .{ .name = "fusion_null_mixed", .rows = "0,null,null,19,0,0,;" },
+    }) |fixture| {
+        var path_buf: [96]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "ci/fixtures/parquet/{s}.parquet", .{fixture.name});
+        std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
+        for ([_]usize{ 1, 4 }) |jobs| {
+            const replays_before = slice_reader.test_replays.load(.monotonic);
+            const got = try sortedGroupText(gpa, ctx, .{
+                .inputs = &.{path},
+                .filter = "v = 0 AND s IS NULL",
+                .aggregate = aggregate,
+                .group_by = "v",
+                .parallelism = jobs,
+            });
+            defer gpa.free(got);
+            try std.testing.expectEqualStrings(fixture.rows, got);
+            // The first pass kept the NULLs and the second replayed them, so the replay is what this proves.
+            if (jobs == 1) try std.testing.expect(slice_reader.test_replays.load(.monotonic) != replays_before);
+        }
+    }
+    // A dense earlier conjunct keeps enough strings to overflow the first pass, so the replay is bypassed in that row
+    // group and, for that worker, in the later ones. Which worker that is must not change an answer (PF-1 depended on it).
+    for ([_]usize{ 1, 4 }) |jobs| {
+        const overflows_before = slice_reader.test_overflows.load(.monotonic);
+        const got = try sortedGroupText(gpa, ctx, .{
+            .inputs = &.{"ci/fixtures/parquet/fusion_null_sparse.parquet"},
+            .filter = "v > 0 AND s IS NULL",
+            .aggregate = aggregate,
+            .group_by = "v",
+            .parallelism = jobs,
+        });
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings("1,null,null,19,0,0,;10,null,null,19,0,0,;2,null,null,19,0,0,;" ++
+            "3,null,null,19,0,0,;4,null,null,18,0,0,;5,null,null,19,0,0,;6,null,null,19,0,0,;7,null,null,19,0,0,;" ++
+            "8,null,null,18,0,0,;9,null,null,19,0,0,;", got);
+        if (jobs == 1) try std.testing.expect(slice_reader.test_overflows.load(.monotonic) != overflows_before);
+    }
+    // The NULLs the first pass also kept are not the rows that survive here: the non-NULL ones are, unchanged.
+    for ([_]usize{ 1, 4 }) |jobs| {
+        const got = try sortedGroupText(gpa, ctx, .{
+            .inputs = &.{"ci/fixtures/parquet/fusion_null_sparse.parquet"},
+            .filter = "v = 0 AND s IS NOT NULL",
+            .aggregate = "min(s) AS lo, count(*) AS n",
+            .group_by = "v",
+            .parallelism = jobs,
+        });
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings("0,\"hay-1001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",527,;", got);
+    }
+}
+

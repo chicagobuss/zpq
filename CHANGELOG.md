@@ -36,6 +36,10 @@
   keeps its Lambda client, and so its connections, across queries in a warm coordinator Lambda, where it used to
   build a new one per query, and reuses its thread pool. Inputs given as `*` patterns keep the previous protocol.
   This changes the worker binary: a 0.5.1 or older worker refuses the new requests, and the coordinator says so.
+- **Fan-out invokes go out on a kept connection.** The coordinator signs each invoke itself and reuses the connection, and it
+  no longer asks Lambda for the log tail after the worker returns. At 128 workers that tail, and boto3's time under the
+  GIL, were the whole gap past the slowest worker. TPC-H Q6 at 128 workers is 384 ms warm (0.5.0 was 461 ms); the grouped
+  line-item aggregate is 294 ms warm (0.5.0 was 524 ms).
 - **The Lambda fan-out coordinator (`tools/serverless/fanout.py`) is faster.** 0.5.1's coordinator asked the worker for its
   capabilities and prepared the plan from every input's footer, one after the other, before any worker started, which
   added 0.3–0.7 s per query. It now caches the capability answer for a published worker version, prepares the plan

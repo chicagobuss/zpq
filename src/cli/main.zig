@@ -668,7 +668,18 @@ fn runParsed(
             }
             return err;
         };
-        if (combination) |compound| {
+        const sets = if (combination != null) null else zpq.core.expr.sql_grouping.expand(arena, stripped) catch |err| {
+            switch (err) {
+                error.GroupingSetsKey => diagnosticPrint("sql: a grouping key that a grouping set leaves out must be a column\n", .{}),
+                error.GroupingSetsDistinct => diagnosticPrint("sql: SELECT DISTINCT with ROLLUP, CUBE or GROUPING SETS is not supported yet\n", .{}),
+                error.GroupingSetsNesting => diagnosticPrint("sql: ROLLUP or CUBE inside GROUPING SETS is not supported yet\n", .{}),
+                error.GroupingSetsGrouping => diagnosticPrint("sql: GROUPING is supported as a select item of its own, of grouping keys written as they are in the GROUP BY\n", .{}),
+                error.GroupingSetsTooMany => diagnosticPrint("sql: ROLLUP, CUBE and GROUPING SETS make at most {d} grouping sets\n", .{zpq.core.expr.sql_grouping.max_sets}),
+                else => {},
+            }
+            return err;
+        };
+        if (combination orelse sets) |compound| {
             if (explain) {
                 diagnosticPrint("zpq query: --explain is not supported for a set operation\n", .{});
                 return error.BadArgs;
@@ -1121,6 +1132,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "IlikePatternNotAscii",        "PostAggNotSupported",         "UpdateWithoutWhere",           "UnparseError",
         "SetOperationAll",             "SetOperationByName",          "SetOperationOrder",            "SetOperationNesting",      "SetOperationColumns",  "SetOperationTypes",
         "SetOperationNullability",
+        "GroupingSetsKey",             "GroupingSetsDistinct",        "GroupingSetsNesting",          "GroupingSetsGrouping",     "GroupingSetsTooMany",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

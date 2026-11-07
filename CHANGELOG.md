@@ -91,6 +91,11 @@
   and `1e3` as integers rounded half away from zero, `inf`/`nan`), checked against DuckDB on 64,000 generated strings;
   a text that is no number is a `ConversionInvalid` error for `CAST`. A text to DECIMAL, DATE or TIMESTAMP is still
   refused by name.
+- **`ROLLUP`, `CUBE`, `GROUPING SETS` and `GROUPING()` in SQL** (`zpq query --query`): `GROUP BY ROLLUP (a, b)`, `CUBE (a, b)`,
+  `GROUPING SETS ((a), (b), ())` and their products with plain keys match DuckDB, including the NULL a key takes in a set
+  that leaves it out (in the key's own type), `GROUPING` / `GROUPING_ID`, HAVING per set and the grand-total row over no
+  input. Each set is one GROUP BY query and the sets are combined as a UNION ALL, so an input is scanned once per set.
+  It was `ColumnMustBeGrouped` (ROLLUP, CUBE) or a parse error (GROUPING SETS).
 - **`UNION [ALL]`, `INTERSECT` and `EXCEPT` in SQL** (`zpq query --query`), of any SELECTs zpq runs alone, with DuckDB's
   precedence, parentheses, NULL, NaN and zero semantics and one ORDER BY / LIMIT / OFFSET for the whole result. Each SELECT
   runs to a scratch Parquet file and the operator is a query over those files; column types must be equal, integers of

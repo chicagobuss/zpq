@@ -158,25 +158,25 @@ fn operatorAt(sql: []const u8, i: usize) Error!?Found {
     return .{ .op = op, .end = end };
 }
 
-fn eql(a: []const u8, comptime lower: []const u8) bool {
+pub fn eql(a: []const u8, comptime lower: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, lower);
 }
 
-fn isWord(ch: u8) bool {
+pub fn isWord(ch: u8) bool {
     return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '$';
 }
 
-fn startsWord(sql: []const u8, i: usize) bool {
+pub fn startsWord(sql: []const u8, i: usize) bool {
     return isWord(sql[i]) and (i == 0 or !isWord(sql[i - 1]));
 }
 
-fn wordAt(sql: []const u8, i: usize) []const u8 {
+pub fn wordAt(sql: []const u8, i: usize) []const u8 {
     var e = i;
     while (e < sql.len and isWord(sql[e])) e += 1;
     return sql[i..e];
 }
 
-fn nextWord(sql: []const u8, from: usize) struct { word: []const u8, end: usize } {
+pub fn nextWord(sql: []const u8, from: usize) struct { word: []const u8, end: usize } {
     var s = from;
     while (s < sql.len and std.ascii.isWhitespace(sql[s])) s += 1;
     const w = wordAt(sql, s);

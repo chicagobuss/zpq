@@ -61,6 +61,18 @@ nullable on one side only, or of another unsigned width, is `SetOperationNullabi
 is not available for them, the in-process SQL requests (libzpq, the service, Lambda) do not carry them yet, and
 `--summary=json` describes the last query. Integers of different widths come out as INT64.
 
+**Grouping sets** (`zpq query --query`): `GROUP BY ROLLUP (...)`, `CUBE (...)` and `GROUPING SETS (...)`, alone or beside plain
+keys and each other (the elements of a GROUP BY multiply, as DuckDB's do; a repeated set repeats its rows), with
+`GROUPING(k, ...)` and `GROUPING_ID(k, ...)` (a BIGINT, the first key the highest bit), WHERE and HAVING per set, and one
+ORDER BY / LIMIT / OFFSET for the whole result. The empty set is a scalar aggregate, so ROLLUP over no rows gives its grand-total
+row, as DuckDB. A query is run as the UNION ALL of one GROUP BY query per set (the set-operation driver above): ROLLUP of n
+keys scans its input n + 1 times and CUBE 2^n times, at most 64 sets (`GroupingSetsTooMany`). A key that some set leaves out
+must be a column or the alias of a select item that is one (`GroupingSetsKey`), and its output is NULL in that set; a select item
+that is an expression of such a key (`coalesce(a, 'all')`) is refused by the ordinary GROUP BY check. Refused by name:
+`SELECT DISTINCT` over grouping sets (`GroupingSetsDistinct`), ROLLUP or CUBE inside GROUPING SETS (`GroupingSetsNesting`), and
+`GROUPING` of anything but a grouping key (`GroupingSetsGrouping`). A grouping-set query stands alone: as a branch of a set
+operation it is not rewritten.
+
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 
 **Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`), string concat (`||`),

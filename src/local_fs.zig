@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const test_skip = @import("test_skip.zig");
 const posix = std.posix;
 
 pub const fd_t = posix.fd_t;
@@ -629,7 +630,7 @@ test "createNewFile refuses an existing path; rename replaces its target" {
 }
 
 test "releaseLeft drops a left mapping's pages from the resident set and leaves its bytes readable" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "mincore residency");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -802,7 +803,7 @@ test "regression: the SIGBUS handler is in place only while a mapping is, and yi
 }
 
 test "regression: mapFile and readFile refuse a directory and a FIFO instead of misreporting or blocking" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "FIFO and directory mapping");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [256]u8 = undefined;
@@ -819,7 +820,7 @@ test "regression: mapFile and readFile refuse a directory and a FIFO instead of 
 }
 
 test "writeAll distinguishes a full device from a broken pipe" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "/dev/full");
     const fd = try posix.openat(posix.AT.FDCWD, "/dev/full", .{ .ACCMODE = .WRONLY }, 0);
     defer close(fd);
     try testing.expectError(error.NoSpaceLeft, writeAll(fd, "x"));
@@ -830,7 +831,7 @@ test "writeAll distinguishes a full device from a broken pipe" {
 }
 
 test "parallel mapping release keeps bytes intact and falls back when concurrency is unavailable" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "madvise release");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

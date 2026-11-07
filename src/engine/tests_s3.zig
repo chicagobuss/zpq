@@ -12,6 +12,7 @@ const engine_print = @import("print.zig");
 const engine_aggregate = @import("aggregate.zig");
 const fetchS3Schema = engine_input.fetchS3Schema;
 const std = @import("std");
+const test_skip = @import("../test_skip.zig");
 const nowMonoNs = @import("../clock.zig").monoNs;
 const profile = @import("../profile.zig");
 const local_fs = @import("../local_fs.zig");
@@ -335,7 +336,8 @@ test "many files keep a count under the memory budget" {
 const fake_s3 = @import("../io/fake_s3.zig");
 
 test "Lambda default fetch window streams a large projection and fetches a smaller one up front" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest; // where the window runs (`s3_window.supported`)
+    // where the window runs (`s3_window.supported`)
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the S3 fetch window (epoll loop)");
     const gpa = std.testing.allocator;
     var fixture_arena = std.heap.ArenaAllocator.init(gpa);
     defer fixture_arena.deinit();
@@ -484,7 +486,7 @@ fn fakeS3AggregateJsonEnv(
 }
 
 test "a windowed S3 aggregate answers exactly as the up-front fetch does, whatever the window" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the S3 fetch window (epoll loop)");
     const gpa = std.testing.allocator;
     // 24 row groups of about 5 KiB. The probe stays at 64 KiB, under this fixture and over its footer, so the first
     // dozen row groups fall outside the suffix and are really fetched. The default 1 MiB probe would hold the file.
@@ -529,7 +531,7 @@ test "a windowed S3 aggregate answers exactly as the up-front fetch does, whatev
 }
 
 test "a suffix that covers the file serves a windowed aggregate from one GET per file" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the S3 fetch window (epoll loop)");
     const gpa = std.testing.allocator;
     const fixture = "ci/fixtures/parquet/group_order.parquet";
     const bytes = metadata.readFileSlice(fixture, gpa) catch return error.SkipZigTest;
@@ -648,7 +650,7 @@ test "every write reads back whole, holding what an unbounded run writes, throug
     // local run's on the default budget: local and S3 inputs, every write path (byte copy, recompress, projection,
     // filter, computed select, Bloom-building), row groups far smaller and far larger than the window and the decode
     // budget, with and without Bloom filters to carry. A run that differs only in its S3 window writes the same bytes.
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the S3 fetch window (epoll loop)");
     const gpa = std.testing.allocator;
     const tiny = metadata.readFileSlice("ci/fixtures/parquet/many_tiny.parquet", gpa) catch return error.SkipZigTest;
     defer gpa.free(tiny);
@@ -863,7 +865,7 @@ const stall_env = [_][*:0]const u8{
 };
 
 test "an S3 read that stalls is retried on a new connection and the query answers exactly, windowed or not" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the S3 fetch window (epoll loop)");
     const gpa = std.testing.allocator;
     const fixture = "ci/fixtures/parquet/group_order.parquet";
     const bytes = metadata.readFileSlice(fixture, gpa) catch return error.SkipZigTest;
@@ -904,7 +906,7 @@ test "the parallel range fetches take the query's first-byte and idle timeouts, 
     // A stalled column-chunk range fetch (the fake stalls only an explicit range of 1 KiB or more, never a suffix)
     // recovers within the query's short timeout of the stalled kind, the other set long: were either ignored,
     // recovery would wait out a default. The probe is smaller than the fixture so those ranges are still requested.
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the S3 fetch window (epoll loop)");
     const gpa = std.testing.allocator;
     const bytes = metadata.readFileSlice("ci/fixtures/parquet/mixed_codec.parquet", gpa) catch return error.SkipZigTest;
     defer gpa.free(bytes);
@@ -944,7 +946,7 @@ test "the parallel range fetches take the query's first-byte and idle timeouts, 
 
 test "a recompressing S3 copy whose ranged read stalls writes the same bytes as one that does not" {
     // The Overture rewrite that hung on Lambda: a byte copy to another codec, input through the fetch window.
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the S3 fetch window (epoll loop)");
     const gpa = std.testing.allocator;
     const bytes = metadata.readFileSlice("ci/fixtures/parquet/mixed_codec.parquet", gpa) catch return error.SkipZigTest;
     defer gpa.free(bytes);
@@ -999,7 +1001,7 @@ test "a recompressing S3 copy whose ranged read stalls writes the same bytes as 
 }
 
 test "a windowed S3 fetch that fails mid-scan fails the query rather than hanging it" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the S3 fetch window (epoll loop)");
     const gpa = std.testing.allocator;
     const fixture = "ci/fixtures/parquet/group_order.parquet";
     const bytes = metadata.readFileSlice(fixture, gpa) catch return error.SkipZigTest;
@@ -1021,7 +1023,7 @@ test "a windowed row print waits for a row group left to its writer, and fails w
     // One row group too big for a producer's share beside 1-row ones: producers leave it to the writer before its bytes
     // are in. Its ranges come slowly, or are refused; the writer waits on its gate as -j1 does, and a refused fetch
     // fails the print with that error rather than decoding a buffer never filled.
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the S3 fetch window (epoll loop)");
     const gpa = std.testing.allocator;
     const full = "ci/fixtures/parquet/full_match.parquet";
     std.Io.Dir.cwd().access(std.testing.io, full, .{}) catch return error.SkipZigTest;
@@ -1116,7 +1118,7 @@ test "a windowed row print waits for a row group left to its writer, and fails w
 }
 
 test "every S3 write path writes the same bytes through a window as with everything fetched up front" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the S3 fetch window (epoll loop)");
     const gpa = std.testing.allocator;
     const fixture = "ci/fixtures/parquet/group_order.parquet";
     const bytes = metadata.readFileSlice(fixture, gpa) catch return error.SkipZigTest;

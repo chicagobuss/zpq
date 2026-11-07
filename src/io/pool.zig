@@ -18,6 +18,7 @@
 //! into it.
 
 const std = @import("std");
+const test_skip = @import("../test_skip.zig");
 const clock = @import("../clock.zig");
 const nowMonoNs = clock.monoNs;
 const Io = std.Io;
@@ -727,7 +728,7 @@ test "preconnect returns without waiting for a stalled handshake" {
 }
 
 test "a preconnect across two addresses of a full listen queue stops without hanging" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "listen-queue behavior");
     const lfd_r = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, std.posix.IPPROTO.TCP);
     try testing.expect(std.posix.errno(lfd_r) == .SUCCESS);
     const lfd: std.posix.fd_t = @intCast(lfd_r);
@@ -895,7 +896,7 @@ fn peerOf(conn: *const tls.Connection) !tls.Ipv4 {
 test "new connections take the host's addresses in turn, and skip one that refuses" {
     // Linux answers on all of 127.0.0.0/8; macOS only on 127.0.0.1, so the other addresses this test listens on and
     // connects to do not exist there.
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "listen-queue behavior");
     const io = testing.io;
     const a = try TestListener.open();
     defer a.close();

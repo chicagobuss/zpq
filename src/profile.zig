@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const test_skip = @import("test_skip.zig");
 const build_options = @import("build_options");
 const clock = @import("clock.zig");
 const json_string = @import("engine/json_string.zig");
@@ -1192,7 +1193,8 @@ test "the RSS sampler keeps its own ring: it never spends the event budget and t
 }
 
 test "peak RSS is this run's, not the process's: a later run does not inherit an earlier peak" {
-    if (!enabled or builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (!enabled) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "/proc RSS accounting");
     const big = 96 << 20;
     var peaks: [2]u64 = undefined;
     for (&peaks, 0..) |*peak, run| {

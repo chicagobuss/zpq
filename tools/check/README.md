@@ -99,9 +99,13 @@ Each stage runs through `zpq-check stage` under its timeout (a hang fails the st
 leaves `zig-out/receipts/NAME.log` and `NAME.json`: the SHA and whether the tree was clean, the host, compiler and
 oracle, the case files' tree hash, the fixtures, and the counts its runner printed. `zpq-check verdict` passes a tier
 only when every stage has a receipt for HEAD from a clean tree, its log still hashes as recorded, it ran something,
-failed nothing and skipped nothing. Unit-test skips are named and never allowed: `tools/check/fixtures.sh` puts
-apache/parquet-testing at `tools/check/corpus.pin` and generates the unit tests' large fixtures (`tools/zpq-gen
-bench`, `nested`) before anything runs. Contracts skip only by a named need (`--privileged`).
+failed nothing and skipped nothing it may not. A unit test that cannot run on a platform says so with
+`if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "epoll")` (`src/test_skip.zig`): it is taken
+only where the target lacks the need, and the runner's log line carries it. The receipt keeps each skip's need and
+the host's OS, and the verdict excuses a skip only where that host does not meet the need (a Linux host never excuses
+a Linux need). Any other skip, a fixture missing for one, fails: `tools/check/fixtures.sh` puts apache/parquet-testing at `tools/check/corpus.pin` and generates
+the unit tests' large fixtures (`tools/zpq-gen bench`, `nested`) before anything runs. CPU-feature skips are declared
+in `receipt.zig` (`hardware_skips`). Contracts skip only by a named need (`--privileged`).
 
 Every test root imports the `tests.gen.zig` build.zig writes beside it, listing the files under it that declare tests,
 so no test file goes unrooted.

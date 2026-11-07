@@ -39,6 +39,7 @@
 //! Advice changes when pages arrive, never what is decoded: answers and refusals are those of the mapping.
 const std = @import("std");
 const builtin = @import("builtin");
+const test_skip = @import("../../test_skip.zig");
 const schema = @import("../schema.zig");
 const agg_plan = @import("../agg_plan.zig");
 const core_memory = @import("../memory.zig");
@@ -446,7 +447,7 @@ const Chunks = struct {
 };
 
 test "a pass's start advises nothing, and each claim advises about one item past it" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "page-cache advice (madvise, mincore)");
     const page = std.heap.pageSize();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -475,7 +476,7 @@ test "a pass's start advises nothing, and each claim advises about one item past
 }
 
 test "the cap holds within an oversized item: advice stops mid-chunk" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "page-cache advice (madvise, mincore)");
     const page = std.heap.pageSize();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -500,7 +501,7 @@ test "the cap holds within an oversized item: advice stops mid-chunk" {
 }
 
 test "a chunk's boundary page counts whole: one byte inside a page advises and counts that page" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "page-cache advice (madvise, mincore)");
     const page = std.heap.pageSize();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -527,7 +528,7 @@ test "a chunk's boundary page counts whole: one byte inside a page advises and c
 }
 
 test "through a file's descriptor: resident pages are left alone, and the rest advised" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "page-cache advice (madvise, mincore)");
     const local_fs = @import("../../local_fs.zig");
     const page = std.heap.pageSize();
     var tmp = std.testing.tmpDir(.{});
@@ -563,7 +564,7 @@ test "through a file's descriptor: resident pages are left alone, and the rest a
 }
 
 test "a column read behind the filter's gate is left to its reader until a reader says the gate kept all of it" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "page-cache advice (madvise, mincore)");
     const page = std.heap.pageSize();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -595,7 +596,7 @@ test "a column read behind the filter's gate is left to its reader until a reade
 }
 
 test "a gated column's kept pages are advised within the window and the ledger, as the cursor's are (review R3)" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "page-cache advice (madvise, mincore)");
     const thrift = @import("../thrift.zig");
     const local_fs = @import("../../local_fs.zig");
     const consumer_plan = @import("../consumer/plan.zig");
@@ -715,7 +716,7 @@ test "a gated column's kept pages are advised within the window and the ledger, 
 }
 
 test "the cap never passes what the query's ledger has free" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "page-cache advice (madvise, mincore)");
     const page = std.heap.pageSize();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

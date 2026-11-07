@@ -238,11 +238,10 @@ if [[ $full == 1 ]]; then
     h=$(for x in "${remote[@]}"; do echo "${busy_for[$x]} $x"; done | sort -n | head -1 | cut -d' ' -f2)
     busy_for[$h]=$(( ${busy_for[$h]} + 1 ))
     stages=$(shard_stages "$s")
-    allow=""; [[ ${target_of[$h]} == *macos ]] && allow="--allow-skip io.epoll. --allow-skip local_fs."
     for st in $stages; do
       bin=zpq-${st#units-}-test; [[ $st == units-core ]] && bin=zpq-test
       ssh "$h" "cd .cache/zpq-fleet/check/common && ../zig-out/bin/zpq-check stage --sha $sha --name $st \
-        --dir ../receipts --kind units --tier full $allow -- ../zig-out/bin/$bin" >> "$W/log/units-$h" 2>&1 || true
+        --dir ../receipts --kind units --tier full -- ../zig-out/bin/$bin" >> "$W/log/units-$h" 2>&1 || true
       expect+=("$st")
     done
     rsync -a "$h:.cache/zpq-fleet/check/receipts/" "$R/" || true

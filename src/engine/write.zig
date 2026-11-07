@@ -5,6 +5,7 @@ const huge_pages = @import("../core/huge_pages.zig");
 const decimal_mod = @import("../core/parquet/decimal.zig");
 const invariant = @import("../core/invariant.zig");
 const std = @import("std");
+const test_skip = @import("../test_skip.zig");
 const nowMonoNs = @import("../clock.zig").monoNs;
 const profile = @import("../profile.zig");
 const local_fs = @import("../local_fs.zig");
@@ -1088,7 +1089,7 @@ test "re-encoded FLOAT16 footer widens to DOUBLE" {
 }
 
 test "FdSink segments keep one contiguous writeback range across page and vector boundaries" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "FdSink writeback ranges");
     const fd = try std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .WRONLY }, 0);
     defer local_fs.close(fd);
     var buffer: [1 << 20]u8 = @splat(0x5a);

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const test_skip = @import("../test_skip.zig");
 const core_memory = @import("memory.zig");
 const blocking = @import("blocking.zig");
 
@@ -675,7 +676,7 @@ fn rssForTest(addr: usize, len: usize) !usize {
 }
 
 test "RSS range excludes resident neighbours in the same VMA" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "smaps RSS ranges");
     const page = std.heap.pageSize();
     const flags: std.posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
     const mapping = try std.posix.mmap(null, 4 * page, .{ .READ = true, .WRITE = true }, flags, -1, 0);
@@ -693,7 +694,7 @@ test "RSS range excludes resident neighbours in the same VMA" {
 }
 
 test "a worker's pair of regions shares its first huge page, counted once, and holds no more than it draws past it" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "huge-page region pairs");
     const huge = huge_page_size;
     const span = Region.pair_scratch_span;
     var budget: core_memory.SharedBudget = .{ .limit = 32 * huge };
@@ -799,7 +800,7 @@ test "THP advice avoids synchronous compaction without enough free huge blocks" 
 }
 
 test "retired pairs return every charge and serve the next take on the same mapping" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "huge-page region pairs");
     drainPairs();
     defer drainPairs();
     var budget: core_memory.SharedBudget = .{ .limit = 64 * huge_page_size };
@@ -837,7 +838,7 @@ test "retired pairs return every charge and serve the next take on the same mapp
 }
 
 test "a pair whose arena still holds spilled blocks is unmapped, not kept" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "huge-page region pairs");
     drainPairs();
     defer drainPairs();
     var pair = takePair(std.testing.allocator, 2 * huge_page_size);

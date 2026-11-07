@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_skip = @import("../../test_skip.zig");
 const spawn_util = @import("../spawn.zig");
 const expr_ast = @import("../expr/ast.zig");
 const expr_agg = @import("../expr/agg.zig");
@@ -1316,7 +1317,7 @@ test "DistinctMergeTask: partitioned distinct sets merge and handle allocation f
 
 test "DistinctMergeTask: a tight budget funds live source and destination without overlap" {
     // "Without overlap" is the destination's page mapping growing in place, which only Linux's mremap does.
-    if (!@import("../memory.zig").page_growth_without_copy) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "mremap page growth");
     const a = std.heap.page_allocator;
     var budget: expr_agg.SharedBudget = .{ .limit = 1 << 20, .block = 1 };
     var dst: expr_agg.DistinctSet = .{ .shared = &budget };

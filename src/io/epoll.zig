@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const test_skip = @import("../test_skip.zig");
 const linux = std.os.linux;
 
 // ============================================================
@@ -347,7 +348,7 @@ fn errnoOrFd(r: usize) ?linux.fd_t {
 // ============================================================
 
 test "timer fires within deadline" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "epoll");
     var loop = try Loop.init(std.testing.allocator);
     defer loop.deinit();
 
@@ -379,7 +380,7 @@ test "timer fires within deadline" {
 }
 
 test "callback can submit follow-up op" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "epoll");
     var loop = try Loop.init(std.testing.allocator);
     defer loop.deinit();
 
@@ -425,7 +426,7 @@ test "callback can submit follow-up op" {
 }
 
 test "two concurrent timers both fire" {
-    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "epoll");
     var loop = try Loop.init(std.testing.allocator);
     defer loop.deinit();
 

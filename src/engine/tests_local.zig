@@ -12,6 +12,7 @@ const engine_print = @import("print.zig");
 const engine_aggregate = @import("aggregate.zig");
 const fetchS3Schema = engine_input.fetchS3Schema;
 const std = @import("std");
+const test_skip = @import("../test_skip.zig");
 const profile = @import("../profile.zig");
 const local_fs = @import("../local_fs.zig");
 const local_reader = @import("../io/local_reader.zig");
@@ -1361,7 +1362,7 @@ test "regression: a DELTA_BYTE_ARRAY value of another length than its FIXED_LEN_
 }
 
 test "regression: the local reader reads the file mapped, even once another is renamed over its path" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "mapped local reads");
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

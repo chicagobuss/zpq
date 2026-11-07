@@ -10,8 +10,8 @@
 - **Re-encoded wide string columns read as fast as the original, or faster, in other engines.** zpq sent a string column
   to a dictionary only while the dictionary stayed within 1 MiB, so wide values (titles, URLs) that repeat just as
   often went to DELTA_BYTE_ARRAY, which the readers we measured decode slower than PLAIN (Polars 2.1.0 about twice as
-  slow). A dictionary may now hold up to a quarter of the values' bytes (still 1 MiB at least, and still a quarter or
-  fewer distinct values), and the other strings are PLAIN unless DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY saves the
+  slow). A dictionary may now hold up to a quarter of the values' bytes (still 1 MiB at least, never more than one dictionary
+  page holds, and still a quarter or fewer distinct values), and the other strings are PLAIN unless DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY saves the
   bytes after the codec (half for DELTA_BYTE_ARRAY, any for DELTA_LENGTH_BYTE_ARRAY), judged on the chunk's first page. On the ClickBench `hits_0` shard at its
   two row groups, reading every string column takes 0.78× (DuckDB 2.0.0) and 0.56× (Polars 2.1.0) the original file's
   speed with 0.5.1's re-encode and 1.08× and 1.11× now (PyArrow 26: 1.09×); the Title column is 1.7× to 2.9× faster, and

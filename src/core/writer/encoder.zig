@@ -977,12 +977,22 @@ fn stringDictMaxEntries(num_present: usize) usize {
 }
 
 /// The most PLAIN bytes a string dictionary may hold: a quarter of the chunk's present values' PLAIN bytes, as the
-/// entry limit is a quarter of their count, and never under 1 MiB. Wide values (titles, URLs) repeat just as much but
-/// their dictionary passes 1 MiB long before the chunk ends, and a dictionary there is the smallest layout and the
-/// fastest to read: a fixed cap sent such chunks to PLAIN or a delta layout, which every reader we measured decodes
-/// slower. The chunk's row-group limit bounds a quarter of it.
+/// entry limit is a quarter of their count, and never under 1 MiB, but never past what one dictionary page can store
+/// (`dictPageMaxBytes`). Wide values (titles, URLs) repeat just as much but their dictionary passes 1 MiB long before
+/// the chunk ends, and a dictionary there is the smallest layout and the fastest to read: a fixed cap sent such chunks
+/// to PLAIN or a delta layout, which every reader we measured decodes slower. The row-group limit bounds a quarter of
+/// it in practice; the page cap bounds it for a row group of any size, so a column too large for a dictionary stops
+/// interning there and takes the values path, and no dictionary is built that the page limit would then refuse.
 fn stringDictMaxBytes(plain_total: usize) usize {
-    return @max(string_dict_floor_bytes, plain_total / 4);
+    return @min(dictPageMaxBytes(), @max(string_dict_floor_bytes, plain_total / 4));
+}
+
+/// The longest PLAIN dictionary page whose compressed form still fits a page header's i32 sizes whatever the codec
+/// does to it: Snappy, the widest bound, grows incompressible bytes by a sixth and 32 bytes. Keeps the PLAIN length
+/// (which `encodePlainBytes` refuses past u32) and the compressed length inside `pageLimit`, so a dictionary that
+/// passes the intern loop is always a dictionary `planDictionary` writes.
+fn dictPageMaxBytes() usize {
+    return (pageLimit() -| 32) / 7 * 6;
 }
 
 /// Try to dictionary-encode a BYTE_ARRAY column (page layout in
@@ -1031,6 +1041,8 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
 
     if (dict_values.items.len == 0) return null;
 
+    // `max_bytes` never exceeds `dictPageMaxBytes`, so this PLAIN length is within u32 and `planDictionary` takes the
+    // page: a dictionary is never built here only to be refused for its size and left on the arena.
     const dict_plain = try encodePlainBytes(arena, dict_values.items, null, 0, fixed);
     const dict_col: filter_eval.Batch.Column = .{ .string = .{ .values = dict_values.items } };
     return try planDictionary(arena, in, num_values, dict_plain, dict_col, indices);
@@ -2974,6 +2986,85 @@ test "a coded string column past the dictionary's byte limit encodes to the same
         try testing.expectEqualSlices(u8, want.bytes, got.bytes);
         try testing.expectEqual(within, want.meta.dictionary_page_offset != null);
     }
+}
+
+test "a string dictionary never outgrows one dictionary page, at any row-group size" {
+    // The review's case: one row group of 131072 rows, 32768 distinct incompressible 131072-byte strings, each four
+    // times. A quarter of the values and of their bytes, so the quarter rule admits it, but its PLAIN length is one
+    // past u32 and `encodePlainBytes` refused the whole column.
+    const plain_total: usize = 131072 * (131072 + 4);
+    const dict_bytes: usize = 32768 * (131072 + 4);
+    try testing.expect(dict_bytes > std.math.maxInt(u32));
+    try testing.expect(dict_bytes <= plain_total / 4);
+    try testing.expect(stringDictMaxBytes(plain_total) < dict_bytes);
+    // The second case: 262144 distinct 8192-byte strings, each four times, a 2 GiB dictionary that used to be built
+    // and then refused by the page limit.
+    const dict_2g: usize = 262144 * (8192 + 4);
+    try testing.expect(dict_2g > std.math.maxInt(i32));
+    try testing.expect(stringDictMaxBytes(4 * dict_2g) < dict_2g);
+    for ([_]usize{ 0, 1 << 20, 1 << 30, 17 << 30, 1 << 40 }) |total| {
+        const max = stringDictMaxBytes(total);
+        try testing.expect(max < std.math.maxInt(u32));
+        try testing.expect(max + max / 6 + 32 <= pageLimit()); // Snappy's worst case still fits a page header
+    }
+    try testing.expectEqual(string_dict_floor_bytes, stringDictMaxBytes(0));
+}
+
+test "a string dictionary past a page's size is never built: the values are written, hashed or coded alike" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const elem = schema.SchemaElement{
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .name = "s",
+        .num_children = 0,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    // 1024 rows over 256 distinct incompressible 1 KiB values: a 263,168-byte dictionary, a quarter of the values by
+    // count and by bytes, far under the 1 MiB floor.
+    var prng = std.Random.DefaultPrng.init(0xd1c7);
+    const dict = try a.alloc([]const u8, 256);
+    for (dict) |*d| {
+        const b = try a.alloc(u8, 1024);
+        prng.random().bytes(b);
+        d.* = b;
+    }
+    const codes = try a.alloc(u32, 1024);
+    const vals = try a.alloc([]const u8, 1024);
+    for (codes, vals, 0..) |*c, *v, i| {
+        c.* = @intCast(i % 256);
+        v.* = dict[c.*];
+    }
+    const hashed = splitInput(.{ .string = .{ .values = vals } }, &elem, .SNAPPY);
+    const coded = splitInput(.{ .string = .{ .values = &.{}, .codes = codes, .dict = dict } }, &elem, .SNAPPY);
+
+    // Page limit as the real one: the dictionary is built, and it takes real arena space.
+    var whole_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer whole_arena.deinit();
+    try testing.expect(try tryEncodeDictBytes(whole_arena.allocator(), hashed, 1024) != null);
+    try testing.expect(whole_arena.queryCapacity() >= 256 * 1028);
+
+    // A page holds 100,000 bytes: interning stops at (100000 - 32) / 7 * 6 bytes of dictionary, nothing the size of
+    // the dictionary is allocated, and the chunk is written as its values.
+    test_page_limit = 100_000;
+    defer test_page_limit = std.math.maxInt(i32);
+    var stopped_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer stopped_arena.deinit();
+    try testing.expect(try tryEncodeDictBytes(stopped_arena.allocator(), hashed, 1024) == null);
+    try testing.expect(stopped_arena.queryCapacity() < 256 * 1028 / 2);
+    const want = try encodeColumn(a, hashed);
+    try testing.expect(want.meta.dictionary_page_offset == null);
+    try testing.expectEqual(@as(usize, 1024), try expectPagesWithin(a, want, 100_000));
+    const back = try readBack([]const u8, a, want, .{ .max_def = 0, .max_rep = 0 }, 1024);
+    for (vals, back.values) |v, got| try testing.expectEqualSlices(u8, v, got);
+    // The same column arriving as codes into a source dictionary: the same limit, the same bytes.
+    const got = try encodeColumn(a, coded);
+    try testing.expect(got.meta.dictionary_page_offset == null);
+    try testing.expectEqualSlices(u8, want.bytes, got.bytes);
 }
 
 test "the string dictionary limits admit exactly a quarter distinct and the 1 MiB floor" {

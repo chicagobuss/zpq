@@ -114,7 +114,7 @@ pages and encodings, regardless of the requested footer version. JSON requests u
 
 **Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output (`--codec lz4` means LZ4_RAW; zpq never compresses
 to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte
-arrays (a quarter or fewer distinct, and a dictionary within a quarter of the values' bytes, at least 1 MiB); DELTA_BINARY_PACKED
+arrays (a quarter or fewer distinct, and a dictionary within a quarter of the values' bytes, at least 1 MiB and at most one page); DELTA_BINARY_PACKED
 for INT32 / INT64; other strings PLAIN, unless a sample of the chunk's first page, compressed with the chosen codec, shows
 DELTA_BYTE_ARRAY at half PLAIN's size or less, or DELTA_LENGTH_BYTE_ARRAY smaller at all (FIXED_LEN_BYTE_ARRAY has no
 DELTA_LENGTH_BYTE_ARRAY).

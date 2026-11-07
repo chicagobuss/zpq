@@ -26,6 +26,11 @@ const system = @import("../core/system.zig");
 const thrift = @import("../core/thrift.zig");
 const page_index = @import("../core/writer/page_index.zig");
 const streaming = @import("../core/writer/streaming.zig");
+const filter_ast = @import("../core/filter/ast.zig");
+const filter_eval = @import("../core/filter/eval.zig");
+const filter_selection = @import("../core/filter/selection.zig");
+const decimal_mod = @import("../core/parquet/decimal.zig");
+const projection = @import("projection.zig");
 const encoder = @import("../core/writer/encoder.zig");
 const fastpath = @import("../core/writer/fastpath.zig");
 const Diag = @import("../core/diag.zig").Diag;
@@ -332,6 +337,165 @@ fn isNull(t: csv_scan.Text, nulls: []const []const u8) bool {
 // ---------------------------------------------------------------- the chunks
 
 /// The window's piece source over a planned file: chunk `i` is bytes `[data_start + i * chunk, ...)`.
+/// A filter or computed SELECT over the file, bound as a Parquet query is (`projection.planProjection`) against the
+/// file's columns as a schema: each chunk parses only the columns it reads (`fetch`), filters them, and writes its
+/// kept rows' outputs, as `consumer.ProjectedRG` writes a row group's.
+pub const Projection = struct {
+    /// The file's columns as a schema (every field, typed as planned), which the query is bound to.
+    meta: *const schema.FileMetaData,
+    filter: ?filter_ast.Filter,
+    output_specs: []const consumer.OutputCol,
+    /// Per field: whether a query reads it, and its position among the parsed columns (`Plan.slot`).
+    fetch: []const bool,
+    lookup: []const ?usize,
+    /// Per field: read by a computed output.
+    computed_refs: []const bool,
+    /// The outputs' schema and paths (`consumer.initOutputAggregator`), and per output the parsed column it passes
+    /// through (null: computed), for a DECIMAL's precision from the data.
+    out_elems: []schema.SchemaElement,
+    out_paths: [][]const []const u8,
+    source: []const ?usize,
+
+    /// Whether the query needs one: a filter, or a SELECT item that is not a plain column under its own name. Plain
+    /// columns are a projection the parse does itself (`Options.columns`).
+    pub fn needed(args: QueryArgs) bool {
+        if (args.filter != null) return true;
+        if (args.plan_source) |ps| {
+            const q = syntax_plan.syntaxOf(ps) orelse return false;
+            if (q.filter != null) return true;
+            for (q.select orelse &.{}) |item| if (itemName(item) == null) return true;
+            return false;
+        }
+        if (args.select != null and args.columns == null) {
+            const sel = args.select_cols orelse return true;
+            if (sel.len == 0) return true;
+            for (sel) |c| if (selectName(c) == null) return true;
+        }
+        return false;
+    }
+
+    /// Bound against every field of `all` (planned with no column list), each typed as `p` has it where `p` parses it.
+    pub fn bind(a: std.mem.Allocator, args: QueryArgs, all: *const Plan, p: ?*const Plan) !Projection {
+        const n = all.fields.len;
+        var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+        try items.append(a, .{
+            .name = "schema",
+            .type = null,
+            .repetition_type = null,
+            .type_length = null,
+            .num_children = @intCast(n),
+            .scale = null,
+            .precision = null,
+            .field_id = null,
+        });
+        for (all.fields, 0..) |name, ci| {
+            const t = if (p) |pp| if (pp.slot[ci]) |o| pp.types[o] else all.types[ci] else all.types[ci];
+            try items.append(a, csv_types.schemaElement(name, t));
+        }
+        const meta = try a.create(schema.FileMetaData);
+        meta.* = .{
+            .version = 2,
+            .schema = items,
+            .num_rows = 0,
+            .created_by = schema.ZPQ_CREATED_BY,
+            .row_groups = .empty,
+        };
+        // A query bound as an aggregate (a GROUP BY, or a DISTINCT rewritten as one) needs more than a row at a time:
+        // refused by name, as `queryInput` refuses the ones its syntax shows.
+        // A SQL query binds through a plan cache, as a Parquet query does (`QueryArgs.withPlanCache`); this one lives
+        // with the projection, bound against this pass's types.
+        const cache = try a.create(engine_types.bound_plan.Cache);
+        cache.* = .{};
+        const pp = projection.planProjection(a, args.withPlanCache(cache), meta) catch |e| return switch (e) {
+            error.InvalidBoundPlan => error.CsvQueryNotSupported,
+            else => e,
+        };
+        const lookup = try a.alloc(?usize, n);
+        var pos: usize = 0;
+        for (lookup, pp.fetch) |*l, f| {
+            l.* = if (f) pos else null;
+            if (f) pos += 1;
+        }
+        const refs = try a.alloc(bool, n);
+        @memset(refs, false);
+        for (pp.output_specs) |spec| switch (spec) {
+            .computed => |c| c.expr.collectColumns(refs),
+            .passthrough => {},
+        };
+        const template = try consumer.initOutputAggregator(a, meta, pp.output_specs);
+        const source = try a.alloc(?usize, pp.output_specs.len);
+        for (source, pp.output_specs) |*src, spec| src.* = switch (spec) {
+            .passthrough => |pt| lookup[pt.ci],
+            .computed => null,
+        };
+        return .{
+            .meta = meta,
+            .filter = pp.filter,
+            .output_specs = pp.output_specs,
+            .fetch = pp.fetch,
+            .lookup = lookup,
+            .computed_refs = refs,
+            .out_elems = template.schema_elems,
+            .out_paths = template.paths,
+            .source = source,
+        };
+    }
+
+    /// The fields' names a chunk parses, in file order.
+    pub fn fetchedNames(pr: *const Projection, a: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (fields, pr.fetch) |name, f| if (f) try out.append(a, name);
+        return out.items;
+    }
+
+    /// `pc.agg` as the outputs of `parsed`'s kept rows. Filters and expressions read a DECIMAL as its scaled value,
+    /// a passthrough writes its unscaled integers (the lossless lane); `scratch` holds the views.
+    fn project(
+        pr: *const Projection,
+        p: *const Plan,
+        pc: *window_mod.Piece,
+        parsed: *const consumer.OutputAggregator,
+        scratch: std.mem.Allocator,
+    ) !void {
+        const rows = parsed.num_rows;
+        const cols = try scratch.alloc(filter_eval.Batch.Column, parsed.cols.len);
+        const pass = try scratch.alloc(?filter_eval.Batch.Column, pr.lookup.len);
+        @memset(pass, null);
+        for (pr.lookup, 0..) |l, ci| {
+            const k = l orelse continue;
+            const raw = consumer.bufRows(parsed.cols[k], 0, rows);
+            const t = p.types[k];
+            if (t.kind != .decimal) {
+                cols[k] = raw;
+                continue;
+            }
+            const unscaled: filter_eval.ColumnT(i128) = switch (raw) {
+                .i128 => |x| x,
+                .i64 => |x| blk: {
+                    const v = try scratch.alloc(i128, x.values.len);
+                    for (v, x.values) |*d, e| d.* = e;
+                    break :blk .{ .values = v, .def_levels = x.def_levels, .max_def = x.max_def, .has_nulls = x.has_nulls };
+                },
+                else => unreachable,
+            };
+            var view = try decimal_mod.scaledF64FromI128(scratch, unscaled, t.scale);
+            view.unscaled = .{ .i128 = unscaled.values };
+            cols[k] = .{ .f64 = view };
+            pass[ci] = .{ .i128 = unscaled };
+        }
+        const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = rows };
+        var sel = try filter_selection.SelectionVector.init(scratch, rows);
+        if (pr.filter) |f| try filter_eval.evaluate(f, &batch, &sel, pr.lookup, scratch);
+        const surviving = sel.count();
+        const pa = pc.arena.allocator();
+        pc.agg = try consumer.initOutputAggregator(pa, pr.meta, pr.output_specs);
+        // A piece's string dictionary is kept for its kept rows where it is no bigger than they are (`appendSelected`).
+        pc.agg.keep_codes = true;
+        pc.agg.captured = true;
+        try consumer.projectDecoded(&pc.agg, &batch, pr.lookup, pass, &sel, surviving, pr.output_specs, pr.computed_refs, scratch);
+    }
+};
+
 pub const Source = struct {
     plan: *const Plan,
     elems: []const schema.SchemaElement,
@@ -360,6 +524,8 @@ pub const Source = struct {
     /// Bytes each chunk's read takes past its end: the record straddling its successor's first byte is in it.
     overhang: usize = 0,
     opts: Options = .{},
+    /// A filter or computed SELECT: each chunk's fields are parsed into scratch and its kept rows projected.
+    proj: ?*const Projection = null,
 
     pub fn init(a: std.mem.Allocator, p: *const Plan, chunk: usize) !Source {
         const data = p.bytes.len - p.data_start;
@@ -485,12 +651,24 @@ pub const Source = struct {
         const bytes = span.bytes;
         const lo_b = s.bound(i);
         var builder: Builder = undefined;
-        const a: std.mem.Allocator = if (piece) |pc| pc.arena.allocator() else std.heap.page_allocator;
+        // Under a projection the fields are parsed into scratch, on the piece's ledger-backed allocator, and only the
+        // kept rows' outputs go into the piece (`project`).
+        var parse_state: ?std.heap.ArenaAllocator = null;
+        defer if (parse_state) |*ps| ps.deinit();
+        var parsed: consumer.OutputAggregator = undefined;
+        if (piece) |pc| if (s.proj != null) {
+            parse_state = .init(pc.arena.child_allocator);
+        };
+        const a: std.mem.Allocator = if (parse_state) |*ps| ps.allocator() else if (piece) |pc|
+            pc.arena.allocator()
+        else
+            std.heap.page_allocator;
+        const agg: *consumer.OutputAggregator = if (piece) |pc| (if (s.proj != null) &parsed else &pc.agg) else &parsed;
         const seen: []Type = if (s.classify) s.seen[i * nout ..][0..nout] else &.{};
         if (s.classify) @memset(seen, .{});
-        if (piece) |pc| try builder.init(pc, s, span.hi - span.lo);
+        if (piece) |_| try builder.init(a, agg, s, span.hi - span.lo);
         if (span.lo >= span.hi) {
-            if (piece) |pc| try builder.finish(pc, s, i);
+            if (piece) |pc| try s.finishPiece(&builder, a, agg, pc, i);
             return;
         }
         const ascii = !hasHighBit(bytes[span.lo..span.hi]);
@@ -577,7 +755,21 @@ pub const Source = struct {
             .malformed = .inconsistent_quotes,
             .offset = span.hi,
         }, span.lines, lo_b);
-        if (piece) |pc| try builder.finish(pc, s, i);
+        if (piece) |pc| try s.finishPiece(&builder, a, agg, pc, i);
+    }
+
+    /// The chunk's columns done: the piece holds them, or, under a projection, the outputs of its kept rows.
+    fn finishPiece(
+        s: *Source,
+        builder: *Builder,
+        a: std.mem.Allocator,
+        agg: *consumer.OutputAggregator,
+        pc: *window_mod.Piece,
+        i: usize,
+    ) !void {
+        try builder.finish(a, agg, s, i);
+        if (s.proj) |pr| try pr.project(s.plan, pc, agg, a);
+        pc.bits_prefix = try consumer.plainBitsPrefix(pc.arena.allocator(), &pc.agg);
     }
 
     /// The window's view of this source.
@@ -667,9 +859,10 @@ const Builder = struct {
     coders: []Coder,
     rows: usize = 0,
 
-    fn init(b: *Builder, piece: *window_mod.Piece, s: *const Source, span_bytes: usize) !void {
+    /// Columns for `s`'s parsed fields in `agg`, on `pa`: the piece's own (`piece.agg`), or, under a projection,
+    /// a scratch aggregator its kept rows are projected from (`Projection.project`).
+    fn init(b: *Builder, pa: std.mem.Allocator, agg: *consumer.OutputAggregator, s: *const Source, span_bytes: usize) !void {
         const p = s.plan;
-        const pa = piece.arena.allocator();
         const ncols = p.names.len;
         const cols = try pa.alloc(consumer.OutputAggregator.ColumnBuf, ncols);
         const reserve = span_bytes / @max(1, p.mean_record) + span_bytes / @max(1, p.mean_record) / 4 + 16;
@@ -696,7 +889,7 @@ const Builder = struct {
         };
         @memset(b.max_abs, 0);
         @memset(b.coders, .{});
-        piece.agg = .{
+        agg.* = .{
             .arena = pa,
             .cols = cols,
             .schema_elems = @constCast(s.elems),
@@ -813,8 +1006,7 @@ const Builder = struct {
         c.* = .{};
     }
 
-    fn finish(b: *Builder, piece: *window_mod.Piece, s: *Source, i: usize) !void {
-        const pa = piece.arena.allocator();
+    fn finish(b: *Builder, pa: std.mem.Allocator, agg: *consumer.OutputAggregator, s: *Source, i: usize) !void {
         for (b.cols, b.coders) |*col, *c| switch (col.*) {
             .string => |*x| if (x.coded) {
                 // No value at all (every row NULL, or none): plain, so no code points past an empty dictionary.
@@ -822,8 +1014,7 @@ const Builder = struct {
             },
             else => {},
         };
-        piece.agg.num_rows = b.rows;
-        piece.bits_prefix = try consumer.plainBitsPrefix(pa, &piece.agg);
+        agg.num_rows = b.rows;
         @memcpy(s.max_abs[i * b.cols.len ..][0..b.cols.len], b.max_abs);
         _ = s.rows.fetchAdd(b.rows, .monotonic);
     }
@@ -885,7 +1076,17 @@ pub fn run(
         else => return e,
     };
     defer mapped.unmap();
-    var p = try plan(arena, mapped.bytes, opts, failure);
+    // A filter or computed SELECT is bound to every field, then only the fields it reads are parsed.
+    var all: ?Plan = null;
+    var p = if (Projection.needed(args)) blk: {
+        var every = opts;
+        every.columns = null;
+        all = try plan(arena, mapped.bytes, every, failure);
+        const first = try Projection.bind(arena, args, &all.?, null);
+        var parsed = opts;
+        parsed.columns = try first.fetchedNames(arena, all.?.fields);
+        break :blk try plan(arena, mapped.bytes, parsed, failure);
+    } else try plan(arena, mapped.bytes, opts, failure);
     var workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
     var chunk = chunkBytes(opts, args, workers, mapped.bytes.len);
     // Everything the report holds is allocated before the output exists: once it is finished, nothing may fail.
@@ -908,6 +1109,12 @@ pub fn run(
         defer pass_state.deinit();
         const pass = pass_state.allocator();
         var source = try Source.init(pass, &p, chunk);
+        // Bound again each pass: a widened column changes what its expressions are.
+        var proj: Projection = undefined;
+        if (all) |*every| {
+            proj = try Projection.bind(pass, args, every, &p);
+            source.proj = &proj;
+        }
         report.chunks = source.count;
         source.opts = opts;
         var narrowed = args;
@@ -1092,7 +1299,11 @@ fn writeOnce(
     var t: engine_types.Timings = .{};
     t.read_ns = @intCast(nowMonoNs() - t_open);
     const p = source.plan;
-    const blooms = try resolveBlooms(arena, args, p.names, source.elems);
+    const out_elems: []const schema.SchemaElement = if (source.proj) |pr| pr.out_elems else source.elems;
+    const out_paths = if (source.proj) |pr| pr.out_paths else source.paths;
+    const out_names = try arena.alloc([]const u8, out_elems.len);
+    for (out_names, out_elems) |*n, e| n.* = e.name;
+    const blooms = try resolveBlooms(arena, args, out_names, out_elems);
 
     var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     defer if (args.profiler) |pr| pr.noteLedger(ledger.peak.load(.monotonic), args.max_memory);
@@ -1142,8 +1353,8 @@ fn writeOnce(
         // budget whether or not it was given: a sixteenth of it, as an explicit --max-memory caps a re-encode's.
         // At the default budget of a host with 1 GiB or more to give, that is the 64 MiB target, unchanged.
         .rg_target = args.row_group.under(args.max_memory),
-        .out_elems = source.elems,
-        .out_paths = source.paths,
+        .out_elems = @constCast(out_elems),
+        .out_paths = @constCast(out_paths),
         .page_indexes = &page_indexes,
         .memory = &memory,
         .slicing = &slicing,
@@ -1194,19 +1405,29 @@ fn writeOnce(
     try page_indexes.write(arena, &so, new_row_groups.items);
     try fastpath.placeFilters(&so, new_row_groups.items);
     const ncols = p.names.len;
+    const nout = out_elems.len;
     var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
     try items.append(arena, .{
         .name = "schema",
         .type = null,
         .repetition_type = null,
         .type_length = null,
-        .num_children = @intCast(ncols),
+        .num_children = @intCast(nout),
         .scale = null,
         .precision = null,
         .field_id = null,
     });
-    for (source.elems, p.types, p.pinned, 0..) |e, ty, pinned, c| {
+    for (out_elems, 0..) |e, o| {
         var elem = e;
+        // A column written as parsed (or passed through a projection) takes its DECIMAL precision from the data; a
+        // computed one is as its expression typed it.
+        const parsed: ?usize = if (source.proj) |pr| pr.source[o] else o;
+        const c = parsed orelse {
+            try items.append(arena, elem);
+            continue;
+        };
+        const ty = p.types[c];
+        const pinned = p.pinned[c];
         if (ty.kind == .decimal) {
             var max: u128 = 0;
             for (0..source.count) |i| max = @max(max, source.max_abs[i * ncols + c]);
@@ -1222,7 +1443,7 @@ fn writeOnce(
         .num_rows = @intCast(w.rows_kept),
         .created_by = schema.ZPQ_CREATED_BY,
         .row_groups = new_row_groups,
-        .column_orders = try schema.FileMetaData.outputColumnOrders(arena, ncols, null, &.{}),
+        .column_orders = try schema.FileMetaData.outputColumnOrders(arena, nout, null, &.{}),
     };
     var tw: thrift.Writer = .init(arena);
     try meta.write(&tw);
@@ -1304,21 +1525,19 @@ pub fn queryInput(args: QueryArgs) !?[]const u8 {
     }
     const path = csv orelse return null;
     if (args.inputs.len > 1) return error.CsvMixedInputs;
-    if (args.output == null or args.aggregate != null or args.group_by != null or args.filter != null or
+    // Written whole, by column, or filtered and projected row by row (`Projection`): anything that needs more than
+    // one row at a time (an aggregate, a sort, a cut) reads the Parquet it writes.
+    if (args.output == null or args.aggregate != null or args.group_by != null or
         args.column_order != null or args.result_order.keys.len > 0 or args.result_order.rows.len > 0 or
         args.result_order.limit != null or args.result_order.offset != 0)
         return error.CsvQueryNotSupported;
     if (args.columns != null and args.select != null) return error.CsvQueryNotSupported;
     if (args.plan_source) |ps| {
-        // SQL: the statement's own syntax, as nothing but a list of columns.
+        // SQL: the statement's own syntax, a SELECT list with or without a WHERE.
         const q = syntax_plan.syntaxOf(ps) orelse return error.CsvQueryNotSupported;
-        if (q.aggregate or q.filter != null or q.row_keys.len > 0 or q.hidden.len > 0) return error.CsvQueryNotSupported;
-        for (q.select orelse &.{}) |item| _ = itemName(item) orelse return error.CsvQueryNotSupported;
-        return path;
+        if (q.aggregate or q.calls.len > 0 or q.join != null or q.keys != null or q.row_keys.len > 0 or q.hidden.len > 0)
+            return error.CsvQueryNotSupported;
     }
-    const sel = args.select_cols orelse &.{};
-    if (sel.len == 0 and args.select != null and args.columns == null) return error.CsvQueryNotSupported;
-    for (sel) |c| _ = selectName(c) orelse return error.CsvQueryNotSupported;
     return path;
 }
 
@@ -1379,7 +1598,8 @@ pub fn writeQuery(ctx: Context, args: QueryArgs, path: []const u8, out_path: []c
     defer scratch.deinit();
     const alloc = args.csv_report_alloc orelse scratch.allocator();
     var opts = args.csv;
-    opts.columns = try queryColumns(scratch.allocator(), args);
+    // A projection picks its own columns (`run`); otherwise the columns named are the ones written.
+    opts.columns = if (Projection.needed(args)) null else try queryColumns(scratch.allocator(), args);
     if (args.diag) |d| d.execution_started = true;
     return run(ctx, args, path, out_path, opts, report, alloc) catch |e| {
         if (args.diag) |d| describe(d, args, path, e, report);

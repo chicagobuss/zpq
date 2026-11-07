@@ -29,6 +29,10 @@ usage:
             [\-\-csv\-delimiter C] [\-\-csv\-header | \-\-csv\-no\-header]
             [\-\-csv\-null STR ...] [\-\-csv\-types COL:TYPE,...] [\-\-csv\-strict]
             [\-\-codec ...] [\-\-row\-group\-size ROWS] [\-j N] [\-\-max\-memory SIZE]
+  zpq query \-\-query "UPDATE 'f.parquet' SET col = literal [, ...] WHERE ..."
+            [\-o <other.parquet>] [\-\-fsync | \-\-no\-fsync] [\-\-summary=json]
+            rewrites only the pages holding matched rows, in place unless \-o
+            (docs/capabilities.md, UPDATE)
   zpq schema <file.parquet>
   zpq inspect FILE... [\-\-format json] [\-\-detail]
   zpq conform <file.parquet>
@@ -90,6 +94,11 @@ usage:
                  \-j or memory. Data pages close at 1 MiB or 20,000
                  rows, and each gets a page index entry. A plain copy
                  keeps its input's row groups.
+  \-\-threads / \-j N
+                 Requested CPU parallelism. Re\-encoding shares CPU turns
+                 between decode and encode, capped by the affinity's
+                 independent cores and the cgroup CPU quota (rounded up),
+                 for explicit N too.
   \-\-parquet\-version v1|v2
                  Value\-encoding profile for new pages; default v2. v1
                  uses PLAIN/PLAIN_DICTIONARY and a version 1 footer; it
@@ -137,17 +146,19 @@ usage:
   CSV input     a file that is not Parquet (PAR1 at both ends) and is named
                 .csv, .tsv or .txt, or any file with \-\-input\-format csv, is
                 written to Parquet: zpq query data.csv \-o data.parquet (or
-                SELECT * FROM 'data.csv' with \-o), whole or by column with
-                \-\-columns a,b or SELECT a, b FROM. RFC 4180: quotes are
-                doubled inside quoted fields; UTF\-8, a BOM is skipped. The
-                delimiter (, tab ; |) and the header are detected. An unquoted
-                empty field is NULL, a quoted one the empty string. Types are
-                exact or VARCHAR: BIGINT, DECIMAL(p,s), DOUBLE (only where 15
-                digits survive), DATE, TIMESTAMP[_NS][TZ], BOOLEAN, else
-                VARCHAR (BLOB when not UTF\-8). A value its sampled type cannot
-                hold widens the column and the write starts again; nothing is
-                rounded or truncated. Malformed input exits 1 with its line,
-                byte and column. \-\-summary=json reports a "csv" object.
+                SELECT * FROM 'data.csv' with \-o), whole, by column, filtered or
+                computed (\-\-columns, \-\-filter, \-\-select, SELECT ... WHERE).
+                ORDER BY, LIMIT and aggregates read the Parquet it writes.
+                RFC 4180: quotes are doubled inside quoted fields; UTF\-8, a BOM
+                is skipped. The delimiter (, tab ; |) and the header are
+                detected. An unquoted empty field is NULL, a quoted one the
+                empty string. Types are exact or VARCHAR: BIGINT, DECIMAL(p,s),
+                DOUBLE (only where 15 digits survive), DATE, TIMESTAMP[_NS][TZ],
+                BOOLEAN, else VARCHAR (BLOB when not UTF\-8). A value its sampled
+                type cannot hold widens the column and the write starts again;
+                nothing is rounded or truncated. Malformed input exits 1 with
+                its line, byte and column. \-\-summary=json reports a "csv"
+                object.
   \-\-csv\-delimiter one character, or \et / tab
   \-\-csv\-header, \-\-csv\-no\-header   the first record names the columns, or not
   \-\-csv\-null    an unquoted text that is NULL too (repeatable)

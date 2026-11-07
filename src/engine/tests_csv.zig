@@ -423,7 +423,8 @@ test "csv query: inputs are told apart by content, then by name, and a CSV is wr
     try testing.expectEqual(@as(i64, 2), r.write.rows_matched);
     try testing.expectEqualStrings("b", report.names[1]);
     // Anything but a whole conversion reads the Parquet it writes.
-    try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .filter = "a > 1" }));
+    // A filter writes the rows it keeps (`csv_write.Projection`).
+    try testing.expectEqual(@as(i64, 1), (try runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .filter = "a > 1" })).write.rows_matched);
     try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .aggregate = "count(*)" }));
     // The Parquet it wrote, renamed .csv, is still Parquet: content first.
     try std.Io.Dir.cwd().copyFile(out, std.Io.Dir.cwd(), disguised, testing.io, .{});
@@ -478,8 +479,9 @@ test "csv query: a column projection writes the columns named, in order, and fra
     // An expression, a rename, ORDER BY or LIMIT is a query over the CSV: refused by name.
     const expr = [_]@import("../core/expr/ast.zig").SelectColumn{.{ .expr = "a + 1" }};
     const renamed = [_]@import("../core/expr/ast.zig").SelectColumn{.{ .expr = "a", .alias = "z" }};
-    try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .select = "a + 1", .select_cols = &expr }));
-    try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .select = "a AS z", .select_cols = &renamed }));
+    // An expression needs a name, as over Parquet; a rename writes.
+    try testing.expectError(error.MissingOutputOrAggregate, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .select = "a + 1", .select_cols = &expr }));
+    _ = try runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .select = "a AS z", .select_cols = &renamed });
     try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .result_order = .{ .limit = 3 } }));
     // A column the file does not have is named; one asked for twice is refused.
     var diag: Diag = .{};
@@ -494,7 +496,7 @@ test "csv query: a column projection writes the columns named, in order, and fra
     try testing.expectEqual(@as(u64, 3), diag.detail.csv.line);
 }
 
-test "csv query: SQL over a CSV is a column list or a refusal, never a dropped clause" {
+test "csv query: SQL over a CSV is a column list, a filter or expressions, or a refusal, never a dropped clause" {
     const sql = @import("../core/expr/sql_parser.zig");
     if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
     const syntax_plan = @import("syntax_plan.zig");
@@ -509,16 +511,19 @@ test "csv query: SQL over a CSV is a column list or a refusal, never a dropped c
     const out = try tmpPath(&b2, &tmp, "s.parquet");
     try writeFile(csv, "a,b,c\n1,x,1.5\n2,y,2.5\n");
     const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
-    const Case = struct { text: []const u8, names: ?[]const []const u8 };
+    // `names`: the columns parsed, as the report gives them; `rows`: the rows written. Null `names`: refused.
+    const Case = struct { text: []const u8, names: ?[]const []const u8, rows: i64 = 2 };
     for ([_]Case{
         .{ .text = "SELECT * FROM 's.csv'", .names = &.{ "a", "b", "c" } },
         .{ .text = "SELECT c, a FROM 's.csv'", .names = &.{ "c", "a" } },
         .{ .text = "SELECT \"b\" AS b FROM 's.csv'", .names = &.{"b"} },
-        .{ .text = "SELECT * FROM 's.csv' WHERE a > 1", .names = null },
+        .{ .text = "SELECT * FROM 's.csv' WHERE a > 1", .names = &.{ "a", "b", "c" }, .rows = 1 },
+        .{ .text = "SELECT b FROM 's.csv' WHERE c < 2", .names = &.{ "b", "c" }, .rows = 1 },
+        .{ .text = "SELECT a + 1 AS a FROM 's.csv'", .names = &.{"a"} },
+        .{ .text = "SELECT a AS z FROM 's.csv'", .names = &.{"a"} },
         .{ .text = "SELECT a FROM 's.csv' ORDER BY a", .names = null },
         .{ .text = "SELECT a FROM 's.csv' LIMIT 1", .names = null },
-        .{ .text = "SELECT a + 1 AS a FROM 's.csv'", .names = null },
-        .{ .text = "SELECT a AS z FROM 's.csv'", .names = null },
+        .{ .text = "SELECT DISTINCT a FROM 's.csv'", .names = null },
         .{ .text = "SELECT count(*) FROM 's.csv'", .names = null },
     }) |case| {
         const parsed = try sql.parseSqlPlan(testing.allocator, case.text);
@@ -538,7 +543,7 @@ test "csv query: SQL over a CSV is a column list or a refusal, never a dropped c
             continue;
         };
         const r = try runQuery(ctx, args);
-        try testing.expectEqual(@as(i64, 2), r.write.rows_matched);
+        try testing.expectEqual(case.rows, r.write.rows_matched);
         try testing.expectEqual(want.len, report.names.len);
         for (want, report.names) |w, n| try testing.expectEqualStrings(w, n);
     }

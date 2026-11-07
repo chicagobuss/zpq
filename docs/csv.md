@@ -10,7 +10,9 @@ zpq query --query "SELECT * FROM 'data.csv'" -o data.parquet
 Every writer option applies (`--codec`, `--row-group-size`, `--row-group-bytes`, `--bloom-filter`, `-j`,
 `--max-memory`, `--summary=json`). Columns are chosen by name, in the order given, with `--columns a,b` or
 `SELECT a, b FROM 'data.csv'`; the fields not written are still framed (a malformed one is refused) but not typed.
-Filters, expressions, renames, ORDER BY, LIMIT and aggregates are refused: they read the Parquet it writes.
+Filters, expressions and renames run row by row as the file is parsed (`--filter`, `--select`, or
+`SELECT a, b * 2 AS c FROM 'data.csv' WHERE ...`): only the fields they read are typed, and a DECIMAL keeps the
+file column's type. ORDER BY, LIMIT, DISTINCT and aggregates are refused: they read the Parquet it writes.
 
 ## Which inputs are CSV
 

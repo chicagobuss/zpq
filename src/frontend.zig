@@ -559,8 +559,9 @@ fn csvError(err: anyerror, diag: *const Diag) bool {
         error.CsvQueryNotSupported => {
             diagnosticPrint(
                 "zpq query: a CSV input is written to Parquet: zpq query data.csv -o data.parquet,\n" ++
-                    "  whole or by column (--columns a,b, or SELECT a, b FROM 'data.csv'); filters,\n" ++
-                    "  expressions, ORDER BY, LIMIT and aggregates read the Parquet it writes\n",
+                    "  whole, by column, filtered or with expressions (--filter, --select, or\n" ++
+                    "  SELECT a, b + 1 AS c FROM 'data.csv' WHERE ...); ORDER BY, LIMIT, DISTINCT and\n" ++
+                    "  aggregates read the Parquet it writes\n",
                 .{},
             );
             return true;

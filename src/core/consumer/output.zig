@@ -1158,6 +1158,39 @@ pub const ProjectedRG = struct {
     }
 };
 
+/// The rows `sel` keeps of a batch already decoded (a CSV piece's parsed columns), projected into `agg` as
+/// `ProjectedRG.projectColumn` projects a row group's: a passthrough output appends its column's kept rows, under
+/// its new name if renamed; a computed output evaluates over the kept rows only (`Survivors`). `passthrough_cols`
+/// gives, per leaf, what a passthrough appends where it is not the batch's column (a DECIMAL's unscaled integers for
+/// the lossless lane, where filters and expressions read its scaled view). Adds `surviving` to `agg.num_rows`.
+pub fn projectDecoded(
+    agg: *OutputAggregator,
+    batch: *const filter_eval.Batch,
+    lookup: []const ?usize,
+    passthrough_cols: []const ?filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    surviving: usize,
+    output_specs: []const OutputCol,
+    computed_refs: []const bool,
+    arena: std.mem.Allocator,
+) !void {
+    var survived: ?Survivors = null;
+    for (output_specs, 0..) |spec, i| switch (spec) {
+        .passthrough => |pt| {
+            const pos = lookup[pt.ci] orelse return error.MissingDecodedColumn;
+            const col = try namedLevels(arena, pt, passthrough_cols[pt.ci] orelse batch.cols[pos]);
+            try appendSelected(&agg.cols[i], col, sel, surviving, agg.arena, agg.keep_codes, arena);
+        },
+        .computed => |c| {
+            if (survived == null) survived = try Survivors.init(arena, batch, lookup, computed_refs, sel, surviving);
+            const s = &survived.?;
+            const col = try computedLane(arena, agg.cols[i], try expr_eval.evalExpr(arena, &s.batch, lookup, c.expr));
+            try appendSelected(&agg.cols[i], col, s.sel, surviving, agg.arena, false, arena);
+        },
+    };
+    agg.num_rows += surviving;
+}
+
 /// The rows a filter kept, as computed outputs evaluate over them: the columns they read gathered down to those rows,
 /// so no expression is computed for a row that is not written (a `value * 1.19` over 1% of a row group costs 1% of
 /// one over all of it). `sel` then covers the gathered rows. A column that cannot be gathered row for row (nested)

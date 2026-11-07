@@ -78,6 +78,7 @@ pub const appendProjectedRG = output.appendProjectedRG;
 pub const appendProjectedRGWithOptions = output.appendProjectedRGWithOptions;
 pub const ProjectedRG = output.ProjectedRG;
 pub const Survivors = output.Survivors;
+pub const projectDecoded = output.projectDecoded;
 const gatherRows = output.gatherRows;
 
 const decodeWriteColumn = consumer_column.decodeWriteColumn;

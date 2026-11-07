@@ -586,13 +586,15 @@ pub const Lower = struct {
         const boolean_only = parser.isBooleanAggName(name_);
         var func = if (state) .avg else parser.resolveAggFunc(name_) orelse return error.UnknownAggFunc;
         if (f.distinct != 0) func = .count_distinct;
-        if (f.args.count != 1) return if (f.args.count == 0) error.UnexpectedChar else error.ExpectedRParen;
+        const wanted: usize = if (parser.aggTakesSecond(name_)) 2 else 1;
+        if (f.args.count != wanted) return if (f.args.count == 0) error.UnexpectedChar else error.ExpectedRParen;
         if (f.order_by.count != 0) return error.ExpectedRParen;
         const arg: *const c.LpNode = f.args.items[0] orelse return error.BadAggArg;
         if (f.distinct != 0 and arg.kind == c.LP_EXPR_STAR) return error.UnexpectedChar;
         return .{
             .func = func,
             .arg = if (arg.kind == c.LP_EXPR_STAR) null else try self.expression(arg, 0),
+            .arg2 = if (wanted == 2) try self.expression(f.args.items[1] orelse return error.BadAggArg, 0) else null,
             .where = if (f.filter) |pred| try self.predicate(pred, 0) else null,
             .alias = if (alias) |a| try self.copy(a) else try self.copy(name_),
             .default_name = if (alias != null) null else try self.copy(display),

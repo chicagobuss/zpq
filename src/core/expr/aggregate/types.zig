@@ -21,6 +21,8 @@ pub const AggFunc = enum {
     stddev_pop,
     /// `approx_count_distinct(col)`: DuckDB's HyperLogLog (`hll.zig`), a BIGINT, 0 over no values.
     approx_count_distinct,
+    /// `median(x)` and `quantile_cont(x, q)`: the interpolated quantile of a number's values, a DOUBLE (`AggCall.q`).
+    quantile_cont,
 
     /// A function only the generic fold and merge (`foldGroupedOne`, `scalar.zig`) run: the specialized strategies
     /// (dense, coded, owner records, partitioned, sketch) know the original six and decline a query that has one of
@@ -28,7 +30,7 @@ pub const AggFunc = enum {
     pub fn extended(f: AggFunc) bool {
         return switch (f) {
             .count, .count_distinct, .sum, .min, .max, .avg => false,
-            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct => true,
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont => true,
         };
     }
 };
@@ -150,6 +152,8 @@ pub const AggCall = struct {
     state: bool = false,
     /// `min`/`max` of `make_date(col)`, folded over `col` itself (`arg`): the answer is the DATE those days are.
     as_date: bool = false,
+    /// The quantile `quantile_cont` takes (`median` is 0.5), a constant in [0, 1].
+    q: f64 = 0.5,
 };
 
 /// How an aggregate folds, and what it emits in the final 1-row parquet:
@@ -375,6 +379,14 @@ pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShap
         },
         // A column only: DuckDB hashes a value at the width its type has there, which an expression's SQL type may not
         // tell (the parser checks the column's own type against the file).
+        // A DOUBLE whatever the integer or DOUBLE argument; a DECIMAL, a FLOAT (whose answer DuckDB types FLOAT), a date,
+        // a BOOLEAN and text are other types' quantiles.
+        .quantile_cont => blk: {
+            const e = arg orelse return error.BadAggArg;
+            if (e.temporal() != null or e.isBoolean() or e.typeOf() == .str or e.typeOf() == .dec) return error.UnsupportedAggType;
+            if (e == .col_ref and e.col_ref.physical_type == .FLOAT) return error.UnsupportedAggType;
+            break :blk .f64;
+        },
         .approx_count_distinct => blk: {
             const e = arg orelse return error.BadAggArg;
             if (e != .col_ref) return error.UnsupportedAggType;

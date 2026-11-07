@@ -189,6 +189,11 @@ fn applyGrouped(
         else
             foldMaxGroupedOne(state, values.?, r, u64_col),
         .avg => try foldAvgGroupedOne(state, values.?, r, u64_col),
+        .quantile_cont => try state.blob.appendF64(
+            persist,
+            ctx.winner_charge,
+            scalar.momentAt(values.?, r, u64_col, null) orelse return error.UnsupportedAggType,
+        ),
         .approx_count_distinct => {
             const kind = hll.kindOfColRef(call.arg.?.col_ref) orelse return error.UnsupportedAggType;
             hll.insert(try state.blob.sketch(persist, ctx.winner_charge), hll.hashRow(kind, values.?, r));

@@ -30,6 +30,12 @@
   expression, and `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `isodow` and
   `dayofyear` of a date or timestamp, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB (a DECIMAL keeps
   DECIMAL(p, 0) after `floor`, an integer floors to a DOUBLE, `least` skips NULLs, `sqrt` of a negative is NaN).
+- **`median` and `quantile_cont` in SQL.** `median(x)` and `quantile_cont(x, q)` over an integer or DOUBLE column or
+  expression, scalar or per group, with a FILTER, in a SELECT, HAVING or ORDER BY, answer the DOUBLE DuckDB does, bit for
+  bit (NaN sorts last, infinities interpolate, NULLs are skipped), the same at every `-j`; equal to DuckDB on four
+  columns of the 100-million-row ClickBench table. A FLOAT, DECIMAL, date, BOOLEAN or text argument, a negative,
+  over-1 or non-constant quantile, and `quantile_disc` / `quantile` are refused by name. The values live in memory (8
+  bytes each) against `--max-memory`.
 - **`approx_count_distinct` in SQL.** `approx_count_distinct(col)` over a bare column, scalar or per group, with a FILTER,
   in a SELECT, HAVING or ORDER BY, answers the number DuckDB does: the same HyperLogLog (1024 registers, DuckDB's hash
   of each type) and estimator, merged by register maximum, so it does not depend on `-j` (identical to DuckDB on all of

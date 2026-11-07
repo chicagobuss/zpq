@@ -15,7 +15,7 @@ pub fn detachOwned(acc: *expr_agg.Accumulator) void {
         .min_bytes => acc.* = .{ .min_bytes = null },
         .max_bytes => acc.* = .{ .max_bytes = null },
         .distinct => acc.* = .{ .distinct = .{} },
-        .blob => |*b| b.bytes = &.{},
+        .blob => |*b| b.release(),
         else => {},
     }
 }
@@ -52,7 +52,7 @@ pub fn mergeOwnedAccumulator(
         .max_bytes => src.* = .{ .max_bytes = null },
         .min_arena => src.min_arena.ref = null,
         .max_arena => src.max_arena.ref = null,
-        .blob => |*b| b.bytes = &.{},
+        .blob => |*b| b.release(),
         else => {},
     }
 }
@@ -138,6 +138,39 @@ test "mergeOwnedAccumulator: sketches fold or move whole, the source is left emp
             // An empty source changes nothing.
             try mergeOwnedAccumulator(&c, &b, gpa);
             try testing.expectEqual(@as(u8, 7), c.blob.bytes[3]);
+        }
+    }.run, .{});
+}
+
+test "mergeOwnedAccumulator: quantile lists join whichever is larger, in any order, and leak nothing" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn list(gpa: std.mem.Allocator, acc: *expr_agg.Accumulator, vals: []const f64) !void {
+            for (vals) |v| try acc.blob.appendF64(gpa, null, v);
+        }
+        fn run(gpa: std.mem.Allocator) !void {
+            var a: expr_agg.Accumulator = .{ .blob = .{ .kind = .quantile } };
+            defer a.blob.deinit(gpa);
+            var b: expr_agg.Accumulator = .{ .blob = .{ .kind = .quantile } };
+            defer b.blob.deinit(gpa);
+            var c: expr_agg.Accumulator = .{ .blob = .{ .kind = .quantile } };
+            defer c.blob.deinit(gpa);
+            try list(gpa, &a, &.{ 1, 2 });
+            try list(gpa, &b, &.{ 3, 4, 5, 6 });
+            // A failed merge leaves both sides as they were, still owned by their holders.
+            mergeOwnedAccumulator(&a, &b, gpa) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                try testing.expectEqual(@as(usize, 16), a.blob.len);
+                try testing.expectEqual(@as(usize, 32), b.blob.len);
+                return err;
+            };
+            try testing.expectEqual(@as(usize, 48), a.blob.len);
+            try testing.expectEqual(@as(usize, 0), b.blob.len);
+            var sum: f64 = 0;
+            for (a.blob.f64s()) |v| sum += v;
+            try testing.expectEqual(@as(f64, 21), sum);
+            try mergeOwnedAccumulator(&c, &a, gpa);
+            try testing.expectEqual(@as(usize, 48), c.blob.len);
+            try testing.expectEqual(@as(usize, 0), a.blob.len);
         }
     }.run, .{});
 }

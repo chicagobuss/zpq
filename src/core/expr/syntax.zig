@@ -42,6 +42,8 @@ pub const Aggregate = struct {
     state: bool = false,
     /// `bool_or` and `bool_and`, which are `max` and `min` of a BOOLEAN and take nothing else.
     boolean_only: bool = false,
+    /// The second argument of a function that has one (`quantile_cont(x, q)`).
+    arg2: ?Expr = null,
 };
 
 pub const SelectItem = struct { expr: Expr, alias: ?[]const u8 = null, display: []const u8 = "" };

@@ -19,6 +19,7 @@ const expr_ast = @import("../ast.zig");
 const schema = @import("../../schema.zig");
 const decimal_mod = @import("../../parquet/decimal.zig");
 const hll = @import("hll.zig");
+const quantile = @import("quantile.zig");
 const statistics = @import("../../parquet/statistics.zig");
 const AggCall = @import("types.zig").AggCall;
 const Error = @import("types.zig").Error;
@@ -292,7 +293,7 @@ pub fn canStatShortCircuit(call: AggCall, has_outer_filter: bool, trust_stats: b
         // num_rows × min to the sum. updateOneFromStats decides per-RG
         // and falls through to decode for non-constant RGs.
         .sum => true,
-        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct => false,
+        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont => false,
     };
 }
 
@@ -412,7 +413,7 @@ pub fn updateOneFromStats(
             return true;
         },
         // Never short-circuitable: the deviations need every value.
-        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct => return false,
+        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont => return false,
     }
 }
 
@@ -725,6 +726,7 @@ pub fn finalize(
             try emitOneF64(arena, call.alias, avgMean(state.avg)),
         .var_samp, .var_pop, .stddev_samp, .stddev_pop => try emitOneF64(arena, call.alias, state.moments.result(call.func)),
         .approx_count_distinct => try emitOneI64(arena, call.alias, hll.count(state.blob.bytes), false),
+        .quantile_cont => try emitOneF64(arena, call.alias, quantile.cont(state.blob.f64s(), call.q)),
     };
 }
 
@@ -947,6 +949,7 @@ pub fn updateOneWithCharge(
         .avg => try foldAvg(state, values.?, sel, u64_col, if (input.gathered_from) |*g| g else null),
         .var_samp, .var_pop, .stddev_samp, .stddev_pop => try foldMoments(state, values.?, sel, u64_col, momentScale(call)),
         .approx_count_distinct => try foldHll(persist, state, call, values.?, sel, charge),
+        .quantile_cont => try foldQuantile(persist, state, values.?, sel, u64_col, charge),
     }
 }
 
@@ -986,7 +989,7 @@ pub fn updateSharedInteger(
             .count => {},
             .count_distinct => unreachable,
             // The shared kernel knows sum, min, max and avg.
-            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct => return false,
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont => return false,
         }
     }
     if (value_calls < 2) return false;
@@ -1035,7 +1038,7 @@ pub fn updateSharedInteger(
                 state.avg.isum += stats.sum;
                 state.avg.count += stats.count;
             },
-            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct => unreachable,
+            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont => unreachable,
         }
     }
     return true;
@@ -1640,6 +1643,22 @@ pub inline fn momentAt(col: filter_eval.Batch.Column, r: usize, unsigned_64: boo
         .f64 => |c| c.values[r],
         else => null,
     };
+}
+
+/// The selected rows' values, as doubles, onto the call's list.
+fn foldQuantile(
+    persist: std.mem.Allocator,
+    state: *Accumulator,
+    col: filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    unsigned_64: bool,
+    charge: ?*accumulator_mod.WinnerCharge,
+) Error!void {
+    var r: usize = 0;
+    while (r < sel.len) : (r += 1) {
+        if (!sel.isActive(r)) continue;
+        try state.blob.appendF64(persist, charge, momentAt(col, r, unsigned_64, null) orelse return error.UnsupportedAggType);
+    }
 }
 
 /// The selected rows' hashes into the call's sketch, which is made on the first.

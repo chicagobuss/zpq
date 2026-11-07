@@ -70,7 +70,7 @@ pub fn sameAccBits(a: expr_agg.Accumulator, b: expr_agg.Accumulator) bool {
         .sum_d => |v| v.lo == b.sum_d.lo and v.hi == b.sum_d.hi and v.n == b.sum_d.n,
         .avg_d => |v| v.lo == b.avg_d.lo and v.hi == b.avg_d.hi and v.n == b.avg_d.n,
         .moments => |v| v.count == b.moments.count and F.f(v.mean, b.moments.mean) and F.f(v.dsquared, b.moments.dsquared),
-        .blob => |v| std.mem.eql(u8, v.bytes, b.blob.bytes),
+        .blob => |v| std.mem.eql(u8, v.used(), b.blob.used()),
     };
 }
 

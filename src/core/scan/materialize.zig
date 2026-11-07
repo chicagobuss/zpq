@@ -3,6 +3,7 @@ const expr_ast = @import("../expr/ast.zig");
 const expr_agg = @import("../expr/agg.zig");
 const AggValue = @import("output_values.zig").AggValue;
 const hll = @import("../expr/aggregate/hll.zig");
+const quantile = @import("../expr/aggregate/quantile.zig");
 
 fn decValue(v: ?i128, spec: expr_ast.Dec) AggValue {
     return if (v) |x| .{ .dec = .{ .v = x, .spec = spec } } else .null_val;
@@ -47,6 +48,7 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
         else if (expr_agg.avgMean(state.avg)) |m| .{ .f = m } else .null_val,
         .var_samp, .var_pop, .stddev_samp, .stddev_pop => if (state.moments.result(call.func)) |v| .{ .f = v } else .null_val,
         .approx_count_distinct => .{ .i = hll.count(state.blob.bytes) },
+        .quantile_cont => if (quantile.cont(state.blob.f64s(), call.q)) |v| .{ .f = v } else .null_val,
     };
 }
 

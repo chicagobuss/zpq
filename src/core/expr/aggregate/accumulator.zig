@@ -63,39 +63,102 @@ pub const Accumulator = union(enum) {
 
     pub const Blob = struct {
         kind: Kind,
-        bytes: []u8 = &.{},
+        /// The allocation, all of it drawn from the ledger; `len` of it is in use.
+        bytes: []align(8) u8 = &.{},
+        len: usize = 0,
 
-        pub const Kind = enum { hll };
+        pub const Kind = enum { hll, quantile };
 
         pub fn deinit(b: *Blob, allocator: std.mem.Allocator) void {
             if (b.bytes.len != 0) allocator.free(b.bytes);
             b.bytes = &.{};
+            b.len = 0;
+        }
+
+        /// The in-use bytes.
+        pub fn used(b: Blob) []align(8) u8 {
+            return b.bytes[0..b.len];
+        }
+
+        /// Forget the bytes without freeing them: another owner has them.
+        pub fn release(b: *Blob) void {
+            b.bytes = &.{};
+            b.len = 0;
+        }
+
+        /// Room for `more` bytes past `len`, grown by doubling. The new allocation is drawn from the ledger before it
+        /// is made, while the old one is still live (both are, during the copy); the old one is given back after.
+        fn reserve(b: *Blob, persist: std.mem.Allocator, charge: ?*WinnerCharge, more: usize) Error!void {
+            if (b.len + more <= b.bytes.len) return;
+            const want = @max(b.len + more, @max(256, b.bytes.len *| 2));
+            const old = winnerBytes(b.bytes.len);
+            const new = winnerBytes(want);
+            if (charge) |c| try c.adjust(old, old + new);
+            errdefer if (charge) |c| c.adjust(old + new, old) catch {};
+            const mem = try persist.alignedAlloc(u8, .@"8", want);
+            @memcpy(mem[0..b.len], b.bytes[0..b.len]);
+            if (b.bytes.len != 0) persist.free(b.bytes);
+            b.bytes = mem;
+            if (charge) |c| c.adjust(old + new, new) catch unreachable;
+        }
+
+        /// One value of a quantile's list.
+        pub fn appendF64(b: *Blob, persist: std.mem.Allocator, charge: ?*WinnerCharge, x: f64) Error!void {
+            try b.reserve(persist, charge, 8);
+            std.mem.writeInt(u64, b.bytes[b.len..][0..8], @bitCast(x), .little);
+            b.len += 8;
+        }
+
+        /// The quantile list's doubles.
+        pub fn f64s(b: Blob) []f64 {
+            return std.mem.bytesAsSlice(f64, b.bytes[0..b.len]);
         }
 
         /// The sketch of an `approx_count_distinct`, made (zeroed, drawn from the ledger as a string winner is) on first use.
-        pub fn sketch(b: *Blob, persist: std.mem.Allocator, charge: ?*WinnerCharge) Error![]u8 {
+        pub fn sketch(b: *Blob, persist: std.mem.Allocator, charge: ?*WinnerCharge) Error![]align(8) u8 {
             if (b.bytes.len == 0) {
                 const drawn = winnerBytes(hll.registers);
                 if (charge) |c| try c.adjust(0, drawn);
                 errdefer if (charge) |c| c.adjust(drawn, 0) catch {};
-                const mem = try persist.alloc(u8, hll.registers);
+                const mem = try persist.alignedAlloc(u8, .@"8", hll.registers);
                 @memset(mem, 0);
                 b.bytes = mem;
+                b.len = mem.len;
             }
             return b.bytes;
         }
 
-        /// `src` into `b`, which takes `src`'s bytes (a sketch it has none yet) or folds and frees them.
-        pub fn merge(b: *Blob, src: Blob, allocator: std.mem.Allocator) void {
-            if (src.bytes.len == 0) return;
-            if (b.bytes.len == 0) {
+        /// `src` into `b`, which takes `src`'s bytes (it has none yet, or for a list the larger of the two) or folds them
+        /// in and frees them. A list that must grow can run out of memory; the merge draws no ledger (the owner settles
+        /// what the merged state holds).
+        pub fn merge(b: *Blob, src: Blob, allocator: std.mem.Allocator) Error!void {
+            if (src.len == 0) {
+                if (src.bytes.len != 0) allocator.free(src.bytes);
+                return;
+            }
+            if (b.len == 0) {
+                if (b.bytes.len != 0) allocator.free(b.bytes);
                 b.bytes = src.bytes;
+                b.len = src.len;
                 return;
             }
             switch (b.kind) {
-                .hll => hll.merge(b.bytes, src.bytes),
+                .hll => {
+                    hll.merge(b.bytes, src.bytes);
+                    allocator.free(src.bytes);
+                },
+                .quantile => {
+                    // The order of a quantile's values is nothing: the larger list stays and takes the smaller.
+                    var big = b.*;
+                    var small = src;
+                    if (small.len > big.len) std.mem.swap(Blob, &big, &small);
+                    try big.reserve(allocator, null, small.len);
+                    @memcpy(big.bytes[big.len..][0..small.len], small.bytes[0..small.len]);
+                    big.len += small.len;
+                    allocator.free(small.bytes);
+                    b.* = big;
+                },
             }
-            allocator.free(src.bytes);
         }
     };
 
@@ -164,6 +227,7 @@ pub const Accumulator = union(enum) {
             .avg => if (call.result == .avg_dec) .{ .avg_d = .{} } else .{ .avg = .{ .sum = 0, .count = 0 } },
             .var_samp, .var_pop, .stddev_samp, .stddev_pop => .{ .moments = .{} },
             .approx_count_distinct => .{ .blob = .{ .kind = .hll } },
+            .quantile_cont => .{ .blob = .{ .kind = .quantile } },
         };
     }
 
@@ -245,7 +309,7 @@ pub const Accumulator = union(enum) {
             .min_d => |*m| if (src.min_d) |sv| foldExtremeI(true, m, sv),
             .max_d => |*m| if (src.max_d) |sv| foldExtremeI(false, m, sv),
             .moments => |*m| m.combine(src.moments) catch return error.RowCountTooLarge,
-            .blob => |*b| b.merge(src.blob, allocator),
+            .blob => |*b| try b.merge(src.blob, allocator),
         }
     }
 };
@@ -289,7 +353,7 @@ pub fn mergePersistent(
             }
             try merge(dst, src, allocator);
             // Its bytes moved or were freed by the merge, whichever merge it was.
-            if (src.* == .blob) src.blob.bytes = &.{};
+            if (src.* == .blob) src.blob.release();
         },
     }
 }

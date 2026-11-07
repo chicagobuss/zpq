@@ -381,7 +381,8 @@ pub fn bindAggSyntax(arena: std.mem.Allocator, node: syntax.Aggregate, file: *co
     if (arg == null and node.func != .count) return error.StarOnlyValidInCount;
     if (node.state and node.func != .avg) return error.BadAggArg;
     try checkSketchColumn(node.func, arg, file);
-    return bindAggregate(node.func, arg, where, node.alias, node.default_name, node.state, node.boolean_only);
+    const second = if (node.arg2) |a| try bindSyntax(arena, a, file, diag) else null;
+    return bindAggregate(node.func, arg, second, where, node.alias, node.default_name, node.state, node.boolean_only);
 }
 
 fn parseSelectOf(
@@ -1159,6 +1160,7 @@ fn parseAggCall(
 
     // 3. Argument: `*` only valid for count; otherwise a regular expression.
     var arg: ?ExprNode(bound) = null;
+    var second: ?ExprNode(bound) = null;
     const peek = try lex.peek();
     if (peek.kind == .star) {
         if (func != .count) return error.StarOnlyValidInCount;
@@ -1172,6 +1174,14 @@ fn parseAggCall(
         if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
         arg = try parseExpr(bound, arena, lex, file);
         lex.depth -= 1;
+        if (aggTakesSecond(name_tok.text)) {
+            const comma = try lex.next();
+            if (comma.kind != .comma) return error.BadAggArg;
+            lex.depth += 1;
+            if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
+            second = try parseExpr(bound, arena, lex, file);
+            lex.depth -= 1;
+        }
     }
 
     const rp = try lex.next();
@@ -1234,9 +1244,9 @@ fn parseAggCall(
 
     return if (bound) blk: {
         try checkSketchColumn(func, arg, file);
-        break :blk bindAggregate(func, arg, where, alias, default_name, state, boolean_only);
+        break :blk bindAggregate(func, arg, second, where, alias, default_name, state, boolean_only);
     } else
-        .{ .func = func, .arg = arg, .where = where, .alias = alias, .default_name = default_name, .state = state, .boolean_only = boolean_only };
+        .{ .func = func, .arg = arg, .arg2 = second, .where = where, .alias = alias, .default_name = default_name, .state = state, .boolean_only = boolean_only };
 }
 
 /// `sum(x + c)`, `sum(c + x)` or `sum(x - c)` as `x` and `c`, for `sum(x) + c·count(x)`: one pass over `x` instead of
@@ -1266,6 +1276,11 @@ pub fn isSqlAggName(name: []const u8) bool {
     return !asciiEqIgnoreCase(name, "count_distinct") and (resolveAggFunc(name) != null or asciiEqIgnoreCase(name, "avg_state"));
 }
 
+/// The aggregates that take a constant or a second column after the first argument.
+pub fn aggTakesSecond(name: []const u8) bool {
+    return asciiEqIgnoreCase(name, "quantile_cont");
+}
+
 pub fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
     if (asciiEqIgnoreCase(name, "bool_or")) return .max;
     if (asciiEqIgnoreCase(name, "bool_and")) return .min;
@@ -1280,6 +1295,7 @@ pub fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
     if (asciiEqIgnoreCase(name, "stddev_samp") or asciiEqIgnoreCase(name, "stddev")) return .stddev_samp;
     if (asciiEqIgnoreCase(name, "stddev_pop")) return .stddev_pop;
     if (asciiEqIgnoreCase(name, "approx_count_distinct")) return .approx_count_distinct;
+    if (asciiEqIgnoreCase(name, "median") or asciiEqIgnoreCase(name, "quantile_cont")) return .quantile_cont;
     return null;
 }
 
@@ -1624,6 +1640,7 @@ pub fn bindCase(whens: []const ast.Case.When, else_: ?*ast.Expr) Error!ast.Expr 
 pub fn bindAggregate(
     func: agg.AggFunc,
     original_arg: ?ast.Expr,
+    second: ?ast.Expr,
     where: ?filter_ast.Filter,
     alias: []const u8,
     default_name: ?[]const u8,
@@ -1645,6 +1662,11 @@ pub fn bindAggregate(
 
     // 6. Resolve result shape from func + arg type.
     const result = try agg.resolveResult(func, arg);
+    var q: f64 = 0.5;
+    if (func == .quantile_cont) if (second) |s| {
+        q = literalNumber(s) orelse return error.UnsupportedAggType;
+        if (!(q >= 0 and q <= 1)) return error.UnsupportedAggType;
+    };
     const shifted = if (func != .sum) null else if (arg) |a| sumOffset(a) else null;
 
     return .{
@@ -1657,6 +1679,18 @@ pub fn bindAggregate(
         .offset = if (shifted) |s| s.offset else 0,
         .state = state,
         .as_date = as_date,
+        .q = q,
+    };
+}
+
+/// A constant number as a double: an integer, a decimal or a double literal. Null for anything else.
+fn literalNumber(e: ast.Expr) ?f64 {
+    if (e != .literal) return null;
+    return switch (e.literal) {
+        .i64 => |v| @floatFromInt(v),
+        .f64 => |v| v,
+        .dec => |d| d.f,
+        .str => null,
     };
 }
 
@@ -1676,9 +1710,9 @@ test "bool_or and bool_and are max and min, of a BOOLEAN only" {
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"i"}, &.{.INT32});
     const int_col = try parseExprOnly(a, "i", &file, null);
-    try testing.expectError(error.TypeMismatch, bindAggregate(.max, int_col, null, "bool_or", null, false, true));
-    _ = try bindAggregate(.max, int_col, null, "max", null, false, false);
-    try testing.expectError(error.TypeMismatch, bindAggregate(.max, null, null, "bool_or", null, false, true));
+    try testing.expectError(error.TypeMismatch, bindAggregate(.max, int_col, null, null, "bool_or", null, false, true));
+    _ = try bindAggregate(.max, int_col, null, null, "max", null, false, false);
+    try testing.expectError(error.TypeMismatch, bindAggregate(.max, null, null, null, "bool_or", null, false, true));
 }
 const test_fixtures = @import("../parquet/test_fixtures.zig");
 const filter_eval_mod = @import("../filter/eval.zig");
@@ -2122,7 +2156,7 @@ test "agg: unknown agg function errors" {
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"x"}, &.{.INT64});
-    try testing.expectError(error.UnknownAggFunc, parseAggList(a, "median(x)", &file, null));
+    try testing.expectError(error.UnknownAggFunc, parseAggList(a, "mode(x)", &file, null));
 }
 
 test "agg: case-insensitive keywords" {

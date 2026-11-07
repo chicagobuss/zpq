@@ -175,7 +175,6 @@ class Replay(unittest.TestCase):
             self.assertEqual(s["verdict"], "INCOMPLETE")
 
 
-@unittest.skipUnless(engines.POLARS.is_file(), "no Polars 2 interpreter")
 class CsvSuite(unittest.TestCase):
     def test_every_engine_writes_parquet_judged_on_values_against_the_texts_exact_reading_streamed(self):
         with tempfile.TemporaryDirectory() as d:
@@ -201,6 +200,7 @@ class CsvSuite(unittest.TestCase):
         self.assertNotIn("csv", suites.SUITES)  # 21 GB of inputs: asked for by name, never a default
 
 
+@unittest.skipUnless(engines.POLARS.is_file(), "no Polars 2 interpreter")
 class PolarsAnswer(unittest.TestCase):
     def test_a_derived_minute_named_event_time_is_not_a_timestamp(self):
         code = ("import sys, polars as pl; sys.path.insert(0, 'bench'); import polars_run as p; "

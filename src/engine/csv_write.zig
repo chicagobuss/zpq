@@ -142,12 +142,13 @@ pub const Plan = struct {
 };
 
 pub fn plan(a: std.mem.Allocator, bytes: []const u8, opts: Options, failure: *Failure) !Plan {
+    // The file as a whole is refused: its location is its start, and no column.
     const bom = csv_scan.bomLen(bytes) catch {
-        failure.* = .{ .kind = .utf16 };
+        failure.* = .{ .kind = .utf16, .line = 1 };
         return error.CsvUtf16;
     };
     if (bytes.len == bom) {
-        failure.* = .{ .kind = .empty };
+        failure.* = .{ .kind = .empty, .line = 1 };
         return error.CsvEmpty;
     }
     const sample_end = @min(bytes.len, bom + opts.sample_bytes);
@@ -298,7 +299,14 @@ fn decode(
 }
 
 fn fieldCount(failure: *Failure, bytes: []const u8, record: usize, want: usize, got: usize) Error {
-    failure.* = .{ .kind = .field_count, .offset = record, .expected_fields = want, .got_fields = got };
+    // The column is the first field missing, or the first past the header's.
+    failure.* = .{
+        .kind = .field_count,
+        .offset = record,
+        .column = @min(want, got),
+        .expected_fields = want,
+        .got_fields = got,
+    };
     failure.line = 1 + csv_scan.countNewlines(bytes[0..record]);
     return error.CsvFieldCount;
 }
@@ -496,6 +504,8 @@ pub const Source = struct {
             if (col >= ncols) return s.fail(i, .{
                 .kind = .field_count,
                 .offset = record_start,
+                // The first field past the header's.
+                .column = ncols,
                 .expected_fields = ncols,
                 // The extra field may end its record; only one that does not has more to count.
                 .got_fields = col + 1 + if (f.last) 0 else countRest(&scanner),
@@ -531,6 +541,8 @@ pub const Source = struct {
                 if (col != ncols) return s.fail(i, .{
                     .kind = .field_count,
                     .offset = record_start,
+                    // The first field missing.
+                    .column = col,
                     .expected_fields = ncols,
                     .got_fields = col,
                 }, span.lines, lo_b);
@@ -835,7 +847,7 @@ pub fn run(
     const t_open = nowMonoNs();
     const mapped = local_fs.mapFile(path) catch |e| switch (e) {
         error.EmptyFile => {
-            failure.* = .{ .kind = .empty };
+            failure.* = .{ .kind = .empty, .line = 1 };
             return error.CsvEmpty;
         },
         else => return e,

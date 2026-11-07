@@ -175,8 +175,9 @@ test "csv write: malformed input is refused at its line, byte and column" {
     const cases = [_]struct { csv: []const u8, err: anyerror, line: u64, offset: u64, column: ?usize }{
         .{ .csv = "a,b\n1,x\n2,ab\"c\n", .err = error.CsvMalformed, .line = 3, .offset = 10, .column = 1 },
         .{ .csv = "a,b\n1,x\n2,\"open\n3,y\n", .err = error.CsvMalformed, .line = 3, .offset = 10, .column = 1 },
-        .{ .csv = "a,b,c\n1,2,3\n4,5\n7,8,9\n", .err = error.CsvFieldCount, .line = 3, .offset = 12, .column = null },
-        .{ .csv = "a,b,c\n1,2,3\n4,5,6,7\n", .err = error.CsvFieldCount, .line = 3, .offset = 12, .column = null },
+        // A record with the wrong number of fields: the first field missing, or the first past the header's.
+        .{ .csv = "a,b,c\n1,2,3\n4,5\n7,8,9\n", .err = error.CsvFieldCount, .line = 3, .offset = 12, .column = 2 },
+        .{ .csv = "a,b,c\n1,2,3\n4,5,6,7\n", .err = error.CsvFieldCount, .line = 3, .offset = 12, .column = 3 },
     };
     for (cases) |c| for ([_]?usize{ null, 3 }) |chunk| {
         try writeFile(in, c.csv);
@@ -638,6 +639,9 @@ test "csv write: a record with too many fields is counted to its own end, not in
         try testing.expectEqual(@as(usize, 3), diag.detail.csv.expected);
         try testing.expectEqual(c[1], diag.detail.csv.got);
         try testing.expectEqual(@as(u64, 3), diag.detail.csv.line);
+        // The column is the first field past the header's (review P2-5).
+        try testing.expect(diag.detail.csv.has_column);
+        try testing.expectEqualStrings("column3", diag.column.get());
     }
 }
 

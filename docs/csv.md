@@ -59,7 +59,10 @@ starts again, so the file is the one a whole-file sample writes. `--csv-strict` 
 ## Refusals
 
 A refused file exits 1 and leaves no output. The message says where: the line (counted from 1, newlines inside quoted
-fields included, as an editor counts them), the byte offset (from 0) and the column.
+fields included, as an editor counts them) and the byte offset (from 0) of the field or record at fault, and its
+column where a field is: the malformed field, the value that does not fit its type, or, for a record with the
+wrong number of fields, the first field missing or the first past the header's (named `columnN` there, 0-based). An
+empty or UTF-16 file is refused as a whole: the message names the file, and no line, byte or column.
 
 ## Memory and speed
 

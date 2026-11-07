@@ -1677,9 +1677,12 @@ fn winWriter(w: *WinCtx) void {
 
 pub fn runWindowedReencode(w: *WinCtx, async_budget: usize, env: ?std.process.Environ) !void {
     // SMT siblings share the private caches and execution resources this pipeline saturates. Use independent
-    // affinity domains where topology proves them, with one combined ready-work budget for decode and encode.
+    // affinity domains where topology proves them, with one combined ready-work budget for decode and encode. A piece
+    // source's parse is branchy and gains from the sibling: a CSV write at 8 independent cores of 16 threads took
+    // 18% longer than at all 16 (lineitem SF10 and hits 10M, interleaved A/B).
     const available = system.discoverAvailableParallelism(env);
-    w.cpu_budget = hw.independentOwnerWorkers(@max(1, @min(w.cpu_budget, available)));
+    const capped = @max(1, @min(w.cpu_budget, available));
+    w.cpu_budget = if (w.source != null) capped else hw.independentOwnerWorkers(capped);
     if (w.memory != null and w.cpu_budget == 1) {
         // No next producer before the writer has admitted and placed this input's sealed groups. Otherwise its
         // pieces can consume the room for the lone encode reservation while that encode waits for the same turn.

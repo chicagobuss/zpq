@@ -1133,6 +1133,23 @@ pub const Extract = struct {
     }
 };
 
+/// `regexp_matches(s, pattern [, options])`: whether the pattern matches anywhere in the text. The `g` option is only
+/// for `regexp_replace`.
+pub const Match = struct {
+    re: Regex,
+
+    pub fn compile(arena: std.mem.Allocator, pattern: []const u8, options: []const u8) Error!Match {
+        const parsed = try parseOptions(options);
+        if (parsed.global) return error.InvalidRegex;
+        return .{ .re = try Regex.compile(arena, pattern, parsed.flags) };
+    }
+
+    pub fn apply(m: *const Match, s: *Scratch, text: []const u8) Error!bool {
+        try s.match.resize(s.gpa, 2 * m.re.groups);
+        return m.re.find(s, text, 0, s.match.items);
+    }
+};
+
 pub const Replace = struct {
     re: Regex,
     pieces: []const Piece,

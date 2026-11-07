@@ -404,6 +404,38 @@ pub const Func = enum {
     sign,
     /// `trunc(x)`: toward zero. A DOUBLE gives a DOUBLE, a DECIMAL(p, s) DECIMAL(p, 0), an integer itself.
     trunc,
+    /// `starts_with(s, 'x')`, `ends_with`, `contains` (and `prefix`, `suffix`), which `Call.str_test` names: a BOOLEAN of
+    /// a text against a constant text; NULL for NULL.
+    str_test,
+    /// `regexp_matches(s, 'pattern' [, 'options'])`: whether the pattern matches anywhere in the text, a BOOLEAN.
+    regexp_matches,
+};
+
+/// The string tests `Func.str_test` stands for.
+pub const StrTest = enum {
+    starts_with,
+    ends_with,
+    contains,
+
+    pub fn parse(name: []const u8) ?StrTest {
+        const table = [_]struct { name: []const u8, test_: StrTest }{
+            .{ .name = "starts_with", .test_ = .starts_with },
+            .{ .name = "prefix", .test_ = .starts_with },
+            .{ .name = "ends_with", .test_ = .ends_with },
+            .{ .name = "suffix", .test_ = .ends_with },
+            .{ .name = "contains", .test_ = .contains },
+        };
+        for (table) |t| if (std.ascii.eqlIgnoreCase(name, t.name)) return t.test_;
+        return null;
+    }
+
+    pub fn holds(self: StrTest, text: []const u8, needle: []const u8) bool {
+        return switch (self) {
+            .starts_with => std.mem.startsWith(u8, text, needle),
+            .ends_with => std.mem.endsWith(u8, text, needle),
+            .contains => std.mem.indexOf(u8, text, needle) != null,
+        };
+    }
 };
 
 /// The DOUBLE functions `Func.math` stands for: the ones whose C-library results DuckDB 2.0.0's agree with on millions of
@@ -531,6 +563,10 @@ pub const Call = struct {
     lenient: bool = false,
     /// Which DOUBLE function a `math` call is.
     math: ?MathFn = null,
+    /// Which test a `str_test` call is.
+    str_test: ?StrTest = null,
+    /// `regexp_matches`'s pattern and options, compiled from its literal arguments.
+    match: ?*const regex.Match = null,
 };
 
 /// Searched `CASE WHEN cond THEN value ... [ELSE value] END`: per row, the first WHEN whose condition is TRUE gives
@@ -781,9 +817,13 @@ pub const Expr = union(enum) {
                 }
                 break :blk any;
             },
-            .call => |c| c.func == .coalesce and for (c.args) |a| {
-                if (!a.isBoolean()) break false;
-            } else true,
+            .call => |c| switch (c.func) {
+                .str_test, .regexp_matches => true,
+                .coalesce => for (c.args) |a| {
+                    if (!a.isBoolean()) break false;
+                } else true,
+                else => false,
+            },
         };
     }
 
@@ -829,6 +869,7 @@ pub const Expr = union(enum) {
                 .math => for (c.args) |a| {
                     if (a.mayBeNull()) break true;
                 } else false,
+                .str_test, .regexp_matches => c.args[0].mayBeNull(),
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp => c.lenient or c.args[0].mayBeNull(),
                 // Any of the three can be NULL (a literal year over a nullable month).
                 .make_date => for (c.args) |a| {

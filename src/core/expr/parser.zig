@@ -782,6 +782,8 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "floor")) return .floor;
     if (asciiEqIgnoreCase(name, "ceil") or asciiEqIgnoreCase(name, "ceiling")) return .ceil;
     if (asciiEqIgnoreCase(name, "sqrt")) return .sqrt;
+    if (ast.StrTest.parse(name) != null) return .str_test;
+    if (asciiEqIgnoreCase(name, "regexp_matches")) return .regexp_matches;
     if (asciiEqIgnoreCase(name, "sign")) return .sign;
     if (asciiEqIgnoreCase(name, "trunc")) return .trunc;
     if (ast.MathFn.parse(name) != null) return .math;
@@ -981,6 +983,17 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             if (args.len == 0) return error.WrongArity;
             for (args) |a| if (!plainNumber(a.*)) return error.TypeMismatch;
             return .f64;
+        },
+        .str_test => {
+            if (args.len != 2) return error.WrongArity;
+            if (args[0].typeOf() != .str or !isStrLiteral(args[1].*)) return error.TypeMismatch;
+            return .i64;
+        },
+        .regexp_matches => {
+            if (args.len != 2 and args.len != 3) return error.WrongArity;
+            if (args[0].typeOf() != .str) return error.TypeMismatch;
+            for (args[1..]) |a| if (!isStrLiteral(a.*)) return error.TypeMismatch;
+            return .i64;
         },
         .sign => {
             if (args.len != 1) return error.WrongArity;
@@ -1589,6 +1602,7 @@ fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, nam
     var e = try bindCall(arena, file, func, args);
     if (isTryCast(name)) e.call.lenient = true;
     e.call.math = math;
+    if (func == .str_test) e.call.str_test = ast.StrTest.parse(name);
     return e;
 }
 
@@ -1636,7 +1650,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
                 .split_part, .regexp_extract, .date_diff, .strftime => null,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => null,
-                .floor, .ceil, .sqrt, .round, .least, .greatest, .math, .sign, .trunc => null,
+                .floor, .ceil, .sqrt, .round, .least, .greatest, .math, .sign, .trunc, .str_test, .regexp_matches => null,
             },
             // A truncated or coalesced TIMESTAMP is as UTC-adjusted as its argument, DuckDB's TIMESTAMP WITH TIME ZONE;
             // every cast and `epoch_ms` give a plain TIMESTAMP.
@@ -1672,6 +1686,11 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                     error.InvalidFormat => error.TypeMismatch,
                 };
                 break :blk f;
+            } else null,
+            .match = if (func == .regexp_matches) blk: {
+                const m = try arena.create(regex.Match);
+                m.* = try .compile(arena, args[1].literal.str, if (args.len == 3) args[2].literal.str else "");
+                break :blk m;
             } else null,
             .extract = if (func == .regexp_extract) blk: {
                 const r = try arena.create(regex.Extract);

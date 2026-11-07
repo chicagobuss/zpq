@@ -1379,6 +1379,7 @@ fn evalCall(
         .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp => return evalCast(arena, batch, column_lookup, c),
         .floor, .ceil, .sqrt, .round, .trunc => return evalMath(arena, batch, column_lookup, c),
         .math => return evalMathFn(arena, batch, column_lookup, c),
+        .str_test, .regexp_matches => return evalStringTest(arena, batch, column_lookup, c),
         .sign => return evalSign(arena, batch, column_lookup, c),
         .least, .greatest => return evalLeastGreatest(arena, batch, column_lookup, c),
     }
@@ -1656,6 +1657,29 @@ fn evalStringFn(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []
         break :blk out;
     } else texts;
     return .{ .string = .{ .values = values, .def_levels = s.def_levels, .max_def = s.max_def, .has_nulls = s.has_nulls } };
+}
+
+/// `starts_with`, `ends_with`, `contains` and `regexp_matches` of a text against a constant: a BOOLEAN lane (0 or 1) that is
+/// NULL where the text is. A coded column is tested once per dictionary entry.
+fn evalStringTest(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const arg = try stringArgument(arena, batch, column_lookup, c.args[0].*);
+    const s = arg.s;
+    var scratch: regex.Scratch = .init(arena);
+    const needle: []const u8 = if (c.func == .str_test) c.args[1].literal.str else "";
+    const tested: []const []const u8 = if (s.codes != null) s.dict else s.values;
+    const results = try arena.alloc(i64, tested.len);
+    for (tested, results, 0..) |text, *r, i| {
+        r.* = 0;
+        // A NULL or unselected row's text is a placeholder.
+        if (s.codes == null and (rowIsNull(arg.col, i) or (batch.sel != null and !batch.sel.?.isActive(i)))) continue;
+        r.* = @intFromBool(if (c.func == .str_test) c.str_test.?.holds(text, needle) else try c.match.?.apply(&scratch, text));
+    }
+    const out = if (s.codes) |codes| blk: {
+        const o = try arena.alloc(i64, codes.len);
+        for (codes, o) |code, *x| x.* = if (code < results.len) results[code] else 0;
+        break :blk o;
+    } else results;
+    return .{ .i64 = .{ .values = out, .def_levels = s.def_levels, .max_def = s.max_def, .has_nulls = s.has_nulls } };
 }
 
 /// `length(s)`: characters of each text, once per dictionary entry where the chunk is coded.
@@ -2798,7 +2822,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .math, .sign, .trunc => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .math, .sign, .trunc, .str_test, .regexp_matches => unreachable,
     }
     return .{ .i64 = .{
         .values = out,

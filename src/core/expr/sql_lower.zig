@@ -558,6 +558,19 @@ pub const Lower = struct {
                 sides[1] = try self.expression(right, depth + 1);
                 break :blk .{ .expr_compare = .{ .left = &sides[0], .op = op, .right = &sides[1] } };
             },
+            // A function that is a BOOLEAN (`starts_with(s, 'x')`) is true where it is: a comparison of the expression with 1.
+            c.LP_EXPR_FUNCTION => blk: {
+                const f = node.u.function;
+                const name_ = std.mem.span(f.name);
+                if (parser.resolveFunc(name_)) |func| {
+                    if (func != .str_test and func != .regexp_matches) return error.BadOperator;
+                } else return error.BadOperator;
+                if (f.over != null or f.distinct != 0 or f.filter != null or f.order_by.count != 0) return error.ExpectedRParen;
+                const sides = try self.arena.alloc(syntax.Expr, 2);
+                sides[0] = try self.expression(node, depth + 1);
+                sides[1] = .{ .number = .{ .token = "1", .floating = false } };
+                break :blk .{ .expr_compare = .{ .left = &sides[0], .op = .Eq, .right = &sides[1] } };
+            },
             c.LP_EXPR_IN => blk: {
                 const list = node.u.in;
                 const values = try self.arena.alloc([]const u8, @intCast(list.values.count));

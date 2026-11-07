@@ -55,6 +55,9 @@ pub const Error = error{
     InsufficientPadding,
     /// A `CAST` whose value does not fit the type it casts to, or is NaN or infinite (DuckDB: "Conversion Error").
     ConversionOutOfRange,
+    /// A side of a WHERE comparison of two expressions does not fit the DECIMAL type both convert to
+    /// (`filter_eval.commonDec`), as DuckDB's conversion fails.
+    ComparisonValueOutOfRange,
     /// A DECIMAL column reached exact evaluation without its unscaled values (see `ColumnT.unscaled`).
     DecimalUnavailable,
     /// A CASE condition over a repeated (nested) column.

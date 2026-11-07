@@ -728,47 +728,103 @@ fn valueAt(col: Batch.Column, r: usize) ?Value {
     };
 }
 
-fn asFloat(v: Value, scale: u8) f64 {
-    return switch (v) {
-        .int => |i| @floatFromInt(i),
-        .float => |f| f,
-        .dec => |d| @as(f64, @floatFromInt(d)) / std.math.pow(f64, 10, @floatFromInt(scale)),
-        .str => unreachable,
-    };
+/// What a comparison needs to know of one side beyond its lane, as DuckDB types it.
+const Side = struct {
+    lane: expr_ast.Type,
+    /// A bare UINT64 column: its i64 lane holds raw bits, read as u64.
+    unsigned: bool,
+    /// FLOAT, not DOUBLE: a FLOAT column, or arithmetic of FLOATs with integers or DECIMALs.
+    float32: bool,
+    /// Its DECIMAL type in exact arithmetic (an integer's widening; UINT64's is DECIMAL(20, 0)).
+    dec: ?expr_ast.Dec,
+
+    fn of(e: expr_ast.Expr) Side {
+        const unsigned = e == .col_ref and e.col_ref.unsigned_64;
+        return .{
+            .lane = e.typeOf(),
+            .unsigned = unsigned,
+            .float32 = isFloat32(e),
+            .dec = if (unsigned) .{ .precision = 20, .scale = 0 } else e.decSpec(),
+        };
+    }
+
+    fn isFloat32(e: expr_ast.Expr) bool {
+        return switch (e) {
+            .col_ref => |c| c.expr_type == .f64 and c.physical_type == .FLOAT,
+            // FLOAT with an integer or DECIMAL stays FLOAT in DuckDB; with a DOUBLE it is DOUBLE.
+            .binop => |b| b.result_type == .f64 and (isFloat32(b.left.*) or isFloat32(b.right.*)) and
+                (isFloat32(b.left.*) or b.left.typeOf() != .f64) and (isFloat32(b.right.*) or b.right.typeOf() != .f64),
+            .literal, .call, .case_ => false,
+        };
+    }
+
+    fn int(s: Side, v: Value) i128 {
+        return switch (v) {
+            .int => |i| if (s.unsigned) @as(u64, @bitCast(i)) else i,
+            .dec => |d| d,
+            .float, .str => unreachable,
+        };
+    }
+
+    fn double(s: Side, v: Value) f64 {
+        return switch (v) {
+            .float => |f| f,
+            .int => @floatFromInt(s.int(v)),
+            // As a CAST to DOUBLE converts it: correctly rounded.
+            .dec => |d| expr_ast.decimalToDouble(d, if (s.dec) |x| x.scale else 0),
+            .str => unreachable,
+        };
+    }
+};
+
+/// DuckDB's common DECIMAL type of two sides: the larger scale, and room for the larger integer part, at most 38
+/// digits in all (the integer part gives way, as DuckDB's does).
+fn commonDec(a: expr_ast.Dec, b: expr_ast.Dec) expr_ast.Dec {
+    const scale = @max(a.scale, b.scale);
+    const int_digits = @max(a.precision - a.scale, b.precision - b.scale);
+    return .{ .precision = @intCast(@min(@as(u16, expr_ast.Dec.max_precision), @as(u16, int_digits) + scale)), .scale = scale };
 }
 
-/// `v` as an unscaled integer at `to` places, from `from` places; wide enough that no DECIMAL(38) overflows.
-fn asScaled(v: Value, from: u8, to: u8) i256 {
-    const raw: i256 = switch (v) {
-        .int => |i| i,
-        .dec => |d| d,
-        .float, .str => unreachable,
-    };
-    return raw * std.math.pow(i256, 10, to - from);
+/// `v` (unscaled at `from` places) at the common type's `to.scale`, or `ComparisonValueOutOfRange` when it has more
+/// digits than `to` holds: DuckDB's conversion to the common type fails there, and so does the comparison.
+fn rescaled(v: i128, from: u8, to: expr_ast.Dec) Error!i256 {
+    const out = @as(i256, v) * std.math.pow(i256, 10, to.scale - from);
+    if (@abs(out) >= std.math.pow(u256, 10, to.precision)) return error.ComparisonValueOutOfRange;
+    return out;
 }
 
 /// `x.left op x.right` over the selected rows (`ast.ExprCompare`), both sides evaluated over those rows only, so a
-/// fault (`1 / 0`) in a row an earlier conjunct dropped is none. A NULL on either side drops the row.
+/// fault (`1 / 0`) in a row an earlier conjunct dropped is none. A NULL on either side drops the row. The two sides
+/// meet in DuckDB's common type: DOUBLE when either is DOUBLE, FLOAT when the floating sides are all FLOAT, else the
+/// common DECIMAL when either is DECIMAL, else an integer wide enough for UINT64 and BIGINT alike.
 fn evalExprCompare(x: ast.ExprCompare, batch: *const Batch, sel: *selection.SelectionVector, column_lookup: []const ?usize, arena: std.mem.Allocator) Error!void {
     if (try compareColumns(x, batch, sel, column_lookup)) return;
     const wanted = batch.restrictedTo(sel);
     const l = try expr_eval.evalGroupKeyExpr(arena, &wanted, column_lookup, x.left.*);
     const r = try expr_eval.evalGroupKeyExpr(arena, &wanted, column_lookup, x.right.*);
-    const lt = x.left.typeOf();
-    const rt = x.right.typeOf();
-    const lane = expr_ast.Type.promote(lt, rt) orelse return error.TypeMismatch;
-    const ls: u8 = if (x.left.decSpec()) |d| d.scale else 0;
-    const rs: u8 = if (x.right.decSpec()) |d| d.scale else 0;
-    const scale = @max(ls, rs);
+    const ls = Side.of(x.left.*);
+    const rs = Side.of(x.right.*);
+    const lane = expr_ast.Type.promote(ls.lane, rs.lane) orelse return error.TypeMismatch;
+    const float32 = lane == .f64 and (ls.lane != .f64 or ls.float32) and (rs.lane != .f64 or rs.float32);
+    const common: ?expr_ast.Dec = if (lane == .dec) commonDec(ls.dec.?, rs.dec.?) else null;
     var it = sel.iterator();
     while (it.next()) |row| {
-        const a = valueAt(l, row);
-        const b = valueAt(r, row);
-        const keep = if (a == null or b == null) false else switch (lane) {
-            .str => ast.applyOpStr(a.?.str, x.op, b.?.str),
-            .f64 => ast.applyOp(f64, asFloat(a.?, ls), x.op, asFloat(b.?, rs)),
-            .dec => ast.applyOp(i256, asScaled(a.?, if (lt == .dec) ls else 0, scale), x.op, asScaled(b.?, if (rt == .dec) rs else 0, scale)),
-            .i64 => ast.applyOp(i64, a.?.int, x.op, b.?.int),
+        const a = valueAt(l, row) orelse {
+            sel.set(row, false);
+            continue;
+        };
+        const b = valueAt(r, row) orelse {
+            sel.set(row, false);
+            continue;
+        };
+        const keep = switch (lane) {
+            .str => ast.applyOpStr(a.str, x.op, b.str),
+            .f64 => if (float32)
+                ast.applyOp(f32, @floatCast(ls.double(a)), x.op, @floatCast(rs.double(b)))
+            else
+                ast.applyOp(f64, ls.double(a), x.op, rs.double(b)),
+            .dec => ast.applyOp(i256, try rescaled(ls.int(a), ls.dec.?.scale, common.?), x.op, try rescaled(rs.int(b), rs.dec.?.scale, common.?)),
+            .i64 => ast.applyOp(i128, ls.int(a), x.op, rs.int(b)),
         };
         if (!keep) sel.set(row, false);
     }

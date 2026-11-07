@@ -3,6 +3,13 @@
   {
    "name": "exprfix",
    "copy": "COPY (SELECT i AS id, (CASE WHEN i % 13 = 0 THEN NULL ELSE i % 50 END)::INTEGER AS a, (CASE WHEN i % 17 = 0 THEN NULL ELSE (i * 7) % 60 END)::BIGINT AS b, ((i % 97) * 0.5)::DOUBLE AS x, ((i % 1000) * 0.01)::DECIMAL(12, 2) AS p, ((i % 37) * 0.1)::DECIMAL(9, 1) AS q, (CASE WHEN i % 19 = 0 THEN NULL ELSE 'k' || (i % 23) END) AS s, 'k' || (i % 29) AS t, (DATE '1995-01-01' + (i % 400)::INTEGER) AS d1, (DATE '1995-01-01' + (i % 333)::INTEGER) AS d2, (TIMESTAMP '1995-01-01' + to_seconds(i)) AS ts, (i % 5)::BIGINT AS z FROM range(0, 20000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 4096)"
+  },
+  {
+   "script": "tools/check/prepare_expr_types.py",
+   "files": [
+    "exprtypes",
+    "exprdecs"
+   ]
   }
  ],
  "cases": [
@@ -577,6 +584,426 @@
    }
   },
   {
+   "id": "expr:review:ep1-uint64-against-uint64",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE u > v"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE u > v"
+   }
+  },
+  {
+   "id": "expr:review:ep1-literal-left-of-uint64",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE 0 < u"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE 0 < u"
+   }
+  },
+  {
+   "id": "expr:review:ep1-uint64-against-bigint",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE u > i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE u > i"
+   }
+  },
+  {
+   "id": "expr:review:ep2-float-against-bigint",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE f = i"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE f = i"
+   }
+  },
+  {
+   "id": "expr:review:ep2-float-against-decimal",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE f = dz"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE f = dz"
+   }
+  },
+  {
+   "id": "expr:review:ep2-float-ordered",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE NOT (f < i)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE NOT (f < i)"
+   }
+  },
+  {
+   "id": "expr:review:ep2-double-against-float",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE x > f"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE x > f"
+   }
+  },
+  {
+   "id": "expr:review:ep3-decimal-against-double",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE p = x"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE p = x"
+   }
+  },
+  {
+   "id": "expr:review:ep3-decimal-against-its-cast",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE p = CAST(p AS DOUBLE)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE p = CAST(p AS DOUBLE)"
+   }
+  },
+  {
+   "id": "expr:review:ep3-scale-2",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprdecs}' WHERE p2 = x2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprdecs}' WHERE p2 = x2"
+   }
+  },
+  {
+   "id": "expr:review:ep3-scale-9",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprdecs}' WHERE p9 = x9"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprdecs}' WHERE p9 = x9"
+   }
+  },
+  {
+   "id": "expr:review:ep3-scale-18",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprdecs}' WHERE p18 = x18"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprdecs}' WHERE p18 = x18"
+   }
+  },
+  {
+   "id": "expr:review:ep3-scale-37",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprdecs}' WHERE p37 = x37"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprdecs}' WHERE p37 = x37"
+   }
+  },
+  {
+   "id": "expr:review:ep4-control-scales-that-fit",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE c2 > c1"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE c2 > c1"
+   }
+  },
+  {
    "id": "expr:refuse:date-against-timestamp",
    "fixture": "exprfix",
    "cli": [
@@ -658,6 +1085,48 @@
    "refuse": {
     "error": "exit 2",
     "diag": "a comparison takes a literal on its right"
+   }
+  },
+  {
+   "id": "expr:review:refuse:ep4-common-decimal-overflow",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE dp < dq"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "does not fit the DECIMAL type both sides convert to"
+   }
+  },
+  {
+   "id": "expr:review:refuse:ep4-either-order",
+   "fixture": "exprtypes",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprtypes}' WHERE dq >= dp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "does not fit the DECIMAL type both sides convert to"
    }
   }
  ]

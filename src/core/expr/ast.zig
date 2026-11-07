@@ -166,6 +166,10 @@ pub fn pow10(n: u8) i128 {
 /// with the remainder as a sticky bit; a 113-bit quotient would lose a tie plus a digit 19 places below the point.
 pub fn decimalToDouble(sum: i192, scale: u8) f64 {
     if (sum == 0) return 0;
+    // Two doubles held exactly (a value to 2^53, a power of ten to 10^22) divide with one rounding, to the nearest.
+    if (scale <= 22 and sum >= -(1 << 53) and sum <= (1 << 53)) {
+        return @as(f64, @floatFromInt(@as(i64, @intCast(sum)))) / @as(f64, @floatFromInt(@as(i64, @intCast(pow10(scale)))));
+    }
     const n: u256 = @abs(sum);
     const d: u256 = @intCast(pow10(scale));
     const n_bits: i32 = 256 - @clz(n);
@@ -678,7 +682,11 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .make_date, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
+                .strlen, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
+                // Any of the three can be NULL (a literal year over a nullable month).
+                .make_date => for (c.args) |a| {
+                    if (a.mayBeNull()) break true;
+                } else false,
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
                 // Infinite times give NULL whatever the columns say.
                 .date_diff => true,

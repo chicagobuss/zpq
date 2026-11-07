@@ -280,7 +280,7 @@ fn split(t: ast.Temporal, v: i64) Error!Split {
         },
         .ts_ms => std.math.mul(i64, v, std.time.us_per_ms) catch return error.TimestampOutOfRange,
         .ts_us => v,
-        .ts_ns => @divFloor(v, std.time.ns_per_us),
+        .ts_ns => roundDivAway(v, std.time.ns_per_us),
     };
     return .{ .days = @divFloor(us, us_per_day), .of_day = @mod(us, us_per_day) };
 }

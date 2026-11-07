@@ -429,9 +429,15 @@ fn evalGroupKeyBinOp(
     const l_col = try keyOperandAs(arena, l_raw, b.left.*, b.result_type);
     const r_col = try keyOperandAs(arena, r_raw, b.right.*, b.result_type);
 
+    // The same SQL-width checks as `evalBinOp`: a key, or an argument of a function, overflows as the bare expression does.
+    const consumed: Consumed = .{ .sel = batch.sel };
+    if (b.result_type == .i64 and (b.op == .mod or b.op == .intdiv)) if (b.int) |t| switch (t) {
+        .i8, .i16, .i32 => try narrowMinOverflow(@intCast(t.minValue()), l_col, r_col, consumed),
+        else => {},
+    };
     return switch (b.result_type) {
-        .i64 => evalGroupKeyNumericBinOp(i64, arena, b.op, l_col, r_col, .{ .sel = batch.sel }),
-        .f64 => evalGroupKeyNumericBinOp(f64, arena, b.op, l_col, r_col, .{ .sel = batch.sel }),
+        .i64 => narrowRange(b, try evalGroupKeyNumericBinOp(i64, arena, b.op, l_col, r_col, consumed), l_col, r_col, consumed),
+        .f64 => evalGroupKeyNumericBinOp(f64, arena, b.op, l_col, r_col, consumed),
         .str => evalGroupKeyConcatBinOp(arena, l_col, r_col),
         .dec => unreachable,
     };
@@ -677,15 +683,10 @@ fn evalAs(
     e: ast.Expr,
     target: ast.Type,
 ) Error!Batch.Column {
-    // A DECIMAL operand of a DOUBLE result: a column's f64 view and a literal's double are already the correctly
-    // converted values; anything computed converts its exact result once.
+    // A DECIMAL operand of a DOUBLE result: a literal's double is already the correctly converted value; a column or
+    // anything computed converts its exact value once (`decToF64`, DuckDB's cast), never through the decoder's
+    // f64 view, whose powers of ten past 10^22 are rounded.
     if (target == .f64 and e.typeOf() == .dec) switch (e) {
-        .col_ref => |c| {
-            const pos = column_lookup[c.col_idx] orelse return error.BadColumn;
-            const col = batch.cols[pos];
-            try rejectNested(col);
-            return withNullsOf(.{ .f64 = .{ .values = try widenToF64(arena, col) } }, col);
-        },
         .literal => |l| {
             const out = try arena.alloc(f64, batch.num_rows);
             @memset(out, l.dec.f);
@@ -1314,7 +1315,7 @@ inline fn mulExact(x: i128, y: i128) error{Overflow}!i128 {
 fn decToF64(arena: std.mem.Allocator, values: []const i128, e: ast.Expr) Error![]f64 {
     const scale = (e.decSpec() orelse return error.TypeMismatch).scale;
     const out = try arena.alloc(f64, values.len);
-    for (values, out) |v, *o| o.* = decimal_mod.applyScaleI128(v, scale);
+    for (values, out) |v, *o| o.* = ast.decimalToDouble(v, scale);
     return out;
 }
 
@@ -1965,7 +1966,7 @@ fn evalCast(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
                     const unit = arg.temporal().?;
                     const out = try arena.alloc(i64, n);
                     for (in.values, out, 0..) |v, *o, i| {
-                        o.* = temporalCast(c.func == .cast_date, unit, v) catch if (quietRow(batch, col, i)) 0 else return error.ConversionOutOfRange;
+                        o.* = temporalCast(c.func == .cast_date, unit, arg.isUtc(), v) catch if (quietRow(batch, col, i)) 0 else return error.ConversionOutOfRange;
                     }
                     return .{ .i64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
                 },
@@ -2030,6 +2031,7 @@ fn quietDecimalRow(batch: *const Batch, nulls: ?Batch.Column, i: usize) bool {
 
 const us_per_day: i64 = 86_400_000_000;
 const ms_per_day: i64 = 86_400_000;
+const ns_per_day: i64 = 86_400_000_000_000;
 
 /// `make_date(year, month, day)`: a NULL in any argument is NULL; a month or day the calendar has not, or a date DuckDB's
 /// DATE cannot hold, fails the query in a row it consumes.
@@ -2124,8 +2126,16 @@ const roundDivAway = calendar.roundDivAway;
 /// floor of the time over a day (so a time before 1970 is the day before); a TIMESTAMP_NS reaches microseconds to the
 /// nearest, a tie away from zero (the DATE of one nanosecond before the epoch is 1970-01-01); a DATE and a TIMESTAMP_MS
 /// reach microseconds exactly, and one beyond the range of a TIMESTAMP is `ConversionOutOfRange`. Infinity stays infinity.
-/// A UTC-adjusted value is read in UTC, as the date parts do.
-fn temporalCast(to_date: bool, unit: ast.Temporal, v: i64) error{ConversionOutOfRange}!i64 {
+/// A UTC-adjusted value is read in UTC, as the date parts do; but a UTC-adjusted nanosecond (TIMESTAMPTZ_NS) floors to
+/// its day from the nanosecond, not the microsecond nearest it.
+/// The earliest TIMESTAMP DuckDB converts a TIMESTAMP_MS to, 290309-12-22 (BC) 00:00:00; earlier ones are a conversion
+/// error as a TIMESTAMP, while as a DATE they floor to their day.
+const ts_min_us: i64 = -9_223_372_022_400_000_000;
+
+/// `unit` is the argument's, `utc` its time-zone flag: a UTC-adjusted nanosecond (DuckDB's TIMESTAMPTZ_NS) floors to
+/// its day from the nanosecond itself, a plain TIMESTAMP_NS from the microsecond nearest it. A TIMESTAMP_MS reaches
+/// microseconds first, an error past an i64 of them (the millisecond count of a day 2^31 from the epoch).
+fn temporalCast(to_date: bool, unit: ast.Temporal, utc: bool, v: i64) error{ConversionOutOfRange}!i64 {
     const ts_infinity: i64 = std.math.maxInt(i64);
     const date_infinity: i64 = std.math.maxInt(i32);
     if (unit == .date) {
@@ -2136,48 +2146,60 @@ fn temporalCast(to_date: bool, unit: ast.Temporal, v: i64) error{ConversionOutOf
     }
     if (v == ts_infinity) return if (to_date) date_infinity else ts_infinity;
     if (v == -ts_infinity) return if (to_date) -date_infinity else -ts_infinity;
-    if (unit == .ts_ms and to_date) return @divFloor(v, ms_per_day);
+    if (unit == .ts_ns and utc and to_date) return @divFloor(v, ns_per_day);
     const us: i64 = switch (unit) {
         .ts_us => v,
         .ts_ms => std.math.mul(i64, v, 1000) catch return error.ConversionOutOfRange,
         .ts_ns => roundDivAway(v, 1000),
         .date => unreachable,
     };
+    if (unit == .ts_ms and !to_date and us < ts_min_us) return error.ConversionOutOfRange;
     return if (to_date) @divFloor(us, us_per_day) else us;
 }
 
 test "casting between DATE and TIMESTAMP matches DuckDB 2.0.0" {
     const T = std.testing;
     // TIMESTAMP to DATE floors: the last microsecond of 1969 is 1969-12-31, the epoch is 1970-01-01.
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_us, -1));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_us, 0));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_us, us_per_day - 1));
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_us, -us_per_day));
-    try T.expectEqual(@as(i64, -2), try temporalCast(true, .ts_us, -us_per_day - 1));
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ms, -1));
-    try T.expectEqual(@as(i64, 1), try temporalCast(true, .ts_ms, ms_per_day));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_us, false, -1));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_us, false, 0));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_us, false, us_per_day - 1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_us, false, -us_per_day));
+    try T.expectEqual(@as(i64, -2), try temporalCast(true, .ts_us, false, -us_per_day - 1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ms, false, -1));
+    try T.expectEqual(@as(i64, 1), try temporalCast(true, .ts_ms, false, ms_per_day));
     // A TIMESTAMP_NS reaches microseconds half away from zero first: -1 ns is the epoch, -500 ns the microsecond before.
-    try T.expectEqual(@as(i64, 0), try temporalCast(false, .ts_ns, -1));
-    try T.expectEqual(@as(i64, -1), try temporalCast(false, .ts_ns, -999));
-    try T.expectEqual(@as(i64, -1), try temporalCast(false, .ts_ns, -500));
-    try T.expectEqual(@as(i64, 0), try temporalCast(false, .ts_ns, -499));
-    try T.expectEqual(@as(i64, 1), try temporalCast(false, .ts_ns, 500));
-    try T.expectEqual(@as(i64, 1), try temporalCast(false, .ts_ns, 999));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, -1));
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ns, -500));
+    try T.expectEqual(@as(i64, 0), try temporalCast(false, .ts_ns, false, -1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(false, .ts_ns, false, -999));
+    try T.expectEqual(@as(i64, -1), try temporalCast(false, .ts_ns, false, -500));
+    try T.expectEqual(@as(i64, 0), try temporalCast(false, .ts_ns, false, -499));
+    try T.expectEqual(@as(i64, 1), try temporalCast(false, .ts_ns, false, 500));
+    try T.expectEqual(@as(i64, 1), try temporalCast(false, .ts_ns, false, 999));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, false, -1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ns, false, -500));
     // DATE and TIMESTAMP_MS to TIMESTAMP are exact; one past the TIMESTAMP range is an error.
-    try T.expectEqual(@as(i64, 19782 * us_per_day), try temporalCast(false, .date, 19782));
-    try T.expectEqual(@as(i64, -999_000), try temporalCast(false, .ts_ms, -999));
-    try T.expectEqual(@as(i64, 106751991 * us_per_day), try temporalCast(false, .date, 106751991));
-    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .date, 106751992));
-    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .ts_ms, std.math.maxInt(i64) - 1));
+    try T.expectEqual(@as(i64, 19782 * us_per_day), try temporalCast(false, .date, false, 19782));
+    try T.expectEqual(@as(i64, -999_000), try temporalCast(false, .ts_ms, false, -999));
+    try T.expectEqual(@as(i64, 106751991 * us_per_day), try temporalCast(false, .date, false, 106751991));
+    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .date, false, 106751992));
+    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .ts_ms, false, std.math.maxInt(i64) - 1));
     // Infinity maps to infinity, both ways and in every unit.
-    try T.expectEqual(@as(i64, std.math.maxInt(i64)), try temporalCast(false, .date, std.math.maxInt(i32)));
-    try T.expectEqual(@as(i64, -std.math.maxInt(i32)), try temporalCast(true, .ts_ns, -std.math.maxInt(i64)));
-    try T.expectEqual(@as(i64, std.math.maxInt(i64)), try temporalCast(false, .ts_ms, std.math.maxInt(i64)));
+    try T.expectEqual(@as(i64, std.math.maxInt(i64)), try temporalCast(false, .date, false, std.math.maxInt(i32)));
+    try T.expectEqual(@as(i64, -std.math.maxInt(i32)), try temporalCast(true, .ts_ns, false, -std.math.maxInt(i64)));
+    try T.expectEqual(@as(i64, std.math.maxInt(i64)), try temporalCast(false, .ts_ms, false, std.math.maxInt(i64)));
     // Identity casts.
-    try T.expectEqual(@as(i64, -165), try temporalCast(true, .date, -165));
-    try T.expectEqual(@as(i64, -47524859999999), try temporalCast(false, .ts_us, -47524859999999));
+    try T.expectEqual(@as(i64, -165), try temporalCast(true, .date, false, -165));
+    try T.expectEqual(@as(i64, -47524859999999), try temporalCast(false, .ts_us, false, -47524859999999));
+    // A TIMESTAMP_MS past the microsecond range is an error to a DATE too, not a wrapped day count; a TIMESTAMP only
+    // from 290309-12-22 (BC), where a DATE floors on.
+    try T.expectError(error.ConversionOutOfRange, temporalCast(true, .ts_ms, false, 185542587187200000));
+    try T.expectEqual(@as(i64, 106751991), try temporalCast(true, .ts_ms, false, 9223372036854775));
+    try T.expectEqual(@as(i64, -106751992), try temporalCast(true, .ts_ms, false, -9223372036854775));
+    try T.expectEqual(ts_min_us, try temporalCast(false, .ts_ms, false, -9223372022400000));
+    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .ts_ms, false, -9223372022400001));
+    // UTC-adjusted nanoseconds floor to their day: one before the epoch is the day before, not the epoch's.
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ns, true, -1));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, false, -1));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, true, ns_per_day - 1));
 }
 
 /// `evalCast` of an exact DECIMAL argument, read at its own scale.

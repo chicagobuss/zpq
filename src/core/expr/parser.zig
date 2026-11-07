@@ -799,6 +799,14 @@ fn isStrLiteral(e: ast.Expr) bool {
     return e == .literal and e.literal == .str;
 }
 
+/// The kind of time DuckDB keeps apart from the rest: UTC-adjusted microseconds (TIMESTAMP WITH TIME ZONE), nanoseconds
+/// (TIMESTAMP_NS) and UTC-adjusted nanoseconds (TIMESTAMPTZ_NS). Null for a DATE, a TIMESTAMP and a TIMESTAMP_MS.
+fn separateClock(e: ast.Expr) ?u2 {
+    const t = e.temporal() orelse return null;
+    if (t == .ts_ns) return if (e.isUtc()) 3 else 2;
+    return if (e.isUtc() and t != .date) 1 else null;
+}
+
 fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.FileMetaData) Error!ast.Type {
     switch (func) {
         .coalesce => {
@@ -808,6 +816,11 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             var t = args[0].typeOf();
             for (args[1..]) |a| {
                 t = ast.Type.promote(t, a.typeOf()) orelse return error.TypeMismatch;
+            }
+            // Dates and times of different units, or UTC-adjusted and not, are different SQL types; DuckDB converts
+            // them to a common one and zpq would otherwise answer the ticks of incompatible clocks, so they are refused.
+            for (args[1..]) |a| {
+                if (a.temporal() != args[0].temporal() or a.isUtc() != args[0].isUtc()) return error.TypeMismatch;
             }
             return t;
         },
@@ -838,6 +851,12 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             if (!isStrLiteral(args[0].*)) return error.TypeMismatch;
             if (ast.DiffPart.parse(args[0].literal.str) == null) return error.UnsupportedDatePart;
             if (args[1].temporal() == null or args[2].temporal() == null) return error.TypeMismatch;
+            // DuckDB keeps three clocks apart, each accepting itself, a DATE, a TIMESTAMP and a TIMESTAMP_MS but no other:
+            // UTC-adjusted microseconds, nanoseconds, and UTC-adjusted nanoseconds. The last it counts in nanoseconds
+            // (the day between one nanosecond before the epoch and its DATE is 0), which zpq's microseconds do not.
+            if (separateClock(args[1].*)) |ka| if (separateClock(args[2].*)) |kb| if (ka != kb) return error.TypeMismatch;
+            if (args[1].temporal() == .ts_ns and args[1].isUtc() or args[2].temporal() == .ts_ns and args[2].isUtc())
+                return error.TypeMismatch;
             return .i64;
         },
         .epoch_ms => {
@@ -851,6 +870,8 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             if (args[0].* != .literal or args[0].literal != .str) return error.TypeMismatch;
             const part = ast.DatePart.parse(args[0].literal.str) orelse return error.UnsupportedDatePart;
             if (args[1].temporal() == null) return error.TypeMismatch;
+            // DuckDB has no date_trunc or date_part of a TIMESTAMPTZ_NS (UTC-adjusted nanoseconds).
+            if (args[1].temporal() == .ts_ns and args[1].isUtc()) return error.TypeMismatch;
             if (func == .date_trunc and switch (part) {
                 .dow, .isodow, .doy => true,
                 else => false,
@@ -965,6 +986,8 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
         .cast_date, .cast_timestamp => {
             if (args.len != 1) return error.WrongArity;
             if (args[0].temporal() == null) return error.TypeMismatch;
+            // A TIMESTAMPTZ_NS (UTC-adjusted nanoseconds) casts to a DATE but not to a TIMESTAMP.
+            if (func == .cast_timestamp and args[0].temporal() == .ts_ns and args[0].isUtc()) return error.TypeMismatch;
             return .i64;
         },
         .cast_dec => {
@@ -1479,10 +1502,8 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
             .temporal = switch (func) {
                 .make_date, .cast_date => .date,
                 .epoch_ms, .date_trunc, .cast_timestamp => .ts_us,
-                // Values of one unit (and one time zone) keep it; mixed ones are no time zpq could name.
-                .coalesce => for (args[1..]) |a| {
-                    if (a.temporal() != args[0].temporal() or a.isUtc() != args[0].isUtc()) break null;
-                } else args[0].temporal(),
+                // Values of one unit (and one time zone) keep it; `resolveCallType` refuses a mix.
+                .coalesce => args[0].temporal(),
                 .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,
                 .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
                 .split_part, .regexp_extract, .date_diff, .strftime => null,

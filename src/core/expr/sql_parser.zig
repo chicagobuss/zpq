@@ -1112,8 +1112,72 @@ fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []cons
     return parseFolded(structured, allocator, folded_sql, literal_report.markers);
 }
 
+/// `sql` with each comment written over by spaces (newlines kept, so every position stays where it was). DuckDB's block
+/// comments nest (`/* a /* b */ c */` is one), which the grammar's own lexer and the rewrites before it do not read:
+/// each would end the comment at the first `*/` and run what is left of it as SQL. Quoted text is untouched, and a block
+/// comment that is never closed is an error, as DuckDB's.
+fn stripComments(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
+    var out = try allocator.dupe(u8, sql);
+    errdefer allocator.free(out);
+    var i: usize = 0;
+    while (i < sql.len) {
+        const ch = sql[i];
+        if (ch == '\'' or ch == '"') {
+            i = quotedForward(sql, i) orelse sql.len;
+        } else if (ch == '-' and i + 1 < sql.len and sql[i + 1] == '-') {
+            while (i < sql.len and sql[i] != '\n') : (i += 1) out[i] = ' ';
+        } else if (ch == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
+            var depth: usize = 1;
+            var k = i + 2;
+            while (k < sql.len and depth > 0) {
+                if (sql[k] == '/' and k + 1 < sql.len and sql[k + 1] == '*') {
+                    depth += 1;
+                    k += 2;
+                } else if (sql[k] == '*' and k + 1 < sql.len and sql[k + 1] == '/') {
+                    depth -= 1;
+                    k += 2;
+                } else k += 1;
+            }
+            if (depth > 0) {
+                diagnosticPrint("sql parse error: unterminated /* comment\n", .{});
+                return error.SqlParseError;
+            }
+            for (out[i..k]) |*b| {
+                if (b.* != '\n') b.* = ' ';
+            }
+            i = k;
+        } else i += 1;
+    }
+    return out;
+}
+
+test "comments are written over by spaces, nested block comments whole, and an open one is an error" {
+    const T = std.testing;
+    // Each comment is as many spaces as it was long: the query with `blank` spaces where the comment was.
+    const spaces: [64]u8 = @splat(' ');
+    const cases = [_]struct { sql: []const u8, head: []const u8, blank: usize, tail: []const u8 }{
+        .{ .sql = "SELECT a /* x */ FROM t", .head = "SELECT a ", .blank = 7, .tail = " FROM t" },
+        .{ .sql = "SELECT a /* o /* i */ + 999 -- */ AS r FROM t", .head = "SELECT a ", .blank = 24, .tail = " AS r FROM t" },
+        .{ .sql = "SELECT a -- c /* d\nFROM t", .head = "SELECT a ", .blank = 9, .tail = "\nFROM t" },
+        .{ .sql = "SELECT '/* x */', \"--y\" FROM t", .head = "SELECT '/* x */', \"--y\" FROM t", .blank = 0, .tail = "" },
+        .{ .sql = "SELECT a /*/ b */ + 1 FROM t", .head = "SELECT a ", .blank = 8, .tail = " + 1 FROM t" },
+    };
+    for (cases) |case| {
+        const got = try stripComments(T.allocator, case.sql);
+        defer T.allocator.free(got);
+        const want = try std.fmt.allocPrint(T.allocator, "{s}{s}{s}", .{ case.head, spaces[0..case.blank], case.tail });
+        defer T.allocator.free(want);
+        try T.expectEqualStrings(want, got);
+    }
+    for ([_][]const u8{ "SELECT a /* x FROM t", "SELECT a /* o /* i */ FROM t" }) |sql| {
+        try T.expectError(error.SqlParseError, stripComments(T.allocator, sql));
+    }
+}
+
 /// `sql` with its typed literals and sugar folded (`sql_literals.rewrite`); `report.markers` say how to read it back.
-fn fold(allocator: std.mem.Allocator, sql: []const u8, report: *literals.Report) ![]u8 {
+fn fold(allocator: std.mem.Allocator, raw: []const u8, report: *literals.Report) ![]u8 {
+    const sql = try stripComments(allocator, raw);
+    defer allocator.free(sql);
     return literals.rewrite(allocator, sql, report) catch |err| {
         if (report.len > 0) diagnosticPrint("sql: {s}\n", .{report.text()});
         return err;

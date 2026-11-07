@@ -46,9 +46,12 @@ rounds half away from zero to an integer or to fewer places, a DOUBLE half to ev
 to a DECIMAL; a value that does not fit stops the query with a conversion error, as DuckDB does, but only in rows that
 are read and not NULL; the result is written as INT64 for every integer type), `CAST(t AS DATE)` and
 `CAST(x AS TIMESTAMP)` (also `::` and `DATETIME`) between a DATE and a TIMESTAMP of any unit (a time's day is its floor,
-before 1970 too; a TIMESTAMP_NS reaches microseconds to the nearest, a tie away from zero; a DATE past the TIMESTAMP
-range is a conversion error; a UTC-adjusted value is read in UTC, as the date parts read it, so DuckDB's answer differs
-under another session time zone), `floor`, `ceil`/`ceiling`, `sqrt` and
+before 1970 too; a TIMESTAMP_NS reaches microseconds to the nearest, a tie away from zero, in `date_trunc` and
+`date_part` as in a cast; a DATE past the TIMESTAMP range, a TIMESTAMP_MS past the range of microseconds (as a DATE
+too), and a TIMESTAMP_MS before 290309-12-22 (BC) as a TIMESTAMP, are conversion errors; a UTC-adjusted value is read
+in UTC, as the date parts read it, so DuckDB's answer differs under another session time zone; a UTC-adjusted
+TIMESTAMP_NS, which DuckDB keeps as a type of its own, casts to a DATE from its nanosecond and has no `date_trunc`,
+`date_part`, `date_diff` or cast to TIMESTAMP here: those are refused by name), `floor`, `ceil`/`ceiling`, `sqrt` and
 `round(x [, n])` of a number (a DECIMAL floors and ceils to DECIMAL(p, 0) and rounds half away from zero, in the
 precision DuckDB gives it; an integer or a DOUBLE floors and ceils to a DOUBLE; `sqrt` is a DOUBLE and NaN below zero;
 `n` is a constant, and an integer is not rounded to tens or up), `least` and `greatest` over numbers (NULLs skipped,
@@ -77,7 +80,8 @@ negative `n` from the end, an empty `sep` splitting into characters, `''` where 
 `make_date(year, month, day)` (any integers; a month or day the calendar has not, or a date past DuckDB's DATE, is an
 error) and `date_diff(part, start, end)` / `datediff` (BIGINT boundaries of the unit between two dates or timestamps:
 a month between 01-31 and 02-01, a week the day count over 7 truncated, a TIMESTAMP_NS rounded to microseconds first,
-NULL for an infinite time; `year` to `microsecond` plus `decade`, `century` and `millennium`, a constant) are the date
+NULL for an infinite time; DuckDB keeps UTC-adjusted microseconds, nanoseconds and UTC-adjusted nanoseconds apart, so
+a pair of two of them is refused, and any UTC-adjusted nanosecond argument; `year` to `microsecond` plus `decade`, `century` and `millennium`, a constant) are the date
 functions beside them, as is `strftime(t, format)` of a DATE or TIMESTAMP (the format a constant of DuckDB's
 specifiers: `%Y %y %m %d %H %I %M %S %j` and their `%-` unpadded forms, `%f %g %n %p %a %A %b %B %h %w %u %U %W %V %G
 %Z %z %c %x %X %T %%`; years print four digits from 0000 to 9999 and as many as they have beyond; infinite times print
@@ -91,6 +95,13 @@ A computed date or time (`make_date`, the casts, `date_trunc`, `epoch_ms`, `coal
 TIMESTAMP a column of it would be, in its unit and time zone, wherever it leaves: a Parquet type, CSV text, a group key,
 a `min` or `max`; JSON and JSONL print the stored integer, as for a column. Each distinct text is computed once, a dictionary-coded
 column once per entry. A DOUBLE column and a DECIMAL default (`coalesce(d, 0.0)`) coalesce to DOUBLE, as in DuckDB.
+`coalesce` of dates and times of different kinds (a DATE and a TIMESTAMP, two units, UTC-adjusted and not, a time and a
+number) is refused by name: DuckDB converts them to a common type, and answering their ticks as they are would mix
+clocks. `make_date(y, m, d)` is NULL where any of its three arguments is, a literal year included.
+A DECIMAL used as a DOUBLE (an operand of `/`, of a DOUBLE `%` when the DECIMAL remainder would need more than 38
+digits, a `CAST AS DOUBLE`) converts to the nearest double, as DuckDB's cast does, for any scale. A block comment nests
+(`/* a /* b */ c */` is one comment) and one that is never closed is an error, as in DuckDB; comments are blanked before
+any other reading of the query.
 
 **Aggregate** with `sum / count / min / max / avg / avg_state`, conditional `agg(...) FILTER (WHERE ...)`, and
 `GROUP BY`. In SQL, GROUP BY keys may be expressions (bound by value, not spelling), SELECT positions or aliases (a

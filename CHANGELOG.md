@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Review fixes for the SQL scalar functions.** Integer overflow checks (`+ - * % //` at the SQL type DuckDB resolves)
+  now apply in a GROUP BY key and under a function or `coalesce` too, as they do in a bare expression. The remainder
+  or quotient of DECIMALs that falls back to DOUBLE converts each DECIMAL to the nearest double, so equal values stay
+  equal (`0.100 % 0.1000000000000000000000000000000000000` was 0.1, it is 0). `make_date(2020, m, d)` over nullable
+  columns no longer writes an unreadable Parquet column. `CAST(t AS DATE)` of a TIMESTAMP_MS past the range of
+  microseconds is a conversion error instead of a wrapped date, as is a TIMESTAMP_MS before 290309-12-22 (BC) cast to a
+  TIMESTAMP. TIMESTAMP_NS reaches microseconds to the nearest in `date_trunc` and `date_part` as in a cast; a UTC-adjusted
+  TIMESTAMP_NS casts to a DATE from its nanosecond. **Now refused by name** (they answered wrongly or in a type DuckDB
+  does not have): `coalesce` of times of different kinds, `date_trunc`, `date_part`, `date_diff` and a cast to TIMESTAMP
+  of a UTC-adjusted TIMESTAMP_NS, and `date_diff` between UTC-adjusted microseconds, nanoseconds and UTC-adjusted
+  nanoseconds. Nested block comments are read whole, and an unterminated one is a parse error.
+
 - **Row-level math and date parts in SQL.** `floor`, `ceil`, `sqrt`, `round(x, n)`, `least` and `greatest` over a column or
   expression, and `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `isodow` and
   `dayofyear` of a date or timestamp, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB (a DECIMAL keeps

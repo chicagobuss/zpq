@@ -241,7 +241,9 @@ test "dependent group keys: nullable multi-key trees and canonical float blocks 
     const a = arena_state.allocator();
     const streaming = @import("../writer/streaming.zig");
     var sink: streaming.MemorySink = .{ .arena = a };
-    const k = [_]i32{ std.math.minInt(i32), -1, 0, 1, std.math.maxInt(i32), -1, 1, 0 };
+    // The keys below are INTEGER arithmetic, which overflows at the INTEGER range as DuckDB's does: the extremes are the
+    // ones `k - 1`, `k * 1` and `k + b` stay inside.
+    const k = [_]i32{ std.math.minInt(i32) + 1, -1, 0, 1, std.math.maxInt(i32), -1, 1, 0 };
     const b = [_]i32{ 0, 1, 1, -1, 0, 1, -1, 1 };
     const defs = [_]u32{ 1, 1, 0, 1, 1, 1, 1, 0 };
     const f = [_]f64{ 1e20, 1, -1e20, -0.0, 7, 1e-20, 11, -0.0 };
@@ -261,7 +263,7 @@ test "dependent group keys: nullable multi-key trees and canonical float blocks 
     meta.row_groups.items = rgs;
     meta.num_rows *= 16;
     const inputs = [_]Input{.{ .name = "dependent.parquet", .bytes = sink.buffer.items }};
-    for ([_][]const u8{ "k, k-1 AS km, k*k AS sq", "b, k-1 AS km, k, k+b AS kb, k*0 AS z" }) |keys| {
+    for ([_][]const u8{ "k, k-1 AS km, k*1 AS sq", "b, k-1 AS km, k, k+b AS kb, k*0 AS z" }) |keys| {
         const args: MultiAggArgs = .{
             .inputs = &inputs,
             .metas = &.{meta},

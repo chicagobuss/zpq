@@ -273,7 +273,9 @@ pub fn hashOnlyByteArray(target: AggTarget, ci: usize) bool {
 /// The LIKE that every surviving row must satisfy on `ci`: the filter itself, or a conjunct of its top-level AND.
 fn mandatoryLike(f: filter_ast.Filter, ci: usize) ?filter_ast.LikeMatch {
     switch (f) {
-        .like => |l| return if (l.col_idx == ci and !l.negate) l else null,
+        // A row the prefilter leaves empty must fail the filter again, so the empty string must fail the LIKE: for
+        // `s LIKE ''` it would not, and every rejected row would come back accepted.
+        .like => |l| return if (l.col_idx == ci and !l.negate and !filter_ast.likeMatches(l.kind, l.operand, "")) l else null,
         .and_filter => |c| {
             if (c.in_set != null or c.null_member) return null;
             for (c.children) |child| if (mandatoryLike(child, ci)) |l| return l;

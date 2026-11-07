@@ -1699,3 +1699,23 @@ test "a streamed string the fold also reads is kept by the first pass and replay
     }
 }
 
+test "a LIKE the empty string satisfies does not blank the rows it rejects" {
+    const fixture = "ci/fixtures/parquet/count_certificate_plain.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // `s` holds no empty string. A rejected value left as "" would be accepted again by `LIKE ''`, which the filter
+    // re-evaluates; the filter-only string and the one min(s) also reads must both answer no rows.
+    for ([_][]const u8{ "count(*) AS c", "min(s) AS lo, count(*) AS c" }) |aggregate| {
+        const got = try sortedGroupText(gpa, ctx, .{
+            .inputs = &.{fixture},
+            .filter = "f >= 0 AND s LIKE ''",
+            .aggregate = aggregate,
+            .group_by = "f",
+            .parallelism = 1,
+        });
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings("", got);
+    }
+}
+

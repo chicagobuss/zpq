@@ -91,8 +91,8 @@ The gates are build.zig steps; CI and the justfile call them.
 | Tier | Command | Stages |
 |---|---|---|
 | edit | `zig build check -Dtier=edit [-Dtest-filter=X]` | core unit tests (ReleaseSafe) |
-| commit | `zig build check -Dtier=commit` | fixtures, core unit tests, the runner's self-test, the bench's rules, every commit-tier case file against the cached oracle |
-| full | `zig build check -Dtier=full [-Dshard=NAME]` | fixtures, every unit-test binary in Debug, Lambda integration, the self-tests, every case uncached, the corpus, decode errors and hardware parity, ClickBench, path parity, OS contracts, libzpq |
+| commit | `zig build check -Dtier=commit` | fixtures, core unit tests, the runner's self-test, the bench's rules, `cross-macos` (the CLI, the runner and the core tests type-checked for the shipped Macs, nothing run: `zig build cross-macos`), every commit-tier case file against the cached oracle |
+| full | `zig build check -Dtier=full [-Dshard=NAME]` | fixtures, every unit-test binary in Debug, Lambda integration, the self-tests, every case uncached, the corpus, decode errors and hardware parity, ClickBench, path parity, OS contracts, `cross-macos`, libzpq |
 | fleet | `tools/check/fleet.sh [--full]` | each push's architecture check over the fleet; with `--full`, also the full tier's shards (tools/check/shards.json) |
 
 Each stage runs through `zpq-check stage` under its timeout (a hang fails the stage, its process group killed) and

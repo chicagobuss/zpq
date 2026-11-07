@@ -487,6 +487,96 @@
    }
   },
   {
+   "id": "expr:same-lane-columns-with-nulls",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(b) AS sb FROM '{fixture:exprfix}' WHERE b >= z"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(b) AS sb FROM '{fixture:exprfix}' WHERE b >= z"
+   }
+  },
+  {
+   "id": "expr:double-against-itself",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE x = x AND a IS NOT NULL"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE x = x AND a IS NOT NULL"
+   }
+  },
+  {
+   "id": "expr:dates-not-equal",
+   "fixture": "exprfix",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE d1 <> d2 AND z = 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:exprfix}' WHERE d1 <> d2 AND z = 3"
+   }
+  },
+  {
    "id": "expr:refuse:date-against-timestamp",
    "fixture": "exprfix",
    "cli": [

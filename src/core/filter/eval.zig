@@ -750,6 +750,7 @@ fn asScaled(v: Value, from: u8, to: u8) i256 {
 /// `x.left op x.right` over the selected rows (`ast.ExprCompare`), both sides evaluated over those rows only, so a
 /// fault (`1 / 0`) in a row an earlier conjunct dropped is none. A NULL on either side drops the row.
 fn evalExprCompare(x: ast.ExprCompare, batch: *const Batch, sel: *selection.SelectionVector, column_lookup: []const ?usize, arena: std.mem.Allocator) Error!void {
+    if (try compareColumns(x, batch, sel, column_lookup)) return;
     const wanted = batch.restrictedTo(sel);
     const l = try expr_eval.evalGroupKeyExpr(arena, &wanted, column_lookup, x.left.*);
     const r = try expr_eval.evalGroupKeyExpr(arena, &wanted, column_lookup, x.right.*);
@@ -770,6 +771,38 @@ fn evalExprCompare(x: ast.ExprCompare, batch: *const Batch, sel: *selection.Sele
             .i64 => ast.applyOp(i64, a.?.int, x.op, b.?.int),
         };
         if (!keep) sel.set(row, false);
+    }
+}
+
+/// Two columns of one integer or float lane compared in place at the selected rows (`l_commitdate < l_receiptdate`):
+/// nothing is widened or copied. False when the sides are anything else, for the general path.
+fn compareColumns(x: ast.ExprCompare, batch: *const Batch, sel: *selection.SelectionVector, column_lookup: []const ?usize) Error!bool {
+    if (x.left.* != .col_ref or x.right.* != .col_ref) return false;
+    const lc = x.left.col_ref;
+    const rc = x.right.col_ref;
+    if (lc.expr_type != rc.expr_type or (lc.expr_type != .i64 and lc.expr_type != .f64)) return false;
+    // An unsigned column's lane holds raw bits a signed compare would misorder.
+    if (lc.unsigned_32 or rc.unsigned_32 or lc.unsigned_64 or rc.unsigned_64) return false;
+    const l = batch.cols[column_lookup[lc.col_idx] orelse return error.BadColumn];
+    const r = batch.cols[column_lookup[rc.col_idx] orelse return error.BadColumn];
+    if (std.meta.activeTag(l) != std.meta.activeTag(r) or l.codes() != null or r.codes() != null) return false;
+    switch (l) {
+        inline .i32, .i64, .f32, .f64 => |lv, tag| {
+            const rv = @field(r, @tagName(tag));
+            if (lv.max_rep > 0 or rv.max_rep > 0) return error.NestedFilterNotSupported;
+            const T = @TypeOf(lv.values[0]);
+            for (sel.mask, 0..) |*w, wi| {
+                var bits = w.*;
+                while (bits != 0) : (bits &= bits - 1) {
+                    const row = wi * 64 + @ctz(bits);
+                    const keep = !rowIsNull(lv.def_levels, lv.max_def, row) and !rowIsNull(rv.def_levels, rv.max_def, row) and
+                        ast.applyOp(T, lv.values[row], x.op, rv.values[row]);
+                    if (!keep) w.* &= ~(@as(u64, 1) << @intCast(row & 63));
+                }
+            }
+            return true;
+        },
+        else => return false,
     }
 }
 

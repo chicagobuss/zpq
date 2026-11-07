@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Re-encoded string columns read faster in other engines.** The v2 writer now keeps a string column's dictionary
+  while it stays within a quarter of the chunk's bytes (and within one dictionary page), and otherwise writes PLAIN unless
+  a delta layout compresses smaller. Before, wide columns such as ClickBench's URL and Title fell to DELTA_BYTE_ARRAY,
+  which PyArrow, DuckDB and Polars read 10–50% slower than the original file. Values don't change; file bytes do.
 - **String filters read dictionaries, not rows.** A filter on a dictionary-encoded string column (`=`, `<>`, `IN`) now
   compares each dictionary entry once and selects rows by code, whether or not the file has a page index. On a Ryzen 9
   9950X, PDS-H-shaped filters such as `l_shipmode IN ('MAIL', 'SHIP')` with a date range are 1.8–6.3× faster.

@@ -1251,7 +1251,7 @@ fn resultOrder(
         // NULLs sort last by default, in either direction, so only NULLS FIRST changes the order.
         const expr = term.*.u.order_term.expr orelse return error.SqlParseError;
         const column = try orderColumn(sel, lp_arena, select_cols, expr) orelse
-            select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, .order_by, hidden, lower, select_cols.len, post);
+            (select_cols.len + try hiddenTerm(allocator, sel, lp_arena, expr, has_group_by, .order_by, hidden, lower, select_cols.len, post));
         key.* = .{
             .column = column,
             .descending = term.*.u.order_term.direction == c.LP_SORT_DESC,

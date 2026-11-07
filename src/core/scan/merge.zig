@@ -162,7 +162,7 @@ pub fn mergesInPlace(calls: []const expr_agg.AggCall, cut: ?ResultCut) bool {
 /// it now is: a fresh count(DISTINCT) state takes a count as it is, so the merge's every value is the same.
 /// A merged-in-place slot's `idx`: its source table above its group.
 fn packRef(ref: MergeGroupRef) usize {
-    return @as(usize, ref.table) << 32 | ref.group;
+    return (@as(usize, ref.table) << 32) | ref.group;
 }
 
 fn inPlaceAccs(
@@ -945,7 +945,7 @@ pub fn premergeLargeDistinctSets(
         var it = large_keys.keyIterator();
         while (it.next()) |k_ptr| {
             const key = k_ptr.*;
-            var sources: std.ArrayListUnmanaged(*const expr_agg.DistinctSet) = .empty;
+            var sources: std.ArrayList(*const expr_agg.DistinctSet) = .empty;
             var is_u64 = true;
 
             for (tables) |*gt| {

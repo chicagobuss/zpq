@@ -69,12 +69,12 @@ fn inlineKey(key: ?[]const u8, comptime tagged: bool) error{ExceededMemoryBudget
         if (k.len > 8) hi = std.mem.readInt(u64, k[k.len - 8 ..][0..8], .little) >> @intCast(8 * (16 - k.len));
     } else if (k.len >= 4) {
         const tail: u64 = std.mem.readInt(u32, k[k.len - 4 ..][0..4], .little);
-        lo = std.mem.readInt(u32, k[0..4], .little) | (if (k.len > 4) tail >> @intCast(8 * (8 - k.len)) else 0) << 32;
+        lo = std.mem.readInt(u32, k[0..4], .little) | ((if (k.len > 4) tail >> @intCast(8 * (8 - k.len)) else 0) << 32);
     } else for (k, 0..) |b, i| {
         lo |= @as(u64, b) << @intCast(8 * i);
     }
     if (tagged) hi |= @as(u64, k.len) << 56;
-    return @as(u128, hi) << 64 | lo;
+    return (@as(u128, hi) << 64) | lo;
 }
 
 /// Partition and probe hash of an inline identity; never part of identity or order.
@@ -470,7 +470,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 };
                 if (cached_full) if (!l.cache_disabled and !l.full_bypass and l.full_cache.entries.len != 0) {
                     // Column nullability is recorded per row: a partial's value-NULL bit means only all-NULL.
-                    l.nulls |= @intFromBool(key == null) | @as(u32, @intFromBool(value == null)) << 1;
+                    l.nulls |= @intFromBool(key == null) | (@as(u32, @intFromBool(value == null)) << 1);
                     const probe = l.cache_seen < l.state.cache_trial_rows;
                     if (probe) l.cache_seen += 1;
                     const hit = try l.full_cache.push(.{
@@ -505,22 +505,22 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                 h: u64,
                 weight: u32,
             ) error{ExceededMemoryBudget}!void {
-                var flags: u32 = (@as(u32, @truncate(h)) & 0x3fffffff) << 2 | @intFromBool(kn);
+                var flags: u32 = ((@as(u32, @truncate(h)) & 0x3fffffff) << 2) | @intFromBool(kn);
                 if (has_value) flags |= @as(u32, @intFromBool(value == null)) << 1;
                 if (kind == .full) l.nulls |= flags & 3;
                 const weighted = (cached_count or cached_full) and weight > 1;
-                if (weighted) flags = if (has_value) weight << 2 | (flags & 3) else weight << 1 | @intFromBool(kn);
+                if (weighted) flags = if (has_value) (weight << 2) | (flags & 3) else (weight << 1) | @intFromBool(kn);
                 const r: Record = if (has_value)
                     .{
                         .key = bits,
                         .value = value orelse 0,
-                        .ordinal = ordinal | len << ordinal_bits | @as(u32, if (weighted) partial else 0),
+                        .ordinal = ordinal | (len << ordinal_bits) | @as(u32, if (weighted) partial else 0),
                         .flags = flags,
                     }
                 else
                     .{
                         .key = bits,
-                        .ordinal = ordinal | len << ordinal_bits | @as(u32, if (weighted) partial else 0),
+                        .ordinal = ordinal | (len << ordinal_bits) | @as(u32, if (weighted) partial else 0),
                         .flags = flags,
                     };
                 const p: usize = @intCast(h >> l.state.shift);
@@ -2362,7 +2362,7 @@ test "hot integer COUNT weighted records keep high counts ordinals NULL and zero
     const early = (1 << 30) + 7;
     const late = (1 << 31) - 2;
     const weight = (1 << 31) - 3;
-    O.foldRecord(.{ .key = 0, .ordinal = late | null_key, .flags = weight << 1 | 1 }, &groups, &slots, 0, &n);
+    O.foldRecord(.{ .key = 0, .ordinal = late | null_key, .flags = (weight << 1) | 1 }, &groups, &slots, 0, &n);
     O.foldRecord(.{ .key = 0, .ordinal = early | null_key, .flags = 4 << 1 }, &groups, &slots, 0, &n);
     O.foldRecord(.{ .key = 0, .ordinal = early, .flags = 1 }, &groups, &slots, 0, &n);
     try std.testing.expectEqual(@as(usize, 2), n);

@@ -44,7 +44,7 @@ pub fn realtimeS() i64 {
 /// Sleep for `ns` nanoseconds, or until a signal cuts it short. The raw syscall on Linux; libc elsewhere, where a
 /// raw Linux syscall is not one.
 pub fn sleepNs(ns: u64) void {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         var ts: std.os.linux.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
         _ = std.os.linux.nanosleep(&ts, null);
     } else {

@@ -19,7 +19,7 @@ pub const PrivateDecode = struct {
         limit: ?usize,
         dictionary_peak: u64,
     ) !PrivateDecode {
-        const share = @min(limit orelse parent.limit / 2, parent.limit / 4) / n;
+        const share = @min(limit orelse (parent.limit / 2), parent.limit / 4) / n;
         // A floor consumed by a dictionary strands the sample on tiny slices even when it later cancels.
         // Decline before reserving runs or reading rows; leave room for a slice beside the fixed dictionary.
         if (share < @max(huge_pages.huge_page_size, dictionary_peak +| parent.block)) return .{};

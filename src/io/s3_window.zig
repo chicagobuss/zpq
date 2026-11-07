@@ -19,7 +19,7 @@ pub const Gate = scan.RowGroupGate;
 
 /// Whether the window runs here. Elsewhere the caller never builds one, and the system calls below are not compiled
 /// for the target (their std wrappers are Linux-only).
-pub const supported = builtin.os.tag == .linux;
+pub const supported = builtin.target.os.tag == .linux;
 
 pub const page = std.heap.page_size_min;
 
@@ -413,7 +413,7 @@ fn stopCopied(gpa: std.mem.Allocator, fetcher: *Fetcher(s3.Pool(1))) void {
 }
 
 test "a skipped copied-only group does not release a charge it never took" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest; // where the window runs (`supported`)
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest; // where the window runs (`supported`)
     const gpa = std.testing.allocator;
     var bufs: [3][]align(page) u8 = undefined;
     for (&bufs) |*b| b.* = try mapBuffer(page);
@@ -443,7 +443,7 @@ test "a skipped copied-only group does not release a charge it never took" {
 }
 
 test "a copied-only group dropped after it is admitted releases its charge" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest; // where the window runs (`supported`)
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest; // where the window runs (`supported`)
     const gpa = std.testing.allocator;
     const buf = try mapBuffer(page);
     defer unmapBuffer(buf);
@@ -464,7 +464,7 @@ test "a copied-only group dropped after it is admitted releases its charge" {
 }
 
 test "only a reader that may stop early starts its fetch at one row group" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     for ([_]bool{ false, true }) |slow| {
         var bufs: [4][]align(page) u8 = undefined;

@@ -12,7 +12,7 @@ pub const exit_code: u8 = 3;
 pub const Feature = enum { avx, avx2, bmi1, bmi2, fma, f16c, lzcnt, movbe };
 
 /// Whether this build assumes x86-64-v3, so must check for it.
-pub const checks = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHasAll(builtin.cpu.features, .{
+pub const checks = builtin.target.cpu.arch == .x86_64 and std.Target.x86.featureSetHasAll(builtin.target.cpu.features, .{
     .avx, .avx2, .bmi, .bmi2, .fma, .f16c, .lzcnt, .movbe,
 });
 
@@ -20,14 +20,14 @@ pub const checks = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHasA
 /// feature they lack, in the order the level lists them. AVX counts only when the OS saves the YMM state.
 pub fn firstMissing(leaf1_ecx: u32, leaf7_ebx: u32, ext_ecx: u32, xcr0: u32) ?Feature {
     const has = std.EnumArray(Feature, bool).init(.{
-        .avx = leaf1_ecx >> 28 & 1 == 1 and leaf1_ecx >> 27 & 1 == 1 and xcr0 & 6 == 6,
-        .avx2 = leaf7_ebx >> 5 & 1 == 1,
-        .bmi1 = leaf7_ebx >> 3 & 1 == 1,
-        .bmi2 = leaf7_ebx >> 8 & 1 == 1,
-        .fma = leaf1_ecx >> 12 & 1 == 1,
-        .f16c = leaf1_ecx >> 29 & 1 == 1,
-        .lzcnt = ext_ecx >> 5 & 1 == 1,
-        .movbe = leaf1_ecx >> 22 & 1 == 1,
+        .avx = (leaf1_ecx >> 28) & 1 == 1 and (leaf1_ecx >> 27) & 1 == 1 and xcr0 & 6 == 6,
+        .avx2 = (leaf7_ebx >> 5) & 1 == 1,
+        .bmi1 = (leaf7_ebx >> 3) & 1 == 1,
+        .bmi2 = (leaf7_ebx >> 8) & 1 == 1,
+        .fma = (leaf1_ecx >> 12) & 1 == 1,
+        .f16c = (leaf1_ecx >> 29) & 1 == 1,
+        .lzcnt = (ext_ecx >> 5) & 1 == 1,
+        .movbe = (leaf1_ecx >> 22) & 1 == 1,
     });
     for (std.enums.values(Feature)) |f| if (!has.get(f)) return f;
     return null;
@@ -78,7 +78,7 @@ pub fn require() void {
         const l7 = if (cpuid(0)[0] >= 7) cpuid(7) else [4]u32{ 0, 0, 0, 0 };
         const ext = if (cpuid(0x80000000)[0] >= 0x80000001) cpuid(0x80000001) else [4]u32{ 0, 0, 0, 0 };
         var xcr0: u32 = 0;
-        if (l1[2] >> 27 & 1 == 1) xcr0 = asm volatile ("xgetbv"
+        if ((l1[2] >> 27) & 1 == 1) xcr0 = asm volatile ("xgetbv"
             : [lo] "={eax}" (-> u32),
             : [x] "{ecx}" (@as(u32, 0)),
             : .{ .edx = true });
@@ -93,8 +93,8 @@ pub fn require() void {
 const testing = std.testing;
 
 test "each missing x86-64-v3 feature is named, first by the level's order, and the compat archive offered" {
-    const l1: u32 = 1 << 28 | 1 << 27 | 1 << 12 | 1 << 29 | 1 << 22;
-    const l7: u32 = 1 << 5 | 1 << 3 | 1 << 8;
+    const l1: u32 = (1 << 28) | (1 << 27) | (1 << 12) | (1 << 29) | (1 << 22);
+    const l7: u32 = (1 << 5) | (1 << 3) | (1 << 8);
     const ext: u32 = 1 << 5;
     try testing.expectEqual(@as(?Feature, null), firstMissing(l1, l7, ext, 6));
     try testing.expectEqual(@as(?Feature, .avx), firstMissing(l1, l7, ext, 0)); // the OS does not save YMM

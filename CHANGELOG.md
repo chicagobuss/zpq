@@ -42,6 +42,7 @@
   INTERVAL anywhere else and a fraction of a whole-number unit are refused by name, never answered. Constants keep DuckDB's
   types and ranges: an integer takes the narrowest type that holds it after its sign, an INTERVAL component its field's width,
   a TIMESTAMP its year-294247 limit, a decimal its 38 digits, and what DuckDB refuses is refused, never wrapped or aborted on.
+- **zpq builds with any Zig 0.17.x patch release,** not only 0.17.0, so 0.17.1 can be adopted when it ships.
 - **The Lambda fan-out coordinator (`tools/serverless/fanout.py`) is faster.** 0.5.1's coordinator asked the worker for its
   capabilities and prepared the plan from every input's footer, one after the other, before any worker started, which
   added 0.3–0.7 s per query. It now caches the capability answer for a published worker version, prepares the plan

@@ -41,7 +41,7 @@ sudo apt install ./zpq_0.5.1_amd64.deb      # or: sudo dnf install ./zpq-0.5.1-1
 
 The default Linux x86_64 build needs AVX2; on older CPUs use the `-compat` build.
 
-**Build it yourself.** All you need is Zig 0.17.0: Zig's bundled clang builds the C codecs, and the first build
+**Build it yourself.** All you need is a Zig 0.17.x release: Zig's bundled clang builds the C codecs, and the first build
 fetches checksum-pinned BoringSSL prebuilts. Cross-compiling is one flag.
 
 ```bash

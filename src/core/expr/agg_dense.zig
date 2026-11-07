@@ -1989,7 +1989,7 @@ test "dense numeric scratch covers tracked capped coded histograms and INT32 dic
         var gids: [ids]u32 = undefined;
         var accs: [ids * calls.len]Accumulator = undefined;
         for (&codes, &comp, 0..) |*code, *cp, r| {
-            code.* = @intCast(r * 101 % dict.len);
+            code.* = @intCast((r * 101) % dict.len);
             cp.* = @intCast(r % ids);
         }
         for (&gids, 0..) |*gid, i| {

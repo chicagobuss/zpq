@@ -60,7 +60,7 @@ pub fn msdProbeHeaders(args: MultiAggArgs, metas: []const schema.FileMetaData, w
         if (off < 0 or cm.total_compressed_size < 0) return null;
         if (args.inputs[item.file].readerBacked()) bytes +|= @as(u64, @min(@as(u64, @intCast(cm.total_compressed_size)), 4096)) + 8192;
     };
-    if (bytes > args.probe_cap orelse ndv.probeCap(args.max_memory)) return null;
+    if (bytes > (args.probe_cap orelse ndv.probeCap(args.max_memory))) return null;
     if (!explain) if (args.dict_probe) |probe| for (work) |item| for (keys) |key| {
         const cm = metas[item.file].row_groups.items[item.rg].columns.items[key.col_ref.col_idx].meta_data.?;
         const start: u64 = @intCast(cm.dictionary_page_offset orelse cm.data_page_offset);
@@ -681,7 +681,7 @@ fn byteTopRowsTrial(a: std.mem.Allocator) !void {
     defer output.deinit(a);
     // Present SUMs (bit 30); key lengths in the high ordinal bits; bit 31 is a NULL key.
     const groups = [_]owner_groups.Full.Group{
-        .{ .key = 'a', .sum = @as(i128, std.math.maxInt(i64)) * 2, .count = 1 << 30, .first = 0 | 2 << 27 },
+        .{ .key = 'a', .sum = @as(i128, std.math.maxInt(i64)) * 2, .count = 1 << 30, .first = 0 | (2 << 27) },
         .{ .key = 0, .sum = -7, .count = 1 << 30, .first = 1 },
         .{ .key = 0, .count = 1 << 31, .first = 2 },
     };

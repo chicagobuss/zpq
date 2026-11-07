@@ -55,7 +55,7 @@ pub const SPLIT_THRESHOLD: usize = 24 * 1024 * 1024;
 /// Every connection's TLS stream costs CPU, and on a 3008 MB (2-vCPU) Graviton sandbox 16 at once took several times
 /// the user CPU of 8 for the same bytes and finished cold scans later; x86_64 finished them sooner at 16. Only that
 /// memory size was measured, so the cap does not follow the vCPU count.
-pub const S3_IN_FLIGHT: usize = if (builtin.cpu.arch == .aarch64) 8 else 16;
+pub const S3_IN_FLIGHT: usize = if (builtin.target.cpu.arch == .aarch64) 8 else 16;
 /// Most data ranges in flight anywhere else, and the size of the connection pool. Over a link with a long round trip
 /// (a laptop or a server far from the bucket), each request's first byte is the cost, so throughput follows how many
 /// are in flight: 16 left most of a home link idle.
@@ -2071,7 +2071,7 @@ test "a server that always stalls fails the request with the timeout once the re
 }
 
 test "S3_IN_FLIGHT is 8 on aarch64 and 16 on x86_64" {
-    try testing.expectEqual(@as(usize, if (builtin.cpu.arch == .aarch64) 8 else 16), S3_IN_FLIGHT);
+    try testing.expectEqual(@as(usize, if (builtin.target.cpu.arch == .aarch64) 8 else 16), S3_IN_FLIGHT);
     try testing.expect(S3_FIRST_WAVE <= S3_IN_FLIGHT);
 }
 

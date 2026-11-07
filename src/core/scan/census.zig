@@ -1069,7 +1069,7 @@ pub fn firstAppearanceCut(
     for (seen.values()[0..n]) |first| {
         const fp = identity.fingerprint(tables[first.table].routeHash(first.group));
         set.map.putAssumeCapacity(fp, {});
-        filter[fp % (1 << expr_agg.FingerprintSet.filter_bits) / 64] |=
+        filter[(fp % (1 << expr_agg.FingerprintSet.filter_bits)) / 64] |=
             @as(u64, 1) << @intCast(fp % 64);
     }
     // The first scan only discovered keys. Replay every row once for complete counts/payloads; hash collisions

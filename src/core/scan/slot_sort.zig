@@ -135,7 +135,7 @@ const SlotRadix = struct {
     /// `first`'s row group ordinal right above its row index's `row_bits`: the same order on fewer bits.
     fn key(s: *const SlotRadix, first: u64) u64 {
         const row_mask = (@as(u64, 1) << s.row_bits) - 1;
-        return (first >> 32) << s.row_bits | (first & row_mask);
+        return ((first >> 32) << s.row_bits) | (first & row_mask);
     }
 
     fn digit(s: *const SlotRadix, first: u64) usize {

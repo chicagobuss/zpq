@@ -114,7 +114,7 @@ fn foldTrial(a: std.mem.Allocator) !void {
         const id = i % 257;
         // The high half alone separates these keys, including zero and all-one low halves.
         try t.append(a, .{
-            .key = @as(u128, id) << 64 | std.math.maxInt(u64),
+            .key = (@as(u128, id) << 64) | std.math.maxInt(u64),
             .ordinal = @intCast(257 * 3 - i),
             .weight = 1,
             .values = .{ if (id == 0) 0 else -7, 1 },

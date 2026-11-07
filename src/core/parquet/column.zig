@@ -346,9 +346,9 @@ fn ValidityExpand(comptime T: type) type {
     };
 }
 
-const has_avx2 = builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2);
+const has_avx2 = builtin.target.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.target.cpu.features, .avx2);
 /// Advanced SIMD is part of every ARMv8-A core, so every aarch64 build takes the NEON step.
-const has_neon = builtin.cpu.arch == .aarch64 and std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon);
+const has_neon = builtin.target.cpu.arch == .aarch64 and std.Target.aarch64.featureSetHas(builtin.target.cpu.features, .neon);
 
 /// One AVX2 expand step: the `E` slots of a 256-bit register at `dst` from the next `popcount(m)` values at `src`,
 /// through `vpermd` with dword indices from a comptime table of every mask. A null slot's indices carry the sign bit,
@@ -1454,7 +1454,7 @@ pub fn ColumnChunkReader(comptime T: type) type {
 
         /// PLAIN fixed-width values are their little-endian bytes, so a little-endian target can read them in place.
         const plain_is_le_bytes = (T == i32 or T == i64 or T == f32 or T == f64) and
-            builtin.cpu.arch.endian() == .little;
+            builtin.target.cpu.arch.endian() == .little;
 
         /// PLAIN fixed-width slots the row gate kept, in place. Unselected slots stay the type default and their
         /// bytes are not copied. False when the page is not a partial PLAIN fixed-width gate, so the caller decodes
@@ -3390,7 +3390,7 @@ test "validity expand takes the target's step: AVX2, NEON for 4- and 8-byte slot
         const S = @sizeOf(T);
         const want: type = if (has_avx2 and (S == 4 or S == 8 or S == 16))
             Avx2Expand(T)
-        else if (builtin.cpu.arch == .aarch64 and (S == 4 or S == 8))
+        else if (builtin.target.cpu.arch == .aarch64 and (S == 4 or S == 8))
             NeonExpand(T)
         else
             void;

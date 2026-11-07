@@ -54,7 +54,7 @@ pub const StatsColumn = struct {
             .dictionary_page_offset = null,
             .statistics = stats,
         } });
-        var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+        var items: std.ArrayList(schema.SchemaElement) = .empty;
         try items.append(a, .{
             .type = null,
             .type_length = null,

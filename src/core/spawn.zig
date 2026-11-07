@@ -268,7 +268,7 @@ pub const Pool = struct {
     }
 
     fn currentPid() std.posix.pid_t {
-        return if (builtin.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
+        return if (builtin.target.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
     }
 
     /// Threads the pool holds, idle or busy.

@@ -170,7 +170,7 @@ pub fn Full(comptime Group: type) type {
                         const p = t.cursor.fetchAdd(1, .monotonic);
                         if (p >= t.state.pieces.len) return;
                         for (t.state.pieces[p].groups, 0..) |g, i| {
-                            const index = @as(u64, p) << 32 | @as(u32, @intCast(i));
+                            const index = (@as(u64, p) << 32) | @as(u32, @intCast(i));
                             t.output[t.offsets[p] + i] = make(g, index);
                         }
                     }

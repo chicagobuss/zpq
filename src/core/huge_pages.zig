@@ -125,7 +125,7 @@ pub const Region = struct {
 
     fn map(child: std.mem.Allocator, reserve: usize) Region {
         var r: Region = .{ .child = child };
-        if (builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) return r;
+        if (builtin.target.os.tag != .linux and !builtin.target.os.tag.isDarwin()) return r;
         const len = std.mem.alignForward(usize, reserve, huge_page_size) + huge_page_size;
         var flags: std.posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
         if (@hasField(std.posix.MAP, "NORESERVE")) flags.NORESERVE = true;
@@ -420,15 +420,15 @@ pub fn drainPairs() void {
 }
 
 fn currentPid() std.posix.pid_t {
-    return if (builtin.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
+    return if (builtin.target.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
 }
 
 /// Drop `span`'s pages now. Linux keeps the mapping and its huge-page advice; Darwin's MADV_DONTNEED may keep the
 /// pages resident, so the span is mapped afresh in place (a failed remap leaves them until `deinit`).
 fn release(span: []align(std.heap.page_size_min) u8) void {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         _ = std.os.linux.madvise(span.ptr, span.len, std.os.linux.MADV.DONTNEED);
-    } else if (builtin.os.tag.isDarwin()) {
+    } else if (builtin.target.os.tag.isDarwin()) {
         var flags: std.posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true };
         if (@hasField(std.posix.MAP, "NORESERVE")) flags.NORESERVE = true;
         _ = std.posix.mmap(span.ptr, span.len, .{ .READ = true, .WRITE = true }, flags, -1, 0) catch {};
@@ -497,7 +497,7 @@ fn adviceFor(mode: []const u8, buddy: []const u8, expected: u64) bool {
 }
 
 fn advise(block: []u8) void {
-    if (builtin.os.tag != .linux or !adviceEnabled()) return;
+    if (builtin.target.os.tag != .linux or !adviceEnabled()) return;
     const lo = std.mem.alignForward(usize, @intFromPtr(block.ptr), huge_page_size);
     const hi = std.mem.alignBackward(usize, @intFromPtr(block.ptr) + block.len, huge_page_size);
     if (hi <= lo) return;
@@ -573,7 +573,7 @@ test "Region.trim hands back the pages past the newest block that an earlier pha
     try std.testing.expectEqual(region.end, region.touched);
     const page = std.heap.pageSize();
     // Nothing past the newest block is resident any more (Linux reports residency per page through mincore).
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         const span = big[huge_page_size..][0..huge_page_size];
         var vec: [huge_page_size / 4096]u8 = undefined;
         const rc = std.os.linux.syscall3(.mincore, @intFromPtr(span.ptr), span.len, @intFromPtr(&vec));
@@ -675,7 +675,7 @@ fn rssForTest(addr: usize, len: usize) !usize {
 }
 
 test "RSS range excludes resident neighbours in the same VMA" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
     const flags: std.posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
     const mapping = try std.posix.mmap(null, 4 * page, .{ .READ = true, .WRITE = true }, flags, -1, 0);
@@ -693,7 +693,7 @@ test "RSS range excludes resident neighbours in the same VMA" {
 }
 
 test "a worker's pair of regions shares its first huge page, counted once, and holds no more than it draws past it" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const huge = huge_page_size;
     const span = Region.pair_scratch_span;
     var budget: core_memory.SharedBudget = .{ .limit = 32 * huge };
@@ -799,7 +799,7 @@ test "THP advice avoids synchronous compaction without enough free huge blocks" 
 }
 
 test "retired pairs return every charge and serve the next take on the same mapping" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     drainPairs();
     defer drainPairs();
     var budget: core_memory.SharedBudget = .{ .limit = 64 * huge_page_size };
@@ -837,7 +837,7 @@ test "retired pairs return every charge and serve the next take on the same mapp
 }
 
 test "a pair whose arena still holds spilled blocks is unmapped, not kept" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     drainPairs();
     defer drainPairs();
     var pair = takePair(std.testing.allocator, 2 * huge_page_size);

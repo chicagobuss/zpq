@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) !void {
         .link_libcpp = true,
         .pic = pic,
     });
-    var flags: std.ArrayListUnmanaged([]const u8) = .empty;
+    var flags: std.ArrayList([]const u8) = .empty;
     try flags.appendSlice(b.allocator, &.{
         "-std=c++17",
         "-DHAVE_CONFIG_H",

@@ -215,7 +215,7 @@ fn coalesceDispatchInner(
     const flight = @max(in_flight, 1);
     var count = n;
     for (gaps.items) |g| {
-        if (std.math.divCeil(usize, count, flight) catch unreachable <= 1) break;
+        if ((std.math.divCeil(usize, count, flight) catch unreachable) <= 1) break;
         if (visits) |v| v.* += 1;
         const left = findRoot(parent, g.left);
         const right = findRoot(parent, g.left + 1);

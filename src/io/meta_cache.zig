@@ -52,7 +52,7 @@ pub const Entry = struct {
     footer_bytes: []u8,
     /// Owned. Byte ranges of this version of the object kept for reuse (whole Bloom filters), keyed by offset. The
     /// ETag that revalidates the footer vouches for them too.
-    blobs: std.ArrayListUnmanaged(Blob) = .empty,
+    blobs: std.ArrayList(Blob) = .empty,
     /// LRU ordering — appended to the tail on insert/touch.
     lru_node: std.DoublyLinkedList.Node = .{},
 };

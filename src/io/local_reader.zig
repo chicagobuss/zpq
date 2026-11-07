@@ -101,7 +101,7 @@ pub const Policy = struct {
             .auto => {},
         }
         if (resident >= warm_resident) return .{ .mode = .mmap, .reason = .cached };
-        if (builtin.os.tag != .linux) return .{ .mode = .mmap, .reason = .not_linux };
+        if (builtin.target.os.tag != .linux) return .{ .mode = .mmap, .reason = .not_linux };
         const cold = resident < cold_resident;
         if (cold and !self.cache and uringAvailable()) return .{ .mode = .uring, .reason = .cold_direct };
         const fill = self.cache and cold;
@@ -174,7 +174,7 @@ var uring_probe: std.atomic.Value(u8) = .init(0); // 0 unknown, 1 yes, 2 no
 
 /// Whether an io_uring can be set up here: seccomp (containers, sandboxes) or `kernel.io_uring_disabled` can refuse it.
 pub fn uringAvailable() bool {
-    if (builtin.os.tag != .linux) return false;
+    if (builtin.target.os.tag != .linux) return false;
     switch (uring_probe.load(.monotonic)) {
         1 => return true,
         2 => return false,
@@ -244,7 +244,7 @@ pub fn sampleRanges(
     bytes: []align(std.heap.page_size_min) const u8,
     ranges: []const Range,
 ) Residency {
-    if (builtin.os.tag != .linux or bytes.len == 0 or ranges.len == 0) return .{};
+    if (builtin.target.os.tag != .linux or bytes.len == 0 or ranges.len == 0) return .{};
     const page = pageLen();
     const limit = std.mem.alignForward(u64, bytes.len, page);
     const aligned = gpa.alloc(Range, ranges.len) catch return .{};
@@ -1409,7 +1409,7 @@ fn testFile(tmp: *testing.TmpDir, name: []const u8, data: []const u8, buf: []u8)
 }
 
 test "every backend reads exactly the planned bytes, row group by row group, within any window" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var prng = std.Random.DefaultPrng.init(0x10ad);
@@ -1464,7 +1464,7 @@ test "every backend reads exactly the planned bytes, row group by row group, wit
 }
 
 test "probed ranges are read first, once, and given back with their row groups" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var prng = std.Random.DefaultPrng.init(0x9e0b);
@@ -1529,7 +1529,7 @@ test "probed ranges are read first, once, and given back with their row groups" 
 }
 
 test "an abandoned reader stops, gives its pages back, and still tears down" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 1 << 20);
@@ -1563,7 +1563,7 @@ test "an abandoned reader stops, gives its pages back, and still tears down" {
 }
 
 test "a failed probe fails planning's wait and every row group's" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 1 << 20);
@@ -1593,7 +1593,7 @@ test "a failed probe fails planning's wait and every row group's" {
 }
 
 test "a failed read fails the row groups waiting on it, and teardown neither hangs nor leaks" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 1 << 20);
@@ -1628,7 +1628,7 @@ test "a failed read fails the row groups waiting on it, and teardown neither han
 }
 
 test "a row group's release keeps pages other row groups' ranges still cover" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var prng = std.Random.DefaultPrng.init(0x1d8);
@@ -1683,7 +1683,7 @@ test "a row group's release keeps pages other row groups' ranges still cover" {
 }
 
 test "an allocation failing anywhere in open, plan or start leaks nothing and leaves no thread behind" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 256 << 10);
@@ -1710,7 +1710,7 @@ test "an allocation failing anywhere in open, plan or start leaks nothing and le
 }
 
 test "threads whose ring fails to set up read with pread, and say so" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     if (!uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1754,7 +1754,7 @@ test "threads whose ring fails to set up read with pread, and say so" {
 }
 
 test "a direct file whose rings never start is counted through the page cache" {
-    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 128 << 10);
@@ -1809,7 +1809,7 @@ fn virtualBytesForTest() !u64 {
 }
 
 test "failed reader open returns its anonymous mapping too" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
@@ -1828,7 +1828,7 @@ test "failed reader open returns its anonymous mapping too" {
 }
 
 test "failed row group gates do not release bytes never admitted" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 256 << 10);
@@ -1853,7 +1853,7 @@ test "failed row group gates do not release bytes never admitted" {
 }
 
 test "continuation reads wait until their row group is admitted" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 8 << 20);
@@ -1894,7 +1894,7 @@ fn continuationsWaitFor(mode: Mode, path: []const u8, size: usize) !void {
 }
 
 test "local read bytes exclude EOF padding without shrinking the window charge" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
@@ -1924,7 +1924,7 @@ fn wholeShare(gpa: std.mem.Allocator, bytes: []align(std.heap.page_size_min) con
 }
 
 test "planned-range residency bounds its allocation and partial-page windows" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
     const mapping = try posix.mmap(null, 4096 * page + 1, .{ .READ = true, .WRITE = true }, .{
         .TYPE = .PRIVATE,
@@ -1957,7 +1957,7 @@ test "auto maps a warm file, buffers a partly warm one, and reads a cold one dir
     try testing.expectEqual(Mode.mmap, hot.mode);
     try testing.expectEqual(Reason.cached, hot.reason);
     try testing.expect(!hot.directRead());
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     if (uringAvailable()) {
         const cold_wide = auto.choose(0, 0.9);
         try testing.expectEqual(Mode.uring, cold_wide.mode);
@@ -1992,7 +1992,7 @@ test "--cache reads through the page cache and never O_DIRECT" {
     try testing.expect(!wide.directRead());
     try testing.expect(!narrow.directRead());
     try testing.expectEqualStrings("through the page cache (--cache)", Reason.page_cache.phrase());
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         try testing.expectEqual(Reason.page_cache, wide.reason);
         try testing.expectEqual(Reason.page_cache, narrow.reason);
         try testing.expectEqual(if (uringAvailable()) Mode.uring else Mode.pread, wide.mode);
@@ -2012,7 +2012,7 @@ test "--cache reads through the page cache and never O_DIRECT" {
 test "a cold read that does not fit the reader is mapped" {
     const auto: Policy = .{};
     const unknown = auto.choose(0, 0.9);
-    if (builtin.os.tag == .linux and uringAvailable()) {
+    if (builtin.target.os.tag == .linux and uringAvailable()) {
         try testing.expect(unknown.directRead());
         try testing.expectEqual(Reason.cold_direct, unknown.reason);
     } else {
@@ -2050,7 +2050,7 @@ test "residency weights a file by its planned pages, and an unknown sample is no
 }
 
 test "residency follows the planned ranges, not the rest of the file" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.pageSize();
     const pages: usize = 512;
     const size = page * pages;
@@ -2102,7 +2102,7 @@ fn readWhole(path: []const u8, data: []const u8, cfg: Config) !void {
 }
 
 test "pread, buffered io_uring and direct io_uring read the same bytes" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var prng = std.Random.DefaultPrng.init(0x10);
@@ -2118,7 +2118,7 @@ test "pread, buffered io_uring and direct io_uring read the same bytes" {
 }
 
 test "io_uring retries a refused enter and resubmits an EAGAIN completion" {
-    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
@@ -2160,7 +2160,7 @@ fn readFaulted(path: []const u8, data: []const u8, faults: *Faults) !void {
 }
 
 test "io_uring past the retry bound finishes the unit with pread" {
-    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
@@ -2195,7 +2195,7 @@ test "io_uring past the retry bound finishes the unit with pread" {
 }
 
 test "a short repair pread failure reaps the rest of its completion batch" {
-    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 128 << 10);
@@ -2210,7 +2210,7 @@ test "a short repair pread failure reaps the rest of its completion batch" {
 }
 
 test "a submitted io_uring read is not published while its wait is interrupted" {
-    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 192 << 10);
@@ -2242,7 +2242,7 @@ test "a submitted io_uring read is not published while its wait is interrupted" 
 }
 
 test "a file that cannot open O_DIRECT is still read through the page cache" {
-    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
@@ -2284,7 +2284,7 @@ test "a file that cannot open O_DIRECT is still read through the page cache" {
 }
 
 test "a finished direct read of EINVAL is pread, and the direct fd stays open" {
-    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 128 << 10);
@@ -2332,7 +2332,7 @@ test "a finished direct read of EINVAL is pread, and the direct fd stays open" {
 }
 
 test "an unaligned direct tail is read through the buffered fd and stays direct" {
-    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, (64 << 10) + 100);
@@ -2364,7 +2364,7 @@ test "an unaligned direct tail is read through the buffered fd and stays direct"
 }
 
 test "a positive short completion repairs from an unaligned offset and stays direct" {
-    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
@@ -2401,7 +2401,7 @@ test "a positive short completion repairs from an unaligned offset and stays dir
 }
 
 test "direct io opens its own fd and does not change a borrowed one" {
-    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
@@ -2474,7 +2474,7 @@ fn forgetFile(path: []const u8, size: usize) !void {
 }
 
 test "a buffered read of a cold file leaves it cached for the next choice" {
-    if (builtin.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux or !uringAvailable()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const page = std.heap.pageSize();
@@ -2503,7 +2503,7 @@ test "a buffered read of a cold file leaves it cached for the next choice" {
 }
 
 test "row groups draw their bytes from the query's ledger as they are admitted, and give them back as released" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const size: usize = 1 << 20;

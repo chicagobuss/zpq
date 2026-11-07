@@ -108,7 +108,7 @@ pub fn l3BytesPerActiveWorker(workers: usize) usize {
 /// A per-worker L2 share typical of the target architecture, for a policy that needs a size when discovery found
 /// none: a 1.25 MiB L2 shared by two SMT siblings on x86, and the 1 MiB per core of Neoverse servers and Apple
 /// efficiency clusters on aarch64. It is a performance assumption only, like every other value here.
-pub const default_l2_bytes_per_worker: usize = switch (builtin.cpu.arch) {
+pub const default_l2_bytes_per_worker: usize = switch (builtin.target.cpu.arch) {
     .x86, .x86_64 => 640 << 10,
     .aarch64, .aarch64_be => 1 << 20,
     else => 256 << 10,
@@ -135,7 +135,7 @@ fn affinityMinimum(cpus: []const Cpu, affinity: CpuSet) usize {
 }
 
 fn currentId() usize {
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         var id: usize = 0;
         if (std.os.linux.getcpu(&id, null) == 0) return id;
         return cpu_capacity;
@@ -148,16 +148,16 @@ fn discover() void {
     if (id < detected.len) detected[id] = fromCpuid();
     // The CPUs execution may use. Linux reads its affinity mask below; macOS has none, so every logical CPU.
     var affinity: ?CpuSet = null;
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         var buf: [4096]u8 = undefined;
         const possible = readFile("/sys/devices/system/cpu/online", &buf);
         const cpus = if (possible) |text| parseCpuList(text) else null;
         if (cpus) |set| {
             scanSysfs(set, &detected, id, true);
-            if (comptime builtin.cpu.arch == .aarch64) fillLineBytes(set, &detected, ctrLineBytes(ctrEl0()));
+            if (comptime builtin.target.cpu.arch == .aarch64) fillLineBytes(set, &detected, ctrLineBytes(ctrEl0()));
         }
     }
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         const sysctl: Sysctl = .{};
         const cpu = fromSysctl(sysctl, detected[id]);
         const count = @min(cpu_capacity, sysctl.int("hw.logicalcpu") orelse 1);
@@ -182,7 +182,7 @@ fn discover() void {
             };
         };
     }
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         var mask: std.os.linux.cpu_set_t = undefined;
         // Query the main thread's mask, not an initializing worker's possibly narrower mask.
         if (std.os.linux.sched_getaffinity(std.os.linux.getpid(), @sizeOf(@TypeOf(mask)), &mask) == 0)
@@ -218,7 +218,7 @@ fn ctrLineBytes(ctr: u64) usize {
 }
 
 fn ctrEl0() u64 {
-    if (comptime builtin.cpu.arch != .aarch64) return 0;
+    if (comptime builtin.target.cpu.arch != .aarch64) return 0;
     // Linux lets EL0 read CTR_EL0, trapping and emulating it where an erratum requires.
     return asm volatile ("mrs %[ctr], ctr_el0"
         : [ctr] "=r" (-> u64),
@@ -232,8 +232,8 @@ const Sysctl = struct {
         var len: usize = value.len;
         if (std.c.sysctlbyname(name, &value, &len, null, 0) != 0) return null;
         return switch (len) {
-            4 => std.mem.readInt(u32, value[0..4], builtin.cpu.arch.endian()),
-            8 => std.math.cast(usize, std.mem.readInt(u64, &value, builtin.cpu.arch.endian())),
+            4 => std.mem.readInt(u32, value[0..4], builtin.target.cpu.arch.endian()),
+            8 => std.math.cast(usize, std.mem.readInt(u64, &value, builtin.target.cpu.arch.endian())),
             else => null,
         };
     }
@@ -288,7 +288,7 @@ fn fromSysctl(sysctl: anytype, seed: Cpu) Cpu {
 }
 
 fn readFile(path: [:0]const u8, buf: []u8) ?[]const u8 {
-    if (builtin.os.tag != .linux) return null;
+    if (builtin.target.os.tag != .linux) return null;
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch
         return null;
     defer _ = std.posix.system.close(fd);
@@ -395,7 +395,7 @@ fn parseCpuList(text: []const u8) ?CpuSet {
 }
 
 fn cpuid(leaf: u32, sub: u32) [4]u32 {
-    if (builtin.cpu.arch != .x86 and builtin.cpu.arch != .x86_64) return @splat(0);
+    if (builtin.target.cpu.arch != .x86 and builtin.target.cpu.arch != .x86_64) return @splat(0);
     var eax: u32 = undefined;
     var ebx: u32 = undefined;
     var ecx: u32 = undefined;
@@ -485,7 +485,7 @@ test "hardware active-worker L3 hints use a stable affinity minimum, including u
 }
 
 test "hardware discovery that shares a sibling's record finds what reading every CPU finds" {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     var buf: [4096]u8 = undefined;
     const online = parseCpuList(readFile("/sys/devices/system/cpu/online", &buf) orelse return) orelse return;
     const full = try std.testing.allocator.alloc(Cpu, cpu_capacity);
@@ -582,13 +582,13 @@ test "hardware aarch64 line size comes from CTR_EL0 only where sysfs gave none" 
 test "hardware discovery finds the cache line on Linux and macOS, and sizes macOS caches" {
     // Live hardware: what a host must discover. The parsing behind it runs everywhere on fixtures above.
     const discovered = forCpu(0);
-    if (comptime builtin.os.tag.isDarwin()) {
+    if (comptime builtin.target.os.tag.isDarwin()) {
         if (std.c.getenv("ZPQ_HW_L2_BYTES") == null) try std.testing.expect(l2BytesPerWorker() != 0);
         try std.testing.expect(discovered.l2.bytes != 0);
         try std.testing.expectEqual(Sysctl.int(.{}, "hw.cachelinesize").?, cacheLineBytes());
     }
     // CPUID, sysfs or CTR_EL0 always gives Linux on these architectures a line.
-    if (comptime builtin.os.tag == .linux and (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64)) {
+    if (comptime builtin.target.os.tag == .linux and (builtin.target.cpu.arch == .x86_64 or builtin.target.cpu.arch == .aarch64)) {
         try std.testing.expect(process_line != 0);
         try std.testing.expect(std.math.isPowerOfTwo(process_line));
     }

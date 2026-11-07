@@ -1694,6 +1694,15 @@ test "M1 parallel DISTINCT source charges and releases preserve the private ceil
     try std.testing.expect(per_set > @sizeOf(DistinctSet));
     sample.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), table.allocated_bytes);
+    // Private reservations only grow until deinit. Check every worker's values against the measured peak, so the
+    // concurrent phase cannot exceed eight reservations even when all workers hold a set at once.
+    for (0..256) |job| {
+        var set = table.freshDistinct();
+        for (0..4) |i| try set.insertU64(a, job * 7 + i);
+        try std.testing.expectEqual(per_set, table.allocated_bytes);
+        set.deinit(a);
+        try std.testing.expectEqual(@as(usize, 0), table.allocated_bytes);
+    }
     table.max_memory_bytes = 8 * per_set;
 
     // Fill the ceiling with eight simultaneously live sets and verify an extra byte cannot be charged.

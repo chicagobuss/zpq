@@ -36,7 +36,7 @@ const Class = struct {
     ranges: []const Range = &.{},
 
     inline fn has(c: *const Class, cp: u21) bool {
-        if (cp < 0x80) return c.ascii[cp >> 6] >> @intCast(cp & 63) & 1 != 0;
+        if (cp < 0x80) return (c.ascii[cp >> 6] >> @intCast(cp & 63)) & 1 != 0;
         var lo: usize = 0;
         var hi = c.ranges.len;
         while (lo < hi) {

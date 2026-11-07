@@ -127,7 +127,7 @@ const Runner = struct {
         return std.mem.trim(u8, result.stdout, " \r\n\t");
     }
     fn hash(self: *Runner, path: []const u8) ![]const u8 {
-        const value = if (builtin.os.tag == .macos)
+        const value = if (builtin.target.os.tag == .macos)
             try self.command(&.{ "shasum", "-a", "256", path })
         else
             try self.command(&.{ "sha256sum", path });
@@ -370,7 +370,7 @@ fn run(init: std.process.Init) !void {
     }
     if (opt.out.len == 0 or opt.revision.len == 0 or opt.duck_sha.len != 64 or opt.budget > 120 or opt.budget == 0)
         return error.BadArgs;
-    if (opt.threads != null and opt.threads.? == 0 or opt.reps == 0) return error.BadArgs;
+    if ((opt.threads != null and opt.threads.? == 0) or opt.reps == 0) return error.BadArgs;
     var runner: Runner = undefined;
     runner.a = a;
     runner.io = io;

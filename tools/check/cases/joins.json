@@ -49,6 +49,10 @@
    "copy": "COPY (SELECT g AS ck, (g * 3)::INTEGER AS w FROM range(0, 5) t(g)) TO '{path}' (FORMAT PARQUET)"
   },
   {
+   "name": "plain_dim",
+   "copy": "COPY (SELECT k AS pk, 'u' || k || repeat('x', (k % 7)::INT) AS uname, 'kind' || (k % 13) AS ukind, (k % 5)::BIGINT AS pgrp FROM range(1, 8001) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048, DICTIONARY_SIZE_LIMIT 1)"
+  },
+  {
    "script": "tools/check/prepare_join_gate.py",
    "files": [
     "join-gate",
@@ -1368,6 +1372,244 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT u.ug, count(*) AS n FROM '{fixture:review-fact}' f, '{fixture:review-dim}' d, '{fixture:review-uniq}' u, '{fixture:nullorder_dim}' e WHERE f.fk = d.pk AND d.grp = u.upk AND f.q = e.pk GROUP BY u.ug ORDER BY u.ug"
+   }
+  },
+  {
+   "id": "join:plain:group-by-repeated-strings",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT ukind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk GROUP BY ukind ORDER BY ukind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT ukind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk GROUP BY ukind ORDER BY ukind"
+   }
+  },
+  {
+   "id": "join:plain:group-by-unique-strings",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT uname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk AND f.q = 3 GROUP BY uname ORDER BY n DESC, uname LIMIT 10"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT uname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk AND f.q = 3 GROUP BY uname ORDER BY n DESC, uname LIMIT 10"
+   }
+  },
+  {
+   "id": "join:plain:count-distinct",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT q, count(DISTINCT ukind) AS k, count(DISTINCT uname) AS u, min(uname) AS lo, max(ukind) AS hi FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk GROUP BY q ORDER BY q"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "8M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT q, count(DISTINCT ukind) AS k, count(DISTINCT uname) AS u, min(uname) AS lo, max(ukind) AS hi FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk GROUP BY q ORDER BY q"
+   }
+  },
+  {
+   "id": "join:plain:left-join-misses",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT ukind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f LEFT JOIN '{fixture:plain_dim}' p ON f.fk = p.pk AND p.pgrp < 2 GROUP BY ukind ORDER BY ukind NULLS FIRST"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT ukind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f LEFT JOIN '{fixture:plain_dim}' p ON f.fk = p.pk AND p.pgrp < 2 GROUP BY ukind ORDER BY ukind NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:plain:through-a-chain",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT ukind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_dim}' p WHERE f.fk = d.pk AND d.w = p.pk GROUP BY ukind ORDER BY ukind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT ukind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_dim}' p WHERE f.fk = d.pk AND d.w = p.pk GROUP BY ukind ORDER BY ukind"
+   }
+  },
+  {
+   "id": "join:plain:group-join-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, uname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk GROUP BY f.fk, uname ORDER BY s DESC, f.fk LIMIT 10"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, uname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk GROUP BY f.fk, uname ORDER BY s DESC, f.fk LIMIT 10"
+   }
+  },
+  {
+   "id": "join:plain:beside-a-filtered-string",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT ukind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk AND p.uname LIKE 'u1%' GROUP BY ukind ORDER BY ukind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT ukind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk AND p.uname LIKE 'u1%' GROUP BY ukind ORDER BY ukind"
    }
   },
   {

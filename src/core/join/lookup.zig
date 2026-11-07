@@ -56,6 +56,10 @@ pub const Payload = struct {
     /// Per slot: the code of this build row's value in `dict`.
     codes: Codes,
     dict: Dict,
+    /// `dict` holds a value per slot (`codes` index it), not distinct values: a string column its writer did not
+    /// dictionary-encode, laid out by slot without hashing (`build`). The scan publishes its values, never codes, so
+    /// no consumer reads it as a dictionary.
+    plain: bool = false,
 };
 
 /// Per-slot codes, two bytes each when the dictionary has fewer than 2^16 values.
@@ -64,9 +68,12 @@ pub const Codes = union(enum) {
     u8: []u8,
     u16: []u16,
     u32: []u32,
+    /// Each code is its index (`len` of them): a plain payload's in slot order, or a plain local's in row order.
+    identity: usize,
 
     pub fn get(c: Codes, s: u32) u32 {
         return switch (c) {
+            .identity => s,
             inline else => |v| v[s],
         };
     }
@@ -75,11 +82,13 @@ pub const Codes = union(enum) {
         switch (c) {
             inline .u8, .u16 => |v| v[s] = @intCast(code),
             .u32 => |v| v[s] = code,
+            .identity => unreachable,
         }
     }
 
     fn free(c: Codes, a: std.mem.Allocator) void {
         switch (c) {
+            .identity => {},
             inline else => |v| a.free(v),
         }
     }
@@ -97,6 +106,7 @@ pub const Codes = union(enum) {
     /// These codes, copied into `a` at the narrowest width a dictionary of `entries` allows.
     fn narrowed(c: Codes, a: std.mem.Allocator, entries: usize) !Codes {
         const n = switch (c) {
+            .identity => return c,
             inline else => |v| v.len,
         };
         const out: Codes = try .init(a, n, entries);
@@ -106,6 +116,7 @@ pub const Codes = union(enum) {
 
     fn bytes(c: Codes) usize {
         return switch (c) {
+            .identity => 0,
             inline else => |v| v.len * @sizeOf(@TypeOf(v[0])),
         };
     }
@@ -378,6 +389,19 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
         }
         codes[r] = payload.codes.get(at[r]);
     }
+    if (payload.plain) {
+        const dict = payload.dict.string;
+        const vals = try a.alloc([]const u8, sel.len);
+        if (dict.len == 0) @memset(vals, "") else for (codes, vals) |code, *v| {
+            v.* = dict[code];
+        }
+        return .{ .string = .{
+            .values = vals,
+            .def_levels = def,
+            .max_def = if (j.kind == .left) 1 else 0,
+            .has_nulls = def != null,
+        } };
+    }
     return switch (payload.dict) {
         inline else => |dict, tag| blk: {
             const T = @TypeOf(dict[0]);
@@ -470,6 +494,8 @@ const Local = struct {
     /// Local code -> global code, filled when the dictionaries unify; empty when the local codes are the global ones
     /// (a build of one part).
     global: []u32 = &.{},
+    /// A plain payload's (`Payload.plain`): the bytes of its strings, a value per survivor in `dict`.
+    bytes: usize = 0,
 
     const empty: Local = .{ .codes = .{ .u32 = &.{} }, .dict = .{ .i64 = &.{} } };
 
@@ -500,6 +526,8 @@ const Ctx = struct {
     /// The payloads (indices into `spec.payload`) no filter reads: each decodes on its own, per row group
     /// (`LateLocal`), so a build of few row groups and many payloads still has a task per core.
     late: []const usize,
+    /// By payload: held plain (`Payload.plain`), a string column no row group's chunk dictionary-encodes.
+    plain: []const bool,
 
     fn arena(c: *const Ctx, rg_index: usize, slot: usize) std.mem.Allocator {
         return c.arenas[rg_index * (c.spec.payload.len + 1) + slot].allocator();
@@ -714,7 +742,24 @@ const LateLocal = struct {
             }
         }
         const rg = &c.meta.row_groups.items[rg_index];
-        part.local[pi] = try c.keepLocal(rg_index, pi, try localOf(c, sa, rg, c.spec.payload[pi], keep, null));
+        if (!c.plain[pi]) {
+            part.local[pi] = try c.keepLocal(rg_index, pi, try localOf(c, sa, rg, c.spec.payload[pi], keep, null));
+            return;
+        }
+        // Plain: the survivors' strings as decoded (into the payload's arena, which outlives the layout), unhashed.
+        const a = c.arena(rg_index, 1 + pi);
+        const col = switch (try decodeValues(a, c.bytes, c.meta, rg, c.spec.payload[pi])) {
+            .string => |x| x,
+            else => return error.JoinPayloadType,
+        };
+        const values = try a.alloc([]const u8, keep.len);
+        var bytes: usize = 0;
+        for (keep, values) |r, *v| {
+            if (col.def_levels) |dl| if (dl[r] < col.max_def) return error.JoinPayloadType;
+            v.* = col.values[r];
+            bytes += v.len;
+        }
+        part.local[pi] = .{ .codes = .{ .identity = keep.len }, .dict = .{ .string = values }, .bytes = bytes };
     }
 };
 
@@ -782,7 +827,7 @@ const Unify = struct {
 
     fn run(self: @This(), _: usize, p: usize) !void {
         const c = self.c;
-        if (c.parts.len == 0) return;
+        if (c.parts.len == 0 or c.plain[p]) return;
         self.out[p] = switch (c.parts[0].local[p].dict) {
             .i32 => try unify(i32, c, p),
             .i64 => try unify(i64, c, p),
@@ -793,6 +838,7 @@ const Unify = struct {
 
     /// The values into the dictionary allocated for them, strings into one blob.
     fn copy(self: @This(), _: usize, p: usize) !void {
+        if (self.c.plain[p]) return;
         const u = self.out[p];
         switch (u.values) {
             .string => |v| {
@@ -902,14 +948,33 @@ const SetBits = struct {
 
 const FillCodes = struct {
     j: *const Join,
+    gpa: std.mem.Allocator,
     parts: []const Part,
     codes: []const Codes,
+    /// By payload: a plain one's values by slot and the blob its strings copy into, from each part's start in it.
+    plain: []const Plain,
+
+    const Plain = struct { values: [][]const u8 = &.{}, blob: []u8 = &.{}, starts: []usize = &.{} };
+
     fn run(c: @This(), _: usize, i: usize) !void {
         const part = c.parts[i];
+        const cursor = try c.gpa.alloc(usize, c.plain.len);
+        defer c.gpa.free(cursor);
+        for (c.plain, cursor) |pl, *at| at.* = if (pl.starts.len != 0) pl.starts[i] else 0;
         switch (part.keys) {
             inline else => |keys| for (keys, 0..) |raw, row| {
                 const s = c.j.slot(Keys.of(raw, part.lo)).?;
-                for (c.codes, part.local) |dst, l| dst.set(s, l.globalOf(row));
+                for (c.codes, part.local, c.plain, cursor) |dst, l, pl, *at| {
+                    if (pl.starts.len == 0) {
+                        dst.set(s, l.globalOf(row));
+                        continue;
+                    }
+                    const v = l.dict.string[row];
+                    const out = pl.blob[at.*..][0..v.len];
+                    @memcpy(out, v);
+                    pl.values[s] = out;
+                    at.* += v.len;
+                }
             },
         }
     }
@@ -953,7 +1018,16 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     var late: std.ArrayList(usize) = .empty;
     defer late.deinit(gpa);
     if (leaves != 0) for (spec.payload, 0..) |leaf, pi| if (!filter_cols[leaf]) try late.append(gpa, pi);
-    var ctx: Ctx = .{ .arenas = arenas, .gpa = gpa, .workers = &workers, .bytes = bytes, .meta = meta, .spec = spec, .parts = parts, .filter_cols = filter_cols, .late = late.items };
+    // A string column its writer kept PLAIN in every row group has about as many values as rows: hashing it into a
+    // dictionary would cost a probe per value and save nothing, so it is held plain.
+    const plain = try gpa.alloc(bool, spec.payload.len);
+    defer gpa.free(plain);
+    @memset(plain, false);
+    for (late.items) |pi| plain[pi] = parts.len != 0 and for (meta.row_groups.items) |*rg| {
+        const cm = rg.columns.items[spec.payload[pi]].meta_data orelse break false;
+        if (cm.type != .BYTE_ARRAY or cm.dictionary_page_offset != null) break false;
+    } else true;
+    var ctx: Ctx = .{ .arenas = arenas, .gpa = gpa, .workers = &workers, .bytes = bytes, .meta = meta, .spec = spec, .parts = parts, .filter_cols = filter_cols, .late = late.items, .plain = plain };
     const trace = std.c.getenv("ZPQ_JOIN_TRACE") != null;
     var t = @import("../../clock.zig").monoNs();
     if (trace) t = lap("start", t);
@@ -1036,8 +1110,26 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     defer for (unified) |u| u.deinit(gpa);
     const un: Unify = .{ .c = &ctx, .out = unified };
     try parallel(spec.payload.len, spec.threads, un, Unify.run);
-    for (spec.payload, payloads, codes, unified) |leaf, *out, *cs, *u| {
+    const fill_plain = try gpa.alloc(FillCodes.Plain, spec.payload.len);
+    defer gpa.free(fill_plain);
+    @memset(fill_plain, .{});
+    defer for (fill_plain) |fp| gpa.free(fp.starts);
+    for (spec.payload, payloads, codes, unified, plain, fill_plain, 0..) |leaf, *out, *cs, *u, is_plain, *fp, pi| {
         const element = @import("../parquet/metadata.zig").leafSchemaElement(meta, leaf).?;
+        if (is_plain) {
+            // A value per slot, the parts' strings in one blob, each part's from where the ones before it end.
+            const starts = try gpa.alloc(usize, parts.len);
+            var total: usize = 0;
+            for (parts, starts) |part, *st| {
+                st.* = total;
+                total += part.local[pi].bytes;
+            }
+            const values = try a.alloc([]const u8, n);
+            fp.* = .{ .values = values, .blob = try a.alloc(u8, total), .starts = starts };
+            cs.* = .{ .identity = n };
+            out.* = .{ .name = element.name, .element = element, .codes = cs.*, .dict = .{ .string = values }, .plain = true };
+            continue;
+        }
         // With no row group the dictionary's type comes from the column's: a LEFT miss still reads it, as NULL.
         if (parts.len == 0) u.values = switch (element.type orelse .INT64) {
             .INT32 => .{ .i32 = &.{} },
@@ -1056,7 +1148,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     try parallel(spec.payload.len, spec.threads, un, Unify.copy);
     j.payloads = payloads;
     if (trace) t = lap("unify dictionaries", t);
-    try parallel(parts.len, spec.threads, FillCodes{ .j = j, .parts = parts, .codes = codes }, FillCodes.run);
+    try parallel(parts.len, spec.threads, FillCodes{ .j = j, .gpa = gpa, .parts = parts, .codes = codes, .plain = fill_plain }, FillCodes.run);
     if (trace) _ = lap("codes by slot", t);
     // An estimate, now that each payload's code width is known; the caller measures what `a` holds.
     j.bytes = key_bytes;
@@ -1088,7 +1180,7 @@ pub fn chain(a: std.mem.Allocator, j: *Join, fk: usize, inner: *const Join) !voi
             if (at == EMPTY) return error.LookupWithoutMatch;
             codes.set(@intCast(s), ip.codes.get(at));
         }
-        op.* = .{ .name = ip.name, .element = ip.element, .codes = codes, .dict = ip.dict };
+        op.* = .{ .name = ip.name, .element = ip.element, .codes = codes, .dict = ip.dict, .plain = ip.plain };
     }
     j.payloads = out;
 }

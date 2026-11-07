@@ -26,14 +26,19 @@ const schema = @import("../schema.zig");
 const filter_ast = @import("../filter/ast.zig");
 const regex = @import("regex.zig");
 
-/// Binary operators. Numeric ops (`add`/`sub`/`mul`/`div`) work on
+/// Binary operators. Numeric ops (`add`/`sub`/`mul`/`div`/`mod`/`intdiv`) work on
 /// `i64` or `f64`; `concat` works on `str` and is the SQL `||`
-/// operator.
+/// operator. `div` is always a DOUBLE division, as DuckDB's `/`. `mod` is the remainder, with the sign of the dividend
+/// (an integer, a DECIMAL exactly, a DOUBLE as C's fmod); `intdiv` is `//`: integers divide truncating toward zero, and
+/// anything else divides as `/` does, but a zero divisor is an error. A zero divisor is an error for both on integers
+/// and DECIMALs, and so is the minimum of a signed integer type divided by -1.
 pub const Op = enum {
     add,
     sub,
     mul,
     div,
+    mod,
+    intdiv,
     concat,
 };
 
@@ -106,6 +111,15 @@ pub const Dec = struct {
         const scale = @max(a.scale, b.scale);
         const int_digits = @max(a.intDigits(), b.intDigits());
         return .{ .precision = @min(max_precision, int_digits + scale + 1), .scale = scale };
+    }
+
+    /// The type of a remainder, as DuckDB gives it: the larger scale and the larger count of integer digits, no digit
+    /// for a carry. Null where that needs more than 38 digits: DuckDB then takes both to DOUBLE.
+    pub fn mod(a: Dec, b: Dec) ?Dec {
+        const scale = @max(a.scale, b.scale);
+        const precision = @as(u16, @max(a.intDigits(), b.intDigits())) + scale;
+        if (precision > max_precision) return null;
+        return .{ .precision = @intCast(@max(precision, 1)), .scale = scale };
     }
 
     pub fn mul(a: Dec, b: Dec) Error!Dec {
@@ -280,6 +294,9 @@ pub const BinOp = struct {
     depth: u32,
     /// The result's DECIMAL type when `result_type == .dec`.
     dec: ?Dec = null,
+    /// The SQL integer type of a `mod` or `intdiv` result, where the binder proves it: the type their minimum divided by
+    /// -1 overflows in.
+    int: ?IntType = null,
 };
 
 /// Built-in scalar functions. The first slice ships only `coalesce`

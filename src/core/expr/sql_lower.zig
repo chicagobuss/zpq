@@ -69,7 +69,7 @@ pub const Lower = struct {
                     c.LP_OP_MUL => .mul,
                     c.LP_OP_DIV => .div,
                     c.LP_OP_CONCAT => .concat,
-                    c.LP_OP_MOD => return error.ModuloNotSupported,
+                    c.LP_OP_MOD => .mod,
                     else => return error.UnexpectedChar,
                 },
                 .left = try self.ptr(node.u.binary.left orelse return error.SqlParseError, depth + 1),
@@ -78,6 +78,14 @@ pub const Lower = struct {
             c.LP_EXPR_FUNCTION => blk: {
                 const f = node.u.function;
                 const name_ = std.mem.span(f.name);
+                // `a // b` reaches the parser as `"//"(a, b)` (`sql_parser.integerDivision`): DuckDB's own name for it.
+                if ((std.mem.eql(u8, name_, "//") or std.mem.eql(u8, name_, "\"//\"")) and f.args.count == 2 and f.over == null and f.distinct == 0 and
+                    f.filter == null and f.order_by.count == 0)
+                    break :blk .{ .binary = .{
+                        .op = .intdiv,
+                        .left = try self.ptr(f.args.items[0] orelse return error.SqlParseError, depth + 1),
+                        .right = try self.ptr(f.args.items[1] orelse return error.SqlParseError, depth + 1),
+                    } };
                 if (try self.sugarCall(f, name_, depth)) |rewritten| break :blk rewritten;
                 if (parser.resolveFunc(name_) != null) {
                     if (f.order_by.count != 0) return error.ExpectedRParen;

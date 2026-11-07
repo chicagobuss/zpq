@@ -406,7 +406,7 @@ test "a row query prints the same bytes at every parallelism, in every text form
         .{ .inputs = skewed, .filter = "x > 0", .max_memory = 512 << 10 },
         .{ .inputs = skewed, .max_memory = 1 << 20 },
         // Row 1000 (row group 5) divides by zero: the rows before its row group print, then its error.
-        .{ .inputs = &.{full}, .select = "ts, 100 / (ts - 1000) AS q", .err = error.DivisionByZero },
+        .{ .inputs = &.{full}, .select = "ts, 100 // (ts - 1000) AS q", .err = error.DivisionByZero },
         .{ .inputs = &.{ escape, escape, bad, escape }, .err = error.InvalidUtf8 },
     };
     for (cases) |c| for ([_]PrintFormat{ .jsonl, .json, .csv }) |format| {
@@ -580,20 +580,20 @@ test "an overflow or a zero divisor fails a query only on a row whose value it c
         .{ .aggregate = "sum(p * 2) AS s", .filter = "p < 1000", .want = 99_000 },
         .{ .aggregate = "sum(p * 2) AS s", .filter = "p != 9000000000000000000", .want = 99_000 },
         .{ .aggregate = "sum(a * 2) AS s", .filter = "id != 500", .want = 99_000 },
-        .{ .aggregate = "sum(10 / d) AS s", .filter = "id != 500", .want = 3_429 },
+        .{ .aggregate = "sum(10 // d) AS s", .filter = "id != 500", .want = 3_429 },
         .{ .aggregate = "sum(p * 2) AS s", .filter = "id >= 0 AND id <= 999 AND id != 500", .want = 99_000 },
         .{ .aggregate = "sum(p * 2) FILTER (WHERE id != 500) AS s, count(*) AS n", .want = 99_000 },
         .{ .aggregate = "count(*) AS n", .group_by = "p * 2 AS k", .filter = "id != 500", .want = 100 },
         .{ .aggregate = "count(*) AS n", .group_by = "a * 2 AS k", .filter = "id != 500", .want = 100 },
-        .{ .aggregate = "count(*) AS n", .group_by = "10 / d AS k", .filter = "id != 500", .want = 5 },
+        .{ .aggregate = "count(*) AS n", .group_by = "10 // d AS k", .filter = "id != 500", .want = 5 },
         // Consumed: still an error.
         .{ .aggregate = "sum(p * 2) AS s", .err = error.IntegerOverflowMul },
         .{ .aggregate = "sum(a * 2) AS s", .filter = "id >= 0", .err = error.IntegerOverflowMul },
-        .{ .aggregate = "sum(10 / d) AS s", .err = error.DivisionByZero },
+        .{ .aggregate = "sum(10 // d) AS s", .err = error.DivisionByZero },
         .{ .aggregate = "sum(p * 2) AS s", .filter = "id >= 0 AND id <= 999", .err = error.IntegerOverflowMul },
         .{ .aggregate = "sum(p * 2) FILTER (WHERE id >= 0) AS s", .err = error.IntegerOverflowMul },
         .{ .aggregate = "count(*) AS n", .group_by = "p * 2 AS k", .err = error.IntegerOverflowMul },
-        .{ .aggregate = "count(*) AS n", .group_by = "10 / d AS k", .filter = "id >= 0", .err = error.DivisionByZero },
+        .{ .aggregate = "count(*) AS n", .group_by = "10 // d AS k", .filter = "id >= 0", .err = error.DivisionByZero },
     };
     for (cases) |c| {
         const args: QueryArgs = .{

@@ -65,7 +65,7 @@
           "coalesce": {"select": "coalesce(nname, 'NA') AS x", "duck_select": "coalesce(nname, 'NA') AS x"},
           "strlen": {"select": "strlen(nname) AS x", "duck_select": "strlen(nname) AS x"},
           "case_str": {"select": "CASE WHEN id > 0 AND name LIKE 'n1%' THEN name WHEN nname IS NULL THEN 'null' END AS x", "duck_select": "CASE WHEN id > 0 AND name LIKE 'n1%' THEN name WHEN nname IS NULL THEN 'null' END AS x"},
-          "case_dead_div": {"select": "CASE WHEN id = 0 THEN -1 ELSE 100 / id END AS x", "duck_select": "CASE WHEN id = 0 THEN -1 ELSE 100 // id END AS x"},
+          "case_dead_div": {"select": "CASE WHEN id = 0 THEN -1 ELSE 100 // id END AS x", "duck_select": "CASE WHEN id = 0 THEN -1 ELSE 100 // id END AS x"},
           "case_bare_bool": {"select": "CASE WHEN flag THEN id WHEN NOT flag THEN -id ELSE 0 END AS x", "duck_select": "CASE WHEN flag THEN id WHEN NOT flag THEN -id ELSE 0 END AS x"},
           "case_dec": {"select": "CASE WHEN flag = true THEN price * 2 WHEN flag IS NULL THEN 1 ELSE price END AS x", "duck_select": "CASE WHEN flag = true THEN price * 2 WHEN flag IS NULL THEN 1 ELSE price END AS x"},
           "amt_x2": {"select": "amt * 2 AS x", "duck_select": "amt * 2 AS x"},
@@ -77,7 +77,7 @@
           "coal_arith": {"select": "coalesce(amt * 2, id, 0) AS x", "duck_select": "coalesce(amt * 2, id, 0) AS x"},
           "coal_dec": {"select": "coalesce(price * CASE WHEN amt IS NOT NULL THEN 2 END, price + 1) AS x", "duck_select": "coalesce(price * CASE WHEN amt IS NOT NULL THEN 2 END, price + 1) AS x"},
           "coal_str": {"select": "coalesce(nname || '_z', name, 'NA') AS x", "duck_select": "coalesce(nname || '_z', name, 'NA') AS x"},
-          "coal_lazy": {"select": "coalesce(id + 1, 100 / (id - id)) AS x", "duck_select": "id + 1 AS x"}
+          "coal_lazy": {"select": "coalesce(id + 1, 100 // (id - id)) AS x", "duck_select": "id + 1 AS x"}
         }
       },
       "cells": {"none": ["id_plus1", "concat", "coalesce", "strlen", "case_str", "case_dead_div", "case_bare_bool", "case_dec", "amt_x2", "amt_id", "int_null", "dec_null", "str_null", "null_div", "coal_arith", "coal_dec", "coal_str", "coal_lazy"], "id_gt": ["id_plus1", "concat", "coalesce", "strlen", "case_str", "case_dead_div", "case_bare_bool", "case_dec", "amt_x2", "amt_id", "int_null", "dec_null", "str_null", "null_div", "coal_arith", "coal_dec", "coal_str", "coal_lazy"]},

@@ -568,6 +568,283 @@ fn extractAsDatePart(allocator: std.mem.Allocator, sql: []const u8) ![:0]u8 {
     return out.toOwnedSliceSentinel(allocator, 0);
 }
 
+/// Words that end an operand of `//` rather than being one.
+fn endsOperand(word: []const u8) bool {
+    const words = [_][]const u8{
+        "and", "or", "not", "in", "is", "like", "ilike", "between", "case", "when", "then", "else", "end", "select",
+        "from", "where", "group", "by", "having", "order", "limit", "offset", "on", "as", "distinct", "union",
+    };
+    for (words) |w| if (std.ascii.eqlIgnoreCase(word, w)) return true;
+    return false;
+}
+
+fn isNameByte(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '$';
+}
+
+fn skipSpacesBack(buf: []const u8, end: usize) usize {
+    var k = end;
+    while (k > 0 and std.ascii.isWhitespace(buf[k - 1])) k -= 1;
+    return k;
+}
+
+/// The start of the quoted text that ends at `buf[end - 1]` (a quote), a doubled quote inside it being one character.
+fn quotedBack(buf: []const u8, end: usize) ?usize {
+    const q = buf[end - 1];
+    var k = end - 1;
+    while (k > 0) {
+        k -= 1;
+        if (buf[k] != q) continue;
+        if (k > 0 and buf[k - 1] == q) {
+            k -= 1;
+            continue;
+        }
+        return k;
+    }
+    return null;
+}
+
+/// The name (a word, or quoted segments joined by dots) that ends at `end`, as its start; null if none or a keyword.
+fn nameBack(buf: []const u8, end: usize) ?usize {
+    var k = end;
+    while (true) {
+        if (k == 0) break;
+        if (buf[k - 1] == '"') {
+            k = quotedBack(buf, k) orelse return null;
+        } else if (isNameByte(buf[k - 1])) {
+            while (k > 0 and isNameByte(buf[k - 1])) k -= 1;
+        } else break;
+        if (k > 0 and buf[k - 1] == '.') k -= 1 else break;
+    }
+    if (k == end) return null;
+    if (endsOperand(buf[k..end])) return null;
+    return k;
+}
+
+/// The start of the operand that ends at `end`: a name or number, a quoted text, or a group or call, whose
+/// parentheses are matched backward.
+fn atomBack(buf: []const u8, end: usize) ?usize {
+    if (end == 0) return null;
+    switch (buf[end - 1]) {
+        ')' => {
+            var depth: usize = 0;
+            var quote: u8 = 0;
+            var k = end;
+            while (k > 0) {
+                k -= 1;
+                const ch = buf[k];
+                if (quote != 0) {
+                    if (ch == quote) quote = 0;
+                    continue;
+                }
+                switch (ch) {
+                    '\'', '"' => quote = ch,
+                    ')' => depth += 1,
+                    '(' => {
+                        depth -= 1;
+                        if (depth == 0) return nameBack(buf, k) orelse k;
+                    },
+                    else => {},
+                }
+            }
+            return null;
+        },
+        '\'' => return quotedBack(buf, end),
+        else => return nameBack(buf, end),
+    }
+}
+
+/// Whether the sign just before `at` is a unary one: nothing, an operator or a keyword comes before it.
+fn signIsUnary(buf: []const u8, at: usize) bool {
+    const k = skipSpacesBack(buf, at);
+    if (k == 0) return true;
+    if (std.mem.indexOfScalar(u8, "(,*/%+-=<>|&^!", buf[k - 1]) != null) return true;
+    var w = k;
+    while (w > 0 and isNameByte(buf[w - 1])) w -= 1;
+    return w < k and endsOperand(buf[w..k]);
+}
+
+/// Where the left operand of a `//` that follows `buf` starts: the chain of operands joined by `*`, `/` and `%` (and
+/// the sign of its first), which `//` shares its level and left-to-right reading with. Null if there is none.
+fn leftOperandStart(buf: []const u8) ?usize {
+    var p = skipSpacesBack(buf, buf.len);
+    while (true) {
+        p = atomBack(buf, p) orelse return null;
+        const k = skipSpacesBack(buf, p);
+        if (k > 0 and (buf[k - 1] == '-' or buf[k - 1] == '+') and signIsUnary(buf, k - 1)) p = k - 1;
+        const o = skipSpacesBack(buf, p);
+        if (o == 0 or std.mem.indexOfScalar(u8, "*/%", buf[o - 1]) == null) return p;
+        // An operator of the chain; a second slash before it is a `//` that was not rewritten.
+        if (buf[o - 1] == '/' and o > 1 and buf[o - 2] == '/') return null;
+        p = skipSpacesBack(buf, o - 1);
+    }
+}
+
+/// The end of the quoted text that starts at `sql[at]`.
+fn quotedForward(sql: []const u8, at: usize) ?usize {
+    const q = sql[at];
+    var k = at + 1;
+    while (k < sql.len) : (k += 1) {
+        if (sql[k] != q) continue;
+        if (k + 1 < sql.len and sql[k + 1] == q) {
+            k += 1;
+            continue;
+        }
+        return k + 1;
+    }
+    return null;
+}
+
+/// The end of the group whose `(` is `sql[at]`.
+fn groupForward(sql: []const u8, at: usize) ?usize {
+    var depth: usize = 0;
+    var k = at;
+    while (k < sql.len) {
+        switch (sql[k]) {
+            '\'', '"' => k = quotedForward(sql, k) orelse return null,
+            '(' => {
+                depth += 1;
+                k += 1;
+            },
+            ')' => {
+                depth -= 1;
+                k += 1;
+                if (depth == 0) return k;
+            },
+            else => k += 1,
+        }
+    }
+    return null;
+}
+
+/// The end of the right operand of a `//` whose operator ends at `from`: one optionally signed operand.
+fn rightOperandEnd(sql: []const u8, from: usize) ?usize {
+    var k = from;
+    while (k < sql.len and std.ascii.isWhitespace(sql[k])) k += 1;
+    if (k < sql.len and (sql[k] == '-' or sql[k] == '+')) {
+        k += 1;
+        while (k < sql.len and std.ascii.isWhitespace(sql[k])) k += 1;
+    }
+    if (k >= sql.len) return null;
+    switch (sql[k]) {
+        '(' => return groupForward(sql, k),
+        '\'', '"' => {
+            var e = quotedForward(sql, k) orelse return null;
+            // Quoted segments joined by dots, then a call's arguments.
+            while (e < sql.len and sql[e] == '.' and e + 1 < sql.len and sql[e + 1] == '"') e = quotedForward(sql, e + 1) orelse return null;
+            return if (e < sql.len and sql[e] == '(') groupForward(sql, e) else e;
+        },
+        else => {
+            const start = k;
+            while (k < sql.len and (isNameByte(sql[k]) or sql[k] == '.')) k += 1;
+            if (k == start or endsOperand(sql[start..k])) return null;
+            // A signed exponent: `1e-3`.
+            if (std.ascii.isDigit(sql[start]) and k + 1 < sql.len and (sql[k - 1] == 'e' or sql[k - 1] == 'E') and
+                (sql[k] == '-' or sql[k] == '+') and std.ascii.isDigit(sql[k + 1]))
+            {
+                k += 1;
+                while (k < sql.len and std.ascii.isDigit(sql[k])) k += 1;
+            }
+            return if (k < sql.len and sql[k] == '(') groupForward(sql, k) else k;
+        },
+    }
+}
+
+/// `sql` with DuckDB's integer division `a // b` written as the call `"//"(a, b)`, DuckDB's own name for it and a form
+/// the grammar reads. `//` has the level of `*`, `/` and `%`, read left to right: its left operand is the chain of
+/// operands before it back to a looser operator, its right one the single operand after it (a signed number, a name, a
+/// string, a call or a group). A `//` whose operands are none of those stays in the text, and the grammar refuses it.
+/// Quoted text is untouched; comments in a query that has a `//` become a space. Nesting is bounded.
+fn integerDivision(allocator: std.mem.Allocator, sql: []const u8, depth: u32) ![:0]u8 {
+    if (depth > 16) return error.SqlParseError;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var found = false;
+    var i: usize = 0;
+    while (i < sql.len) {
+        const ch = sql[i];
+        if (ch == '\'' or ch == '"') {
+            const end = quotedForward(sql, i) orelse sql.len;
+            try out.appendSlice(allocator, sql[i..end]);
+            i = end;
+        } else if (ch == '-' and i + 1 < sql.len and sql[i + 1] == '-') {
+            while (i < sql.len and sql[i] != '\n') i += 1;
+            try out.append(allocator, ' ');
+        } else if (ch == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
+            const end = std.mem.indexOfPos(u8, sql, i + 2, "*/") orelse sql.len - 2;
+            i = end + 2;
+            try out.append(allocator, ' ');
+        } else if (ch == '/' and i + 1 < sql.len and sql[i + 1] == '/') {
+            const left = leftOperandStart(out.items);
+            const right = rightOperandEnd(sql, i + 2);
+            if (left == null or right == null) {
+                try out.appendSlice(allocator, "//");
+                i += 2;
+                continue;
+            }
+            found = true;
+            const lhs = try allocator.dupe(u8, std.mem.trim(u8, out.items[left.?..], " \t\r\n"));
+            defer allocator.free(lhs);
+            out.shrinkRetainingCapacity(left.?);
+            const rhs = try integerDivision(allocator, std.mem.trim(u8, sql[i + 2 .. right.?], " \t\r\n"), depth + 1);
+            defer allocator.free(rhs);
+            try out.appendSlice(allocator, "\"//\"(");
+            try out.appendSlice(allocator, lhs);
+            try out.appendSlice(allocator, ", ");
+            try out.appendSlice(allocator, rhs);
+            try out.append(allocator, ')');
+            i = right.?;
+        } else {
+            try out.append(allocator, ch);
+            i += 1;
+        }
+    }
+    // Only a query with a `//` is rewritten: any other keeps its text, so its diagnostics keep their positions.
+    if (!found) {
+        out.clearRetainingCapacity();
+        try out.appendSlice(allocator, sql);
+    }
+    return out.toOwnedSliceSentinel(allocator, 0);
+}
+
+test "integer division is rewritten to the call DuckDB names it by, operands and levels as read" {
+    const T = std.testing;
+    const cases = [_][2][]const u8{
+        .{ "SELECT sum(a // 7) FROM t", "SELECT sum(\"//\"(a, 7)) FROM t" },
+        .{ "SELECT a // b // c FROM t", "SELECT \"//\"(\"//\"(a, b), c) FROM t" },
+        .{ "SELECT x * y // 3 FROM t", "SELECT \"//\"(x * y, 3) FROM t" },
+        .{ "SELECT 1 + x // 2 FROM t", "SELECT 1 + \"//\"(x, 2) FROM t" },
+        .{ "SELECT a - 7 // 2 FROM t", "SELECT a - \"//\"(7, 2) FROM t" },
+        .{ "SELECT -7 // 2 FROM t", "SELECT \"//\"(-7, 2) FROM t" },
+        .{ "SELECT x // -2 FROM t", "SELECT \"//\"(x, -2) FROM t" },
+        .{ "SELECT f(x, 1) // g(2) FROM t", "SELECT \"//\"(f(x, 1), g(2)) FROM t" },
+        .{ "SELECT (a + b) // (c - d) FROM t", "SELECT \"//\"((a + b), (c - d)) FROM t" },
+        .{ "SELECT a // (b // c) FROM t", "SELECT \"//\"(a, (\"//\"(b, c))) FROM t" },
+        .{ "SELECT a%3 //2 FROM t", "SELECT \"//\"(a%3, 2) FROM t" },
+        .{ "SELECT a // 2 * 3 FROM t", "SELECT \"//\"(a, 2) * 3 FROM t" },
+        .{ "SELECT \"my col\" // 2, t.x // 1e-3 FROM t", "SELECT \"//\"(\"my col\", 2), \"//\"(t.x, 1e-3) FROM t" },
+        .{ "SELECT a // 2 AS q -- c // d\nFROM t", "SELECT \"//\"(a, 2) AS q  \nFROM t" },
+    };
+    for (cases) |pair| {
+        const got = try integerDivision(T.allocator, pair[0], 0);
+        defer T.allocator.free(got);
+        try T.expectEqualStrings(pair[1], got);
+    }
+    // Untouched: no operator outside quotes or comments, and operands this cannot delimit.
+    for ([_][]const u8{
+        "SELECT '// not' FROM 's3://b/k.parquet'",
+        "SELECT a /* x // y */ FROM t",
+        "SELECT a // FROM t",
+        "SELECT // 2 FROM t",
+        "SELECT CASE WHEN a THEN 1 END // 2 FROM t",
+        "SELECT a // CASE WHEN a THEN 1 END FROM t",
+    }) |sql| {
+        const got = try integerDivision(T.allocator, sql, 0);
+        defer T.allocator.free(got);
+        try T.expectEqualStrings(sql, got);
+    }
+}
+
 /// `sql` with the keyword form of `substring` written as the call DuckDB reads it as: `substring(x FROM a FOR b)` is
 /// `substring(x, a, b)`, `substring(x FROM a)` is `substring(x, a)` and `substring(x FOR b)` is `substring(x, 1, b)`.
 /// Only a keyword that sits directly in the call's own parentheses counts (not one in a nested call or subquery) and
@@ -851,7 +1128,9 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
     var error_msg: [*c]const u8 = null;
     const extracted = try extractAsDatePart(allocator, folded_sql);
     defer allocator.free(extracted);
-    const sql_c = try substringKeywords(allocator, extracted);
+    const keyworded = try substringKeywords(allocator, extracted);
+    defer allocator.free(keyworded);
+    const sql_c = try integerDivision(allocator, keyworded, 0);
     defer allocator.free(sql_c);
 
     // lp_parse() silently stops at the first ';', so trailing statements/clauses

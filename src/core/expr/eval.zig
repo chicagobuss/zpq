@@ -567,11 +567,14 @@ fn evalGroupKeyConcatBinOp(
 }
 
 fn applyScalarKernel(comptime T: type, op: ast.Op, a: T, b: T) Error!T {
+    // A DOUBLE divides by zero to infinity or NaN, as `/` does; `//` and the integers and DECIMALs raise it.
     if (@typeInfo(T) != .int) return switch (op) {
         .add => a + b,
         .sub => a - b,
         .mul => a * b,
         .div => a / b,
+        .mod => @rem(a, b),
+        .intdiv => if (b == 0) error.DivisionByZero else a / b,
         .concat => error.TypeMismatch,
     };
     if (rowFault(T, op, a, b)) |fault| return fault;
@@ -579,7 +582,8 @@ fn applyScalarKernel(comptime T: type, op: ast.Op, a: T, b: T) Error!T {
         .add => a + b,
         .sub => a - b,
         .mul => a * b,
-        .div => @divTrunc(a, b),
+        .div, .intdiv => @divTrunc(a, b),
+        .mod => @rem(a, b),
         .concat => error.TypeMismatch,
     };
 }
@@ -604,7 +608,7 @@ fn rowFault(comptime T: type, op: ast.Op, a: T, b: T) ?Error {
         .add => if (@addWithOverflow(a, b)[1] != 0) error.IntegerOverflowAdd else null,
         .sub => if (@subWithOverflow(a, b)[1] != 0) error.IntegerOverflowSub else null,
         .mul => if (@mulWithOverflow(a, b)[1] != 0) error.IntegerOverflowMul else null,
-        .div => if (b == 0)
+        .div, .mod, .intdiv => if (b == 0)
             error.DivisionByZero
         else if (a == std.math.minInt(T) and b == -1)
             error.IntegerOverflowDiv
@@ -765,24 +769,71 @@ fn evalBinOp(
     const r_col = try evalAs(arena, batch, column_lookup, b.right.*, b.result_type);
 
     const consumed: Consumed = .{ .sel = batch.sel };
+    // The rows are computed in the i64 lane; the minimum of a narrower SQL type over -1 overflows in that type.
+    if (b.result_type == .i64 and (b.op == .mod or b.op == .intdiv)) if (b.int) |t| switch (t) {
+        .i8, .i16, .i32 => try narrowMinOverflow(@intCast(t.minValue()), l_col, r_col, consumed),
+        else => {},
+    };
     // A NULL on either side makes the row NULL, never computed, so its placeholder raises no fault. Only a batch with
     // a NULL row pays for that; the rest run the vector kernels below.
     if (columnHasNullRows(l_col) or columnHasNullRows(r_col)) return switch (b.result_type) {
-        .i64 => evalGroupKeyNumericBinOp(i64, arena, b.op, l_col, r_col, consumed),
+        .i64 => try narrowRange(b, try evalGroupKeyNumericBinOp(i64, arena, b.op, l_col, r_col, consumed), l_col, r_col, consumed),
         .f64 => evalGroupKeyNumericBinOp(f64, arena, b.op, l_col, r_col, consumed),
         .str => evalGroupKeyConcatBinOp(arena, l_col, r_col),
         .dec => unreachable,
     };
     return switch (b.result_type) {
-        .i64 => .{ .i64 = .{
+        .i64 => try narrowRange(b, .{ .i64 = .{
             .values = try applyKernel(i64, arena, b.op, l_col.i64.values, r_col.i64.values, consumed),
-        } },
+        } }, l_col, r_col, consumed),
         .f64 => .{ .f64 = .{
             .values = try applyKernel(f64, arena, b.op, l_col.f64.values, r_col.f64.values, consumed),
         } },
         .str => .{ .string = .{ .values = try concatKernel(arena, l_col.string.values, r_col.string.values) } },
         .dec => unreachable,
     };
+}
+
+/// `res`, the `+`, `-` or `*` of two integers computed in the i64 lane, checked against the SQL type DuckDB resolves for the
+/// pair when that is narrower (`SMALLINT + TINYINT` of 32767 and 127 is an overflow error there, and 32894 here without
+/// this): a result outside the type, in a row the query consumes and that is not NULL, fails as the lane's own overflow
+/// does. One min/max pass over the slice; only a value outside the type sends it looking at its row.
+fn narrowRange(b: ast.BinOp, res: Batch.Column, l: Batch.Column, r: Batch.Column, consumed: Consumed) Error!Batch.Column {
+    if (b.op != .add and b.op != .sub and b.op != .mul) return res;
+    const t = b.int orelse return res;
+    switch (t) {
+        .i8, .i16, .i32, .u8, .u16, .u32 => {},
+        .i64, .i128, .u64 => return res,
+    }
+    const lo: i64 = @intCast(t.minValue());
+    const hi: i64 = @intCast(t.maxValue());
+    const values = res.i64.values;
+    var least: i64 = std.math.maxInt(i64);
+    var most: i64 = std.math.minInt(i64);
+    for (values) |v| {
+        least = @min(least, v);
+        most = @max(most, v);
+    }
+    if (least >= lo and most <= hi) return res;
+    for (values, 0..) |v, i| {
+        if (v >= lo and v <= hi) continue;
+        if (!consumed.has(i) or rowIsNull(l, i) or rowIsNull(r, i)) continue;
+        return switch (b.op) {
+            .add => error.IntegerOverflowAdd,
+            .sub => error.IntegerOverflowSub,
+            else => error.IntegerOverflowMul,
+        };
+    }
+    return res;
+}
+
+/// `minimum % -1` and `minimum // -1` of a SQL integer type narrower than the i64 lane the rows are computed in: an
+/// overflow DuckDB raises, in a row the query consumes and that is not NULL.
+fn narrowMinOverflow(min: i64, l: Batch.Column, r: Batch.Column, consumed: Consumed) Error!void {
+    for (l.i64.values, r.i64.values, 0..) |x, y, i| {
+        if (x != min or y != -1) continue;
+        if (consumed.has(i) and !rowIsNull(l, i) and !rowIsNull(r, i)) return error.IntegerOverflowDiv;
+    }
 }
 
 // ============================================================
@@ -812,7 +863,7 @@ pub const ExactPlan = struct {
                 if (col.codes() != null or col.levelsOnly() or col.nullInfo().max_rep != 0) return null;
             },
             .binop => |b| {
-                if (b.result_type != .dec or b.op == .div or b.op == .concat) return null;
+                if (b.result_type != .dec or b.op == .div or b.op == .mod or b.op == .concat) return null;
                 _ = (try self.add(a, batch, lookup, b.left.*)) orelse return null;
                 _ = (try self.add(a, batch, lookup, b.right.*)) orelse return null;
             },
@@ -1047,11 +1098,12 @@ fn decBinOpLaneCached(
     b: ast.BinOp,
     plan: ?*ExactPlan,
 ) Error!Batch.Column {
+    if (b.op == .mod) return decModLane(arena, batch, column_lookup, b);
     const spec = b.dec.?;
     const lhs_scale, const rhs_scale = switch (b.op) {
         .add, .sub => .{ spec.scale, spec.scale },
         .mul => .{ b.left.decSpec().?.scale, b.right.decSpec().?.scale },
-        .div, .concat => unreachable,
+        .div, .mod, .intdiv, .concat => unreachable,
     };
     const l = try decOperandCached(arena, batch, column_lookup, b.left.*, lhs_scale, plan);
     const r = try decOperandCached(arena, batch, column_lookup, b.right.*, rhs_scale, plan);
@@ -1126,9 +1178,37 @@ fn decBinOpLaneCached(
                 },
             },
         },
-        .div, .concat => unreachable,
+        .div, .mod, .intdiv, .concat => unreachable,
     }
     unreachable;
+}
+
+/// `l % r` of exact operands: both at the result's scale (the larger of theirs), then the remainder of the unscaled
+/// integers, with the sign of the dividend, as DuckDB's. A zero divisor is an error in a row that is read and not NULL;
+/// a NULL on either side is NULL, never computed. The remainder is smaller than the divisor, so it fits the type.
+fn decModLane(
+    arena: std.mem.Allocator,
+    batch: *const Batch,
+    column_lookup: []const ?usize,
+    b: ast.BinOp,
+) Error!Batch.Column {
+    const scale = b.dec.?.scale;
+    const l = try decRows(arena, batch, column_lookup, b.left.*, scale);
+    const r = try decRows(arena, batch, column_lookup, b.right.*, scale);
+    const n = batch.num_rows;
+    const out = try arena.alloc(i128, n);
+    const def: ?[]u32 = if (l.nulls != null or r.nulls != null) try arena.alloc(u32, n) else null;
+    for (out, l.v, r.v, 0..) |*o, x, y, i| {
+        const is_null = (l.nulls != null and rowIsNull(l.nulls.?, i)) or (r.nulls != null and rowIsNull(r.nulls.?, i));
+        if (def) |d| d[i] = @intFromBool(!is_null);
+        if (is_null or y == 0) {
+            o.* = 0;
+            if (!is_null and (batch.sel == null or batch.sel.?.isActive(i))) return error.DivisionByZero;
+            continue;
+        }
+        o.* = @rem(x, y);
+    }
+    return .{ .i128 = .{ .values = out, .def_levels = def, .max_def = if (def != null) 1 else 0, .has_nulls = def != null } };
 }
 
 fn decChecked64(
@@ -2549,17 +2629,25 @@ fn applyKernel(
         .mul => for (a, b, 0..) |x, y, i| {
             out[i] = x * y;
         },
-        .div => if (@typeInfo(T) == .int) {
+        .div, .intdiv, .mod => if (@typeInfo(T) == .int) {
             // A zero divisor or minInt / -1 leaves a 0 and a flag; then, as for + - *, only a consumed row fails.
             var faulted = false;
             for (a, b, 0..) |x, y, i| {
                 const bad = y == 0 or (x == std.math.minInt(T) and y == -1);
                 faulted = faulted or bad;
-                out[i] = if (bad) 0 else @divTrunc(x, y);
+                out[i] = if (bad) 0 else if (op == .mod) @rem(x, y) else @divTrunc(x, y);
             }
             if (faulted) try firstConsumedFault(T, op, a, b, consumed);
-        } else for (a, b, 0..) |x, y, i| {
-            out[i] = x / y;
+        } else if (op == .mod) {
+            for (a, b, 0..) |x, y, i| out[i] = @rem(x, y);
+        } else {
+            var zero = false;
+            for (a, b, 0..) |x, y, i| {
+                zero = zero or y == 0;
+                out[i] = x / y;
+            }
+            // `/` of a DOUBLE by zero is infinity or NaN; `//` of one is DuckDB's division-by-zero error.
+            if (zero and op == .intdiv) for (b, 0..) |y, i| if (y == 0 and consumed.has(i)) return error.DivisionByZero;
         },
         // String concat is dispatched via concatKernel — should never
         // reach the numeric kernel.
@@ -2794,7 +2882,7 @@ test "integer division truncates" {
     lp.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     const rp = try a.create(ast.Expr);
     rp.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
-    const e: ast.Expr = .{ .binop = .{ .op = .div, .left = lp, .right = rp, .result_type = .i64, .depth = 2 } };
+    const e: ast.Expr = .{ .binop = .{ .op = .intdiv, .left = lp, .right = rp, .result_type = .i64, .depth = 2 } };
 
     const out = try evalExpr(a, &batch, &lookup, e);
     try testing.expectEqualSlices(i64, &.{ 3, 4, 4 }, out.i64.values);
@@ -2813,6 +2901,66 @@ fn evalI64Binop(a: std.mem.Allocator, op: ast.Op, xs: []const i64, ys: []const i
     return evalExpr(a, &batch, &lookup, e);
 }
 
+test "% and // on integers take the sign of the dividend, truncate, and fault on a zero divisor or minimum over -1" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const xs = [_]i64{ 7, -7, 7, -7, 0, 6 };
+    const ys = [_]i64{ 3, 3, -3, -3, 5, 3 };
+    const rem = try evalI64Binop(a, .mod, &xs, &ys);
+    try testing.expectEqualSlices(i64, &.{ 1, -1, 1, -1, 0, 0 }, rem.i64.values);
+    const quot = try evalI64Binop(a, .intdiv, &xs, &ys);
+    try testing.expectEqualSlices(i64, &.{ 2, -2, -2, 2, 0, 2 }, quot.i64.values);
+    for ([_]ast.Op{ .mod, .intdiv }) |op| {
+        try testing.expectError(error.DivisionByZero, evalI64Binop(a, op, &.{ 1, 2 }, &.{ 1, 0 }));
+        try testing.expectError(error.IntegerOverflowDiv, evalI64Binop(a, op, &.{ std.math.minInt(i64), 1 }, &.{ -1, 1 }));
+    }
+    // The scalar kernel the NULL-aware path runs agrees, and a DOUBLE takes fmod and a `//` that is `/` but for zero.
+    try testing.expectEqual(@as(i64, -1), try applyScalarKernel(i64, .mod, -7, 3));
+    try testing.expectEqual(@as(f64, -1.5), try applyScalarKernel(f64, .mod, -7.5, 2));
+    try testing.expectEqual(@as(f64, 5), try applyScalarKernel(f64, .mod, 5, std.math.inf(f64)));
+    try testing.expect(std.math.isNan(try applyScalarKernel(f64, .mod, 5, 0)));
+    try testing.expect(std.math.isNan(try applyScalarKernel(f64, .mod, std.math.inf(f64), 2)));
+    try testing.expectEqual(@as(f64, 3.75), try applyScalarKernel(f64, .intdiv, 7.5, 2));
+    try testing.expectEqual(std.math.inf(f64), try applyScalarKernel(f64, .div, 1, 0));
+    try testing.expectError(error.DivisionByZero, applyScalarKernel(f64, .intdiv, 1, 0));
+}
+
+test "+ - * and % // of a narrow SQL integer type fail where the type overflows, not only the i64 lane" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const lookup = [_]?usize{ 0, 1 };
+    const lp = try a.create(ast.Expr);
+    lp.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT32, .expr_type = .i64 } };
+    const rp = try a.create(ast.Expr);
+    rp.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT32, .expr_type = .i64 } };
+    // Row 1 is always fine; row 0 leaves SMALLINT (for % and //, the minimum over -1).
+    var only_row_1 = try selection.SelectionVector.init(a, 3);
+    only_row_1.set(0, false);
+    only_row_1.set(2, false);
+    for ([_]struct { op: ast.Op, x: i64, y: i64, err: Error }{
+        .{ .op = .add, .x = 32767, .y = 1, .err = error.IntegerOverflowAdd },
+        .{ .op = .sub, .x = -32768, .y = 1, .err = error.IntegerOverflowSub },
+        .{ .op = .mul, .x = 32767, .y = 2, .err = error.IntegerOverflowMul },
+        .{ .op = .mod, .x = -32768, .y = -1, .err = error.IntegerOverflowDiv },
+        .{ .op = .intdiv, .x = -32768, .y = -1, .err = error.IntegerOverflowDiv },
+    }) |c| {
+        const cols = [_]Batch.Column{ col_i64(&.{ c.x, 5, 7 }), col_i64(&.{ c.y, 5, 7 }) };
+        const batch: Batch = .{ .cols = &cols, .num_rows = 3 };
+        const e: ast.Expr = .{ .binop = .{ .op = c.op, .left = lp, .right = rp, .result_type = .i64, .depth = 2, .int = .i16 } };
+        try testing.expectError(c.err, evalExpr(a, &batch, &lookup, e));
+        // Only a row the query consumes fails.
+        var selected = batch;
+        selected.sel = &only_row_1;
+        _ = try evalExpr(a, &selected, &lookup, e);
+        // As BIGINT the same values cannot overflow the lane (the minimum of i64 aside).
+        var wide = e;
+        wide.binop.int = .i64;
+        _ = try evalExpr(a, &batch, &lookup, wide);
+    }
+}
+
 test "integer + - * / that overflow the i64 lane fail the query, in a vector or the tail after it" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2829,7 +2977,7 @@ test "integer + - * / that overflow the i64 lane fail the query, in a vector or 
         xs[at] = min;
         try testing.expectError(error.IntegerOverflowSub, evalI64Binop(a, .sub, &xs, &ys));
         ys[at] = -1;
-        try testing.expectError(error.IntegerOverflowDiv, evalI64Binop(a, .div, &xs, &ys));
+        try testing.expectError(error.IntegerOverflowDiv, evalI64Binop(a, .intdiv, &xs, &ys));
     }
     // At the edges, exact: nothing wraps and nothing is refused that fits.
     const out = try evalI64Binop(a, .add, &.{ max - 1, min + 1, 0 }, &.{ 1, -1, max });
@@ -2859,7 +3007,7 @@ test "an integer fault in a null slot or an unselected row is not the query's; o
     const z = try a.create(ast.Expr);
     z.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
     const times_two: ast.Expr = .{ .binop = .{ .op = .mul, .left = x, .right = two, .result_type = .i64, .depth = 2 } };
-    const over_zero: ast.Expr = .{ .binop = .{ .op = .div, .left = x, .right = z, .result_type = .i64, .depth = 2 } };
+    const over_zero: ast.Expr = .{ .binop = .{ .op = .intdiv, .left = x, .right = z, .result_type = .i64, .depth = 2 } };
 
     // Row 3 consumed: its overflow, and its zero divisor, fail the key. The null row's never would.
     const all: Batch = .{ .cols = &cols, .num_rows = 4 };
@@ -2904,7 +3052,7 @@ test "integer division by zero errors" {
     lp.* = .{ .col_ref = .{ .col_idx = 0, .physical_type = .INT64, .expr_type = .i64 } };
     const rp = try a.create(ast.Expr);
     rp.* = .{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } };
-    const e: ast.Expr = .{ .binop = .{ .op = .div, .left = lp, .right = rp, .result_type = .i64, .depth = 2 } };
+    const e: ast.Expr = .{ .binop = .{ .op = .intdiv, .left = lp, .right = rp, .result_type = .i64, .depth = 2 } };
 
     try testing.expectError(error.DivisionByZero, evalExpr(a, &batch, &lookup, e));
 }
@@ -3417,7 +3565,7 @@ test "arithmetic over NULLs is NULL, and a NULL, unwanted or placeholder row nev
     const sum = try evalExpr(a, &batch, &lookup, bin(.add, &x, &y, .i64));
     try testing.expectEqualSlices(u32, &.{ 0, 1, 0, 1 }, sum.i64.def_levels.?);
     try testing.expectEqual(@as(i64, 7), sum.i64.values[1]);
-    const quotient = try evalExpr(a, &batch, &lookup, bin(.div, &x, &y, .i64));
+    const quotient = try evalExpr(a, &batch, &lookup, bin(.intdiv, &x, &y, .i64));
     try testing.expectEqualSlices(u32, &.{ 0, 1, 0, 1 }, quotient.i64.def_levels.?);
     try testing.expectEqual(@as(i64, 1), quotient.i64.values[3]);
 
@@ -3584,7 +3732,7 @@ test "coalesce over any arguments: first present value, each argument evaluated 
     var na: ast.Expr = .{ .literal = .{ .str = "NA" } };
     var suffix: ast.Expr = .{ .literal = .{ .str = "!" } };
     var x2: ast.Expr = .{ .binop = .{ .op = .mul, .left = &x, .right = &two, .result_type = .i64, .depth = 2 } };
-    var div: ast.Expr = .{ .binop = .{ .op = .div, .left = &hundred, .right = &y, .result_type = .i64, .depth = 2 } };
+    var div: ast.Expr = .{ .binop = .{ .op = .intdiv, .left = &hundred, .right = &y, .result_type = .i64, .depth = 2 } };
     var cat: ast.Expr = .{ .binop = .{ .op = .concat, .left = &s, .right = &suffix, .result_type = .str, .depth = 2 } };
     const call = struct {
         fn of(args: []const *ast.Expr, t: ast.Type) ast.Expr {

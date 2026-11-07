@@ -84,6 +84,9 @@ const TokenKind = enum {
     minus,
     star,
     slash,
+    /// `//`, integer division; `%`, the remainder.
+    slash_slash,
+    percent,
     /// `||` — SQL string concatenation.
     pipe_pipe,
     lparen,
@@ -137,6 +140,10 @@ const Lexer = struct {
                 return .{ .kind = .star, .text = "" };
             },
             '/' => {
+                if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '/') {
+                    self.pos += 2;
+                    return .{ .kind = .slash_slash, .text = "" };
+                }
                 self.pos += 1;
                 return .{ .kind = .slash, .text = "" };
             },
@@ -152,8 +159,10 @@ const Lexer = struct {
                 self.pos += 1;
                 return .{ .kind = .comma, .text = "" };
             },
-            // An operator SQL has and zpq does not: named, not an unexpected character.
-            '%' => return error.ModuloNotSupported,
+            '%' => {
+                self.pos += 1;
+                return .{ .kind = .percent, .text = "" };
+            },
             '|' => {
                 if (self.pos + 1 < self.src.len and self.src[self.pos + 1] == '|') {
                     self.pos += 2;
@@ -274,8 +283,8 @@ fn syntaxArgs(arena: std.mem.Allocator, args: []const *syntax.Expr) Error![]cons
     return out;
 }
 
-fn binaryNode(comptime bound: bool, arena: std.mem.Allocator, op: ast.Op, left: ExprNode(bound), right: ExprNode(bound)) Error!ExprNode(bound) {
-    if (bound) return makeBinop(arena, op, left, right);
+fn binaryNode(comptime bound: bool, arena: std.mem.Allocator, file: *const schema.FileMetaData, op: ast.Op, left: ExprNode(bound), right: ExprNode(bound)) Error!ExprNode(bound) {
+    if (bound) return makeBinopIn(arena, file, op, left, right);
     const l = try arena.create(syntax.Expr);
     l.* = left;
     const r = try arena.create(syntax.Expr);
@@ -316,8 +325,8 @@ fn bindSyntaxAt(arena: std.mem.Allocator, node: syntax.Expr, file: *const schema
         .column => |name| bindColumn(arena, file, name, diag),
         .number => |n| bindSyntaxNumber(n.token, n.floating),
         .string => |value| .{ .literal = .{ .str = value } },
-        .negate => |inner| negate(arena, try bindSyntaxAt(arena, inner.*, file, diag, depth + 1)),
-        .binary => |b| makeBinop(arena, b.op, try bindSyntaxAt(arena, b.left.*, file, diag, depth + 1), try bindSyntaxAt(arena, b.right.*, file, diag, depth + 1)),
+        .negate => |inner| negateIn(arena, file, try bindSyntaxAt(arena, inner.*, file, diag, depth + 1)),
+        .binary => |b| makeBinopIn(arena, file, b.op, try bindSyntaxAt(arena, b.left.*, file, diag, depth + 1), try bindSyntaxAt(arena, b.right.*, file, diag, depth + 1)),
         .call => |c| blk: {
             const func = resolveFunc(c.name) orelse return error.UnknownFunction;
             const args = try arena.alloc(*ast.Expr, c.args.len);
@@ -505,7 +514,7 @@ fn parseExpr(comptime bound: bool, arena: std.mem.Allocator, lex: *Lexer, file: 
         };
         _ = try lex.next();
         const right = try parseTerm(bound, arena, lex, file);
-        left = try binaryNode(bound, arena, op, left, right);
+        left = try binaryNode(bound, arena, file, op, left, right);
     }
 }
 
@@ -516,11 +525,13 @@ fn parseTerm(comptime bound: bool, arena: std.mem.Allocator, lex: *Lexer, file: 
         const op: ast.Op = switch (tk.kind) {
             .star => .mul,
             .slash => .div,
+            .slash_slash => .intdiv,
+            .percent => .mod,
             else => return left,
         };
         _ = try lex.next();
         const right = try parseFactor(bound, arena, lex, file);
-        left = try binaryNode(bound, arena, op, left, right);
+        left = try binaryNode(bound, arena, file, op, left, right);
     }
 }
 
@@ -538,7 +549,7 @@ fn parseFactor(comptime bound: bool, arena: std.mem.Allocator, lex: *Lexer, file
             if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
             const inner = try parseFactor(bound, arena, lex, file);
             lex.depth -= 1;
-            return if (bound) negate(arena, inner) else unaryNode(arena, inner);
+            return if (bound) negateIn(arena, file, inner) else unaryNode(arena, inner);
         },
         .number_int => return if (bound) bindNumber(tk.text, false) else .{ .number = .{ .token = tk.text, .floating = false } },
         .number_float => return if (bound) bindNumber(tk.text, true) else .{ .number = .{ .token = tk.text, .floating = true } },
@@ -934,6 +945,12 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
 }
 
 pub fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr) Error!ast.Expr {
+    return makeBinopIn(arena, null, op, l, r);
+}
+
+/// `makeBinop` with the file the operands' columns belong to, which proves the SQL integer type a `%` or `//` checks its
+/// overflow in.
+pub fn makeBinopIn(arena: std.mem.Allocator, file: ?*const schema.FileMetaData, op: ast.Op, l: ast.Expr, r: ast.Expr) Error!ast.Expr {
     try rejectUnsigned64Operand(l);
     try rejectUnsigned64Operand(r);
     var result_type = ast.Type.promote(l.typeOf(), r.typeOf()) orelse return error.TypeMismatch;
@@ -941,13 +958,33 @@ pub fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr)
     // must stop here, before the DECIMAL result spec below.
     if (op == .concat and result_type != .str) return error.TypeMismatch;
     if (op != .concat and result_type == .str) return error.TypeMismatch;
-    // Exact division has no closed result scale; DECIMAL `/` is DOUBLE, as DuckDB types it.
-    if (op == .div and result_type == .dec) result_type = .f64;
+    // DuckDB has no remainder or integer division of a date, a time or a BOOLEAN.
+    if ((op == .mod or op == .intdiv) and (l.temporal() != null or r.temporal() != null or l.isBoolean() or r.isBoolean()))
+        return error.TypeMismatch;
+    // DuckDB's `/` divides in DOUBLE whatever the operands (7 / 2 is 3.5), exact division having no closed result
+    // scale; `//` is an integer division only between integers, and `/` with a zero-divisor error between the rest.
+    // A remainder of DECIMALs is a DECIMAL unless it needs more than 38 digits, then a DOUBLE.
+    switch (op) {
+        .div => result_type = .f64,
+        .intdiv => if (result_type != .i64) {
+            result_type = .f64;
+        },
+        .mod => if (result_type == .dec and ast.Dec.mod(l.decSpec().?, r.decSpec().?) == null) {
+            result_type = .f64;
+        },
+        .add, .sub, .mul, .concat => {},
+    }
     const dec: ?ast.Dec = if (result_type != .dec) null else switch (op) {
         .add, .sub => ast.Dec.addSub(l.decSpec().?, r.decSpec().?),
         .mul => try ast.Dec.mul(l.decSpec().?, r.decSpec().?),
-        .div, .concat => unreachable, // `.div` became f64 and `.concat` returned above
+        .mod => ast.Dec.mod(l.decSpec().?, r.decSpec().?).?,
+        .div, .intdiv, .concat => unreachable, // `.div` and `.intdiv` became f64 and `.concat` returned above
     };
+    // The SQL type DuckDB resolves for two integers, which `+ - *` overflow in and `%` and `//` fault on at its minimum.
+    const int: ?ast.IntType = if (result_type == .i64 and op != .concat and op != .div)
+        if (file) |f| arithInt(f, l, r) else null
+    else
+        null;
 
     // Tree height, not parser recursion: `a + 1 + 1 + ...` parses in a loop but still grows the left spine, which the
     // evaluator does recurse over. Checking as we build rejects a runaway chain before the whole AST is allocated.
@@ -965,6 +1002,7 @@ pub fn makeBinop(arena: std.mem.Allocator, op: ast.Op, l: ast.Expr, r: ast.Expr)
         .result_type = result_type,
         .depth = depth,
         .dec = dec,
+        .int = int,
     } };
 }
 
@@ -1212,6 +1250,13 @@ pub fn bindColumn(arena: std.mem.Allocator, file: *const schema.FileMetaData, na
     };
 }
 
+/// `negate` with the file that proves the SQL integer type the negation overflows in (`-(-128)` of a TINYINT).
+pub fn negateIn(arena: std.mem.Allocator, file: *const schema.FileMetaData, inner: ast.Expr) Error!ast.Expr {
+    var e = try negate(arena, inner);
+    if (e == .binop and e.binop.result_type == .i64) e.binop.int = arithInt(file, .{ .literal = .{ .i64 = 0 } }, inner);
+    return e;
+}
+
 pub fn negate(arena: std.mem.Allocator, inner: ast.Expr) Error!ast.Expr {
     switch (inner) {
         .literal => |lit| switch (lit) {
@@ -1303,6 +1348,24 @@ const IntBranches = struct {
     }
 };
 
+/// The SQL integer type of `l op r` for `+ - * % //` as DuckDB resolves it (`ast.IntType.combine`), or null where an
+/// operand's cannot be proved. A literal takes the other operand's type when it fits (`tinyint_col + 0` is a TINYINT).
+fn arithInt(file: *const schema.FileMetaData, l: ast.Expr, r: ast.Expr) ?ast.IntType {
+    const lit_l = if (l == .literal and l.literal == .i64) l.literal.i64 else null;
+    const lit_r = if (r == .literal and r.literal == .i64) r.literal.i64 else null;
+    if (lit_l == null or lit_r == null) {
+        if (lit_r) |v| {
+            const t = intTypeOf(file, l) orelse return null;
+            return if (t.holds(v)) t else ast.IntType.combine(t, ast.IntType.ofValue(v));
+        }
+        if (lit_l) |v| {
+            const t = intTypeOf(file, r) orelse return null;
+            return if (t.holds(v)) t else ast.IntType.combine(ast.IntType.ofValue(v), t);
+        }
+    }
+    return ast.IntType.combine(intTypeOf(file, l) orelse return null, intTypeOf(file, r) orelse return null);
+}
+
 /// The SQL integer type of an integer-valued expression as DuckDB resolves it, or null where zpq cannot prove it. Row
 /// arithmetic runs in i64 whatever the operands' widths, so the type is not in the values: it comes from the columns'
 /// schema elements, the casts' targets and the literals' magnitudes, joined by DuckDB's rules.
@@ -1317,23 +1380,8 @@ fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
             return ast.IntType.ofElement(elem);
         },
         .binop => |b| {
-            if (b.op != .add and b.op != .sub and b.op != .mul) return null;
-            // A literal takes the other operand's type when it fits (`tinyint_col + 0` is a TINYINT).
-            const lit_l = if (b.left.* == .literal and b.left.literal == .i64) b.left.literal.i64 else null;
-            const lit_r = if (b.right.* == .literal and b.right.literal == .i64) b.right.literal.i64 else null;
-            if (lit_l == null or lit_r == null) {
-                if (lit_r) |v| {
-                    const t = intTypeOf(file, b.left.*) orelse return null;
-                    return if (t.holds(v)) t else ast.IntType.combine(t, ast.IntType.ofValue(v));
-                }
-                if (lit_l) |v| {
-                    const t = intTypeOf(file, b.right.*) orelse return null;
-                    return if (t.holds(v)) t else ast.IntType.combine(ast.IntType.ofValue(v), t);
-                }
-            }
-            const l = intTypeOf(file, b.left.*) orelse return null;
-            const r = intTypeOf(file, b.right.*) orelse return null;
-            return ast.IntType.combine(l, r);
+            if (b.op == .div or b.op == .concat) return null;
+            return arithInt(file, b.left.*, b.right.*);
         },
         .call => |c| switch (c.func) {
             .abs, .cast_i8, .cast_i16, .cast_i32, .cast_i64 => return c.int,
@@ -1713,11 +1761,12 @@ test "parse and evaluate: searched CASE takes the first TRUE WHEN and evaluates 
     const batch: filter_eval_mod.Batch = .{ .cols = &.{ .{ .i64 = .{ .values = &av } }, .{ .string = .{ .values = &sv } } }, .num_rows = 4 };
     const lookup = [_]?usize{ 0, 1 };
 
-    // The row a = 3 divides by zero in the second branch, which the first WHEN takes it from.
+    // The row a = 3 divides by zero in the second branch, which the first WHEN takes it from. `/` is a DOUBLE division
+    // (10 / 1 and 10 / 2 are 10 and 5; DuckDB has no integer `/`), so the CASE is a DOUBLE.
     const num = try parseExprOnly(a, "CASE WHEN a = 3 THEN 0 WHEN a > 2 THEN 10 / (a - 3) ELSE -1 END", &file, null);
     const got = try expr_eval.evalExpr(a, &batch, &lookup, num);
-    try testing.expectEqualSlices(i64, &.{ -1, 0, 10, 5 }, got.i64.values);
-    try testing.expect(got.i64.def_levels == null);
+    try testing.expectEqualSlices(f64, &.{ -1, 0, 10, 5 }, got.f64.values);
+    try testing.expect(got.f64.def_levels == null);
     // Without ELSE a row no WHEN takes is NULL; a string literal joins a string column.
     const str = try parseExprOnly(a, "CASE WHEN s LIKE 'x%' AND (a < 2 OR a > 4) THEN s WHEN a = 3 THEN 'three' END", &file, null);
     const sg = try expr_eval.evalExpr(a, &batch, &lookup, str);
@@ -2143,13 +2192,25 @@ test "fuzz: select, aggregate, group-by and filter text parse or fail with an er
     } });
 }
 
-test "regression: `%` in an expression is named as an operator zpq does not have" {
+test "`%` and `//` in an expression are the remainder and the integer division, at the level of `*` and `/`" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const file = try fakeFile(a, &.{"id"}, &.{.INT64});
-    try testing.expectError(error.ModuloNotSupported, parseExprOnly(a, "id % 2", &file, null));
-    try testing.expectError(error.ModuloNotSupported, parseSelect(a, "id, id%2 AS m", &file, null));
+    const rem = try parseExprOnly(a, "id % 2", &file, null);
+    try testing.expectEqual(ast.Op.mod, rem.binop.op);
+    const sel = try parseSelect(a, "id, id%2 AS m, id // 2 AS q", &file, null);
+    try testing.expectEqual(ast.Op.mod, sel[1].expr.binop.op);
+    try testing.expectEqual(ast.Op.intdiv, sel[2].expr.binop.op);
+    // Left to right at one level: (id * 3) % 2, then the integer division of that.
+    const chain = try parseExprOnly(a, "id * 3 % 2 // 5", &file, null);
+    try testing.expectEqual(ast.Op.intdiv, chain.binop.op);
+    try testing.expectEqual(ast.Op.mod, chain.binop.left.binop.op);
+    // `/` is a DOUBLE division even between integers; `%` and `//` of integers stay integers.
+    try testing.expectEqual(ast.Type.f64, (try parseExprOnly(a, "id / 2", &file, null)).typeOf());
+    try testing.expectEqual(ast.Type.i64, rem.typeOf());
+    try testing.expectEqual(ast.Type.i64, chain.typeOf());
+    try testing.expectEqual(ast.Type.f64, (try parseExprOnly(a, "id // 2.5", &file, null)).typeOf());
     // In a string literal it is a character.
     _ = try parseExprOnly(a, "coalesce('a%', 'b')", &file, null);
 }

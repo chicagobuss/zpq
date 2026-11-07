@@ -223,7 +223,7 @@ test "runMultiAggregate: a pilot short of rows a group judges again at twice the
             .inputs = &inputs,
             .ndv_policy = false,
             .aggregate = "count(DISTINCT u) AS d, count(*) AS c",
-            .group_by = "u / 5000000000 AS b",
+            .group_by = "u // 5000000000 AS b",
             .parallelism = j,
             .min_bytes_per_worker = 1,
             .distinct_pairs = .off,

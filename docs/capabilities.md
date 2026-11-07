@@ -61,7 +61,15 @@ text), and searched `CASE WHEN cond THEN v ...
 [ELSE v] END`, parens, unary minus. A CASE evaluates a branch only on the rows that take it, and coalesce an argument
 only on the rows every earlier one left NULL, so a fault where no row needs the value is no error; the simple form
 `CASE c WHEN v ...` is the searched form `WHEN c = v` for a column and literals. DECIMAL arithmetic is exact (see below).
-The string functions count and cut text in characters (UTF-8 code points, as DuckDB does: a combining mark is a
+Integer arithmetic is typed and checked as DuckDB does: `+`, `-`, `*`, `%` and `//` of two integers are of the type
+DuckDB resolves for the pair (`SMALLINT + TINYINT` is a SMALLINT; a literal takes the other operand's type when it
+fits, so `tinyint_col + 0` is a TINYINT), and a result outside that type is an overflow error, in rows that are read
+and not NULL. `%` takes the sign of the dividend; `//` truncates toward zero; `/` of two integers is a DOUBLE division
+(`7 / 2` is 3.5: an earlier release truncated it, which `//` now spells). A zero divisor of `%` or `//` of integers or
+DECIMALs is an error, and so is the minimum of a signed type over -1; a DOUBLE `%` is C's `fmod` (`x % 0` is NaN), and
+`//` of anything but two integers is `/` with a zero-divisor error. `%` of DECIMALs is exact: a DECIMAL of the larger
+integer part and the larger scale, or a DOUBLE where that passes 38 digits. `%` and `//` over aggregates, and in a
+WHERE predicate, are refused by name. The string functions count and cut text in characters (UTF-8 code points, as DuckDB does: a combining mark is a
 character); `upper` and `lower` map one code point to one with DuckDB's own table, so `ß` upper-cases to `ẞ` and
 there is no final-sigma form. Their other arguments are constants (a column there is refused; an empty `lpad`/`rpad`
 pad is an error only where padding is needed, as in DuckDB). `trim`, `ltrim` and `rtrim` strip Unicode's space

@@ -1071,7 +1071,7 @@ test "callsTotal: bare columns and literals cannot fail, computed arguments and 
     }) |bad| try testing.expect(!callsTotal(&.{ ok[0], bad }));
     var left = col;
     var right: expr_ast.Expr = .{ .literal = .{ .i64 = 0 } };
-    const div: expr_ast.Expr = .{ .binop = .{ .op = .div, .left = &left, .right = &right, .result_type = .i64, .depth = 2 } };
+    const div: expr_ast.Expr = .{ .binop = .{ .op = .intdiv, .left = &left, .right = &right, .result_type = .i64, .depth = 2 } };
     try testing.expect(!callsTotal(&.{.{ .func = .count_distinct, .alias = "d", .result = .i64, .arg = div, .where = null }}));
 }
 

@@ -658,8 +658,8 @@ test "runMultiAggregate: a count(DISTINCT) census never drops the error a comput
     defer testing.allocator.free(bytes);
     const inputs = [_]Input{.{ .name = path, .bytes = bytes }};
     const aggregates = [_][]const u8{
-        "count(DISTINCT 100 / (u - 368403641522)) AS d",
-        "count(DISTINCT u) AS d, sum(100 / (u - 368403641522)) AS s",
+        "count(DISTINCT 100 // (u - 368403641522)) AS d",
+        "count(DISTINCT u) AS d, sum(100 // (u - 368403641522)) AS s",
     };
     for (aggregates) |aggregate| for ([_]usize{ 1, 3, 16 }) |parallelism| {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -691,8 +691,8 @@ test "runMultiAggregate: count and first-keys cuts never drop the error a comput
     const top: expr_ast.ResultOrder = .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 10 };
     const Case = struct { aggregate: []const u8, order: expr_ast.ResultOrder };
     const cases = [_]Case{
-        .{ .aggregate = "count(*) AS c, sum(100 / (u - 573290335422)) AS s", .order = top },
-        .{ .aggregate = "sum(100 / (u - 573290335422)) AS s", .order = .{ .limit = 3 } },
+        .{ .aggregate = "count(*) AS c, sum(100 // (u - 573290335422)) AS s", .order = top },
+        .{ .aggregate = "sum(100 // (u - 573290335422)) AS s", .order = .{ .limit = 3 } },
     };
     for (cases) |case| for ([_]?bool{ true, false }) |fuse| for ([_]usize{ 1, 3, 16 }) |parallelism| {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);

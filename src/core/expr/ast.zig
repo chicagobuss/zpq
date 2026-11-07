@@ -41,6 +41,9 @@ pub const Op = enum {
     mod,
     intdiv,
     concat,
+    /// `-x` of a DOUBLE: the right operand with its sign bit flipped, a zero or a NaN included (`0 - x` leaves a zero's
+    /// sign, and `-0.0 - x` a NaN's). The left operand is a placeholder. Negating an integer or a DECIMAL stays `0 - x`.
+    neg,
 };
 
 /// The value type an expression evaluates to. Three lanes — i64, f64,

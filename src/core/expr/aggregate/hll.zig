@@ -94,8 +94,11 @@ pub fn kindOfColRef(c: expr_ast.ColRef) ?Kind {
 pub inline fn hashRow(kind: Kind, col: filter_eval.Batch.Column, r: usize) error{ConversionOutOfRange}!u64 {
     switch (kind) {
         .ts_ms => {
-            // DuckDB stops at a count its microseconds do not hold ("Could not convert Timestamp(MS) to Timestamp(US)").
-            const us = std.math.mul(i64, @intCast(wide(col, r)), 1000) catch return error.ConversionOutOfRange;
+            // DuckDB stops at a count its microseconds do not hold ("Could not convert Timestamp(MS) to Timestamp(US)"),
+            // but reads the two infinite counts as the infinite microsecond timestamps.
+            const ms: i64 = @intCast(wide(col, r));
+            if (ms == std.math.maxInt(i64) or ms == -std.math.maxInt(i64)) return murmur64(@bitCast(ms));
+            const us = std.math.mul(i64, ms, 1000) catch return error.ConversionOutOfRange;
             return murmur64(@bitCast(us));
         },
         .w32 => return murmur64(@as(u32, @truncate(@as(u128, @bitCast(wide(col, r)))))),
@@ -216,11 +219,14 @@ test "hashes are DuckDB 2.0.0's `hash()`" {
     try T.expectEqual(@as(u64, 13381090676719377747), try hashRow(.w32, col, 2));
     try T.expectEqual(@as(u64, 6774767090898797280), try hashRow(.w64, col, 3));
     // A millisecond timestamp hashes as the microseconds DuckDB reads it as; one its microseconds cannot hold is an error.
-    const ms = [_]i64{ 5, -3, std.math.maxInt(i64) / 1000 + 1 };
+    const ms = [_]i64{ 5, -3, std.math.maxInt(i64) / 1000 + 1, std.math.maxInt(i64), -std.math.maxInt(i64) };
     const ms_col: filter_eval.Batch.Column = .{ .i64 = .{ .values = &ms } };
     try T.expectEqual(murmur64(5000), try hashRow(.ts_ms, ms_col, 0));
     try T.expectEqual(murmur64(@bitCast(@as(i64, -3000))), try hashRow(.ts_ms, ms_col, 1));
     try T.expectError(error.ConversionOutOfRange, hashRow(.ts_ms, ms_col, 2));
+    // The two infinite counts are the infinite microsecond timestamps (DuckDB: 1 distinct among them and a TIMESTAMP's).
+    try T.expectEqual(murmur64(@bitCast(@as(i64, std.math.maxInt(i64)))), try hashRow(.ts_ms, ms_col, 3));
+    try T.expectEqual(murmur64(@bitCast(@as(i64, -std.math.maxInt(i64)))), try hashRow(.ts_ms, ms_col, 4));
     // A HUGEINT (a DECIMAL past 18 digits): the hash of the low half xor the hash of the high.
     const wide_vals = [_]i128{ 123456789012345678901234567890, -3, -12345 };
     const wide_col: filter_eval.Batch.Column = .{ .i128 = .{ .values = &wide_vals } };

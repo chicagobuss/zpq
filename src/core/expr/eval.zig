@@ -588,6 +588,7 @@ fn applyScalarKernel(comptime T: type, op: ast.Op, a: T, b: T) Error!T {
         .div => a / b,
         .mod => @rem(a, b),
         .intdiv => if (b == 0) error.DivisionByZero else a / b,
+        .neg => -b,
         .concat => error.TypeMismatch,
     };
     if (rowFault(T, op, a, b)) |fault| return fault;
@@ -597,7 +598,7 @@ fn applyScalarKernel(comptime T: type, op: ast.Op, a: T, b: T) Error!T {
         .mul => a * b,
         .div, .intdiv => @divTrunc(a, b),
         .mod => @rem(a, b),
-        .concat => error.TypeMismatch,
+        .concat, .neg => error.TypeMismatch,
     };
 }
 
@@ -627,7 +628,7 @@ fn rowFault(comptime T: type, op: ast.Op, a: T, b: T) ?Error {
             error.IntegerOverflowDiv
         else
             null,
-        .concat => error.TypeMismatch,
+        .concat, .neg => error.TypeMismatch,
     };
 }
 
@@ -1111,7 +1112,7 @@ fn decBinOpLaneCached(
     const lhs_scale, const rhs_scale = switch (b.op) {
         .add, .sub => .{ spec.scale, spec.scale },
         .mul => .{ b.left.decSpec().?.scale, b.right.decSpec().?.scale },
-        .div, .mod, .intdiv, .concat => unreachable,
+        .div, .mod, .intdiv, .concat, .neg => unreachable,
     };
     const l = try decOperandCached(arena, batch, column_lookup, b.left.*, lhs_scale, plan);
     const r = try decOperandCached(arena, batch, column_lookup, b.right.*, rhs_scale, plan);
@@ -1186,7 +1187,7 @@ fn decBinOpLaneCached(
                 },
             },
         },
-        .div, .mod, .intdiv, .concat => unreachable,
+        .div, .mod, .intdiv, .concat, .neg => unreachable,
     }
     unreachable;
 }
@@ -2247,7 +2248,7 @@ const roundDivAway = calendar.roundDivAway;
 /// its day from the nanosecond, not the microsecond nearest it.
 /// The earliest TIMESTAMP DuckDB converts a TIMESTAMP_MS to, 290309-12-22 (BC) 00:00:00; earlier ones are a conversion
 /// error as a TIMESTAMP, while as a DATE they floor to their day.
-const ts_min_us: i64 = -9_223_372_022_400_000_000;
+const ts_min_us = calendar.min_timestamp_us;
 
 /// `unit` is the argument's, `utc` its time-zone flag: a UTC-adjusted nanosecond (DuckDB's TIMESTAMPTZ_NS) floors to
 /// its day from the nanosecond itself, a plain TIMESTAMP_NS from the microsecond nearest it. A TIMESTAMP_MS reaches
@@ -2272,6 +2273,23 @@ fn temporalCast(to_date: bool, unit: ast.Temporal, utc: bool, check_min: bool, v
     };
     if (check_min and unit == .ts_ms and !to_date and us < ts_min_us) return error.ConversionOutOfRange;
     return if (to_date) @divFloor(us, us_per_day) else us;
+}
+
+test "negating a DOUBLE flips its sign bit, a zero's and a NaN's included" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const left = [_]f64{ 0, 0, 0, 0, 0 };
+    const right = [_]f64{ 0.0, -0.0, std.math.nan(f64), -std.math.nan(f64), 1.5 };
+    const out = try applyKernel(f64, arena_state.allocator(), .neg, &left, &right, .{});
+    const want = [_]u64{
+        @bitCast(@as(f64, -0.0)),
+        @bitCast(@as(f64, 0.0)),
+        @bitCast(-std.math.nan(f64)),
+        @bitCast(std.math.nan(f64)),
+        @bitCast(@as(f64, -1.5)),
+    };
+    for (out, want) |got, w| try std.testing.expectEqual(w, @as(u64, @bitCast(got)));
+    for (right, want) |r, w| try std.testing.expectEqual(w, @as(u64, @bitCast(try applyScalarKernel(f64, .neg, 0, r))));
 }
 
 test "casting between DATE and TIMESTAMP matches DuckDB 2.0.0" {
@@ -2940,6 +2958,9 @@ fn applyKernel(
         },
         .mul => for (a, b, 0..) |x, y, i| {
             out[i] = x * y;
+        },
+        .neg => if (@typeInfo(T) == .int) return error.TypeMismatch else for (b, 0..) |y, i| {
+            out[i] = -y;
         },
         .div, .intdiv, .mod => if (@typeInfo(T) == .int) {
             // A zero divisor or minInt / -1 leaves a 0 and a flag; then, as for + - *, only a consumed row fails.

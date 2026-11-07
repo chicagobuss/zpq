@@ -1053,13 +1053,13 @@ pub fn makeBinopIn(arena: std.mem.Allocator, file: ?*const schema.FileMetaData, 
         .mod => if (result_type == .dec and ast.Dec.mod(l.decSpec().?, r.decSpec().?) == null) {
             result_type = .f64;
         },
-        .add, .sub, .mul, .concat => {},
+        .add, .sub, .mul, .concat, .neg => {},
     }
     const dec: ?ast.Dec = if (result_type != .dec) null else switch (op) {
         .add, .sub => ast.Dec.addSub(l.decSpec().?, r.decSpec().?),
         .mul => try ast.Dec.mul(l.decSpec().?, r.decSpec().?),
         .mod => ast.Dec.mod(l.decSpec().?, r.decSpec().?).?,
-        .div, .intdiv, .concat => unreachable, // `.div` and `.intdiv` became f64 and `.concat` returned above
+        .div, .intdiv, .concat, .neg => unreachable, // `.div` and `.intdiv` became f64, `.concat` returned above, and `.neg` is built by `negate`
     };
     // The SQL type DuckDB resolves for two integers, which `+ - *` overflow in and `%` and `//` fault on at its minimum.
     const int: ?ast.IntType = if (result_type == .i64 and op != .concat and op != .div)
@@ -1410,15 +1410,15 @@ pub fn negate(arena: std.mem.Allocator, inner: ast.Expr) Error!ast.Expr {
             const lp = try arena.create(ast.Expr);
             const result_type = ast.Type.promote(.i64, inner.typeOf()) orelse return error.TypeMismatch;
             if (result_type == .str) return error.TypeMismatch;
-            // `-0.0 - x` flips the sign of a zero, which `0 - x` leaves (DuckDB's `-x` of 0.0 is -0.0).
-            lp.* = if (result_type == .f64) .{ .literal = .{ .f64 = -0.0 } } else .{ .literal = .{ .i64 = 0 } };
+            lp.* = .{ .literal = .{ .i64 = 0 } };
             const rp = try arena.create(ast.Expr);
             rp.* = inner;
             const depth = 1 + inner.depth();
             if (depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
             // Negation can't grow a value, so a DECIMAL keeps its operand's type (as SQL engines type `-x`).
+            // A DOUBLE flips its sign bit (a zero and a NaN too, as DuckDB's `-x`); an integer or a DECIMAL is `0 - x`.
             return .{ .binop = .{
-                .op = .sub,
+                .op = if (result_type == .f64) .neg else .sub,
                 .left = lp,
                 .right = rp,
                 .result_type = result_type,

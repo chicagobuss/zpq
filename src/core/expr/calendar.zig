@@ -491,3 +491,6 @@ test "strftime formats as DuckDB 2.0.0 does" {
         try T.expectError(error.InvalidFormat, Format.compile(a, bad, false));
 }
 
+/// DuckDB's earliest TIMESTAMP in microseconds, 290309-12-22 (BC) 00:00:00: a TIMESTAMP or TIMESTAMP_MS below it is a
+/// conversion error wherever DuckDB converts it.
+pub const min_timestamp_us: i64 = -9_223_372_022_400_000_000;

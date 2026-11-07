@@ -57,6 +57,8 @@ when the file loads, as is a file with no cases):
   positions) must match row by row. `written_sql` checks a written file against a query: names, types (an integer
   at another width compares exactly) and the multiset of rows. `written_hash` checks the same multiset for files too
   big to load: each written column cast to the query's type, both sides folded to counts and hash sums in DuckDB.
+  A cast must lose nothing: every written value must cast back from the query's type to itself (DOUBLE 1.4 as
+  BIGINT, 1.004 as DECIMAL(4,2) or a noon TIMESTAMP as DATE fails by its column).
 - `refuse`: `{"error": KIND, "diag": SUBSTRING, "exit": N, "no_output": true, "binder_sql": SQL}`, the declared
   refusal of this exact query (a CLI refusal's kind is its JSON `code`, its `(Name)`, else `exit N`);
   with `binder_sql`, DuckDB must refuse that SQL with a Binder Error too (or with the error `duck_error` names, such

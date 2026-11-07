@@ -1864,9 +1864,12 @@ fn modeWrittenAs(in: Inputs, spec: Spec) !Reason {
 }
 
 /// A written file's rows against a query's as multisets, holding neither: for files too big to load (a CSV suite's
-/// gigabytes). The names must match in order; DuckDB casts each written column to the query's type (a value the
-/// type cannot hold is a failure) and folds each side to its row count and two independent sums of row hashes, so
-/// only a word comes back. Equal values compare equal whatever type an engine wrote them in.
+/// gigabytes). The names must match in order; DuckDB casts each written column to the query's type and folds each
+/// side to its row count and two independent sums of row hashes, so only a word comes back. Equal values compare
+/// equal whatever type an engine wrote them in, but only through a cast that loses nothing: DuckDB's casts round
+/// (DOUBLE 1.4 is BIGINT 1), cut scale (1.004 is DECIMAL(4,2) 1.00) and truncate (a noon TIMESTAMP is its DATE), so
+/// every written value must come back from the query's type as itself, and one that does not, or does not cast at
+/// all, fails by its column before any hash is compared.
 fn modeWrittenHash(in: Inputs, spec: Spec) !Reason {
     const sql = try oracleSql(in, spec);
     const want = duck(in, try std.fmt.allocPrint(in.arena, "SELECT * FROM ({s}) LIMIT 0", .{sql})) catch |err|
@@ -1879,21 +1882,32 @@ fn modeWrittenHash(in: Inputs, spec: Spec) !Reason {
     if (!std.mem.eql(u8, got_names, want_names)) return fail(in, "columns {s} want {s}", .{ got_names, want_names });
     var cast: std.ArrayList(u8) = .empty;
     var plain: std.ArrayList(u8) = .empty;
-    for (want.names, want.types, 0..) |name, ty, i| {
+    // Per converted column, whether a row's value failed the round trip; and the names of the columns where any did.
+    var flags: std.ArrayList(u8) = .empty;
+    var lossy: std.ArrayList(u8) = .empty;
+    for (want.names, want.types, got.types, 0..) |name, ty, written, i| {
         if (i != 0) {
             try cast.appendSlice(in.arena, ", ");
             try plain.appendSlice(in.arena, ", ");
         }
-        try cast.print(in.arena, "CAST(\"{s}\" AS {s})", .{ name, ty });
+        try cast.print(in.arena, "TRY_CAST(\"{s}\" AS {s})", .{ name, ty });
         try plain.print(in.arena, "\"{s}\"", .{name});
+        // A column already of the query's type needs no check.
+        if (std.mem.eql(u8, ty, written)) continue;
+        try flags.print(in.arena, ", TRY_CAST(TRY_CAST(\"{s}\" AS {s}) AS {s}) IS DISTINCT FROM \"{s}\" AS l{d}", .{
+            name, ty, written, name, i,
+        });
+        const label = try std.mem.replaceOwned(u8, in.arena, name, "'", "''");
+        try lossy.print(in.arena, ", CASE WHEN bool_or(l{d}) THEN '{s} ({s} as {s})' END", .{ i, label, written, ty });
     }
     const fold = "count(*) AS n, sum(hash(r)::HUGEINT) AS a, sum(hash(r::VARCHAR)::HUGEINT) AS b";
     const verdict = try std.fmt.allocPrint(in.arena,
-        \\WITH w AS (SELECT {s} FROM (SELECT ROW({s}) AS r FROM {s})),
+        \\WITH w AS (SELECT {s}, concat_ws(', ', NULL::VARCHAR{s}) AS lossy FROM (SELECT ROW({s}) AS r{s} FROM {s})),
         \\t AS (SELECT {s} FROM (SELECT ROW({s}) AS r FROM ({s})))
-        \\SELECT CASE WHEN w.n <> t.n THEN 'rows ' || w.n || ', want ' || t.n
+        \\SELECT CASE WHEN w.lossy <> '' THEN 'values change type with loss: ' || w.lossy
+        \\WHEN w.n <> t.n THEN 'rows ' || w.n || ', want ' || t.n
         \\WHEN w.a <> t.a OR w.b <> t.b THEN 'rows differ' ELSE 'same' END AS v FROM w, t
-    , .{ fold, cast.items, file, fold, plain.items, sql });
+    , .{ fold, lossy.items, cast.items, flags.items, file, fold, plain.items, sql });
     const ans = try in.oracle.askAfter(in.arena, in.setup, verdict);
     if (ans.refused) |why| return fail(in, "{s}", .{std.mem.trim(u8, why, " \t\r\n")});
     if (ans.rows.len != 1) return fail(in, "no verdict", .{});

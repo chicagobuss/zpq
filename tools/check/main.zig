@@ -1470,13 +1470,27 @@ const self_fixture =
     \\ "schema": ["id"]
 ;
 
-fn selfCase(
+/// One row of the types a lossy cast changes: a fraction, a scale the query's DECIMAL cuts, a time of day.
+const self_typed_fixture =
+    \\"fixtures": [{"name": "typed",
+    \\ "copy": "COPY (SELECT 1.4::DOUBLE v, 1.004::DECIMAL(5,3) d, TIMESTAMP '2024-01-01 12:00:00' ts) TO '{path}'"}],
+    \\ "schema": ["v", "d", "ts"]
+;
+
+const SelfCounts = struct { failed: usize, matched: usize, refusals: usize };
+
+fn selfCase(run: *Run, arena: std.mem.Allocator, extra: []const u8, cases: []const u8) !SelfCounts {
+    return selfCaseOver(run, arena, self_fixture, extra, cases);
+}
+
+fn selfCaseOver(
     run: *Run,
     arena: std.mem.Allocator,
+    fixture: []const u8,
     extra: []const u8,
     cases: []const u8,
-) !struct { failed: usize, matched: usize, refusals: usize } {
-    const text = try std.fmt.allocPrint(arena, "{{{s}{s}, \"cases\": [{s}]}}", .{ self_fixture, extra, cases });
+) !SelfCounts {
+    const text = try std.fmt.allocPrint(arena, "{{{s}{s}, \"cases\": [{s}]}}", .{ fixture, extra, cases });
     const file = try loadFile(arena, text);
     const before = run.*;
     const fixtures = try prepareFixtures(run, arena, file, 99);
@@ -1624,6 +1638,33 @@ fn selfTest(run: *Run, arena: std.mem.Allocator) !void {
     expect(
         (try selfCase(run, arena, "", try std.mem.concat(arena, u8, &.{ written, "\"}}" }))).matched == 1,
         "a written file of the query's rows passes",
+        &problems,
+    );
+    // Hashed values compare only through casts that lose nothing: a fraction rounded to an integer, a scale cut and
+    // a time of day dropped all fail by their column, while the same values and lossless widenings pass (P1-7).
+    const hashed = struct {
+        fn case(a: std.mem.Allocator, select: []const u8) ![]const u8 {
+            return std.fmt.allocPrint(a, "{{\"id\": \"hash\", \"fixture\": \"typed\", \"emit\": \"copy\", " ++
+                "\"oracle\": {{\"compare\": \"written_hash\", \"sql\": \"SELECT {s}\"}}}}", .{select});
+        }
+    }.case;
+    const exact = "1.4::DOUBLE AS v, 1.004::DECIMAL(5,3) AS d, TIMESTAMP '2024-01-01 12:00:00' AS ts";
+    for ([_][]const u8{
+        exact,
+        "1.4::DOUBLE AS v, 1.004::DECIMAL(10,3) AS d, TIMESTAMP_NS '2024-01-01 12:00:00' AS ts",
+    }) |select| expect(
+        (try selfCaseOver(run, arena, self_typed_fixture, "", try hashed(arena, select))).matched == 1,
+        "hashed values of the query's types, or wider ones, pass",
+        &problems,
+    );
+    for ([_][]const u8{
+        "1::BIGINT AS v, 1.004::DECIMAL(5,3) AS d, TIMESTAMP '2024-01-01 12:00:00' AS ts",
+        "1.4::DOUBLE AS v, 1.00::DECIMAL(4,2) AS d, TIMESTAMP '2024-01-01 12:00:00' AS ts",
+        "1.4::DOUBLE AS v, 1.004::DECIMAL(5,3) AS d, DATE '2024-01-01' AS ts",
+        "1.4::DOUBLE AS v, 1.005::DECIMAL(5,3) AS d, TIMESTAMP '2024-01-01 12:00:00' AS ts",
+    }) |select| expect(
+        (try selfCaseOver(run, arena, self_typed_fixture, "", try hashed(arena, select))).failed == 1,
+        "a hashed value cast with loss, or a different value, fails",
         &problems,
     );
     // A second front door must give the same bytes.

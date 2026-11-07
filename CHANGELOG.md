@@ -96,8 +96,8 @@
   prints the value as DuckDB 2.0 does: a DOUBLE by its shortest digits (`1e+16`, `5e-324`, `nan`, `-0.0`), a DECIMAL at its
   scale, a year before 1 as `(BC)`, a fraction cut of trailing zeros, `+00` after a UTC-adjusted time. A FLOAT column prints
   as DuckDB's own formatter does, which settles on non-shortest digits for ties such as `-521345.625`; zpq ports that
-  formatter step for step. Checked against DuckDB on 600,000 generated DOUBLEs and FLOATs and 90,000 values of every other
-  type. A cast of an expression computed from a FLOAT (DuckDB computes it in single precision) and of an INT96 timestamp
+  formatter step for step. Checked against DuckDB on 300,000 generated DOUBLEs, 300,000 FLOATs and 24,000
+  values of each other type. A cast of an expression computed from a FLOAT (DuckDB computes it in single precision) and of an INT96 timestamp
   is refused by name. It was `type mismatch in expression` for every non-text argument. A NaN prints with its sign
   (`-nan` for `inf - inf`, `sqrt(-1)` and the text `-nan`, as DuckDB does); `-x` of a DOUBLE now gives -0.0 for 0.0 as
   DuckDB's does (it gave 0.0), while the negation of a NaN keeps the NaN's sign where DuckDB flips it, which only the text

@@ -6,6 +6,8 @@
   `count(*)` or an integer `sum` now runs on one worker per L2 cache when more workers would push it off the dense plan
   or crowd its tables out of cache. On a Ryzen 9 9950X, `SELECT a, b, count(*), sum(v) ... GROUP BY a, b` over a
   Zipf-distributed file is 44% faster (319 ms to 178 ms). `--threads N` keeps the plan it had.
+- **Writes take one pass for column statistics.** A column chunk's statistics are merged from its pages' instead of
+  read from a second scan of the values: the same statistics, 2–4% less CPU when writing ClickBench or TPC-H data.
 - **Re-encoded string columns read faster in other engines.** The v2 writer now keeps a string column's dictionary
   while it stays within a quarter of the chunk's bytes (and within one dictionary page), and otherwise writes PLAIN unless
   a delta layout compresses smaller. Before, wide columns such as ClickBench's URL and Title fell to DELTA_BYTE_ARRAY,

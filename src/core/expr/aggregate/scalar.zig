@@ -1679,33 +1679,41 @@ const ArgScalarVisit = struct {
     }
 };
 
-const ArgCell = enum { int, float, text };
+const ArgCell = enum { int, float, text, wide };
 
 fn argCellKind(e: expr_ast.Expr) ArgCell {
     return switch (e.typeOf()) {
         .i64 => .int,
         .f64 => .float,
         .str => .text,
-        .dec => unreachable,
+        .dec => .wide,
     };
 }
 
-/// The bytes of row `r` of a prepared argument of `kind`: eight for a number, the text itself otherwise.
-inline fn argCell(kind: ArgCell, col: filter_eval.Batch.Column, r: usize, buf: *[8]u8) ?[]const u8 {
+/// The bytes of row `r` of a prepared argument of `kind`: eight for a number, sixteen for a DECIMAL's unscaled value,
+/// the text itself otherwise.
+inline fn argCell(kind: ArgCell, col: filter_eval.Batch.Column, r: usize, buf: *[16]u8) ?[]const u8 {
     switch (kind) {
-        .int => {
-            buf.* = argminmax.bytes8(switch (col) {
-                .i64 => |c| c.values[r],
+        .wide => {
+            buf.* = argminmax.bytes16(switch (col) {
+                .i32, .i64, .i128 => exactAt(col, r),
                 else => return null,
             });
             return buf;
         },
+        .int => {
+            buf[0..8].* = argminmax.bytes8(switch (col) {
+                .i64 => |c| c.values[r],
+                else => return null,
+            });
+            return buf[0..8];
+        },
         .float => {
-            buf.* = argminmax.bytes8(switch (col) {
+            buf[0..8].* = argminmax.bytes8(switch (col) {
                 .f64 => |c| c.values[r],
                 else => return null,
             });
-            return buf;
+            return buf[0..8];
         },
         .text => return textAt(col, r),
     }
@@ -1757,13 +1765,14 @@ pub fn forEachArgRow(
         .int => if (arg2 == .col_ref and arg2.col_ref.unsigned_64) .unsigned else .signed,
         .float => .double,
         .text => .text,
+        .wide => .wide,
     };
     const is_min = call.func == .arg_min;
     var r: usize = 0;
     while (r < sel.len) : (r += 1) {
         if (!sel.isActive(r)) continue;
-        var buf_a: [8]u8 = undefined;
-        var buf_b: [8]u8 = undefined;
+        var buf_a: [16]u8 = undefined;
+        var buf_b: [16]u8 = undefined;
         const arg = argCell(a_kind, va, r, &buf_a) orelse return error.UnsupportedAggType;
         const val = argCell(b_kind, vb, r, &buf_b) orelse return error.UnsupportedAggType;
         try visitor.visit(r, order, is_min, val, arg);

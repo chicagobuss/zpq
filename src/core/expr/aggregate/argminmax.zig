@@ -7,7 +7,7 @@ const std = @import("std");
 const testing = std.testing;
 
 /// How `val`s compare.
-pub const Order = enum(u8) { signed, unsigned, double, text };
+pub const Order = enum(u8) { signed, unsigned, double, text, wide };
 
 /// Bytes before the value: the order, the direction (1 for `arg_min`), and the length of the value.
 pub const header = 6;
@@ -57,8 +57,16 @@ pub fn beats(order: Order, is_min_dir: bool, a: []const u8, b: []const u8) bool 
         .unsigned => std.math.order(std.mem.readInt(u64, a[0..8], .little), std.mem.readInt(u64, b[0..8], .little)),
         .double => doubleOrder(@bitCast(std.mem.readInt(u64, a[0..8], .little)), @bitCast(std.mem.readInt(u64, b[0..8], .little))),
         .text => std.mem.order(u8, a, b),
+        .wide => std.math.order(std.mem.readInt(i128, a[0..16], .little), std.mem.readInt(i128, b[0..16], .little)),
     };
     return if (is_min_dir) ord == .lt else ord == .gt;
+}
+
+/// The sixteen bytes an exact DECIMAL's unscaled value is held as.
+pub fn bytes16(x: i128) [16]u8 {
+    var out: [16]u8 = undefined;
+    std.mem.writeInt(i128, &out, x, .little);
+    return out;
 }
 
 /// The eight bytes an integer or a double is held as.
@@ -88,6 +96,10 @@ test "arg_max and arg_min order values as DuckDB does" {
     try T.expect(!beats(.double, false, &nan, &nan));
     try T.expect(beats(.double, true, &inf, &nan));
     try T.expect(!beats(.double, false, &bytes8(@as(f64, 0.0)), &bytes8(@as(f64, -0.0))));
+    const wide_lo = bytes16(-5);
+    const wide_hi = bytes16(@as(i128, 1) << 100);
+    try T.expect(beats(.wide, false, &wide_hi, &wide_lo));
+    try T.expect(beats(.wide, true, &wide_lo, &wide_hi));
     try T.expect(beats(.text, false, "c", "b"));
     try T.expect(beats(.text, false, "ba", "b"));
     try T.expect(beats(.text, true, "a", "b"));

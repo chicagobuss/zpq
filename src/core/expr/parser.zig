@@ -1688,8 +1688,8 @@ pub fn bindAggregate(
     var arg2: ?ast.Expr = null;
     if (func == .arg_max or func == .arg_min) {
         const s = second orelse return error.BadAggArg;
-        // What it orders by: an integer, date or time, a DOUBLE or text. Not a DECIMAL or a BOOLEAN.
-        if (s.isBoolean() or s.typeOf() == .dec) return error.UnsupportedAggType;
+        // What it orders by: an integer, date or time, a DECIMAL, a DOUBLE or text. Not a BOOLEAN.
+        if (s.isBoolean()) return error.UnsupportedAggType;
         arg2 = s;
     }
     var sep: []const u8 = ",";

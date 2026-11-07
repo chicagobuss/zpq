@@ -31,10 +31,10 @@
   `dayofyear` of a date or timestamp, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB (a DECIMAL keeps
   DECIMAL(p, 0) after `floor`, an integer floors to a DOUBLE, `least` skips NULLs, `sqrt` of a negative is NaN).
 - **`arg_max` and `arg_min` in SQL.** `arg_max(arg, val)`, `arg_min(arg, val)` and their aliases `max_by`, `min_by`,
-  `argmax`, `argmin` over integers, dates and times, DOUBLEs, FLOATs and text, scalar or per group, with a FILTER, answer
-  in the type of `arg` what DuckDB does, with the first row of the scan winning a tie (the same at every `-j`; DuckDB's
-  own tie varies with its threads). DECIMAL or BOOLEAN arguments, an unsigned 64-bit `arg`, the three-argument list form
-  and `DISTINCT` are refused by name.
+  `argmax`, `argmin` over integers, dates and times, DOUBLEs, FLOATs and text (ordered by those or a DECIMAL), scalar or
+  per group, with a FILTER, answer in the type of `arg` what DuckDB does, with the first row of the scan winning a tie
+  (the same at every `-j`; DuckDB's own tie varies with its threads). A DECIMAL `arg`, a BOOLEAN, an unsigned 64-bit
+  `arg`, the three-argument list form and `DISTINCT` are refused by name.
 - **`string_agg` in SQL.** `string_agg(text [, sep])` (and `group_concat`, `listagg`) over a text column or expression,
   scalar or per group, with a FILTER, answers the texts of the group in the order of the file (the same at every `-j`),
   joined by a constant separator; NULL over none. A non-text argument, a non-constant separator and `DISTINCT` are

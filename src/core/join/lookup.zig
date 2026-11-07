@@ -1004,17 +1004,18 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     for (&workers) |*w| w.* = .init(gpa);
     defer for (&workers) |*w| w.deinit();
     defer for (parts) |*p| p.freeLarge(gpa);
+    // By the row groups' leaves: a build with none decodes nothing, and its filter marks nothing.
     const leaves = if (parts.len == 0) 0 else meta.row_groups.items[0].columns.items.len;
     const filter_cols = try gpa.alloc(bool, leaves);
     defer gpa.free(filter_cols);
     @memset(filter_cols, false);
     if (leaves != 0) filter_cols[spec.key] = true;
-    if (spec.filter) |f| {
+    if (leaves != 0) if (spec.filter) |f| {
         var fc: std.ArrayList(usize) = .empty;
         defer fc.deinit(gpa);
         try f.collectColumns(&fc, gpa);
         for (fc.items) |ci| filter_cols[ci] = true;
-    }
+    };
     var late: std.ArrayList(usize) = .empty;
     defer late.deinit(gpa);
     if (leaves != 0) for (spec.payload, 0..) |leaf, pi| if (!filter_cols[leaf]) try late.append(gpa, pi);

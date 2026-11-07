@@ -8,52 +8,44 @@
   (Q21 584 ms to 209 ms), and a filter-only `LIKE` (Q20) is 13% faster.
 - **Re-encoded files read faster than the original.** Dictionary data pages are sized by their packed index bytes
   rather than a fixed row count, and integer pages choose PLAIN or DELTA_BINARY_PACKED by compressing a sample of the
-  first page both ways. A Snappy re-encode of the 14.8 GB ClickBench file is 13% smaller than the original and reads
-  15% faster in DuckDB 2.0 and Polars 2.1 and 8% faster in PyArrow 26 (Ryzen 9 9950X, full-column reads). Values don't
-  change; file bytes do.
+  first page both ways. For strings, the v2 writer used to send a column to a dictionary only while the dictionary
+  stayed within 1 MiB, so wide columns such as ClickBench's URL and Title, whose values repeat just as often, fell to
+  DELTA_BYTE_ARRAY, which the readers we measured decode slower than PLAIN (DuckDB and Polars read it 10–50% slower
+  than the original file, Polars 2.1.0 about twice as slow as PLAIN). A dictionary may now hold up to a quarter of the
+  values' bytes (still 1 MiB at least, never more than one dictionary page holds, and still a quarter or fewer
+  distinct values), and the other strings are PLAIN unless DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY saves bytes
+  after the codec (half for DELTA_BYTE_ARRAY, any for DELTA_LENGTH_BYTE_ARRAY), judged on the chunk's first page. A
+  Snappy re-encode of the 14.8 GB ClickBench file is 13% smaller than the original and reads 15% faster in DuckDB 2.0
+  and Polars 2.1 and 8% faster in PyArrow 26 (Ryzen 9 9950X, full-column reads). On the ClickBench `hits_0` shard at
+  its two row groups, reading every string column takes 0.78× (DuckDB 2.0.0) and 0.56× (Polars 2.1.0) the original
+  file's speed with 0.5.1's re-encode and 1.08× and 1.11× now (PyArrow 26: 1.09×); the Title column is 1.7× to 2.9×
+  faster, and the file is 98.7 MB where 0.5.1 wrote 116.3 MB and the original is 122.4 MB. Values don't change; file
+  bytes do.
 - **Two-key GROUP BY counts and sums are faster at the default thread count.** An exact `GROUP BY a, b` with
   `count(*)` or an integer `sum` now runs on one worker per L2 cache when more workers would push it off the dense plan
   or crowd its tables out of cache. On a Ryzen 9 9950X, `SELECT a, b, count(*), sum(v) ... GROUP BY a, b` over a
   Zipf-distributed file is 44% faster (319 ms to 178 ms). `--threads N` keeps the plan it had.
 - **Writes take one pass for column statistics.** A column chunk's statistics are merged from its pages' instead of
   read from a second scan of the values: the same statistics, 2–4% less CPU when writing ClickBench or TPC-H data.
-- **Re-encoded string columns read faster in other engines.** The v2 writer now keeps a string column's dictionary
-  while it stays within a quarter of the chunk's bytes (and within one dictionary page), and otherwise writes PLAIN unless
-  a delta layout compresses smaller. Before, wide columns such as ClickBench's URL and Title fell to DELTA_BYTE_ARRAY,
-  which PyArrow, DuckDB and Polars read 10–50% slower than the original file. Values don't change; file bytes do.
 - **String filters read dictionaries, not rows.** A filter on a dictionary-encoded string column (`=`, `<>`, `IN`) now
   compares each dictionary entry once and selects rows by code, whether or not the file has a page index. On a Ryzen 9
   9950X, PDS-H-shaped filters such as `l_shipmode IN ('MAIL', 'SHIP')` with a date range are 1.8–6.3× faster.
 - **`LIKE '%text%'` is faster.** The substring search's tail now runs in vectors too: ClickBench Q20 is 11% faster.
 - **zpq builds with any Zig 0.17.x patch release,** not only 0.17.0, so 0.17.1 can be adopted when it ships.
-- **Re-encoded wide string columns read as fast as the original, or faster, in other engines.** zpq sent a string column
-  to a dictionary only while the dictionary stayed within 1 MiB, so wide values (titles, URLs) that repeat just as
-  often went to DELTA_BYTE_ARRAY, which the readers we measured decode slower than PLAIN (Polars 2.1.0 about twice as
-  slow). A dictionary may now hold up to a quarter of the values' bytes (still 1 MiB at least, never more than one dictionary
-  page holds, and still a quarter or fewer distinct values), and the other strings are PLAIN unless DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY saves the
-  bytes after the codec (half for DELTA_BYTE_ARRAY, any for DELTA_LENGTH_BYTE_ARRAY), judged on the chunk's first page. On the ClickBench `hits_0` shard at its
-  two row groups, reading every string column takes 0.78× (DuckDB 2.0.0) and 0.56× (Polars 2.1.0) the original file's
-  speed with 0.5.1's re-encode and 1.08× and 1.11× now (PyArrow 26: 1.09×); the Title column is 1.7× to 2.9× faster, and
-  the file is 98.7 MB where 0.5.1 wrote 116.3 MB and the original is 122.4 MB. Written bytes change; the values don't.
-- **The Lambda fan-out coordinator makes no call before its workers start.** Each worker now prepares the aggregate
-  itself and answers its share with a fingerprint of its inputs' schema and a digest of its plan, through a new
-  worker operation, `partial_aggregate` (docs/lambda_requests.md). The coordinator merges only when every worker
-  agrees on both, and refuses the query naming the inputs that differ; it no longer asks for capabilities or reads
-  any footer first, which took about 90 ms warm and 250 ms cold per query on 0.5.1. Row-group ranges can be
-  fractions of an input that each worker resolves against its own footer (`[start, end, of]`), so row-group counts a
-  caller supplies only balance the work: a wrong count no longer fails the query or loses rows. The coordinator also
-  keeps its Lambda client, and so its connections, across queries in a warm coordinator Lambda, where it used to
-  build a new one per query, and reuses its thread pool. Inputs given as `*` patterns keep the previous protocol.
+- **The Lambda fan-out coordinator makes no call before its workers start, and invokes on a kept connection.** Each
+  worker now prepares the aggregate itself and answers its share with a fingerprint of its inputs' schema and a digest
+  of its plan, through a new worker operation, `partial_aggregate` (docs/lambda_requests.md). The coordinator
+  (`tools/serverless/fanout.py`) merges only when every worker agrees on both, and refuses the query naming the inputs
+  that differ; it no longer asks for capabilities or reads any footer first, which took about 90 ms warm and 250 ms
+  cold per query on 0.5.1. Row-group ranges can be fractions of an input that each worker resolves against its own
+  footer (`[start, end, of]`), so row-group counts a caller supplies only balance the work: a wrong count no longer
+  fails the query or loses rows. The coordinator signs each invoke itself and reuses the connection, and it no longer
+  asks Lambda for the log tail after the worker returns; at 128 workers that tail, and boto3's time under the GIL,
+  were the whole gap past the slowest worker. A warm coordinator Lambda also keeps its Lambda client, and so its
+  connections, across queries, where it used to build a new one per query, and reuses its thread pool. TPC-H Q6 at 128
+  workers is 384 ms warm (0.5.0 was 461 ms); the grouped line-item aggregate is 294 ms warm (0.5.0 was 524 ms). Inputs
+  given as `*` patterns keep the previous protocol, which caches the capability answer for a published worker version.
   This changes the worker binary: a 0.5.1 or older worker refuses the new requests, and the coordinator says so.
-- **Fan-out invokes go out on a kept connection.** The coordinator signs each invoke itself and reuses the connection, and it
-  no longer asks Lambda for the log tail after the worker returns. At 128 workers that tail, and boto3's time under the
-  GIL, were the whole gap past the slowest worker. TPC-H Q6 at 128 workers is 384 ms warm (0.5.0 was 461 ms); the grouped
-  line-item aggregate is 294 ms warm (0.5.0 was 524 ms).
-- **The Lambda fan-out coordinator (`tools/serverless/fanout.py`) is faster.** 0.5.1's coordinator asked the worker for its
-  capabilities and prepared the plan from every input's footer, one after the other, before any worker started, which
-  added 0.3–0.7 s per query. It now caches the capability answer for a published worker version, prepares the plan
-  from one footer, and checks every footer while the workers run (a mismatch still refuses the query). TPC-H Q6 over
-  32 workers went from 749 to 541 ms warm on 0.5.1's own workers. No binary changed.
 - **Nullable columns decode faster.** For a nullable column that isn't nested, zpq now decodes the definition levels
   straight into a validity bitmap and places the values from it (an AVX2 lookup table in the default x86_64 build,
   a NEON table lookup on aarch64, and a portable word-at-a-time kernel in `-compat` and the x86_64 Lambda), where it

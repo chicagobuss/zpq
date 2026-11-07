@@ -3,7 +3,6 @@
   "refuse": {
     "sql_pred:diff:where:20": {"error": "BadValue"},
     "sql_pred:diff:filter:20": {"error": "BadValue"},
-    "sql_pred:diff:where:26": {"error": "BadValue"},
     "sql_pred:diff:filter:26": {"error": "BadValue"},
     "sql_pred:diff:where:27": {"error": "BadValue"},
     "sql_pred:diff:filter:27": {"error": "BadValue"},
@@ -17,9 +16,7 @@
     "sql_pred:unit:filter:34": {"error": "BadValue"},
     "sql_pred:unit:where:42": {"error": "BadOperator"},
     "sql_pred:unit:filter:42": {"error": "BadOperator"},
-    "sql_pred:unit:where:44": {"error": "BadValue"},
     "sql_pred:unit:filter:44": {"error": "BadValue"},
-    "sql_pred:unit:where:45": {"error": "BadValue"},
     "sql_pred:unit:filter:45": {"error": "BadValue"},
     "sql_pred:unit:where:46": {"error": "BadValue"},
     "sql_pred:unit:filter:46": {"error": "BadValue"},
@@ -31,9 +28,7 @@
     "sql_pred:unit:filter:49": {"error": "BadValue"},
     "sql_pred:unit:where:50": {"error": "BadValue"},
     "sql_pred:unit:filter:50": {"error": "BadValue"},
-    "sql_pred:unit:where:53": {"error": "BadValue"},
     "sql_pred:unit:filter:53": {"error": "BadValue"},
-    "sql_pred:unit:where:54": {"error": "ExpressionInPredicate"},
     "sql_pred:unit:filter:54": {"error": "ExpressionInPredicate"},
     "sql_pred:unit:where:55": {"error": "BadOperator"},
     "sql_pred:unit:filter:55": {"error": "BadOperator"}

@@ -1558,7 +1558,8 @@ fn selfTest(run: *Run, arena: std.mem.Allocator) !void {
     };
     for (wrong) |c| expect((try selfCase(run, arena, "", c)).failed == 1, "a wrong value must fail", &problems);
     // A refusal passes only as declared, with its exact kind.
-    const sql = "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE id = id";
+    // A column on IN's value side refuses as BadValue (`id = id` compares two expressions now).
+    const sql = "SELECT count(*) AS c, sum(id) AS s FROM '{path}' WHERE id IN (id)";
     const declared =
         try std.fmt.allocPrint(
             arena,

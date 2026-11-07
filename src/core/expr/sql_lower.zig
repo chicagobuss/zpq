@@ -10,6 +10,23 @@ const lits = @import("sql_literals.zig");
 const stack_guard = @import("../stack_guard.zig");
 const Error = parser.Error || error{ SqlParseError, UnparseError, ConstantTooDeep };
 
+/// Whether `node` reads a column anywhere beneath it.
+fn readsColumn(node: *const c.LpNode) bool {
+    const Find = struct {
+        hit: bool = false,
+        fn enter(v: [*c]c.LpVisitor, x: [*c]c.LpNode) callconv(.c) c_int {
+            if (x.*.kind != c.LP_EXPR_COLUMN_REF) return 0;
+            const self: *@This() = @ptrCast(@alignCast(v.*.user_data));
+            self.hit = true;
+            return 2;
+        }
+    };
+    var find: Find = .{};
+    var visitor: c.LpVisitor = .{ .user_data = &find, .enter = Find.enter, .leave = null };
+    c.lp_ast_walk(@constCast(node), &visitor);
+    return find.hit;
+}
+
 pub const Lower = struct {
     arena: std.mem.Allocator,
     lp_arena: *c.arena_t,
@@ -512,12 +529,13 @@ pub const Lower = struct {
                 };
                 if (!self.compare_expressions)
                     break :blk .{ .comparison = .{ .operand = try self.operand(left), .op = op, .value = try self.literal(right) } };
-                // A column against a literal (a constant folds to one) keeps the leaf whose statistics prune.
-                plain: {
-                    const column = self.operand(left) catch break :plain;
-                    const value = self.literal(right) catch break :plain;
-                    break :blk .{ .comparison = .{ .operand = column, .op = op, .value = value } };
+                // A constant side folds as it always has, refusing what DuckDB refuses (`i > 2147483647 + 1`); a column
+                // against it keeps the leaf whose statistics prune.
+                if (!readsColumn(right)) {
+                    const value = try self.literal(right);
+                    if (self.operand(left)) |column| break :blk .{ .comparison = .{ .operand = column, .op = op, .value = value } } else |_| {}
                 }
+                if (!readsColumn(left)) _ = try self.literal(left);
                 const sides = try self.arena.alloc(syntax.Expr, 2);
                 sides[0] = try self.expression(left, depth + 1);
                 sides[1] = try self.expression(right, depth + 1);

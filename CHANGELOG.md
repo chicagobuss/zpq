@@ -91,6 +91,11 @@
   and `1e3` as integers rounded half away from zero, `inf`/`nan`), checked against DuckDB on 64,000 generated strings;
   a text that is no number is a `ConversionInvalid` error for `CAST`. A text to DECIMAL, DATE or TIMESTAMP is still
   refused by name.
+- **`UNION [ALL]`, `INTERSECT` and `EXCEPT` in SQL** (`zpq query --query`), of any SELECTs zpq runs alone, with DuckDB's
+  precedence, parentheses, NULL, NaN and zero semantics and one ORDER BY / LIMIT / OFFSET for the whole result. Each SELECT
+  runs to a scratch Parquet file and the operator is a query over those files; column types must be equal, integers of
+  any width, or an integer with a DOUBLE, and anything else is refused by name (`SetOperationTypes`, `-Columns`,
+  `-Nullability`, `-All`, `-ByName`, `-Order`, `-Nesting`). It was `UnsupportedStatement`. See docs/capabilities.md.
 - **`CAST(x AS VARCHAR)` of a number, BOOLEAN, DECIMAL, DATE or TIMESTAMP in SQL** (also `TEXT`, `STRING`, `VARCHAR(n)`,
   `x::VARCHAR` and `TRY_CAST`), in a SELECT, an aggregate argument (`min`, `max`, `count(DISTINCT ...)`) or a GROUP BY key,
   prints the value as DuckDB 2.0 does: a DOUBLE by its shortest digits (`1e+16`, `5e-324`, `nan`, `-0.0`), a DECIMAL at its

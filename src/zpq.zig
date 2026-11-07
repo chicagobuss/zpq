@@ -40,6 +40,7 @@ pub const core = struct {
             @import("core/expr/sql_parser.zig")
         else
             struct {};
+        pub const sql_setops = @import("core/expr/sql_setops.zig");
         pub const sql_join = if (@import("build_options").enable_sql)
             @import("core/expr/sql_join.zig")
         else

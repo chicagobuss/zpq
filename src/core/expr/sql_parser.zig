@@ -1284,7 +1284,7 @@ fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []cons
 /// comments nest (`/* a /* b */ c */` is one), which the grammar's own lexer and the rewrites before it do not read:
 /// each would end the comment at the first `*/` and run what is left of it as SQL. Quoted text is untouched, and a block
 /// comment that is never closed is an error, as DuckDB's.
-fn stripComments(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
+pub fn stripComments(allocator: std.mem.Allocator, sql: []const u8) ![]u8 {
     var out = try allocator.dupe(u8, sql);
     errdefer allocator.free(out);
     var i: usize = 0;

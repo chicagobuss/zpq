@@ -43,6 +43,22 @@ the comparison nor its NOT. A side is evaluated only over the rows earlier conju
 divides no zero. No statistic prunes such a comparison yet. LIKE, IN and BETWEEN still take literals on their value
 side, as do FILTER clauses and CASE conditions.
 
+**Set operations** (`zpq query --query`): `UNION [ALL]`, `INTERSECT` and `EXCEPT` of two or more SELECTs, each an ordinary
+query of its own (a scan, an aggregate, a GROUP BY, a DISTINCT, `SELECT *`), grouped as DuckDB groups them (INTERSECT
+first, then UNION and EXCEPT left to right, parentheses honoured), with the trailing ORDER BY, LIMIT and OFFSET applying to the whole
+result and a parenthesized SELECT keeping its own. The result is named by the first SELECT. NULLs are equal in UNION,
+INTERSECT and EXCEPT, as are all NaNs and the two zeros (which one is printed is arbitrary, as in DuckDB). Each SELECT runs
+to a scratch Parquet file beside the output (in `/tmp` for stdout), a pass renames and casts its
+columns, and the operator is a query over those files; the scratch directory is removed when the query ends or fails. The
+two sides' column types must be equal, or integers of any width (BIGINT), or an integer with a DOUBLE (DOUBLE): any other
+difference is `SetOperationTypes` (a FLOAT with a DOUBLE, DECIMALs of different scales, a DATE with a TIMESTAMP, text with a
+number), a different column count is `SetOperationColumns`, and a BOOLEAN, FLOAT or non-microsecond TIMESTAMP column that is
+nullable on one side only is `SetOperationNullability`. `INTERSECT ALL`, `EXCEPT ALL` and `UNION BY NAME` are refused
+(`SetOperationAll`, `SetOperationByName`), as are an ORDER BY or LIMIT before an operator without parentheses
+(`SetOperationOrder`) and a parenthesized combination with its own ORDER BY or LIMIT (`SetOperationNesting`). `--explain`
+is not available for them, the in-process SQL requests (libzpq, the service, Lambda) do not carry them yet, and
+`--summary=json` describes the last query. Integers of different widths come out as INT64.
+
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 
 **Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`), string concat (`||`),

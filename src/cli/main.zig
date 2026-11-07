@@ -33,6 +33,7 @@ const local_fs = zpq.local_fs;
 const Diag = zpq.core.diag.Diag;
 
 const usage_text = @embedFile("help.txt");
+const setops = @import("setops.zig");
 
 var machine_diagnostics = false;
 var diagnostic_buffer: [16 * 1024]u8 = undefined;
@@ -482,6 +483,54 @@ const QueryOptions = struct {
     }
 };
 
+/// Runs a set operation's queries through `runParsed`, each on a copy of the user's options.
+const SetopStager = struct {
+    init: std.process.Init,
+    options: *const QueryOptions,
+    diag: *Diag,
+    arena: std.mem.Allocator,
+
+    fn interface(self: *SetopStager) setops.Stager {
+        return .{ .ptr = self, .stage = stage, .finish = finish, .say = say };
+    }
+
+    fn stage(ptr: *anyopaque, sql: []const u8, out: []const u8, leaf: bool) anyerror!void {
+        const self: *SetopStager = @ptrCast(@alignCast(ptr));
+        var o = self.options.*;
+        o.query = sql;
+        o.output = out;
+        o.format = .parquet;
+        o.limit = null;
+        o.summary = false;
+        o.explain = false;
+        o.fsync = false;
+        o.profile_out = .{};
+        o.bloom_filters = .empty;
+        if (!leaf) {
+            o.input_format = .auto;
+            o.csv = .{};
+            o.csv_nulls = .empty;
+            o.csv_types = .empty;
+        }
+        try runParsed(self.init, &o, self.diag, self.arena);
+    }
+
+    fn finish(ptr: *anyopaque, sql: []const u8) anyerror!void {
+        const self: *SetopStager = @ptrCast(@alignCast(ptr));
+        var o = self.options.*;
+        o.query = sql;
+        o.input_format = .auto;
+        o.csv = .{};
+        o.csv_nulls = .empty;
+        o.csv_types = .empty;
+        try runParsed(self.init, &o, self.diag, self.arena);
+    }
+
+    fn say(message: []const u8) void {
+        diagnosticPrint("{s}", .{message});
+    }
+};
+
 fn runQuery(
     init: std.process.Init,
     iter: *std.process.Args.Iterator,
@@ -489,11 +538,22 @@ fn runQuery(
     arena: std.mem.Allocator,
 ) !void {
     const gpa = zpq.core.memory.processAllocator(init.gpa);
-    const env = init.minimal.environ;
-    const io = init.io;
     var options: QueryOptions = .{};
     defer options.deinit(gpa);
     if (!try options.parse(gpa, iter)) return;
+    try runParsed(init, &options, diag, arena);
+}
+
+/// The query `options` describe. A set operation runs its branches through here too, on copies of the options.
+fn runParsed(
+    init: std.process.Init,
+    options: *const QueryOptions,
+    diag: *Diag,
+    arena: std.mem.Allocator,
+) !void {
+    const gpa = zpq.core.memory.processAllocator(init.gpa);
+    const env = init.minimal.environ;
+    const io = init.io;
     const inputs_raw = options.inputs_raw;
     const output = options.output;
     var filter = options.filter;
@@ -557,6 +617,31 @@ fn runQuery(
             return error.BadArgs;
         }
     }
+    if (comptime build_options.enable_sql) if (query) |q| {
+        const stripped = try zpq.core.expr.sql_parser.stripComments(arena, q);
+        const combination = zpq.core.expr.sql_setops.split(arena, stripped) catch |err| {
+            switch (err) {
+                error.SetOperationAll => diagnosticPrint("sql: INTERSECT ALL and EXCEPT ALL are not supported yet\n", .{}),
+                error.SetOperationByName => diagnosticPrint("sql: UNION BY NAME is not supported yet\n", .{}),
+                error.SetOperationOrder => diagnosticPrint("sql: an ORDER BY, LIMIT or OFFSET before a set operator needs the SELECT in parentheses\n", .{}),
+                error.SetOperationNesting => diagnosticPrint("sql: a parenthesized set operation with its own ORDER BY, LIMIT or OFFSET is not supported yet\n", .{}),
+                else => {},
+            }
+            return err;
+        };
+        if (combination) |compound| {
+            if (explain) {
+                diagnosticPrint("zpq query: --explain is not supported for a set operation\n", .{});
+                return error.BadArgs;
+            }
+            var stager: SetopStager = .{ .init = init, .options = options, .diag = diag, .arena = arena };
+            const out_dir: ?[]const u8 = if (output) |o| blk: {
+                if (std.mem.eql(u8, o, "-") or std.mem.startsWith(u8, o, "s3://")) break :blk null;
+                break :blk std.fs.path.dirname(o) orelse ".";
+            } else null;
+            return setops.run(gpa, io, compound, out_dir, stager.interface());
+        }
+    };
 
     if (bloom_filters.items.len > 0 and output == null) {
         diagnosticPrint("zpq query: --bloom-filter requires --output\n", .{});
@@ -987,6 +1072,8 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "NestedColumnSelected",        "NestedAggregateNotSupported", "NestedGroupKeyNotSupported",   "UnsupportedDatePart",      "InvalidRegex",         "UnsupportedRegex",
         "RegexTooBig",                 "TypedLiteralColumn",          "BadInterval",                  "IntervalNotSupported",     "TemporalOutOfRange",   "ConstantTooDeep",
         "IlikePatternNotAscii",        "PostAggNotSupported",         "UpdateWithoutWhere",           "UnparseError",
+        "SetOperationAll",             "SetOperationByName",          "SetOperationOrder",            "SetOperationNesting",      "SetOperationColumns",  "SetOperationTypes",
+        "SetOperationNullability",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

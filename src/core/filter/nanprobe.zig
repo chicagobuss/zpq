@@ -233,7 +233,7 @@ const Worker = struct {
                 t.oom = err == error.OutOfMemory;
                 break :blk false;
             };
-            _ = arena.reset(.retain_capacity);
+            if (!arena.reset(.retain_capacity)) t.oom = true;
         }
     }
 };
@@ -607,10 +607,12 @@ test "load fails cleanly, or proves exactly, under every allocation failure" {
     const mapped: membership.MappedSource = .{ .files = &.{file} };
     try testing.checkAllAllocationFailures(testing.allocator, struct {
         fn run(gpa: std.mem.Allocator, ms: []schema.FileMetaData, src: membership.Source) !void {
+            // Exercise arena reset's allocation fallback even when the backing allocator can resize in place.
+            var no_resize = std.testing.FailingAllocator.init(gpa, .{ .resize_fail_index = 0 });
             const chunk = &ms[0].row_groups.items[0].columns.items[0];
             chunk.nan_free = false;
             const f: ast.Filter = .{ .float = .{ .col_idx = 0, .op = .GtEq, .value = 100 } };
-            _ = try load(gpa, f, ms, src, .{ .threads = 1 });
+            _ = try load(no_resize.allocator(), f, ms, src, .{ .threads = 1 });
             // Run to the end, the probe proves this NaN-free chunk, and pruning skips it.
             try testing.expect(chunk.nan_free);
             if (chunk.nan_free) try testing.expect(prune.pruneRowGroup(&ms[0].row_groups.items[0], f, &ms[0]) == .skip);

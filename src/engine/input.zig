@@ -1289,7 +1289,7 @@ pub fn localReaderInputs(
     out: *?*local_reader.Reader,
 ) ![]const scan.Input {
     if (io.choice.mode == .mmap) return opened.inputs;
-    const default_window = s3_window.windowFor(args.max_memory);
+    const default_window = readerWindow(args.max_memory, ledger.available());
     return planLocalReader(ctx, arena, opened, io.plan.?, .{
         .mode = io.choice.mode,
         .threads = io.policy.threads,
@@ -1297,6 +1297,27 @@ pub fn localReaderInputs(
         .ledger = ledger,
         .direct = io.choice.directRead(),
     }, out);
+}
+
+/// The local reader's window, from what the ledger has `free` as it starts rather than the whole budget: a join's
+/// builds and group-join are held by then, and a window sized from --max-memory took the room the scan's decode needs.
+/// The cold read, the one that takes the reader, then refused where the warm one, on the mapping, answered (SF30 j2 in
+/// a 1 GiB cgroup), or sliced its row groups at a tenth of the speed (a 64 MiB scan). A quarter of what is free, as
+/// `windowFor` takes a quarter of the budget, and at least one MiB.
+pub fn readerWindow(max_memory: usize, free: usize) u64 {
+    return @min(s3_window.windowFor(max_memory), @max(1 << 20, @as(u64, free) / 4));
+}
+
+test "the local reader's window is a quarter of what the ledger has free, within windowFor" {
+    const mib: u64 = 1 << 20;
+    // Nothing held: the window `windowFor` gives the budget.
+    try std.testing.expectEqual(s3_window.windowFor(8 << 30), readerWindow(8 << 30, 8 << 30));
+    try std.testing.expectEqual(192 * mib, readerWindow(768 * mib, 768 * mib));
+    // A join holding 495 MiB of 768: the decode keeps three quarters of the 273 left, not 81 after a 192 MiB window.
+    try std.testing.expectEqual(273 * mib / 4, readerWindow(768 * mib, 273 * mib));
+    // A small budget: no 64 MiB floor taking all of it.
+    try std.testing.expectEqual(16 * mib, readerWindow(64 * mib, 64 * mib));
+    try std.testing.expectEqual(mib, readerWindow(64 * mib, 0));
 }
 
 /// Start reading every local input's planned ranges, row group by row group, and return the inputs the scan should use:

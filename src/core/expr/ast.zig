@@ -174,7 +174,8 @@ pub fn decimalToDouble(sum: i192, scale: u8) f64 {
 pub fn roundDouble(x: f64, digits: i32) f64 {
     if (!std.math.isFinite(x)) return x;
     if (digits < 0) {
-        const m = std.math.pow(f64, 10, @floatFromInt(-digits));
+        // Negated as a double: `-digits` in i32 overflows at the minimum, which the parser admits.
+        const m = std.math.pow(f64, 10, -@as(f64, @floatFromInt(digits)));
         const r = @round(x / m) * m;
         return if (std.math.isFinite(r)) r else 0;
     }
@@ -187,7 +188,8 @@ pub fn roundDouble(x: f64, digits: i32) f64 {
 /// gives the result: scale `digits` when that is fewer than `scale` (0 when negative), else `v` itself.
 pub fn roundDecimal(v: i128, scale: u8, digits: i32) error{DecimalOverflow}!i128 {
     if (digits >= scale) return v;
-    const drop: i32 = scale - digits;
+    // In i64: `scale - digits` overflows i32 for the digit counts near the minimum, which the parser admits.
+    const drop: i64 = @as(i64, scale) - digits;
     // A divisor past 10^38 is past twice any value a DECIMAL holds: everything rounds to zero.
     if (drop > Dec.max_precision) return 0;
     const divisor = pow10(@intCast(drop));

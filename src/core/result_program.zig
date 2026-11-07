@@ -1657,6 +1657,26 @@ test "ROUND keeps a non-finite input whatever the digits, and zeroes only a fini
     try std.testing.expectEqual(@as(f64, 1.7e308), roundDouble(1.7e308, -1));
 }
 
+test "ROUND takes every digit count the parser admits, to the extremes of i32" {
+    const lo = std.math.minInt(i32);
+    const hi = std.math.maxInt(i32);
+    // The negation and the distance from the scale both overflow i32 near the minimum.
+    for ([_]i32{ lo, lo + 1, lo + 2, -1_000_000, -39 }) |digits| {
+        try std.testing.expectEqual(@as(f64, 0), roundDouble(1.25, digits));
+        try std.testing.expectEqual(@as(f64, 0), roundDouble(-1.25, digits));
+        try std.testing.expectEqual(@as(i128, 0), try roundDecimal(125, 2, digits));
+        try std.testing.expectEqual(@as(i128, 0), try roundDecimal(-125, 2, digits));
+        try std.testing.expectEqual(@as(i128, 0), try roundDecimal(std.math.pow(i128, 10, 38) - 1, 38, digits));
+    }
+    for ([_]i32{ hi, hi - 1, 1_000_000, 400 }) |digits| {
+        try std.testing.expectEqual(@as(f64, 1.25), roundDouble(1.25, digits));
+        try std.testing.expectEqual(@as(i128, 125), try roundDecimal(125, 2, digits));
+    }
+    // The last count that still divides (10^38 at scale 2): 0.5 * 10^36 rounds away from zero to 10^36, 49 to 0.
+    try std.testing.expectEqual(@as(i128, 0), try roundDecimal(49, 2, -36));
+    try std.testing.expectEqual(std.math.pow(i128, 10, 36), try roundDecimal(5 * std.math.pow(i128, 10, 37), 2, -36));
+}
+
 test "abs keeps its type and overflows at the type's minimum; nullif is NULL where the value equals the other" {
     const kinds = [_]?expr_ast.IntType{ null, .i32, null, .i32, .i32 };
     const types = [_]scan.GroupColType{

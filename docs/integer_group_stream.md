@@ -30,8 +30,8 @@ gather disjoint output rows directly. Exact input presence flags let a window om
 are impossible; output schema nullability remains unchanged. No full answer of typed columns or generic
 output-value unions is retained.
 
-The aggregate writer uses the normal writer's defaults: 131,072 rows per row group and at most 20,000 rows per data
-page (the byte target can cut a page earlier). Row-group boundaries depend on output row positions. Input row-group
+The aggregate writer uses the normal writer's defaults: 131,072 rows per row group and a target of 20,000 rows per
+data page. The byte target can cut a page earlier; dictionary pages can hold more rows within their byte budgets. Row-group boundaries depend on output row positions. Input row-group
 boundaries, worker count, scheduling and memory-driven encoder waves do not affect the file. Small answers remain
 one row group. Values and row order are unchanged from the general executor.
 

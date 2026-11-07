@@ -1855,7 +1855,8 @@ test "a payload page whose rows the filter rejects is not decoded; one with a se
     const v_def = try a.alloc(u32, n);
     for (0..n) |i| {
         k[i] = @intCast(i);
-        v[i] = @intCast(i % 97);
+        // Distinct values keep multiple value pages even when dictionary indices fit in a single page.
+        v[i] = @intCast(i * 97);
         v_def[i] = @intFromBool(i % 5 != 0);
     }
     const cols = [_]expr_agg.OutputCol{

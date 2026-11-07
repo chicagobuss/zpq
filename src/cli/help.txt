@@ -78,9 +78,10 @@ usage:
                  one holds ROWS rows (default 131072) or its values
                  take SIZE bytes uncompressed (default 64MB), from
                  the rows written alone, not the input's row groups,
-                 -j or memory. Data pages close at 1 MiB or 20,000
-                 rows, and each gets a page index entry. A plain copy
-                 keeps its input's row groups.
+                 -j or memory. Data pages target 1 MiB or 20,000
+                 rows; dictionary pages can hold more rows within
+                 their byte budgets. Each has a page index entry.
+                 A plain copy keeps its input's row groups.
   --threads / -j N
                  Requested CPU parallelism. Re-encoding shares CPU turns
                  between decode and encode, capped by the affinity's

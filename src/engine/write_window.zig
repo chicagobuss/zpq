@@ -405,7 +405,7 @@ const Assembler = struct {
         }
         job.pieces = try w.gpa.dupe(*Piece, pieces.items);
         for (job.pieces) |p| p.ref();
-        job.charge = a.bits / 8 *| 3;
+        job.charge = a.bits / 8 *| 3 +| integerSampleCharge(w.out_elems, a.rows);
         try a.pending.append(w.gpa, job);
         a.pending_bytes += job.charge;
         started = true;
@@ -516,7 +516,7 @@ const Assembler = struct {
         var held: u64 = 0;
         for (a.done.items) |p| held +|= p.arena.queryCapacity();
         const live = a.bits / 8;
-        if (a.w.memory) |m| if (m.budget.available() < live *| 3) return false;
+        if (a.w.memory) |m| if (m.budget.available() < (live *| 3) +| integerSampleCharge(a.w.out_elems, a.rows)) return false;
         return held > @max(64 << 20, live *| 2);
     }
 
@@ -527,8 +527,21 @@ const Assembler = struct {
     }
 };
 
-/// The encode estimate the hashagg answer writer charges a column by: three times its values and levels (a dictionary
-/// attempt's table and indices, the pages, their compressed copies).
+/// One bounded integer trial per output column, charged before a row group starts encoding.
+fn integerSampleCharge(elems: []const schema.SchemaElement, rows: usize) u64 {
+    var total: u64 = 0;
+    for (elems) |elem| {
+        const width: usize = switch (elem.type orelse continue) {
+            .INT32 => @sizeOf(i32),
+            .INT64 => @sizeOf(i64),
+            else => continue,
+        };
+        total +|= encoder.integerSampleScratchBytes(rows, width, encoder.default_page_bytes);
+    }
+    return total;
+}
+
+/// The encode estimate charges three times values and levels, plus a bounded integer sample where needed.
 fn encodeCharge(col: filter_eval.Batch.Column) u64 {
     const bytes: u64 = switch (col) {
         inline else => |c| blk: {
@@ -542,7 +555,13 @@ fn encodeCharge(col: filter_eval.Batch.Column) u64 {
             break :blk n + if (c.def_levels) |d| d.len * @sizeOf(u32) else 0;
         },
     };
-    return bytes *| 3;
+    const sample: usize = switch (col) {
+        .i32 => |c| encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i32), encoder.default_page_bytes),
+        .i64 => |c| encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i64), encoder.default_page_bytes),
+        .i128 => |c| encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i64), encoder.default_page_bytes),
+        else => 0,
+    };
+    return (bytes *| 3) +| sample;
 }
 
 /// An output row group the assembler sealed: its column/page tasks share the executor, then it is placed by

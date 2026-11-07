@@ -115,7 +115,7 @@ pages and encodings, regardless of the requested footer version. JSON requests u
 **Write** with SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED output (`--codec lz4` means LZ4_RAW; zpq never compresses
 to the deprecated LZ4 codec, though a plain copy keeps an LZ4 chunk as it is); RLE_DICTIONARY for low-cardinality byte
 arrays (a quarter or fewer distinct, and a dictionary within a quarter of the values' bytes, at least 1 MiB and at most one page); DELTA_BINARY_PACKED
-for INT32 / INT64; other strings PLAIN, unless a sample of the chunk's first page, compressed with the chosen codec, shows
+or PLAIN for INT32 / INT64, whichever is smaller on a compressed first-page sample; other strings PLAIN, unless a sample of the chunk's first page, compressed with the chosen codec, shows
 DELTA_BYTE_ARRAY at half PLAIN's size or less, or DELTA_LENGTH_BYTE_ARRAY smaller at all (FIXED_LEN_BYTE_ARRAY has no
 DELTA_LENGTH_BYTE_ARRAY).
 DECIMAL columns re-encode losslessly: INT32 / INT64 / FIXED_LEN_BYTE_ARRAY backings carry the unscaled integer, never
@@ -124,9 +124,10 @@ a DOUBLE. Direct projection copies preserve page indexes; re-encoded chunks get 
 **Output layout.** A write that re-encodes (a filter, `--select` or a computed column) cuts its row groups from the
 rows it writes, in order, not from the input's row groups: one closes once it holds `--row-group-size` rows (default
 131,072) or its values take `--row-group-bytes` (default 64 MiB) at their PLAIN size, a fixed-width value its
-width and a byte array 4 bytes plus its length. Each column chunk is split into data pages of at most 1 MiB of
-values or 20,000 rows, and gets a page index (ColumnIndex and OffsetIndex, written after the row groups, column by
-column). The bytes written depend only on the inputs and the options: the same file at every `-j`, on every machine.
+width and a byte array 4 bytes plus its length. Each column chunk is split into data pages targeting 1 MiB of
+values or 20,000 rows. Dictionary pages can hold more rows within their encoded-index and decoded-value byte budgets;
+string pages also retain their string-byte budget. Each chunk gets a page index (ColumnIndex and OffsetIndex, written
+after the row groups, column by column). The bytes written depend only on the inputs and the options: the same file at every `-j`, on every machine.
 An explicit `--max-memory` caps row groups at a sixteenth of it, so there the file can depend on that value (never
 on `-j`). Holding a row group's decoded rows until it is encoded is the write's largest fixed cost: with the default
 budget a machine needs a few times `--row-group-bytes` of memory, or an explicit `--max-memory`. Plain copies and row

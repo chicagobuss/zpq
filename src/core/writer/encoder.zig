@@ -152,10 +152,8 @@ pub const PageInfo = struct {
     max: ?[]const u8 = null,
 };
 
-/// The data page target: a page is closed once its present values take this many PLAIN bytes or it holds
-/// `default_page_rows` rows, whichever comes first. These are the defaults Arrow C++ (pyarrow) writes with and
-/// parquet-mr's 1 MiB page and 20,000-row page cap; they keep a page small enough for the page index to skip at a
-/// useful grain and large enough that per-page overhead stays in the noise.
+/// The data page target for values: PLAIN bytes or rows, whichever is reached first. Dictionary pages use their
+/// index width instead, bounded by the bytes needed to materialize their values for statistics and pruning.
 pub const default_page_bytes: usize = 1 << 20;
 pub const default_page_rows: usize = 20_000;
 
@@ -183,6 +181,7 @@ pub const ColumnInput = struct {
     /// The caller proves present values unique, so a dictionary attempt would decline without changing the bytes.
     distinct: bool = false,
     /// The data page target (`default_page_bytes`, `default_page_rows`). A repeated column is one page.
+    /// The default dictionary row target may grow under its byte budgets; a non-default target remains a hard limit.
     page_bytes: usize = default_page_bytes,
     page_rows: usize = default_page_rows,
 };
@@ -718,8 +717,64 @@ fn pageEnds(
     return ends.items;
 }
 
-/// The plan of a column written as values (no dictionary): DELTA_BINARY_PACKED for INT32/INT64, a delta string layout
-/// for byte arrays (`stringsEncoding`), PLAIN otherwise; each page encodes its own rows.
+/// Dictionary indices use at most `bit_width` packed bits per present row; definition levels use their own width.
+/// A separate decoded-value budget bounds the materialized page statistics and the reader's pruning granularity,
+/// even when RLE makes the index stream arbitrarily small. String bytes also retain their existing pruning bound.
+fn dictionaryPageEnds(
+    arena: std.mem.Allocator,
+    rows: usize,
+    def_levels: ?[]const u32,
+    max_def: u32,
+    bit_width: u8,
+    value_size: usize,
+    page_bytes: usize,
+    page_rows: usize,
+    strings: ?filter_eval.ColumnT([]const u8),
+    fixed: bool,
+) Error![]const usize {
+    const row_limit = @min(pageLimit(), if (page_rows == default_page_rows)
+        @max(page_rows, page_bytes / @max(1, value_size))
+    else
+        @max(1, page_rows));
+    const bit_limit = @as(u64, @intCast(@max(1, page_bytes))) *| 8;
+    var ends: std.ArrayList(usize) = .empty;
+    if (rows == 0) {
+        try ends.append(arena, 0);
+        return ends.items;
+    }
+    if (def_levels == null and strings == null) {
+        const per_page: usize = @intCast(@max(1, @min(@as(u64, @intCast(row_limit)), bit_limit / bit_width)));
+        var end = per_page;
+        while (end < rows) : (end += per_page) try ends.append(arena, end);
+        try ends.append(arena, rows);
+        return ends.items;
+    }
+    const level_width = bitWidthFor(@max(max_def, 1));
+    var bits: u64 = 0;
+    var string_bytes: usize = 0;
+    var start: usize = 0;
+    for (0..rows) |r| {
+        if (def_levels != null) bits +|= level_width;
+        if (isPresent(def_levels, max_def, r)) {
+            bits +|= bit_width;
+            if (strings) |s| {
+                const value = if (s.codes) |codes| s.dict[codes[r]] else s.values[r];
+                string_bytes +|= value.len +| @as(usize, if (fixed) 0 else 4);
+            }
+        }
+        if (r + 1 - start >= row_limit or bits >= bit_limit or string_bytes >= @max(1, page_bytes)) {
+            try ends.append(arena, r + 1);
+            start = r + 1;
+            bits = 0;
+            string_bytes = 0;
+        }
+    }
+    if (start < rows) try ends.append(arena, rows);
+    return ends.items;
+}
+
+/// The plan of a column written as values (no dictionary): sampled PLAIN or DELTA for integers, a sampled delta string
+/// layout for byte arrays, PLAIN otherwise; each page encodes its own rows.
 fn planValues(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
     const elem = in.schema_elem;
     const phys = elem.type orelse return error.UnsupportedType;
@@ -763,10 +818,7 @@ fn planValues(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
         }
     }
 
-    // i32/i64 take DELTA_BINARY_PACKED: it dominates PLAIN by 4-8× on sorted/timestamp columns and is roughly
-    // equivalent on random data (per-block overhead is small and bit-packing adapts to actual delta range). Strings
-    // the dictionary declined take DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY (`stringsEncoding`), decided over the
-    // whole chunk so every page has the same one. Everything else is PLAIN.
+    // Choose once from the first page's values, so every page has the same encoding independently of worker order.
     const nested = src_max_rep > 0;
     const ends: []const usize = if (nested) blk: {
         const one = try arena.alloc(usize, 1);
@@ -779,7 +831,7 @@ fn planValues(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
     const selected_encoding: schema.Encoding = if (in.parquet_version == .v1)
         .PLAIN
     else if (src_max_rep == 0 and (in.values == .i32 or in.values == .i64))
-        .DELTA_BINARY_PACKED
+        try integerEncoding(arena, in, ends[0])
     else if (src_max_rep == 0 and in.values == .string)
         try stringsEncoding(arena, in, in.values.string.values, src_def_levels, src_max_def, fixed, ends[0]) orelse .PLAIN
     else
@@ -801,6 +853,59 @@ fn planValues(arena: std.mem.Allocator, in: ColumnInput) Error!Plan {
         .max_def = src_max_def,
         .optional = elem.repetition_type == .OPTIONAL,
     };
+}
+
+/// Scratch for one integer-encoding trial. A block can require its dense values, encoded bytes, compressed bytes and
+/// a codec recheck at once; bound the trial by the existing page budget, even for a tiny column.
+pub fn integerSampleScratchBytes(rows: usize, width: usize, page_bytes: usize) usize {
+    if (rows == 0) return 0;
+    const block = @as(usize, delta_binary_packed.DEFAULT_BLOCK_SIZE) *| width;
+    return @min(page_bytes, @max(rows *| width, block *| 4));
+}
+
+/// Compare the same present values after the requested codec. The fixed buffer bounds transient allocations and is
+/// reused between trials; if a codec's worst case does not fit, retry a shorter prefix and finally use PLAIN.
+/// Trial compression does not count as a written page in the caller's zstd statistics.
+fn integerEncoding(arena: std.mem.Allocator, in: ColumnInput, first_page_rows: usize) Error!schema.Encoding {
+    const width: usize = switch (in.values) {
+        .i32 => @sizeOf(i32),
+        .i64 => @sizeOf(i64),
+        else => unreachable,
+    };
+    const cap = integerSampleScratchBytes(valueCount(in.values), width, in.page_bytes);
+    if (cap == 0) return .PLAIN;
+    const buf = try arena.alloc(u8, cap);
+    defer arena.free(buf);
+    var scratch = std.heap.FixedBufferAllocator.init(buf);
+    var n = @min(@min(first_page_rows, valueCount(in.values)), @max(1, cap / (width * 4)));
+    while (n != 0) {
+        scratch.reset();
+        const plain = integerSampleLength(scratch.allocator(), in, n, .PLAIN) catch |err| {
+            if (err == error.OutOfMemory) {
+                n /= 2;
+                continue;
+            }
+            return err;
+        };
+        scratch.reset();
+        const delta = integerSampleLength(scratch.allocator(), in, n, .DELTA_BINARY_PACKED) catch |err| {
+            if (err == error.OutOfMemory) {
+                n /= 2;
+                continue;
+            }
+            return err;
+        };
+        return if (delta < plain) .DELTA_BINARY_PACKED else .PLAIN;
+    }
+    return .PLAIN;
+}
+
+fn integerSampleLength(a: std.mem.Allocator, in: ColumnInput, rows: usize, encoding: schema.Encoding) Error!usize {
+    const sample = sliceRows(in.values, 0, rows);
+    const values = try encodeValuesAs(a, sample, sourceDefLevels(sample), sourceMaxDef(sample), encoding, false);
+    var zstd = in.zstd;
+    zstd.counts = null;
+    return (try compression.compressPage(a, values, in.codec, zstd)).len;
 }
 
 /// `c`'s present values in `encoding` (as `planValues` chose it).
@@ -1426,11 +1531,26 @@ fn planDictionary(
         },
         .data_page_header_v2 = null,
     });
-    const fixed_width: ?usize = if (in.schema_elem.type == .FIXED_LEN_BYTE_ARRAY)
-        @intCast(in.schema_elem.type_length.?)
-    else
-        null;
-    const ends = try pageEnds(arena, in.values, def_levels, max_def, fixed_width, in.page_bytes, in.page_rows);
+    const value_size: usize = switch (dict) {
+        inline else => |c| @sizeOf(@typeInfo(@TypeOf(c.values)).pointer.child),
+    };
+    const bit_width = dictIndexBitWidth(dict_count);
+    const strings = switch (in.values) {
+        .string => |s| s,
+        else => null,
+    };
+    const ends = try dictionaryPageEnds(
+        arena,
+        @intCast(num_values),
+        def_levels,
+        max_def,
+        bit_width,
+        value_size,
+        in.page_bytes,
+        in.page_rows,
+        strings,
+        in.schema_elem.type == .FIXED_LEN_BYTE_ARRAY,
+    );
     const present_before = try arena.alloc(usize, ends.len + 1);
     present_before[0] = 0;
     var lo: usize = 0;
@@ -1445,7 +1565,7 @@ fn planDictionary(
         .kind = .{ .dict = .{
             .entries = dict,
             .indices = indices,
-            .bit_width = dictIndexBitWidth(dict_count),
+            .bit_width = bit_width,
             .present_before = present_before,
         } },
         .ends = ends,
@@ -3070,8 +3190,7 @@ test "string columns: dictionary within its limits, else PLAIN unless a delta la
             @memset(b[0..40], 'h');
             r.bytes(b[40..]);
             break :blk b;
-        } else
-            big[(i % 100) * (16 << 10) ..][0 .. 16 << 10];
+        } else big[(i % 100) * (16 << 10) ..][0 .. 16 << 10];
         const enc = try encodeColumn(a, .{ .values = .{ .string = .{ .values = vals } }, .schema_elem = &elem, .path_in_schema = path });
         const got: Form = if (enc.meta.dictionary_page_offset != null)
             .dictionary
@@ -3545,7 +3664,7 @@ test "a chunk is cut into pages at the page target, decodes whole, and pages bui
         .{
             .values = .{ .i64 = .{ .values = ints, .def_levels = defs, .max_def = 1 } },
             .t = .INT64,
-            .want = .DELTA_BINARY_PACKED,
+            .want = .PLAIN,
         },
         .{
             .values = .{ .i64 = .{ .values = low, .def_levels = defs, .max_def = 1 } },
@@ -3579,7 +3698,10 @@ test "a chunk is cut into pages at the page target, decodes whole, and pages bui
         const enc = try encodeColumn(a, in);
         const data_stats = enc.meta.encoding_stats.?.getLast();
         try testing.expectEqual(case.want, @as(schema.Encoding, @fromBackingInt(@intCast(data_stats.encoding))));
-        try testing.expect(enc.pages.len > 1);
+        if (case.want == .RLE_DICTIONARY)
+            try testing.expectEqual(@as(usize, 1), enc.pages.len)
+        else
+            try testing.expect(enc.pages.len > 1);
         try expectPagesDescribed(a, enc, n);
         // Pages cut by rows (20,000) or, for the strings, by bytes (1 MiB at about 64 bytes a value).
         for (enc.pages[0 .. enc.pages.len - 1]) |p| {
@@ -3654,7 +3776,52 @@ test "a chunk is cut into pages at the page target, decodes whole, and pages bui
     }
 }
 
-test "page boundaries come from the values, not the encoding: a coded column has its values' pages" {
+test "dictionary pages use index width and bound decoded values and page statistics" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // The packed-index byte budget matters even when the decoded-row budget would permit more rows.
+    const narrow = try dictionaryPageEnds(a, 1000, null, 0, 1, 1, 100, default_page_rows, null, false);
+    const wide = try dictionaryPageEnds(a, 1000, null, 0, 32, 1, 100, default_page_rows, null, false);
+    try testing.expectEqual(@as(usize, 800), narrow[0]);
+    try testing.expectEqual(@as(usize, 25), wide[0]);
+    try testing.expectEqualSlices(usize, &.{0}, try dictionaryPageEnds(a, 0, null, 0, 1, 8, 100, 10, null, false));
+
+    const row_limit = default_page_bytes / @sizeOf(i64);
+    const n = row_limit + 123;
+    const values = try a.alloc(i64, n);
+    const defs = try a.alloc(u32, n);
+    for (values, defs, 0..) |*v, *d, i| {
+        v.* = @intCast(i % 3);
+        d.* = @intFromBool(i % 7 != 0);
+    }
+    var elem = flbaElem(0, .OPTIONAL);
+    elem.type = .INT64;
+    const in: ColumnInput = .{
+        .values = .{ .i64 = .{ .values = values, .def_levels = defs, .max_def = 1 } },
+        .schema_elem = &elem,
+        .path_in_schema = &.{"v"},
+        .codec = .SNAPPY,
+    };
+    const encoded = try encodeColumn(a, in);
+    try testing.expect(encoded.meta.dictionary_page_offset != null);
+    try testing.expectEqual(@as(usize, 2), encoded.pages.len);
+    try testing.expectEqual(@as(u64, row_limit), encoded.pages[0].rows);
+    try expectPagesDescribed(a, encoded, n);
+    for (encoded.pages) |p| {
+        var nulls: i64 = 0;
+        for (p.first_row..p.first_row + p.rows) |i| nulls += @intFromBool(defs[i] == 0);
+        try testing.expectEqual(nulls, p.null_count);
+        try testing.expectEqual(@as(i64, 0), std.mem.readInt(i64, p.min.?[0..8], .little));
+        try testing.expectEqual(@as(i64, 2), std.mem.readInt(i64, p.max.?[0..8], .little));
+    }
+    const back = try readBack(i64, a, encoded, .{ .max_def = 1, .max_rep = 0 }, n);
+    try testing.expectEqualSlices(u32, defs, back.defs);
+    for (values, defs, back.values) |value, def, got| if (def == 1) try testing.expectEqual(value, got);
+}
+
+test "dictionary page boundaries agree for coded and materialized values" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -3686,7 +3853,7 @@ test "page boundaries come from the values, not the encoding: a coded column has
     const plain_col: filter_eval.Batch.Column = .{ .string = .{ .values = vals } };
     const plain = try encodeColumn(a, .{ .values = plain_col, .schema_elem = &elem, .path_in_schema = path });
     try testing.expectEqualSlices(u8, plain.bytes, coded.bytes);
-    // About 1.2 KiB of PLAIN bytes per three rows: a 1 MiB page holds about 2,600 rows.
+    // Long repeated strings still respect the decoded-byte limit used for pruning.
     try testing.expectEqual(@as(usize, 4), coded.pages.len);
     try expectPagesDescribed(a, coded, n);
 }
@@ -4210,6 +4377,79 @@ test "parquet version selects value encodings and dictionary metadata" {
         try testing.expectEqual(if (version == .v1) schema.Encoding.PLAIN else .DELTA_BINARY_PACKED, high_pages[0].header.data_page_header.?.encoding);
         try testing.expectEqual(if (version == .v1) @as(i32, 1) else 2, version.footer());
     }
+}
+
+test "integer samples choose compressed plain or delta with bounded scratch and roundtrip" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqual(@as(usize, 0), integerSampleScratchBytes(0, @sizeOf(i64), default_page_bytes));
+    try testing.expect(integerSampleScratchBytes(1_000_000, @sizeOf(i64), default_page_bytes) <= default_page_bytes);
+    inline for (.{ i32, i64 }) |T| {
+        const n = 4096;
+        const random = try a.alloc(T, n);
+        const ordered = try a.alloc(T, n);
+        const defs = try a.alloc(u32, n);
+        var prng = std.Random.DefaultPrng.init(0x537a);
+        for (random, ordered, defs, 0..) |*r, *o, *d, i| {
+            r.* = prng.random().int(T);
+            o.* = @intCast(i * 1009);
+            d.* = @intFromBool(i % 13 != 0);
+        }
+        var elem = flbaElem(0, .OPTIONAL);
+        elem.type = if (T == i32) .INT32 else .INT64;
+        for ([_]schema.CompressionCodec{ .UNCOMPRESSED, .SNAPPY, .ZSTD, .LZ4_RAW }) |codec| {
+            for ([_]bool{ false, true }) |nullable| {
+                elem.repetition_type = if (nullable) .OPTIONAL else .REQUIRED;
+                for ([_]bool{ false, true }) |random_values| {
+                    const values = if (random_values) random else ordered;
+                    const col: filter_eval.ColumnT(T) = .{
+                        .values = values,
+                        .def_levels = if (nullable) defs else null,
+                        .max_def = @intFromBool(nullable),
+                    };
+                    var counts: compression.ZstdModeCounts = .{};
+                    const input: ColumnInput = .{
+                        .values = if (T == i32) .{ .i32 = col } else .{ .i64 = col },
+                        .schema_elem = &elem,
+                        .path_in_schema = &.{"v"},
+                        .codec = codec,
+                        .zstd = .{ .counts = &counts },
+                        .distinct = true,
+                    };
+                    const p = try plan(a, input);
+                    try testing.expectEqual(if (random_values) schema.Encoding.PLAIN else .DELTA_BINARY_PACKED, p.values_encoding);
+                    for (&counts.pages) |*count| try testing.expectEqual(@as(u64, 0), count.load(.monotonic));
+                    const encoded = try encodeColumn(a, input);
+                    const back = try readBack(T, a, encoded, .{ .max_def = @intFromBool(nullable), .max_rep = 0 }, n);
+                    for (values, back.values, 0..) |want, got, i| if (!nullable or defs[i] == 1) {
+                        try testing.expectEqual(want, got);
+                    };
+                    if (nullable) try testing.expectEqualSlices(u32, defs, back.defs);
+                    var old = input;
+                    old.parquet_version = .v1;
+                    try testing.expectEqual(schema.Encoding.PLAIN, (try plan(a, old)).values_encoding);
+                }
+            }
+        }
+    }
+}
+
+test "integer sampling falls back safely when the page budget cannot hold a trial" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const values = [_]i64{ 9, 8, 7, 6 };
+    var elem = flbaElem(0, .REQUIRED);
+    elem.type = .INT64;
+    const input: ColumnInput = .{
+        .values = .{ .i64 = .{ .values = &values } },
+        .schema_elem = &elem,
+        .path_in_schema = &.{"v"},
+        .page_bytes = 1,
+        .distinct = true,
+    };
+    try testing.expectEqual(schema.Encoding.PLAIN, (try plan(a, input)).values_encoding);
 }
 
 test "parquet version statistics retain byte ordering on tied prefixes" {

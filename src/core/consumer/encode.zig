@@ -344,7 +344,6 @@ pub const RGEncoder = struct {
     }
 };
 
-
 /// The PLAIN size, in bits, of the present values in rows `lo..hi` of an output buffer written as `elem`: its physical
 /// width (a BOOLEAN one bit, a FIXED_LEN_BYTE_ARRAY its length), a BYTE_ARRAY 4 bytes plus its length. What output row
 /// groups are cut by: a property of the rows, however they were decoded or batched.
@@ -594,7 +593,6 @@ fn aggLeafElem(out_col: expr_agg.OutputCol) schema.SchemaElement {
     return elem;
 }
 
-
 /// Rows from which `writeAggregateRows` encodes columns on several threads: fewer encode faster than threads start.
 const parallel_encode_rows = 1 << 16;
 
@@ -677,8 +675,7 @@ fn ownColumnMeta(arena: std.mem.Allocator, meta: schema.ColumnMetaData) !schema.
     return out;
 }
 
-/// What encoding `col` may hold at its peak: three times its values and levels, the estimate the re-encode path
-/// slices row groups by (a dictionary attempt's table and indices, the page, its compressed copy).
+/// What encoding `col` may hold at its peak: three times its values and levels, plus bounded integer trial scratch.
 fn aggEncodeCharge(col: expr_agg.OutputCol) u64 {
     const bytes: u64 = switch (col.col) {
         .string => |c| blk: {
@@ -689,7 +686,13 @@ fn aggEncodeCharge(col: expr_agg.OutputCol) u64 {
         inline else => |c| c.values.len * @sizeOf(@TypeOf(c.values[0])) +
             if (c.def_levels) |d| d.len * @sizeOf(u32) else 0,
     };
-    return bytes *| 3;
+    const sample: usize = switch (col.col) {
+        .i32 => |c| encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i32), encoder.default_page_bytes),
+        .i64 => |c| encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i64), encoder.default_page_bytes),
+        .i128 => |c| encoder.integerSampleScratchBytes(c.rowCount(), @sizeOf(i64), encoder.default_page_bytes),
+        else => 0,
+    };
+    return (bytes *| 3) +| sample;
 }
 
 /// A run of an answer's columns encoded together, one thread a column, each into an arena of its own that holds the
@@ -1105,7 +1108,6 @@ fn aggregateFooter(
     return off;
 }
 
-
 /// Columns of each lane and encoding an answer writes: near-unique integers (DELTA), repeating ones (dictionary),
 /// floats and strings with NULLs, and a DECIMAL whose value at `bad_row`, when set, its INT32 cannot hold.
 fn aggAnswerCols(a: std.mem.Allocator, n: usize, bad_row: ?usize) ![]expr_agg.OutputCol {
@@ -1457,7 +1459,6 @@ test "writeAggregateRows: retained integer encode scratch stays charged through 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, cachedIntegerWindows, .{});
 }
 
-
 test "cloneColumnMeta keeps every statistics field, the bounds' exactness among them" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1545,7 +1546,6 @@ test "plainBitsPrefix: every range's bits are plainBits' over the same rows, wha
     }
 }
 
-
 test "writeAggregateRows preserves the automatic Bloom policy for small and parallel answers" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -1566,7 +1566,6 @@ test "writeAggregateRows preserves the automatic Bloom policy for small and para
         };
     }
 }
-
 
 test "grouped key dictionaries keep later-key codes with and without dense lanes" {
     const testing = std.testing;
@@ -1728,4 +1727,3 @@ test "grouped key dictionaries keep later-key codes with and without dense lanes
     };
     try testing.checkAllAllocationFailures(testing.allocator, Trial.run, .{ capture.bytes.items, &meta });
 }
-

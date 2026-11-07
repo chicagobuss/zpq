@@ -1344,6 +1344,41 @@ fn appendMapped(bytes: *std.ArrayList(u8), arena: std.mem.Allocator, parts: []co
     return .{ .built = .{ start, bytes.items.len } };
 }
 
+/// Whether `cp` is one of the space separators (Unicode category Zs) above U+00A0, the characters DuckDB's `trim` strips
+/// beside U+0020 and U+00A0. Found by asking DuckDB 2.0.0 about every code point: a tab, a line break, NEL and the
+/// zero-width spaces stay.
+fn isWideSpace(cp: u21) bool {
+    return switch (cp) {
+        0x1680, 0x2000...0x200A, 0x202F, 0x205F, 0x3000 => true,
+        else => false,
+    };
+}
+
+/// The byte length of the space that opens `s`, 0 if it does not open with one.
+fn spaceAtStart(s: []const u8) usize {
+    if (s.len == 0) return 0;
+    if (s[0] == ' ') return 1;
+    if (s.len >= 2 and s[0] == 0xC2 and s[1] == 0xA0) return 2;
+    if (s.len >= 3 and s[0] >= 0xE1 and s[0] <= 0xE3) {
+        const cp = std.unicode.utf8Decode(s[0..3]) catch return 0;
+        if (isWideSpace(cp)) return 3;
+    }
+    return 0;
+}
+
+/// The byte length of the space that closes `s`, 0 if it does not close with one. A three-byte space starts with a lead
+/// byte, which no continuation byte of another character can be.
+fn spaceAtEnd(s: []const u8) usize {
+    if (s.len == 0) return 0;
+    if (s[s.len - 1] == ' ') return 1;
+    if (s.len >= 2 and s[s.len - 2] == 0xC2 and s[s.len - 1] == 0xA0) return 2;
+    if (s.len >= 3 and s[s.len - 3] >= 0xE1 and s[s.len - 3] <= 0xE3) {
+        const cp = std.unicode.utf8Decode(s[s.len - 3 ..]) catch return 0;
+        if (isWideSpace(cp)) return 3;
+    }
+    return 0;
+}
+
 /// One text through a string function; `bytes` holds what is built. Characters are code points, positions 1-based.
 fn applyStringFn(arena: std.mem.Allocator, bytes: *std.ArrayList(u8), c: ast.Call, text: []const u8) Error!Mapped {
     const int = struct {
@@ -1415,8 +1450,16 @@ fn applyStringFn(arena: std.mem.Allocator, bytes: *std.ArrayList(u8), c: ast.Cal
         .trim, .ltrim, .rtrim => {
             var lo: usize = 0;
             var hi: usize = text.len;
-            if (c.func != .rtrim) while (lo < hi and text[lo] == ' ') : (lo += 1) {};
-            if (c.func != .ltrim) while (hi > lo and text[hi - 1] == ' ') : (hi -= 1) {};
+            if (c.func != .rtrim) while (lo < hi) {
+                const n = spaceAtStart(text[lo..hi]);
+                if (n == 0) break;
+                lo += n;
+            };
+            if (c.func != .ltrim) while (hi > lo) {
+                const n = spaceAtEnd(text[lo..hi]);
+                if (n == 0) break;
+                hi -= n;
+            };
             return .{ .text = text[lo..hi] };
         },
         .replace => {
@@ -3854,12 +3897,23 @@ test "left, right, trim, replace and the pads match DuckDB's answers" {
     try expectString("", .right, s, &.{intArg(0)});
     try expectString(s, .right, s, &.{intArg(100)});
     try expectString("😀😀", .left, "😀😀x", &.{intArg(2)});
-    // Only spaces trim.
+    // Unicode's space separators trim, as DuckDB 2.0.0's trim does; tabs, line breaks and zero-width spaces do not.
     try expectString("a b", .trim, "  a b  ", &.{});
     try expectString("a ", .ltrim, "  a ", &.{});
     try expectString("  a", .rtrim, "  a ", &.{});
     try expectString("", .trim, "   ", &.{});
-    try expectString("\ta\t", .trim, "\ta\t", &.{});
+    try expectString("a b", .trim, " \u{a0}\u{2003}a b\u{3000}\u{1680} ", &.{});
+    try expectString("a\u{202f}", .ltrim, "\u{a0}\u{205f}a\u{202f}", &.{});
+    try expectString("\u{a0}a", .rtrim, "\u{a0}a\u{2000}\u{200a}", &.{});
+    try expectString("", .trim, "\u{a0}\u{2009}", &.{});
+    for ([_][]const u8{ "\t", "\n", "\r", "\x0b", "\x0c", "\u{85}", "\u{180e}", "\u{200b}", "\u{2028}", "\u{feff}", "\u{2060}", "\u{3164}", "\u{ad}" }) |kept| {
+        const text = try std.mem.concat(std.testing.allocator, u8, &.{ kept, "a", kept });
+        defer std.testing.allocator.free(text);
+        try expectString(text, .trim, text, &.{});
+    }
+    // A text that is no UTF-8 stops at its first byte that is no space: the lead byte of a space cut short is not one.
+    try expectString("\xe2\x80", .trim, "\xe2\x80", &.{});
+    try expectString("a\xe2\x80", .rtrim, "a\xe2\x80", &.{});
     try expectString("ba", .replace, "aaa", &.{ strArg("aa"), strArg("b") });
     try expectString("aaaaaa", .replace, "aaa", &.{ strArg("a"), strArg("aa") });
     try expectString(s, .replace, s, &.{ strArg(""), strArg("x") });

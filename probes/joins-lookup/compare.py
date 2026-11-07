@@ -16,6 +16,8 @@ for d, z in zip(duck, zpq):
         if a is not None and b is not None:
             if abs(a - b) > 1e-9 * max(1.0, abs(a)):
                 ok = False
+        elif dv in ("", "NULL") and zv is None:
+            continue  # DuckDB's CSV writes NULL as nothing or NULL
         elif str(dv) != str(zv):
             # DuckDB prints DATE as ISO text, zpq as days since the epoch.
             import datetime

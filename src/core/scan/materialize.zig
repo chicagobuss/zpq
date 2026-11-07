@@ -3,6 +3,7 @@ const expr_ast = @import("../expr/ast.zig");
 const expr_agg = @import("../expr/agg.zig");
 const AggValue = @import("output_values.zig").AggValue;
 const hll = @import("../expr/aggregate/hll.zig");
+const argminmax = @import("../expr/aggregate/argminmax.zig");
 const quantile = @import("../expr/aggregate/quantile.zig");
 
 fn decValue(v: ?i128, spec: expr_ast.Dec) AggValue {
@@ -48,6 +49,17 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
         else if (expr_agg.avgMean(state.avg)) |m| .{ .f = m } else .null_val,
         .var_samp, .var_pop, .stddev_samp, .stddev_pop => if (state.moments.result(call.func)) |v| .{ .f = v } else .null_val,
         .approx_count_distinct => .{ .i = hll.count(state.blob.bytes) },
+        .arg_max, .arg_min => blk: {
+            const rec = state.blob.used();
+            if (rec.len == 0) break :blk .null_val;
+            const arg = argminmax.argOf(rec);
+            break :blk switch (call.result) {
+                .i64 => .{ .i = std.mem.readInt(i64, arg[0..8], .little) },
+                .f64 => .{ .f = @bitCast(std.mem.readInt(u64, arg[0..8], .little)) },
+                .bytes => .{ .s = try gpa.dupe(u8, arg) },
+                else => unreachable,
+            };
+        },
         .string_agg => if (try state.blob.joinText(gpa, call.sep)) |joined| .{ .s = joined } else .null_val,
         .quantile_cont => if (quantile.cont(state.blob.f64s(), call.q)) |v| .{ .f = v } else .null_val,
     };

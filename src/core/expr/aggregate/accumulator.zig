@@ -13,6 +13,7 @@ const keyEql = @import("../../bytes.zig").keyEql;
 const foldExtremeF = @import("contracts.zig").foldExtremeF;
 const foldExtremeI = @import("contracts.zig").foldExtremeI;
 const hll = @import("hll.zig");
+const argminmax = @import("argminmax.zig");
 
 /// Accumulator state. One per AggCall, lives across all RGs of all
 /// input files. Tagged union so the dispatcher picks the right
@@ -67,7 +68,7 @@ pub const Accumulator = union(enum) {
         bytes: []align(8) u8 = &.{},
         len: usize = 0,
 
-        pub const Kind = enum { hll, quantile, text };
+        pub const Kind = enum { hll, quantile, text, arg };
 
         pub fn deinit(b: *Blob, allocator: std.mem.Allocator) void {
             if (b.bytes.len != 0) allocator.free(b.bytes);
@@ -100,6 +101,29 @@ pub const Accumulator = union(enum) {
             if (b.bytes.len != 0) persist.free(b.bytes);
             b.bytes = mem;
             if (charge) |c| c.adjust(old + new, new) catch unreachable;
+        }
+
+        /// `arg` at `val` offered as the best so far: kept if none is held or `val` strictly beats it, so the first of
+        /// equal rows stays. The record is written over the old one, in the room it has if it fits.
+        pub fn offerArg(
+            b: *Blob,
+            persist: std.mem.Allocator,
+            charge: ?*WinnerCharge,
+            order: argminmax.Order,
+            is_min: bool,
+            val: []const u8,
+            arg: []const u8,
+        ) Error!void {
+            if (b.len != 0 and !argminmax.beats(order, is_min, val, argminmax.valOf(b.used()))) return;
+            const need = argminmax.size(val.len, arg.len);
+            const held = b.len;
+            b.len = 0;
+            b.reserve(persist, charge, need) catch |err| {
+                b.len = held;
+                return err;
+            };
+            argminmax.write(b.bytes[0..need], order, is_min, val, arg);
+            b.len = need;
         }
 
         /// One text of a `string_agg`: its length (four bytes) and the bytes, after the ones before it.
@@ -183,6 +207,16 @@ pub const Accumulator = union(enum) {
                 .hll => {
                     hll.merge(b.bytes, src.bytes);
                     allocator.free(src.bytes);
+                },
+                // The source's rows come after the destination's: its record wins only by being strictly better.
+                .arg => {
+                    const mine = b.used();
+                    const theirs = src.bytes[0..src.len];
+                    if (argminmax.beats(argminmax.orderOf(theirs), argminmax.isMin(theirs), argminmax.valOf(theirs), argminmax.valOf(mine))) {
+                        allocator.free(b.bytes);
+                        b.bytes = src.bytes;
+                        b.len = src.len;
+                    } else allocator.free(src.bytes);
                 },
                 // Texts keep their order: the destination's, then the source's.
                 .text => {
@@ -273,6 +307,7 @@ pub const Accumulator = union(enum) {
             .approx_count_distinct => .{ .blob = .{ .kind = .hll } },
             .quantile_cont => .{ .blob = .{ .kind = .quantile } },
             .string_agg => .{ .blob = .{ .kind = .text } },
+            .arg_max, .arg_min => .{ .blob = .{ .kind = .arg } },
         };
     }
 

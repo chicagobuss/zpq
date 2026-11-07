@@ -20,6 +20,7 @@ const schema = @import("../../schema.zig");
 const decimal_mod = @import("../../parquet/decimal.zig");
 const hll = @import("hll.zig");
 const quantile = @import("quantile.zig");
+const argminmax = @import("argminmax.zig");
 const statistics = @import("../../parquet/statistics.zig");
 const AggCall = @import("types.zig").AggCall;
 const Error = @import("types.zig").Error;
@@ -293,7 +294,7 @@ pub fn canStatShortCircuit(call: AggCall, has_outer_filter: bool, trust_stats: b
         // num_rows × min to the sum. updateOneFromStats decides per-RG
         // and falls through to decode for non-constant RGs.
         .sum => true,
-        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => false,
+        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => false,
     };
 }
 
@@ -413,7 +414,7 @@ pub fn updateOneFromStats(
             return true;
         },
         // Never short-circuitable: the deviations need every value.
-        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => return false,
+        .avg, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => return false,
     }
 }
 
@@ -728,6 +729,21 @@ pub fn finalize(
         .approx_count_distinct => try emitOneI64(arena, call.alias, hll.count(state.blob.bytes), false),
         .quantile_cont => try emitOneF64(arena, call.alias, quantile.cont(state.blob.f64s(), call.q)),
         .string_agg => try emitOneString(arena, call.alias, try state.blob.joinText(arena, call.sep)),
+        .arg_max, .arg_min => blk: {
+            const rec = state.blob.used();
+            if (rec.len == 0) break :blk switch (call.result) {
+                .f64 => try emitOneF64(arena, call.alias, null),
+                .bytes => try emitOneString(arena, call.alias, null),
+                else => try emitOneI64(arena, call.alias, null, true),
+            };
+            const arg = argminmax.argOf(rec);
+            break :blk switch (call.result) {
+                .i64 => try emitOneI64(arena, call.alias, std.mem.readInt(i64, arg[0..8], .little), true),
+                .f64 => try emitOneF64(arena, call.alias, @bitCast(std.mem.readInt(u64, arg[0..8], .little))),
+                .bytes => try emitOneString(arena, call.alias, arg),
+                else => unreachable,
+            };
+        },
     };
 }
 
@@ -913,6 +929,10 @@ pub fn updateOneWithCharge(
     outer_sel: *const filter_selection.SelectionVector,
     charge: ?*@import("accumulator.zig").WinnerCharge,
 ) Error!void {
+    if (call.func == .arg_max or call.func == .arg_min) {
+        var visit: ArgScalarVisit = .{ .state = state, .persist = persist, .charge = charge };
+        return forEachArgRow(arena, call, batch, column_lookup, outer_sel, &visit);
+    }
     if (try agg_coded.updateOneCoded(arena, persist, state, call, batch, column_lookup, outer_sel, charge)) return;
     // The functions only the generic fold runs read values; a column the decoder left as codes and a dictionary is
     // expanded first (its nulls stay where they were).
@@ -952,6 +972,8 @@ pub fn updateOneWithCharge(
         .approx_count_distinct => try foldHll(persist, state, call, values.?, sel, charge),
         .quantile_cont => try foldQuantile(persist, state, values.?, sel, u64_col, charge),
         .string_agg => try foldText(persist, state, values.?, sel, charge),
+        // Dispatched above, before one argument is prepared.
+        .arg_max, .arg_min => unreachable,
     }
 }
 
@@ -991,7 +1013,7 @@ pub fn updateSharedInteger(
             .count => {},
             .count_distinct => unreachable,
             // The shared kernel knows sum, min, max and avg.
-            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => return false,
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => return false,
         }
     }
     if (value_calls < 2) return false;
@@ -1040,7 +1062,7 @@ pub fn updateSharedInteger(
                 state.avg.isum += stats.sum;
                 state.avg.count += stats.count;
             },
-            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => unreachable,
+            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => unreachable,
         }
     }
     return true;
@@ -1645,6 +1667,107 @@ pub inline fn momentAt(col: filter_eval.Batch.Column, r: usize, unsigned_64: boo
         .f64 => |c| c.values[r],
         else => null,
     };
+}
+
+const ArgScalarVisit = struct {
+    state: *Accumulator,
+    persist: std.mem.Allocator,
+    charge: ?*accumulator_mod.WinnerCharge,
+
+    pub fn visit(self: *ArgScalarVisit, _: usize, order: argminmax.Order, is_min: bool, val: []const u8, arg: []const u8) Error!void {
+        try self.state.blob.offerArg(self.persist, self.charge, order, is_min, val, arg);
+    }
+};
+
+const ArgCell = enum { int, float, text };
+
+fn argCellKind(e: expr_ast.Expr) ArgCell {
+    return switch (e.typeOf()) {
+        .i64 => .int,
+        .f64 => .float,
+        .str => .text,
+        .dec => unreachable,
+    };
+}
+
+/// The bytes of row `r` of a prepared argument of `kind`: eight for a number, the text itself otherwise.
+inline fn argCell(kind: ArgCell, col: filter_eval.Batch.Column, r: usize, buf: *[8]u8) ?[]const u8 {
+    switch (kind) {
+        .int => {
+            buf.* = argminmax.bytes8(switch (col) {
+                .i64 => |c| c.values[r],
+                else => return null,
+            });
+            return buf;
+        },
+        .float => {
+            buf.* = argminmax.bytes8(switch (col) {
+                .f64 => |c| c.values[r],
+                else => return null,
+            });
+            return buf;
+        },
+        .text => return textAt(col, r),
+    }
+}
+
+/// Every row `arg_max` or `arg_min` considers, in row order: both arguments prepared as any aggregate's is (the FILTER
+/// applied, a column's NULLs and a computed value's dropped from the selection), then `visitor.visit(row, order,
+/// is_min, val, arg)` for each selected row. A code-only column is expanded first.
+pub fn forEachArgRow(
+    arena: std.mem.Allocator,
+    call: AggCall,
+    batch: *const filter_eval.Batch,
+    column_lookup: []const ?usize,
+    outer_sel: *const filter_selection.SelectionVector,
+    visitor: anytype,
+) Error!void {
+    const arg1 = call.arg orelse return error.BadAggArg;
+    const arg2 = call.arg2 orelse return error.BadAggArg;
+    var flat: filter_eval.Batch = batch.*;
+    var batch_in = batch;
+    var cols: ?[]filter_eval.Batch.Column = null;
+    for ([2]expr_ast.Expr{ arg1, arg2 }) |e| if (e == .col_ref) {
+        const pos = column_lookup[e.col_ref.col_idx] orelse return error.BadColumn;
+        if (switch (batch.cols[pos]) {
+            inline else => |c| c.codesOnly(),
+        }) {
+            if (cols == null) cols = try arena.dupe(filter_eval.Batch.Column, batch.cols);
+            cols.?[pos] = try agg_coded.materialize(arena, batch.cols[pos]);
+            flat.cols = cols.?;
+            batch_in = &flat;
+        }
+    };
+    var first = call;
+    first.arg2 = null;
+    var in_a: PreparedAggInput = try .init(arena, first, batch_in, column_lookup, outer_sel, false);
+    defer in_a.deinit(arena);
+    var second = call;
+    second.arg = arg2;
+    second.arg2 = null;
+    second.where = null;
+    var in_b: PreparedAggInput = try .init(arena, second, batch_in, column_lookup, in_a.selection(), false);
+    defer in_b.deinit(arena);
+    const sel = in_b.selection();
+    const va = in_a.values orelse return error.BadAggArg;
+    const vb = in_b.values orelse return error.BadAggArg;
+    const a_kind = argCellKind(arg1);
+    const b_kind = argCellKind(arg2);
+    const order: argminmax.Order = switch (b_kind) {
+        .int => if (arg2 == .col_ref and arg2.col_ref.unsigned_64) .unsigned else .signed,
+        .float => .double,
+        .text => .text,
+    };
+    const is_min = call.func == .arg_min;
+    var r: usize = 0;
+    while (r < sel.len) : (r += 1) {
+        if (!sel.isActive(r)) continue;
+        var buf_a: [8]u8 = undefined;
+        var buf_b: [8]u8 = undefined;
+        const arg = argCell(a_kind, va, r, &buf_a) orelse return error.UnsupportedAggType;
+        const val = argCell(b_kind, vb, r, &buf_b) orelse return error.UnsupportedAggType;
+        try visitor.visit(r, order, is_min, val, arg);
+    }
 }
 
 /// Row `r` of a text lane, whether it holds its values or codes into a dictionary.

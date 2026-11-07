@@ -2598,7 +2598,10 @@ pub fn refuseRepeated(
         @memset(reads, false);
         if (in_keys) {
             for (keys orelse &.{}) |k| k.collectColumns(reads);
-        } else for (calls) |c| if (c.arg) |a| a.collectColumns(reads);
+        } else for (calls) |c| {
+            if (c.arg) |a| a.collectColumns(reads);
+            if (c.arg2) |a| a.collectColumns(reads);
+        }
         var leaves: schema.LeafIterator = .init(meta.schema.items);
         while (leaves.next()) |leaf| if (leaf.max_rep > 0 and leaf.index < reads.len and reads[leaf.index]) {
             Diag.setColumn(diag, try std.mem.join(arena, ".", leaf.path));

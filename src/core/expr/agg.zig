@@ -144,6 +144,7 @@ pub const GroupTable = group_state.GroupTable;
 pub const grouped_mod = @import("aggregate/grouped.zig");
 pub const firstPosition = grouped_mod.firstPosition;
 pub const updateOneGrouped = grouped_mod.updateOneGrouped;
+pub const updateOneGroupedWithContext = grouped_mod.updateOneGroupedWithContext;
 pub const updateTableGrouped = grouped_mod.updateTableGrouped;
 pub const updateTableGroupedWithContext = grouped_mod.updateTableGroupedWithContext;
 pub const FoldContext = grouped_mod.FoldContext;

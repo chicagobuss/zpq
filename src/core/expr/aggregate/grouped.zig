@@ -13,6 +13,7 @@ const GroupTable = @import("group_table.zig").GroupTable;
 const DistinctSet = @import("distinct.zig").DistinctSet;
 const scalar = @import("scalar.zig");
 const hll = @import("hll.zig");
+const argminmax = @import("argminmax.zig");
 const PreparedAggInput = scalar.PreparedAggInput;
 const exactAt = scalar.exactAt;
 const foldExtremeF = scalar.foldExtremeF;
@@ -61,6 +62,10 @@ pub fn updateOneGroupedWithContext(
     outer_sel: *const filter_selection.SelectionVector,
     ctx: FoldContext,
 ) Error!void {
+    if (call.func == .arg_max or call.func == .arg_min) {
+        var visit: ArgGroupedVisit = .{ .accs = accs, .gids = group_id_arr, .ai = agg_idx, .agg_len = agg_len, .persist = persist, .charge = ctx.winner_charge };
+        return scalar.forEachArgRow(arena, call, batch, column_lookup, outer_sel, &visit);
+    }
     var input: PreparedAggInput = try .init(arena, call, batch, column_lookup, outer_sel, false);
     defer input.deinit(arena);
     try updateOneGroupedValuesWithContext(
@@ -77,6 +82,19 @@ pub fn updateOneGroupedWithContext(
         ctx,
     );
 }
+
+const ArgGroupedVisit = struct {
+    accs: []Accumulator,
+    gids: []const u32,
+    ai: usize,
+    agg_len: usize,
+    persist: std.mem.Allocator,
+    charge: ?*@import("accumulator.zig").WinnerCharge,
+
+    pub fn visit(self: *ArgGroupedVisit, r: usize, order: argminmax.Order, is_min: bool, val: []const u8, arg: []const u8) Error!void {
+        try self.accs[self.gids[r] * self.agg_len + self.ai].blob.offerArg(self.persist, self.charge, order, is_min, val, arg);
+    }
+};
 
 pub fn updateTableGrouped(
     arena: std.mem.Allocator,
@@ -199,6 +217,8 @@ fn applyGrouped(
             ctx.winner_charge,
             scalar.momentAt(values.?, r, u64_col, null) orelse return error.UnsupportedAggType,
         ),
+        // Both arguments are prepared together by `updateOneGroupedWithContext`; one prepared column is not enough.
+        .arg_max, .arg_min => return error.UnsupportedAggType,
         .approx_count_distinct => {
             const kind = hll.kindOfColRef(call.arg.?.col_ref) orelse return error.UnsupportedAggType;
             hll.insert(try state.blob.sketch(persist, ctx.winner_charge), hll.hashRow(kind, values.?, r));

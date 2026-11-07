@@ -2030,6 +2030,12 @@ fn foldGroupedValue(
     // Dense lanes pass literal null, specializing away record access on the established typed-array path.
     const table: ?*agg.GroupTable = maybe_table;
     if (table) |t| if (t.compact.stride != 0 and t.compact.fields[ai].shared_sum) return;
+    // `arg_max` and `arg_min` prepare both of their arguments themselves, row by row over the group ids.
+    if (call.func == .arg_max or call.func == .arg_min) {
+        const gids = try ra.alloc(u32, comp.len);
+        for (gids, comp) |*g, cp| g.* = gid_of[cp];
+        return agg.updateOneGroupedWithContext(ra, gpa, accs, gids, ai, agg_len, call, batch, lookup, outer, fold_ctx);
+    }
     // Selection for this call: outer, narrowed by FILTER and the argument's nulls.
     var own: ?Sel = null;
     defer if (own) |*s| s.deinit();
@@ -2225,7 +2231,7 @@ fn foldGroupedNumeric(
                 // Each order's identity (`agg.minTotal`/`maxTotal`): NaN for min, -inf for max.
                 .min => @memset(part, std.math.nan(f64)),
                 .max => @memset(part, -std.math.inf(f64)),
-                .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => unreachable,
+                .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => unreachable,
             }
             switch (call.func) {
                 .sum, .avg => forEachActive(sel, comp.len, struct {
@@ -2244,7 +2250,7 @@ fn foldGroupedNumeric(
                         part[cp] = if (is_min) agg.minTotal(part[cp], v[r]) else agg.maxTotal(part[cp], v[r]);
                     }
                 },
-                .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => unreachable,
+                .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => unreachable,
             }
             for (0..space) |cp| {
                 if (seen[cp] == 0) continue;
@@ -2270,7 +2276,7 @@ fn foldGroupedNumeric(
                 .sum, .avg => @memset(part, 0),
                 .min => @memset(part, std.math.maxInt(i128)),
                 .max => @memset(part, std.math.minInt(i128)),
-                .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => unreachable,
+                .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => unreachable,
             }
             var r: usize = 0;
             while (r < comp.len) : (r += 1) {
@@ -2283,7 +2289,7 @@ fn foldGroupedNumeric(
                     .avg => part[cp] += x,
                     .min => part[cp] = @min(part[cp], x),
                     .max => part[cp] = @max(part[cp], x),
-                    .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => unreachable,
+                    .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => unreachable,
                 }
             }
             for (0..space) |cp| {
@@ -2317,7 +2323,7 @@ fn foldGroupedNumeric(
                 .sum, .avg => {},
                 .min => @memset(ext, std.math.maxInt(i128)),
                 .max => @memset(ext, std.math.minInt(i128)),
-                .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => unreachable,
+                .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => unreachable,
             }
             var r: usize = 0;
             while (r < comp.len) : (r += 1) {
@@ -2328,7 +2334,7 @@ fn foldGroupedNumeric(
                     .sum, .avg => sums[cp] += v[r],
                     .min => ext[cp] = @min(ext[cp], v[r]),
                     .max => ext[cp] = @max(ext[cp], v[r]),
-                    .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => unreachable,
+                    .count, .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => unreachable,
                 }
             }
             for (0..space) |cp| {

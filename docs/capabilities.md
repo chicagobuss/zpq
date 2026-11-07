@@ -117,7 +117,12 @@ of it: true if any, false unless all, NULL over no values), `var_samp` / `varian
 forms are NULL below two values and the population forms 0 for one; Welford's mean and squared deviations as DuckDB
 folds them, so one row group is bit for bit DuckDB's. Row groups combine pairwise in file order, the same at every `-j`;
 DuckDB itself varies in the last digits with its thread count and between runs, and zpq's answer is always one it gives.
-`DISTINCT`, and a date, BOOLEAN or text argument, are refused), `string_agg(text [, sep])` (also `group_concat` and
+`DISTINCT`, and a date, BOOLEAN or text argument, are refused), `arg_max(arg, val)` and `arg_min(arg, val)` (also `max_by`,
+`min_by`, `argmax`, `argmin`: the `arg` of the row with the greatest or least `val`, rows with a NULL in either ignored,
+NULL over none; the first such row of the scan on a tie, the same at every `-j`, where DuckDB's own tie varies with its
+threads; `arg` an integer, date or time, DOUBLE or FLOAT, or text, answered in its own type, `val` anything of those that
+orders, a DOUBLE with NaN greatest; a DECIMAL or BOOLEAN on either side, an unsigned 64-bit `arg`, the `n` form and
+`DISTINCT` are refused), `string_agg(text [, sep])` (also `group_concat` and
 `listagg`: the non-NULL values in file, row-group and row order, joined by a constant separator, `,` by default; NULL
 over none; empty texts count. The order is the scan order, the same at every `-j` unless `--unordered`; DuckDB's own
 varies with its threads. A text argument only; the other types, a non-constant separator and `DISTINCT` are refused. The

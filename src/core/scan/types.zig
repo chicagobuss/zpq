@@ -338,7 +338,7 @@ pub const GroupColType = struct {
         return switch (call.func) {
             .count, .count_distinct, .approx_count_distinct => .i64,
             .sum => .i128,
-            .min, .max => if (source) |elem| expr_ast.IntType.ofElement(elem) else null,
+            .min, .max, .arg_max, .arg_min => if (source) |elem| expr_ast.IntType.ofElement(elem) else null,
             else => null,
         };
     }

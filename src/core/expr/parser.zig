@@ -1282,9 +1282,15 @@ pub fn isSqlAggName(name: []const u8) bool {
 pub const Second = enum { none, required, optional };
 
 pub fn aggSecond(name: []const u8) Second {
-    if (asciiEqIgnoreCase(name, "quantile_cont")) return .required;
+    if (asciiEqIgnoreCase(name, "quantile_cont") or resolveArgName(name) != null) return .required;
     if (isStringAggName(name)) return .optional;
     return .none;
+}
+
+fn resolveArgName(name: []const u8) ?agg.AggFunc {
+    if (asciiEqIgnoreCase(name, "arg_max") or asciiEqIgnoreCase(name, "argmax") or asciiEqIgnoreCase(name, "max_by")) return .arg_max;
+    if (asciiEqIgnoreCase(name, "arg_min") or asciiEqIgnoreCase(name, "argmin") or asciiEqIgnoreCase(name, "min_by")) return .arg_min;
+    return null;
 }
 
 pub fn isStringAggName(name: []const u8) bool {
@@ -1307,6 +1313,7 @@ pub fn resolveAggFunc(name: []const u8) ?agg.AggFunc {
     if (asciiEqIgnoreCase(name, "approx_count_distinct")) return .approx_count_distinct;
     if (asciiEqIgnoreCase(name, "median") or asciiEqIgnoreCase(name, "quantile_cont")) return .quantile_cont;
     if (isStringAggName(name)) return .string_agg;
+    if (resolveArgName(name)) |f| return f;
     return null;
 }
 
@@ -1678,6 +1685,13 @@ pub fn bindAggregate(
         q = literalNumber(s) orelse return error.UnsupportedAggType;
         if (!(q >= 0 and q <= 1)) return error.UnsupportedAggType;
     };
+    var arg2: ?ast.Expr = null;
+    if (func == .arg_max or func == .arg_min) {
+        const s = second orelse return error.BadAggArg;
+        // What it orders by: an integer, date or time, a DOUBLE or text. Not a DECIMAL or a BOOLEAN.
+        if (s.isBoolean() or s.typeOf() == .dec) return error.UnsupportedAggType;
+        arg2 = s;
+    }
     var sep: []const u8 = ",";
     if (func == .string_agg) if (second) |s| {
         if (s != .literal or s.literal != .str) return error.UnsupportedAggType;
@@ -1697,6 +1711,7 @@ pub fn bindAggregate(
         .as_date = as_date,
         .q = q,
         .sep = sep,
+        .arg2 = arg2,
     };
 }
 

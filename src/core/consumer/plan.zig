@@ -792,10 +792,12 @@ pub fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !
             if (call.where != null or arg != .col_ref or agg_coded.floatSum(call) or call.func.extended())
                 markExprSet(u.hist_ok, arg, false);
         }
+        if (call.arg2) |arg| markExprSet(u.hist_ok, arg, false);
     };
     if (in.filter) |f| markFilter(u, f);
     for (target.planCalls()) |call| {
         if (call.where) |w| markFilter(u, w);
+        if (call.arg2) |arg| arg.collectColumns(u.code);
         if (call.arg) |arg| switch (arg) {
             .col_ref => |c| mark(if (call.func == .count and target == .scalar) u.levels else u.code, c.col_idx),
             // A scalar fold evaluates a computed argument itself, gathering coded columns (`agg_coded.gatherSelected`).

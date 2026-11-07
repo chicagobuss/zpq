@@ -26,6 +26,10 @@ pub const AggFunc = enum {
     /// `string_agg(x, sep)` (also `group_concat`, `listagg`): the non-NULL texts of the group in scan order, joined by
     /// the constant `AggCall.sep`; NULL over none.
     string_agg,
+    /// `arg_max(arg, val)` and `arg_min(arg, val)` (also `max_by`, `min_by`): the `arg` of the first row with the
+    /// greatest or least `val` (`AggCall.arg2`), rows with either NULL ignored; `argminmax.zig`.
+    arg_max,
+    arg_min,
 
     /// A function only the generic fold and merge (`foldGroupedOne`, `scalar.zig`) run: the specialized strategies
     /// (dense, coded, owner records, partitioned, sketch) know the original six and decline a query that has one of
@@ -33,7 +37,7 @@ pub const AggFunc = enum {
     pub fn extended(f: AggFunc) bool {
         return switch (f) {
             .count, .count_distinct, .sum, .min, .max, .avg => false,
-            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => true,
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => true,
         };
     }
 };
@@ -159,6 +163,8 @@ pub const AggCall = struct {
     q: f64 = 0.5,
     /// The text `string_agg` puts between values.
     sep: []const u8 = ",",
+    /// The values `arg_max` and `arg_min` order by; `arg` is what they return.
+    arg2: ?expr_ast.Expr = null,
 };
 
 /// How an aggregate folds, and what it emits in the final 1-row parquet:
@@ -391,6 +397,19 @@ pub fn resolveResult(func: AggFunc, arg: ?expr_ast.Expr) ResolveError!ResultShap
             if (e.temporal() != null or e.isBoolean() or e.typeOf() == .str or e.typeOf() == .dec) return error.UnsupportedAggType;
             if (e == .col_ref and e.col_ref.physical_type == .FLOAT) return error.UnsupportedAggType;
             break :blk .f64;
+        },
+        // The argument's own type, as min and max have it: an integer or date or time, a DOUBLE, text. A DECIMAL, a
+        // BOOLEAN and an unsigned 64-bit column are other shapes.
+        .arg_max, .arg_min => blk: {
+            const e = arg orelse return error.BadAggArg;
+            if (e.isBoolean() or e.typeOf() == .dec) return error.UnsupportedAggType;
+            if (e == .col_ref and e.col_ref.unsigned_64) return error.UnsupportedAggType;
+            break :blk switch (e.typeOf()) {
+                .i64 => .i64,
+                .f64 => .f64,
+                .str => .bytes,
+                .dec => unreachable,
+            };
         },
         // Text only: DuckDB casts anything else to text, which zpq has no spelling of that it can match.
         .string_agg => blk: {

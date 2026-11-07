@@ -276,7 +276,7 @@ pub fn shapeOk(calls: []const AggCall, keys: []const expr_ast.Expr) bool {
             .count => {},
             .sum, .min, .max => if (call.result != .i64) return false,
             .avg => if (call.result != .avg_f64) return false,
-            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => return false,
+            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => return false,
         }
         if (call.arg) |arg| {
             if (arg != .col_ref or arg.col_ref.expr_type != .i64) return false;
@@ -323,7 +323,7 @@ pub fn numericCalls(calls: []const AggCall) bool {
             .sum, .avg => if (call.arg == null or call.arg.?.typeOf() == .str) return false,
             .min, .max => if (call.arg == null or call.arg.?.typeOf() == .f64 or
                 call.arg.?.typeOf() == .str) return false,
-            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => return false,
+            .count_distinct, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => return false,
         }
     }
     return true;

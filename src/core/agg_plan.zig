@@ -121,7 +121,7 @@ pub const OwnerProgram = struct {
                 .count = p.find(.present_count, col) orelse return null,
             } },
             .count_distinct => if (p.distinct_arg != null and p.distinct_arg.?.col_idx == col) .distinct else null,
-            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg => null,
+            .var_samp, .var_pop, .stddev_samp, .stddev_pop, .approx_count_distinct, .quantile_cont, .string_agg, .arg_max, .arg_min => null,
         };
     }
 
@@ -313,6 +313,7 @@ fn consumedColumns(
     @memset(cols, false);
     for (calls) |call| {
         if (call.arg) |arg_expr| arg_expr.collectColumns(cols);
+        if (call.arg2) |arg_expr| arg_expr.collectColumns(cols);
         if (call.where) |w| try markFilterColumns(arena, w, cols);
     }
     if (group_keys) |keys| for (keys) |key| key.collectColumns(cols);

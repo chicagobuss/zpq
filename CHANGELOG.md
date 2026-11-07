@@ -69,8 +69,8 @@
 - **Re-encoding writes share the CPU between reading and encoding.** Their producers and encoders now take turns
   from one budget of independent cores, so neither side starves the other. On a Ryzen 9 9950X, rewriting the 60 M-row
   lineitem to zstd went from 14.4 to 4.8 s uncached at 16 threads, and from 4.5 to 3.8 s at the default threads with
-  45% less CPU time. Output bytes don't change. An explicit `-j` above the number of independent cores the process may
-  run on now gives a re-encoding write at most that many turns.
+  45% less CPU time. Output bytes don't change. Turns are capped by the independent cores the process may run on and by
+  its cgroup CPU quota, for an explicit `-j` too, and a `-j 1` re-encode stays inside `--max-memory`.
 - **Uncached scans read ahead of their workers.** When a query reads a file that isn't in the page cache through
   its memory mapping, zpq now asks the kernel for each worker's next planned chunks just before they are needed,
   within a window bounded by `--max-memory` and one device queue. For a column behind a filter, it asks only for the

@@ -1048,7 +1048,7 @@ fn writeOnce(
     };
     w.cpu_budget = sizing.budget;
     // Idle pieces kept for reuse are on the ledger too: a sixteenth of a small budget, not a fixed 32 MiB of it.
-    w.piece_pool = .{ .gpa = ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = &ledger, .limit = @min(32 << 20, args.max_memory / 16) };
+    w.piece_pool = .{ .gpa = ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = &ledger, .limit = args.max_memory / 16 };
     defer w.piece_pool.deinit();
     w.piece_pages.child = w.outAlloc();
     const t_scan = nowMonoNs();

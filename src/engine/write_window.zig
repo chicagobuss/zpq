@@ -228,7 +228,8 @@ pub const PieceSource = struct {
 
 /// Freed pieces with their arenas reset but their memory kept, for the producers' next pieces: a piece's rows are
 /// megabytes the general allocator maps fresh and unmaps whole, a fault per page and, unmapped while encode threads
-/// run, a TLB shootdown on every one of them. Idle pieces keep at most 32 MiB together, still on the ledger.
+/// run, a TLB shootdown on every one of them. Idle pieces keep at most `limit` together, still on the ledger, and
+/// none once the ledger runs tight.
 const PiecePool = struct {
     io: std.Io = undefined,
     mutex: std.Io.Mutex = .init,

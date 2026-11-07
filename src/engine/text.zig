@@ -1000,6 +1000,13 @@ fn writeExplainLookup(writer: anytype, l: engine_join.Explained.Lookup) !void {
         try writeExplainLookup(writer, s);
         try writer.writeByte('}');
     }
+    try writer.writeAll("],\"dims\":[");
+    for (l.dims, 0..) |d, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.print("{{\"kind\":\"{s}\",", .{@tagName(d.kind)});
+        try writeExplainLookup(writer, d);
+        try writer.writeByte('}');
+    }
     try writer.writeAll("]}");
 }
 

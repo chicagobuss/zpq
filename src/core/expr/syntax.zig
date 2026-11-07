@@ -87,6 +87,9 @@ pub const Build = struct {
     filter: ?Predicate = null,
     /// SEMI joins of the build: a third table the frontend reduced onto it (q3's customer inside orders).
     semis: []const Semi = &.{},
+    /// A snowflake's tables joined to this build by an FK of its own, INNER: each keeps the build rows it matches and
+    /// publishes its columns through this build's (q10's customer and nation through orders).
+    dims: []const Dim = &.{},
 };
 
 /// `unique`: an INNER edge the frontend reduced to a SEMI join because no column of its table is read. Its keys must

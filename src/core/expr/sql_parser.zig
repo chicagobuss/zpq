@@ -573,8 +573,8 @@ fn extractAsDatePart(allocator: std.mem.Allocator, sql: []const u8) ![:0]u8 {
 /// Words that end an operand of `//` rather than being one.
 fn endsOperand(word: []const u8) bool {
     const words = [_][]const u8{
-        "and", "or", "not", "in", "is", "like", "ilike", "between", "case", "when", "then", "else", "end", "select",
-        "from", "where", "group", "by", "having", "order", "limit", "offset", "on", "as", "distinct", "union",
+        "and",  "or",    "not",   "in", "is",     "like",  "ilike", "between", "case", "when", "then",     "else",  "end", "select",
+        "from", "where", "group", "by", "having", "order", "limit", "offset",  "on",   "as",   "distinct", "union",
     };
     for (words) |w| if (std.ascii.eqlIgnoreCase(word, w)) return true;
     return false;
@@ -1145,27 +1145,33 @@ fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u
     const owners: Owners = .{ .metas = metas };
     const p = try sql_join.plan(a, sql, .{ .paths = paths, .has = Owners.has, .rows = rows, .ctx = &owners });
     const unique = unique_ins or p.reduced;
-    const dims = try a.alloc(syntax.Dim, p.dims.len);
-    for (p.dims, dims) |d, *out| out.* = .{
-        .fk = d.fk,
-        .build = try resolveBuild(a, d.path, d.key, d.columns, d.where, schemas, markers, unique),
-        .left = d.left,
-    };
+    const dims = try resolveDims(a, p.dims, schemas, markers, unique);
     return .{
         .kind = switch (p.kind) {
             inline else => |k| @field(syntax.JoinKind, @tagName(k)),
         },
         .fk = p.fk,
-        .build = try resolveBuild(a, p.build_path, p.build_key, p.build_columns, p.build_where, schemas, markers, unique),
+        .build = try resolveBuild(a, p.build_path, p.build_key, p.build_columns, p.build_where, p.build_dims, schemas, markers, unique),
         .dims = dims,
         .probe_sql = p.probe_sql,
         .reduced = unique,
     };
 }
 
-/// One build: its own conjuncts, and the SEMI joins the binder reduced onto it (tables of a chain).
-fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, columns: []const []const u8, where: ?[]const u8, schemas: Schemas, markers: literals.Markers, unique: bool) !syntax.Build {
-    var build: syntax.Build = .{ .path = path, .key = key, .columns = columns };
+fn resolveDims(a: std.mem.Allocator, plan_dims: []const sql_join.Dim, schemas: Schemas, markers: literals.Markers, unique: bool) anyerror![]const syntax.Dim {
+    const dims = try a.alloc(syntax.Dim, plan_dims.len);
+    for (plan_dims, dims) |d, *out| out.* = .{
+        .fk = d.fk,
+        .build = try resolveBuild(a, d.path, d.key, d.columns, d.where, d.dims, schemas, markers, unique),
+        .left = d.left,
+    };
+    return dims;
+}
+
+/// One build: its own conjuncts, the SEMI joins the binder reduced onto it (tables of a chain), and a snowflake's
+/// tables under it.
+fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, columns: []const []const u8, where: ?[]const u8, plan_dims: []const sql_join.Dim, schemas: Schemas, markers: literals.Markers, unique: bool) anyerror!syntax.Build {
+    var build: syntax.Build = .{ .path = path, .key = key, .columns = columns, .dims = try resolveDims(a, plan_dims, schemas, markers, unique) };
     const w = where orelse return build;
     const text = try std.fmt.allocPrint(a, "SELECT count(*) FROM '{s}' WHERE {s}", .{ path, w });
     const peeled = try peelSemis(a, text, schemas, markers, unique);

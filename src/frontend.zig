@@ -187,7 +187,7 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             .{diag.input orelse "S3"},
         ),
         error.UnsupportedJoin => diagnosticPrint(
-            "zpq query: a join is a star of N:1 tables, each joined to the largest by one key (comma, INNER or LEFT JOIN ... ON), or [NOT] IN (SELECT ...)\n",
+            "zpq query: a join is a tree of N:1 tables, each joined by one key to the largest or to a table joined to it (comma, INNER or LEFT JOIN ... ON), or [NOT] IN (SELECT ...)\n",
             .{},
         ),
         error.JoinKeyNotFound => diagnosticPrint("zpq query: a join needs one key equality between its tables\n", .{}),

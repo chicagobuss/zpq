@@ -46,6 +46,8 @@ pub const Plan = struct {
     reduced: bool = false,
     /// The star's other dimensions: each joined to the probe by one key equality and publishing its own columns.
     dims: []const Dim = &.{},
+    /// A snowflake's tables joined to the main build by an FK of its own (`Dim.dims`).
+    build_dims: []const Dim = &.{},
 };
 
 /// One dimension of a star beside the main build (`Plan`'s own build fields).
@@ -57,6 +59,9 @@ pub const Dim = struct {
     columns: []const []const u8,
     /// A LEFT JOIN's: every probe row stays, a miss reading the dimension's columns as NULL.
     left: bool = false,
+    /// A snowflake's tables joined to this one by an FK of its own (`fk` a column of this table), INNER, each
+    /// publishing its columns through this one's build.
+    dims: []const Dim = &.{},
 };
 
 /// What the caller knows of the tables (from their footers): whether a column name is theirs, and their rows.
@@ -421,25 +426,45 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
     const sides: Sides = .{ .t = t, .tables = live.items, .aliases = aliases };
     const n = live.items.len;
     const probe = std.mem.indexOfScalar(usize, live.items, center).?;
-    // Each other table: its one key equality with the probe, and its own conjuncts.
+    // The join tree: each other table's parent (the table holding its FK), its FK there and its key. Breadth first
+    // from the probe, each table takes the first key equality joining it to the level before: a star's dimensions,
+    // then theirs (a snowflake). Every other conjunct reads one table; a second edge (a cycle) refuses as a residual.
     const fks = try a.alloc(?[]const u8, n);
     const keys = try a.alloc(?[]const u8, n);
+    const parent = try a.alloc(usize, n);
     @memset(fks, null);
     @memset(keys, null);
+    @memset(parent, probe);
     const wheres = try a.alloc(std.ArrayList(*c.LpNode), n);
     @memset(wheres, .empty);
-    for (conjuncts.items) |node| {
-        if (try keyEquality(sides, node)) |eq| if (eq.l == probe or eq.x == probe) {
-            const dim = if (eq.l == probe) eq.x else eq.l;
-            const fk_ref = if (eq.l == probe) eq.l_ref else eq.x_ref;
-            const key_ref = if (eq.l == probe) eq.x_ref else eq.l_ref;
-            if (keys[dim] == null) {
-                fks[dim] = try a.dupe(u8, span(fk_ref.*.u.column_ref.column));
-                keys[dim] = try a.dupe(u8, span(key_ref.*.u.column_ref.column));
-                continue;
-            }
-        };
-        // A conjunct reads one table; a second equality, a dimension-to-dimension edge or a residual refuses.
+    const used = try a.alloc(bool, conjuncts.items.len);
+    @memset(used, false);
+    // A LEFT JOIN's null-supplying table joins the probe by its ON alone.
+    var null_live: u64 = 0;
+    for (nulls.items) |ns| null_live |= @as(u64, 1) << @intCast(std.mem.indexOfScalar(usize, live.items, ns.table).?);
+    var in_tree: u64 = @as(u64, 1) << @intCast(probe);
+    var level = in_tree;
+    while (level != 0) {
+        var next: u64 = 0;
+        for (conjuncts.items, used) |node, *u| {
+            const eq = try keyEquality(sides, node) orelse continue;
+            const l_up = level & (@as(u64, 1) << @intCast(eq.l)) != 0;
+            if (l_up == (level & (@as(u64, 1) << @intCast(eq.x)) != 0)) continue;
+            const up = if (l_up) eq.l else eq.x;
+            const dn = if (l_up) eq.x else eq.l;
+            const bit = @as(u64, 1) << @intCast(dn);
+            if ((in_tree | null_live) & bit != 0) continue;
+            parent[dn] = up;
+            fks[dn] = try a.dupe(u8, span((if (l_up) eq.l_ref else eq.x_ref).*.u.column_ref.column));
+            keys[dn] = try a.dupe(u8, span((if (l_up) eq.x_ref else eq.l_ref).*.u.column_ref.column));
+            in_tree |= bit;
+            next |= bit;
+            u.* = true;
+        }
+        level = next;
+    }
+    for (conjuncts.items, used) |node, u| {
+        if (u) continue;
         const side = try sides.only(node, a) orelse probe;
         try wheres[side].append(a, node);
     }
@@ -465,24 +490,25 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         }
     }
     for (0..n) |i| if (i != probe and keys[i] == null) return error.JoinKeyNotFound;
-    // The probe query: its own FROM, its own conjuncts, unqualified names; each dimension's key reads as its FK.
+    // The probe query: its own FROM, its own conjuncts, unqualified names. A table's key reads as its FK, up the tree
+    // to the probe's own column or a table's that publishes it; a LEFT JOIN's key is NULL on a miss, where the FK is
+    // not, so it reads as a build column.
     const columns = try a.alloc(std.ArrayList([]const u8), n);
     @memset(columns, .empty);
     for (try columnRefs(p.root, a)) |ref| {
         const side = try sides.of(ref);
         ref.*.u.column_ref.table = null;
-        const d = side orelse continue;
-        if (d == probe) continue;
-        const name = span(ref.*.u.column_ref.column);
-        // A LEFT JOIN's key is NULL on a miss, where the FK is not: it reads as a build column.
-        if (!left[d] and std.mem.eql(u8, name, keys[d].?)) {
-            ref.*.u.column_ref.column = (try a.dupeSentinel(u8, fks[d].?, 0)).ptr;
-            continue;
+        var d = side orelse continue;
+        var name = span(ref.*.u.column_ref.column);
+        while (d != probe and !left[d] and std.mem.eql(u8, name, keys[d].?)) {
+            name = fks[d].?;
+            d = parent[d];
         }
-        for (columns[d].items) |b| {
-            if (std.mem.eql(u8, b, name)) break;
-        } else try columns[d].append(a, try a.dupe(u8, name));
+        if (name.ptr != span(ref.*.u.column_ref.column).ptr) ref.*.u.column_ref.column = (try a.dupeSentinel(u8, name, 0)).ptr;
+        if (d != probe) try addName(a, &columns[d], name);
     }
+    // A snowflake's table reads its FK off its parent's build: the parent publishes it.
+    for (0..n) |d| if (d != probe and parent[d] != probe) try addName(a, &columns[parent[d]], fks[d].?);
     const probe_from = list.items[live.items[probe]];
     probe_from.*.u.from_table.alias = null;
     sel.from = probe_from;
@@ -491,22 +517,18 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         ref.*.u.column_ref.table = null;
     };
     // The main build: the dimension a GROUP BY key names the FK of (a group-join's), else the first.
-    var main: usize = if (probe == 0) 1 else 0;
+    var main: usize = for (0..n) |d| {
+        if (d != probe and parent[d] == probe) break d;
+    } else unreachable;
     for (0..@intCast(sel.group_by.count)) |gi| if (sel.group_by.items[gi]) |g| if (g.*.kind == c.LP_EXPR_COLUMN_REF) {
         const name = span(g.*.u.column_ref.column);
-        for (0..n) |d| if (d != probe and std.mem.eql(u8, name, fks[d].?)) {
+        for (0..n) |d| if (d != probe and parent[d] == probe and std.mem.eql(u8, name, fks[d].?)) {
             main = d;
         };
     };
+    const tree: Tree = .{ .t = t, .p = p, .live = live.items, .probe = probe, .parent = parent, .fks = fks, .keys = keys, .wheres = wheres, .columns = columns, .left = left };
     var dims: std.ArrayList(Dim) = .empty;
-    for (0..n) |d| if (d != probe and d != main) try dims.append(a, .{
-        .path = t.paths[live.items[d]],
-        .fk = fks[d].?,
-        .key = keys[d].?,
-        .where = try whereSql(a, p, wheres[d].items),
-        .columns = columns[d].items,
-        .left = left[d],
-    });
+    for (0..n) |d| if (d != probe and d != main and parent[d] == probe) try dims.append(a, try tree.dim(a, d));
     return .{
         .kind = if (left[main]) .left else .inner,
         .probe_path = t.paths[live.items[probe]],
@@ -516,10 +538,49 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         .probe_sql = try toSql(a, p, p.root),
         .build_where = try whereSql(a, p, wheres[main].items),
         .build_columns = columns[main].items,
+        .build_dims = try tree.children(a, main),
         .reduced = reduced,
         .dims = dims.items,
     };
 }
+
+fn addName(a: std.mem.Allocator, list: *std.ArrayList([]const u8), name: []const u8) !void {
+    for (list.items) |b| if (std.mem.eql(u8, b, name)) return;
+    try list.append(a, try a.dupe(u8, name));
+}
+
+/// The join tree `plan` resolved, by position in `live`: each table's build, with its own snowflake under it.
+const Tree = struct {
+    t: Tables,
+    p: Parsed,
+    live: []const usize,
+    probe: usize,
+    parent: []const usize,
+    fks: []const ?[]const u8,
+    keys: []const ?[]const u8,
+    wheres: []const std.ArrayList(*c.LpNode),
+    columns: []const std.ArrayList([]const u8),
+    left: []const bool,
+
+    fn dim(tr: Tree, a: std.mem.Allocator, d: usize) Error!Dim {
+        return .{
+            .path = tr.t.paths[tr.live[d]],
+            .fk = tr.fks[d].?,
+            .key = tr.keys[d].?,
+            .where = try whereSql(a, tr.p, tr.wheres[d].items),
+            .columns = tr.columns[d].items,
+            .left = tr.left[d],
+            .dims = try tr.children(a, d),
+        };
+    }
+
+    /// The tables joined to `d` by an FK of its own.
+    fn children(tr: Tree, a: std.mem.Allocator, d: usize) Error![]const Dim {
+        var out: std.ArrayList(Dim) = .empty;
+        for (0..tr.parent.len) |x| if (x != tr.probe and x != d and tr.parent[x] == d) try out.append(a, try tr.dim(a, x));
+        return out.items;
+    }
+};
 
 /// The probe, as a position in `live`: the largest table by footer rows (a star's fact), the first of equals, of the
 /// tables outside `skip` (original indices: LEFT JOINs' null-supplying ones). The FROM's first table is never skipped.
@@ -601,4 +662,34 @@ fn planSemi(a: std.mem.Allocator, p: Parsed, sel: anytype, from: *c.LpNode, t: T
         .build_where = try whereSql(a, p, build_conj.items),
         .build_columns = &.{},
     };
+}
+
+test "a snowflake plans as a tree: a dimension's dimension under its build, its key read as the FK" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const Cols = struct {
+        const of = [_][]const []const u8{ &.{ "fk", "amt" }, &.{ "pk", "grp", "w" }, &.{ "gk", "gname" } };
+        fn has(_: *const anyopaque, table: usize, name: []const u8) bool {
+            for (of[table]) |col| if (std.mem.eql(u8, col, name)) return true;
+            return false;
+        }
+    };
+    const t: Tables = .{ .paths = &.{ "f.parquet", "d.parquet", "g.parquet" }, .has = Cols.has, .rows = &.{ 1000, 100, 4 }, .ctx = undefined };
+    const p = try plan(a, "SELECT gname, g.gk, sum(amt) AS s FROM 'f.parquet' f, 'd.parquet' d, 'g.parquet' g WHERE f.fk = d.pk AND d.grp = g.gk AND d.w > 2 GROUP BY gname, g.gk", t);
+    try std.testing.expectEqualStrings("d.parquet", p.build_path);
+    try std.testing.expectEqual(@as(usize, 0), p.dims.len);
+    // The chained table's key reads as the FK its parent publishes; its own column publishes through the parent.
+    try std.testing.expectEqual(@as(usize, 1), p.build_columns.len);
+    try std.testing.expectEqualStrings("grp", p.build_columns[0]);
+    try std.testing.expectEqualStrings("w > 2", p.build_where.?);
+    try std.testing.expectEqual(@as(usize, 1), p.build_dims.len);
+    const g = p.build_dims[0];
+    try std.testing.expectEqualStrings("grp", g.fk);
+    try std.testing.expectEqualStrings("gk", g.key);
+    try std.testing.expectEqual(@as(usize, 1), g.columns.len);
+    try std.testing.expectEqualStrings("gname", g.columns[0]);
+    try std.testing.expect(std.mem.indexOf(u8, p.probe_sql, "grp") != null);
+    // A second edge to a table already in the tree is a cycle: a residual, refused.
+    try std.testing.expectError(error.JoinResidualNotSupported, plan(a, "SELECT gname, count(*) AS n FROM 'f.parquet' f, 'd.parquet' d, 'g.parquet' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.amt = g.gk GROUP BY gname", t));
 }

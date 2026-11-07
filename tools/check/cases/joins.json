@@ -37,6 +37,18 @@
    "copy": "COPY (SELECT * FROM (VALUES (1::BIGINT, 10), (NULL, 20), (3, 30), (5, 40)) t(pk, w)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 2)"
   },
   {
+   "name": "snow_grp",
+   "copy": "COPY (SELECT g AS gk, 'g' || g AS gname, (g % 2)::BIGINT AS grk FROM range(0, 4) t(g)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
+   "name": "snow_region",
+   "copy": "COPY (SELECT r AS rk, 'r' || r AS rname FROM range(0, 2) t(r)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
+   "name": "snow_clash",
+   "copy": "COPY (SELECT g AS ck, (g * 3)::INTEGER AS w FROM range(0, 5) t(g)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
    "script": "tools/check/prepare_join_gate.py",
    "files": [
     "join-gate",
@@ -969,6 +981,332 @@
    }
   },
   {
+   "id": "join:snowflake:three-levels",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT rname, gname, kind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:snow_region}' r WHERE f.fk = d.pk AND d.grp = g.gk AND g.grk = r.rk GROUP BY rname, gname, kind ORDER BY rname, gname, kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT rname, gname, kind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:snow_region}' r WHERE f.fk = d.pk AND d.grp = g.gk AND g.grk = r.rk GROUP BY rname, gname, kind ORDER BY rname, gname, kind"
+   }
+  },
+  {
+   "id": "join:snowflake:filters-at-each-level",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT gname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:snow_region}' r WHERE f.fk = d.pk AND d.grp = g.gk AND g.grk = r.rk AND r.rname = 'r1' AND d.w > 2000 AND f.q < 5 GROUP BY gname ORDER BY gname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT gname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:snow_region}' r WHERE f.fk = d.pk AND d.grp = g.gk AND g.grk = r.rk AND r.rname = 'r1' AND d.w > 2000 AND f.q < 5 GROUP BY gname ORDER BY gname"
+   }
+  },
+  {
+   "id": "join:snowflake:key-through-the-chain",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g.gk, r.rk, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:snow_region}' r WHERE f.fk = d.pk AND d.grp = g.gk AND g.grk = r.rk GROUP BY g.gk, r.rk ORDER BY g.gk, r.rk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT g.gk, r.rk, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:snow_region}' r WHERE f.fk = d.pk AND d.grp = g.gk AND g.grk = r.rk GROUP BY g.gk, r.rk ORDER BY g.gk, r.rk"
+   }
+  },
+  {
+   "id": "join:snowflake:beside-a-star",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT gname, sgrp, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND d.grp = g.gk AND f.sfk = x.spk GROUP BY gname, sgrp ORDER BY gname, sgrp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT gname, sgrp, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND d.grp = g.gk AND f.sfk = x.spk GROUP BY gname, sgrp ORDER BY gname, sgrp"
+   }
+  },
+  {
+   "id": "join:snowflake:join-on",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT gname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk JOIN '{fixture:snow_grp}' g ON d.grp = g.gk WHERE g.grk = 0 GROUP BY gname ORDER BY gname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT gname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk JOIN '{fixture:snow_grp}' g ON d.grp = g.gk WHERE g.grk = 0 GROUP BY gname ORDER BY gname"
+   }
+  },
+  {
+   "id": "join:snowflake:group-by-fk",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, gname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk GROUP BY f.fk, gname ORDER BY s DESC, f.fk LIMIT 10"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, gname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk GROUP BY f.fk, gname ORDER BY s DESC, f.fk LIMIT 10"
+   }
+  },
+  {
+   "id": "join:refuse:snowflake-duplicate-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_dup}' x WHERE f.fk = d.pk AND d.grp = x.pk AND x.grp > 0"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "holds a key of"
+   }
+  },
+  {
+   "id": "join:refuse:snowflake-cycle",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.q = g.gk GROUP BY gname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a join condition reads both tables beyond its one key equality"
+   }
+  },
+  {
+   "id": "join:refuse:columns-share-a-name",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.w, c.w, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_clash}' c WHERE f.fk = d.pk AND d.grp = c.ck GROUP BY d.w, c.w"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "ambiguous column name"
+   }
+  },
+  {
+   "id": "join:explain:snowflake",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT rname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:snow_region}' r WHERE f.fk = d.pk AND d.grp = g.gk AND g.grk = r.rk GROUP BY rname",
+    "--explain"
+   ],
+   "oracle": {
+    "compare": "plan",
+    "holds": {
+     "join": {
+      "fk": "fk",
+      "build": {
+       "key": "pk",
+       "columns": {
+        "$list": [
+         "grp",
+         "grk",
+         "rname"
+        ]
+       },
+       "dims": {
+        "$list": [
+         {
+          "fk": "grp",
+          "build": {
+           "key": "gk",
+           "columns": {
+            "$list": [
+             "grk",
+             "rname"
+            ]
+           },
+           "dims": {
+            "$list": [
+             {
+              "fk": "grk",
+              "build": {
+               "key": "rk",
+               "columns": {
+                "$list": [
+                 "rname"
+                ]
+               }
+              }
+             }
+            ]
+           }
+          }
+         }
+        ]
+       }
+      }
+     }
+    }
+   }
+  },
+  {
    "id": "join:explain:star",
    "fixture": "fact",
    "cli": [
@@ -1012,7 +1350,7 @@
    }
   },
   {
-   "id": "join:refuse:snowflake",
+   "id": "join:snowflake:review-chain",
    "fixture": "review-fact",
    "cli": [
     "query",
@@ -1027,9 +1365,9 @@
      "jobs": 4
     }
    ],
-   "refuse": {
-    "error": "exit 1",
-    "diag": "a join condition reads both tables beyond its one key equality"
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT u.ug, count(*) AS n FROM '{fixture:review-fact}' f, '{fixture:review-dim}' d, '{fixture:review-uniq}' u, '{fixture:nullorder_dim}' e WHERE f.fk = d.pk AND d.grp = u.upk AND f.q = e.pk GROUP BY u.ug ORDER BY u.ug"
    }
   },
   {
@@ -2633,7 +2971,7 @@
    ],
    "refuse": {
     "error": "exit 1",
-    "diag": "a join is a star of N:1 tables"
+    "diag": "a join is a tree of N:1 tables"
    }
   },
   {
@@ -2654,7 +2992,7 @@
    ],
    "refuse": {
     "error": "exit 1",
-    "diag": "a join is a star of N:1 tables"
+    "diag": "a join is a tree of N:1 tables"
    }
   },
   {

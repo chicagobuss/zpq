@@ -75,6 +75,8 @@ pub const Explained = struct {
         bytes: usize,
         columns: []const []const u8,
         semis: []const Lookup,
+        /// A snowflake's tables under this build, whose columns it publishes too.
+        dims: []const Lookup,
 
         fn of(a: std.mem.Allocator, l: Leaf) !Lookup {
             const j = l.join;
@@ -82,6 +84,8 @@ pub const Explained = struct {
             for (j.payloads, columns) |p, *c| c.* = try a.dupe(u8, p.name);
             const semis = try a.alloc(Lookup, l.semis.len);
             for (l.semis, semis) |s, *out| out.* = try of(a, s);
+            const dims = try a.alloc(Lookup, l.dims.len);
+            for (l.dims, dims) |d, *out| out.* = try of(a, d);
             return .{
                 .kind = j.kind,
                 .fk = try a.dupe(u8, l.fk),
@@ -92,6 +96,7 @@ pub const Explained = struct {
                 .bytes = j.bytes,
                 .columns = columns,
                 .semis = semis,
+                .dims = dims,
             };
         }
     };
@@ -99,7 +104,7 @@ pub const Explained = struct {
 
 /// One lookup conjunct of a filter: the FK it reads, by name, and the build it probes; with that build's own SEMI
 /// joins, the inner tables of a chain (`--explain` shows them).
-pub const Leaf = struct { fk: []const u8, join: *lookup.Join, semis: []const Leaf = &.{} };
+pub const Leaf = struct { fk: []const u8, join: *lookup.Join, semis: []const Leaf = &.{}, dims: []const Leaf = &.{} };
 
 /// The builds' memory: an arena for their many small pieces, and an exact allocation of its own for each large array (a
 /// key map, a payload's codes). In an arena alone each new block is half again the previous one plus the request, so a
@@ -426,6 +431,12 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind) !Leaf {
         inner.* = try build(t, s.fk, s.build, semiKind(s));
         filter = try withLookup(arena, filter, try leafOf(meta, inner.*, diag));
     }
+    // A snowflake's tables under this build: INNER lookups of its filter, whose columns it publishes (`lookup.chain`).
+    const dims = try arena.alloc(Leaf, b.dims.len);
+    for (b.dims, dims) |d, *inner| {
+        inner.* = try build(t, d.fk, d.build, .inner);
+        filter = try withLookup(arena, filter, try leafOf(meta, inner.*, diag));
+    }
     const payload = try arena.alloc(usize, b.columns.len);
     for (b.columns, payload) |name, *leaf| leaf.* = metadata.resolveColumn(meta, name) catch |err| {
         Diag.setColumn(diag, name);
@@ -450,6 +461,17 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind) !Leaf {
         Diag.setColumn(diag, b.key);
         return if (p.charge.refusal(err) == error.ExceededMemoryBudget) error.JoinBuildExceedsBudget else err;
     };
+    // The binder publishes each FK a snowflake's table reads.
+    for (b.dims, dims) |d, inner| {
+        const at = for (b.columns, 0..) |name, i| {
+            if (std.mem.eql(u8, name, d.fk)) break i;
+        } else unreachable;
+        lookup.chain(t.store.allocator(), j, at, inner.join) catch |err| {
+            Diag.setInput(diag, b.path, null);
+            Diag.setColumn(diag, d.fk);
+            return if (p.charge.refusal(err) == error.ExceededMemoryBudget) error.JoinBuildExceedsBudget else err;
+        };
+    }
     // The build read its file whole: one that changed meanwhile refuses, as a scanned input does.
     file.map.intact(b.path) catch |err| {
         Diag.setInput(diag, b.path, err);
@@ -457,7 +479,7 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind) !Leaf {
     };
     j.bytes = t.store.capacity() - before;
     t.charged += j.bytes;
-    return .{ .fk = fk, .join = j, .semis = semis };
+    return .{ .fk = fk, .join = j, .semis = semis, .dims = dims };
 }
 
 /// Read every build of `args`' join; null for a query without one. The probe's inputs must be local files too.

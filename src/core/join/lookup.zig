@@ -84,17 +84,22 @@ pub const Codes = union(enum) {
         }
     }
 
-    /// These codes, copied into `a` at the narrowest width a dictionary of `entries` allows.
-    fn narrowed(c: Codes, a: std.mem.Allocator, entries: usize) !Codes {
-        const n = switch (c) {
-            inline else => |v| v.len,
-        };
-        const out: Codes = if (entries <= 1 << 8)
+    /// `n` codes on `a`, unset, at the narrowest width a dictionary of `entries` allows.
+    fn init(a: std.mem.Allocator, n: usize, entries: usize) !Codes {
+        return if (entries <= 1 << 8)
             .{ .u8 = try a.alloc(u8, n) }
         else if (entries <= 1 << 16)
             .{ .u16 = try a.alloc(u16, n) }
         else
             .{ .u32 = try a.alloc(u32, n) };
+    }
+
+    /// These codes, copied into `a` at the narrowest width a dictionary of `entries` allows.
+    fn narrowed(c: Codes, a: std.mem.Allocator, entries: usize) !Codes {
+        const n = switch (c) {
+            inline else => |v| v.len,
+        };
+        const out: Codes = try .init(a, n, entries);
         for (0..n) |i| out.set(@intCast(i), c.get(@intCast(i)));
         return out;
     }
@@ -931,12 +936,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
             .f64 => try unify(f64, a, gpa, arenas, parts, p),
             .string => try unify([]const u8, a, gpa, arenas, parts, p),
         };
-        cs.* = if (dict.len() <= 1 << 8)
-            .{ .u8 = try a.alloc(u8, n) }
-        else if (dict.len() <= 1 << 16)
-            .{ .u16 = try a.alloc(u16, n) }
-        else
-            .{ .u32 = try a.alloc(u32, n) };
+        cs.* = try .init(a, n, dict.len());
         out.* = .{ .name = element.name, .element = element, .codes = cs.*, .dict = dict };
     }
     j.payloads = payloads;
@@ -947,6 +947,35 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     j.bytes = key_bytes;
     for (payloads) |p| j.bytes += p.codes.bytes() + p.dict.len() * 16;
     return j;
+}
+
+/// Publish `inner`'s payloads through `j` (a snowflake): each slot of `j` reads the `inner` slot its payload `fk`, the
+/// FK into `inner`, names, and the codes keep `inner`'s dictionaries. Every slot has one: `inner`'s lookup in `j`'s
+/// build filter kept only the rows it matches. The payloads are `j`'s after its own, `inner`'s own publishing through
+/// it already, so a chain of any length publishes at its top.
+pub fn chain(a: std.mem.Allocator, j: *Join, fk: usize, inner: *const Join) !void {
+    const f = j.payloads[fk];
+    // Each FK value's slot in `inner`, once per dictionary entry.
+    const by_code = try a.alloc(u32, f.dict.len());
+    defer a.free(by_code);
+    switch (f.dict) {
+        inline .i32, .i64 => |d| for (d, by_code) |k, *s| {
+            s.* = inner.slot(k) orelse EMPTY;
+        },
+        else => return error.JoinKeyType,
+    }
+    const out = try a.alloc(Payload, j.payloads.len + inner.payloads.len);
+    @memcpy(out[0..j.payloads.len], j.payloads);
+    for (inner.payloads, out[j.payloads.len..]) |ip, *op| {
+        const codes: Codes = try .init(a, j.n, ip.dict.len());
+        for (0..j.n) |s| {
+            const at = by_code[f.codes.get(@intCast(s))];
+            if (at == EMPTY) return error.LookupWithoutMatch;
+            codes.set(@intCast(s), ip.codes.get(at));
+        }
+        op.* = .{ .name = ip.name, .element = ip.element, .codes = codes, .dict = ip.dict };
+    }
+    j.payloads = out;
 }
 
 // ---------------------------------------------------------------- group-join

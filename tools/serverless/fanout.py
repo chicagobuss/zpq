@@ -208,6 +208,17 @@ def executor(n):
     return _EXECUTOR
 
 
+def _worker_stat(resp, stats):
+    """What one worker cost, including the phase split the engine already returns (`wall_ms`, `worker_ms`)."""
+    item = dict(stats, total_ms=resp.get("total_ms"), rows_in=resp.get("rows_in"), bytes_in=resp.get("bytes_in"),
+                row_groups_in=resp.get("row_groups_in"), files_in=resp.get("files_in"))
+    if isinstance(resp.get("wall_ms"), dict):
+        item["wall_ms"] = resp["wall_ms"]
+    if isinstance(resp.get("worker_ms"), dict):
+        item["worker_ms"] = resp["worker_ms"]
+    return item
+
+
 def lambda_invoker(function, region=None, pool=256, client=None):
     """invoke(payload) -> (response, stats) through boto3 `lambda.invoke`, every call to exactly `function`
     (qualifier included). When that is a published version, `invoke.capability_key` is its identity for the
@@ -377,8 +388,7 @@ def run(invoke, request, workers, order_by=None, limit=None, counts=None):
     group = [(None, name) for name in answers[0]["groups"]]
     merged = merge([a["agg"] for a in answers], aggs, group)
     rows = order(merged, order_by, limit) if group else merged
-    stats = [dict(s, total_ms=resp.get("total_ms"), rows_in=resp.get("rows_in"), bytes_in=resp.get("bytes_in"))
-             for resp, s in out]
+    stats = [_worker_stat(resp, s) for resp, s in out]
     return {"agg": rows, "workers": len(payloads), "footer_ms": footer_ms, "scatter_ms": scatter_ms,
             "check_ms": None, "e2e_ms": (time.perf_counter() - t0) * 1000, "worker_stats": stats,
             "protocol": "partial"}

@@ -342,10 +342,6 @@ pub fn statsCoverageComplete(
     return true;
 }
 
-/// `a + b` for counts a footer claims: each file's is bounded (`metadata.max_row_count`), their sum across files is
-/// not. Past i64, the type count() answers in, it is an error rather than a count that cannot be written.
-
-
 /// Update one accumulator from a row group's metadata WITHOUT
 /// decoding. Returns true on success, false if the column's stats
 /// aren't populated (caller falls back to the decode path).

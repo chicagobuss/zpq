@@ -509,6 +509,59 @@ pub fn sameMultiset(arena: std.mem.Allocator, got: []const []const Val, want: []
     return null;
 }
 
+/// Equal multisets of rows under the scalar policy (`same`): the comparison `modeTiedRows` already makes position by
+/// position, made independent of the order the two engines emit unordered rows in. Rows meet by the `canon` keys of
+/// their columns that are not floats (`float_cols` marks the oracle's DOUBLE, FLOAT and REAL columns); within one key a
+/// row takes the first unclaimed oracle row whose columns are all `same`.
+pub fn sameMultisetNear(
+    arena: std.mem.Allocator,
+    got: []const []const Val,
+    want: []const []const Val,
+    float_cols: []const bool,
+) !?[]const u8 {
+    if (got.len != want.len) return try std.fmt.allocPrint(arena, "zpq={d} rows oracle={d}", .{ got.len, want.len });
+    var buckets: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty;
+    for (want, 0..) |row, i| {
+        const entry = try buckets.getOrPut(arena, try fixedKey(arena, row, float_cols));
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        try entry.value_ptr.append(arena, i);
+    }
+    const taken = try arena.alloc(bool, want.len);
+    @memset(taken, false);
+    for (got) |row| {
+        const hit: ?usize = blk: {
+            const bucket = buckets.get(try fixedKey(arena, row, float_cols)) orelse break :blk null;
+            for (bucket.items) |i| if (!taken[i] and rowSame(row, want[i])) break :blk i;
+            break :blk null;
+        };
+        const i = hit orelse return try std.fmt.allocPrint(arena, "row zpq={s} has no oracle row within tolerance", .{
+            clip(try rowKey(arena, row)),
+        });
+        taken[i] = true;
+    }
+    return null;
+}
+
+/// A row's key over the columns that never compare by tolerance.
+fn fixedKey(arena: std.mem.Allocator, row: []const Val, float_cols: []const bool) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (row, 0..) |v, c| {
+        if (c < float_cols.len and float_cols[c]) {
+            try out.appendSlice(arena, "~|");
+            continue;
+        }
+        const k = try canon(arena, v);
+        try out.print(arena, "{d}:{s}|", .{ k.len, k });
+    }
+    return out.items;
+}
+
+fn rowSame(got: []const Val, want: []const Val) bool {
+    if (got.len != want.len) return false;
+    for (got, want) |g, w| if (!same(g, w)) return false;
+    return true;
+}
+
 /// Equal rows in order: each pair's `canon` keys must be identical.
 pub fn sameOrdered(arena: std.mem.Allocator, got: []const []const Val, want: []const []const Val) !?[]const u8 {
     if (got.len != want.len) return try std.fmt.allocPrint(arena, "zpq={d} rows oracle={d}", .{ got.len, want.len });
@@ -786,6 +839,40 @@ test "row comparisons need equal canonical values, not values within the scalar 
     try testing.expect((try sameOrdered(a, &got, &want)) != null);
     const near = [_][]const Val{&.{ .{ .int = 1 }, .{ .float = 0.30000000000000004 } }};
     try testing.expect((try sameOrdered(a, &near, &want)) == null);
+}
+
+test "rows within the scalar tolerance match in any row order, rows beyond it do not" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const float_cols = [_]bool{ false, true, false };
+    // zpq's decimal averages carry fewer digits than the oracle's doubles (0.050007 against 0.05000657): equal within
+    // the scalar tolerance, different at six significant digits, so no canonical comparison accepts them.
+    const zpq = [_][]const Val{
+        &.{ .{ .text = "A" }, .{ .float = 0.050007 }, .{ .int = 14804077 } },
+        &.{ .{ .text = "R" }, .{ .float = 0.049997 }, .{ .int = 14808183 } },
+    };
+    const oracle = [_][]const Val{
+        &.{ .{ .text = "A" }, .{ .float = 0.05000657454 }, .{ .int = 14804077 } },
+        &.{ .{ .text = "R" }, .{ .float = 0.04999679231 }, .{ .int = 14808183 } },
+    };
+    const swapped = [_][]const Val{ oracle[1], oracle[0] };
+    try testing.expect((try sameMultiset(a, &zpq, &oracle)) != null);
+    try testing.expect((try sameMultisetNear(a, &zpq, &oracle, &float_cols)) == null);
+    try testing.expect((try sameMultisetNear(a, &zpq, &swapped, &float_cols)) == null);
+    // A float beyond the tolerance, an integer one apart, or a row claimed twice still fails.
+    const far = [_][]const Val{ oracle[0], &.{ .{ .text = "R" }, .{ .float = 0.06 }, .{ .int = 14808183 } } };
+    const off_by_one = [_][]const Val{ oracle[0], &.{ .{ .text = "R" }, .{ .float = 0.04999679231 }, .{ .int = 14808184 } } };
+    const twice = [_][]const Val{ oracle[0], oracle[0] };
+    try testing.expect((try sameMultisetNear(a, &zpq, &far, &float_cols)) != null);
+    try testing.expect((try sameMultisetNear(a, &zpq, &off_by_one, &float_cols)) != null);
+    try testing.expect((try sameMultisetNear(a, &zpq, &twice, &float_cols)) != null);
+    // Rows that differ only in a float pair up one to one.
+    const ties_got = [_][]const Val{ &.{ .{ .text = "K" }, .{ .float = 1.5 }, .{ .int = 1 } }, &.{ .{ .text = "K" }, .{ .float = 2.5 }, .{ .int = 1 } } };
+    const ties_want = [_][]const Val{ ties_got[1], ties_got[0] };
+    const ties_bad = [_][]const Val{ ties_got[1], ties_got[1] };
+    try testing.expect((try sameMultisetNear(a, &ties_got, &ties_want, &float_cols)) == null);
+    try testing.expect((try sameMultisetNear(a, &ties_got, &ties_bad, &float_cols)) != null);
 }
 
 test "raw equality is exact: a binary 0.1 is not the DECIMAL 0.1, and NaN equals nothing" {

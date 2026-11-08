@@ -1473,7 +1473,12 @@ fn modeTiedRows(in: Inputs, spec: Spec) !Reason {
     }
     const sql = try oracleSql(in, spec);
     const upper = try std.ascii.allocUpperString(in.arena, sql);
-    const cut = std.mem.lastIndexOf(u8, upper, " LIMIT ") orelse return compare.sameMultiset(in.arena, got, t.rows);
+    // Unordered rows meet under the same float tolerance as the position-by-position pass above, so the verdict
+    // does not depend on the order the two engines happen to emit them in.
+    const float_cols = try in.arena.alloc(bool, t.types.len);
+    for (t.types, float_cols) |ty, *is_float| is_float.* = compare.isFloatType(ty);
+    const cut = std.mem.lastIndexOf(u8, upper, " LIMIT ") orelse
+        return compare.sameMultisetNear(in.arena, got, t.rows, float_cols);
     // Membership in DuckDB, as the old check did: an unlimited answer can be every row of the input (Q32's 16M
     // groups), which zpq-check must never hold. Each distinct zpq row needs at least as many exact matches in the
     // whole answer as zpq printed copies of it.

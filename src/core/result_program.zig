@@ -48,6 +48,8 @@ pub const ResultProgram = struct {
     /// The query has a GROUP BY, whether or not any key is selected: it picks the plan an AVG of a DECIMAL is computed
     /// by (`Facts`), and no `key` column says so when the keys are projected away.
     grouped: bool = false,
+    /// Threads the per-row passes over a large answer (`widen`, `project`) may run on.
+    workers: usize = 1,
 
     /// The order the strategies before this stage may cut by. A cut ranks groups before HAVING has dropped any, so
     /// under HAVING it would keep the top rows of the wrong set and underfill the answer: the limit is masked there,
@@ -86,7 +88,7 @@ pub const ResultProgram = struct {
         if (self.order.having) |h| try applyHaving(gpa, out, h.*);
         try out.applyResultOrder(gpa, self.order);
         if (out.group_rows == null) return self.projectScalar(gpa, out);
-        try project(self.visible, gpa, out, col_types);
+        try project(self.visible, self.workers, gpa, out, col_types);
         // A cut leaves few of the rows the slab was built for: release the rest. Only memory is at stake, so a
         // refused allocation keeps the larger slab rather than fail an answer already final.
         out.compactRows(gpa) catch {};
@@ -97,6 +99,7 @@ pub const ResultProgram = struct {
     /// own) from the old rows.
     fn project(
         visible: ?usize,
+        workers: usize,
         gpa: std.mem.Allocator,
         out: *scan.AggOutput,
         col_types: ?*?[]const scan.GroupColType,
@@ -110,15 +113,25 @@ pub const ResultProgram = struct {
         const narrowed = try gpa.alloc([]const scan.AggValue, rows.len);
         errdefer gpa.free(narrowed);
         const names = try gpa.dupe([]const u8, cols[0..n]);
-        for (rows, narrowed, 0..) |row, *dst, i| {
-            const cells = slab[i * n ..][0..n];
-            @memcpy(cells, row[0..n]);
-            dst.* = cells;
-        }
-        for (rows) |row| {
-            for (row[n..]) |v| freeValue(gpa, v);
-            out.releaseRowSlice(gpa, row);
-        }
+        const Narrow = struct {
+            rows: []const []const scan.AggValue,
+            narrowed: [][]const scan.AggValue,
+            slab: []scan.AggValue,
+            n: usize,
+            out: *const scan.AggOutput,
+            gpa: std.mem.Allocator,
+            fn run(c: @This(), lo: usize, hi: usize) void {
+                for (c.rows[lo..hi], c.narrowed[lo..hi], lo..) |row, *dst, i| {
+                    const cells = c.slab[i * c.n ..][0..c.n];
+                    @memcpy(cells, row[0..c.n]);
+                    dst.* = cells;
+                    // A hidden column's string may be the answer's to free or borrowed (`AggOutput.borrowed_strings`).
+                    for (row[c.n..]) |v| c.out.freeValue(c.gpa, v);
+                    c.out.releaseRowSlice(c.gpa, row);
+                }
+            }
+        };
+        eachRowBlock(workers, rows.len, Narrow{ .rows = rows, .narrowed = narrowed, .slab = slab, .n = n, .out = out, .gpa = gpa }, Narrow.run);
         gpa.free(rows);
         gpa.free(out.slab);
         for (cols[n..]) |c| gpa.free(c);
@@ -295,7 +308,7 @@ pub const ResultProgram = struct {
         @memset(wanted, true);
         try computeDerived(out.group_rows.?, programs, wanted, computed);
         try out.applyResultOrder(gpa, self.order);
-        try project(self.select.len, gpa, out, col_types);
+        try project(self.select.len, self.workers, gpa, out, col_types);
         out.compactRows(gpa) catch {};
     }
 
@@ -332,20 +345,32 @@ pub const ResultProgram = struct {
         const slab = try gpa.alloc(scan.AggValue, rows.len * width);
         errdefer gpa.free(slab);
         const wide = try gpa.alloc([]const scan.AggValue, rows.len);
-        for (rows, wide, 0..) |row, *dst, i| {
-            const cells = slab[i * width ..][0..width];
-            raw = 0;
-            for (cells, programs) |*cell, program| {
-                if (program != null) {
-                    cell.* = .null_val;
-                } else {
-                    cell.* = row[raw];
-                    raw += 1;
+        const Widen = struct {
+            rows: []const []const scan.AggValue,
+            wide: [][]const scan.AggValue,
+            slab: []scan.AggValue,
+            programs: []const ?*const Compiled,
+            out: *const scan.AggOutput,
+            gpa: std.mem.Allocator,
+            fn run(c: @This(), lo: usize, hi: usize) void {
+                const w = c.programs.len;
+                for (c.rows[lo..hi], c.wide[lo..hi], lo..) |row, *dst, i| {
+                    const cells = c.slab[i * w ..][0..w];
+                    var at: usize = 0;
+                    for (cells, c.programs) |*cell, program| {
+                        if (program != null) {
+                            cell.* = .null_val;
+                        } else {
+                            cell.* = row[at];
+                            at += 1;
+                        }
+                    }
+                    dst.* = cells;
+                    c.out.releaseRowSlice(c.gpa, row);
                 }
             }
-            dst.* = cells;
-        }
-        for (rows) |row| out.releaseRowSlice(gpa, row);
+        };
+        eachRowBlock(self.workers, rows.len, Widen{ .rows = rows, .wide = wide, .slab = slab, .programs = programs, .out = out, .gpa = gpa }, Widen.run);
         gpa.free(rows);
         gpa.free(out.slab);
         gpa.free(raw_names);
@@ -355,6 +380,30 @@ pub const ResultProgram = struct {
         out.group_cols = names;
         out.owned_types = owned_types;
         col_types.?.* = owned_types;
+    }
+
+    /// `f(ctx, lo, hi)` over `n` rows in blocks, on up to `workers` threads; the blocks are disjoint, so each row is one
+    /// thread's. Short answers, and a host that cannot start a thread, take one pass on this one.
+    fn eachRowBlock(workers: usize, n: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize, usize) void) void {
+        const block = 4096;
+        const Task = struct {
+            ctx: @TypeOf(ctx),
+            cursor: *std.atomic.Value(usize),
+            n: usize,
+            fn run(t: *@This()) void {
+                while (true) {
+                    const lo = t.cursor.fetchAdd(block, .monotonic);
+                    if (lo >= t.n) return;
+                    f(t.ctx, lo, @min(t.n, lo + block));
+                }
+            }
+        };
+        const threads = @max(1, @min(workers, 64, n / block));
+        var cursor: std.atomic.Value(usize) = .init(0);
+        var storage: [64]Task = undefined;
+        const tasks = storage[0..threads];
+        for (tasks) |*t| t.* = .{ .ctx = ctx, .cursor = &cursor, .n = n };
+        if (threads == 1 or !@import("spawn.zig").runTree(Task, tasks, .{ .stack_size = 1 << 20 }, Task.run)) tasks[0].run();
     }
 
     fn column(self: ResultProgram, j: usize) expr_ast.SelectColumn {

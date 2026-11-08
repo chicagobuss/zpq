@@ -283,7 +283,9 @@ fn executeAggregateOver(
     // A join reads its builds first, on this ledger; the probe binds against footers given the build columns.
     var args = args_in;
     const joined = try engine_join.prepare(ctx.gpa, arena, args_in, &ledger);
-    defer if (joined) |j| j.release();
+    // A process about to exit leaves the builds to it, as the scan leaves its tables (`leave_regions`): unmapping a
+    // large dimension's arrays is serial time the exit would only repeat. Builds that check for leaks free them.
+    defer if (joined) |j| if (!ctx.exit_after or std.debug.runtime_safety) j.release();
     if (joined) |j| {
         args.plan_source = j.source(args_in.plan_source.?);
         args.join = j;
@@ -490,6 +492,7 @@ fn executeAggregateOver(
         .select = if (post) args.select_cols.? else &.{},
         .calls = r.state.agg_calls,
         .sources = r.state.agg_sources,
+        .workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env),
     };
     try program.finish(ctx.gpa, &r.output, &r.state.group_col_types);
     const text_kinds = try answerTextKinds(ctx.gpa, r.output, r.state, args.output == null, args.diag);

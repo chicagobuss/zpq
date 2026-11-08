@@ -62,9 +62,10 @@ const Builder = struct {
     lp: *c.arena_t,
     why: *Refusal,
     inputs: std.ArrayList([]const u8) = .empty,
-    /// The select items that hold a window call, by alias: QUALIFY may name them.
-    aliases: std.ArrayList(struct { name: []const u8, lowered: []const u8 }) = .empty,
-    alias_used: bool = false,
+    /// The select items that have an alias, in order: QUALIFY may name them.
+    aliases: std.ArrayList(struct { name: []const u8, expr: *c.LpNode }) = .empty,
+    /// The window calls planned so far, by their tree: one written twice (a select item, then QUALIFY by its alias) is one column.
+    planned: std.ArrayList(struct { node: *c.LpNode, name: []const u8 }) = .empty,
     /// The table's column names, when they are known: in QUALIFY a column of the table is read before a select alias of that name.
     columns: ?[]const []const u8 = null,
     wins: std.ArrayList(Win) = .empty,
@@ -93,7 +94,9 @@ const Builder = struct {
     fn lower(self: *Builder, node: *c.LpNode) Error![]const u8 {
         if (node.kind == c.LP_RESULT_COLUMN) return self.lower(node.u.result_column.expr orelse return error.SqlParseError);
         if (node.kind == c.LP_EXPR_FUNCTION and node.u.function.over != null) {
+            for (self.planned.items) |p| if (c.lp_node_equal(p.node, node) != 0) return std.fmt.allocPrint(self.arena, "\"{s}\"", .{p.name});
             const name = try self.window(node);
+            try self.planned.append(self.arena, .{ .node = node, .name = name });
             return std.fmt.allocPrint(self.arena, "\"{s}\"", .{name});
         }
         if (!hasWindow(node)) return std.fmt.allocPrint(self.arena, "\"{s}\"", .{try self.input(try self.unparse(node))});
@@ -137,23 +140,52 @@ const Builder = struct {
 
     /// An operand of an operation: a literal stays in place, anything else is lowered.
     fn operand(self: *Builder, node: *c.LpNode) Error![]const u8 {
-        if (node.kind == c.LP_EXPR_COLUMN_REF and node.u.column_ref.table == null and node.u.column_ref.schema == null) {
-            const name = std.mem.span(node.u.column_ref.column);
-            for (self.aliases.items) |al| if (std.ascii.eqlIgnoreCase(al.name, name)) {
-                // DuckDB reads a column of the table before an output name in QUALIFY. Without the table's columns it cannot be
-                // told which this is.
-                const cols = self.columns orelse return self.why.set("QUALIFY names the output column {s}, and the table's columns are not known to tell it from one", .{name});
-                var is_column = false;
-                for (cols) |col| is_column = is_column or std.ascii.eqlIgnoreCase(col, name);
-                if (!is_column) {
-                    self.alias_used = true;
-                    return al.lowered;
-                }
-            };
-        }
         switch (node.kind) {
             c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT, c.LP_EXPR_LITERAL_STRING, c.LP_EXPR_LITERAL_NULL => return self.unparse(node),
             else => return self.lower(node),
+        }
+    }
+
+    /// QUALIFY reads a name as DuckDB does: a column of the table first, else the last select item with that alias, whatever it is
+    /// and wherever the name stands (an argument, a window's PARTITION BY). Each such name is replaced by that item's expression.
+    fn substituteAliases(self: *Builder, root: *c.LpNode) Error!void {
+        const Found = struct {
+            arena: std.mem.Allocator,
+            nodes: std.ArrayList(*c.LpNode) = .empty,
+            failed: bool = false,
+
+            fn enter(data: [*c]c.LpVisitor, n: [*c]c.LpNode) callconv(.c) c_int {
+                const found: *@This() = @ptrCast(@alignCast(data.*.user_data));
+                // A subquery reads its own names.
+                if (n.*.kind == c.LP_STMT_SELECT) return 1;
+                if (n.*.kind == c.LP_EXPR_COLUMN_REF and n.*.u.column_ref.table == null and n.*.u.column_ref.schema == null)
+                    found.nodes.append(found.arena, n) catch {
+                        found.failed = true;
+                    };
+                return 0;
+            }
+        };
+        var found: Found = .{ .arena = self.arena };
+        var visitor: c.LpVisitor = .{ .user_data = &found, .enter = Found.enter, .leave = null };
+        c.lp_ast_walk(root, &visitor);
+        if (found.failed) return error.OutOfMemory;
+        for (found.nodes.items) |ref| {
+            const name = std.mem.span(ref.u.column_ref.column);
+            var alias: ?*c.LpNode = null;
+            var at = self.aliases.items.len;
+            while (at > 0) {
+                at -= 1;
+                if (std.ascii.eqlIgnoreCase(self.aliases.items[at].name, name)) {
+                    alias = self.aliases.items[at].expr;
+                    break;
+                }
+            }
+            const expr = alias orelse continue;
+            // Without the table's columns it cannot be told whether this is a column or the alias.
+            const cols = self.columns orelse return self.why.set("QUALIFY names the output column {s}, and the table's columns are not known to tell it from one", .{name});
+            var is_column = false;
+            for (cols) |col| is_column = is_column or std.ascii.eqlIgnoreCase(col, name);
+            if (!is_column) ref.* = expr.*;
         }
     }
 
@@ -508,6 +540,9 @@ pub fn build(arena: std.mem.Allocator, full_text: [:0]const u8, why: *Refusal, c
     var qualify_text: ?[]const u8 = null;
     const whole = clauses(full_text);
     if (whole.qualify) |at| {
+        // DuckDB's grammar puts QUALIFY before ORDER BY and LIMIT; after them it is a syntax error.
+        if ((whole.order orelse at) < at or (whole.tail orelse at) < at)
+            return why.set("QUALIFY must come before ORDER BY, LIMIT and OFFSET", .{});
         const end = whole.order orelse whole.tail orelse full_text.len;
         qualify_text = std.mem.trim(u8, full_text[at + "qualify".len .. end], " \t\r\n;");
         text = try std.fmt.allocPrintSentinel(arena, "{s} {s}", .{ full_text[0..at], full_text[end..] }, 0);
@@ -559,7 +594,7 @@ pub fn build(arena: std.mem.Allocator, full_text: [:0]const u8, why: *Refusal, c
             break :blk try quoteName(arena, name);
         };
         try aliases.append(arena, if (alias) |al| al else shown);
-        if (windowed) if (alias) |al| try b.aliases.append(arena, .{ .name = if (al.len >= 2 and al[0] == '"') al[1 .. al.len - 1] else al, .lowered = lowered });
+        if (alias) |al| try b.aliases.append(arena, .{ .name = if (al.len >= 2 and al[0] == '"') al[1 .. al.len - 1] else al, .expr = expr });
         if (i > 0) try items.appendSlice(arena, ", ");
         try items.print(arena, "{s} AS {s}", .{ lowered, shown });
     }
@@ -576,8 +611,10 @@ pub fn build(arena: std.mem.Allocator, full_text: [:0]const u8, why: *Refusal, c
         if (proot.*.kind != c.LP_STMT_SELECT or proot.*.u.select.result_columns.count != 1) return error.SqlParseError;
         const prc: *c.LpNode = proot.*.u.select.result_columns.items[0] orelse return error.SqlParseError;
         const pexpr: *c.LpNode = if (prc.kind == c.LP_RESULT_COLUMN) prc.u.result_column.expr orelse return error.SqlParseError else prc;
+        try b.substituteAliases(pexpr);
+        // DuckDB asks for a window function in the select list or in QUALIFY, one of them.
+        if (!any_window and !hasWindow(pexpr)) return why.set("a window function must appear in the select list or in QUALIFY", .{});
         where_text = try b.predicate(pexpr);
-        if (!hasWindow(pexpr) and !b.alias_used) return why.set("QUALIFY needs a window function in its condition", .{});
     }
 
     // The outer ORDER BY: a position or an output name stays, any other expression is read like a select item.
@@ -670,9 +707,46 @@ test "QUALIFY is the final query's WHERE over the window columns, and a column o
     const column_first = try build(a, text, &why, &.{ "id", "g", "v", "r" });
     try std.testing.expect(std.mem.indexOf(u8, column_first.final_where, "\"w0\" <= 2") == null);
     try std.testing.expect(std.mem.indexOf(u8, column_first.final_where, "<= 2") != null);
-    // And with nothing but that column there is no window call in QUALIFY at all.
+    // And with nothing but that column QUALIFY holds no window call, which DuckDB takes when the select list has one.
     const only_column: [:0]const u8 = "SELECT id, rank() OVER (ORDER BY v) AS r FROM t QUALIFY r <= 2";
-    try std.testing.expectError(error.WindowNotSupported, build(a, only_column, &why, &.{ "id", "v", "r" }));
+    const filtered = try build(a, only_column, &why, &.{ "id", "v", "r" });
+    try std.testing.expect(std.mem.indexOf(u8, filtered.final_where, "\"w0\"") == null);
     // Without the table's columns the name cannot be told, and is refused rather than guessed.
     try std.testing.expectError(error.WindowNotSupported, build(a, text, &why, null));
+}
+
+test "QUALIFY binds a name to the last select item of that alias, in any select item and anywhere in the condition" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var why: Refusal = .{};
+    const columns: []const []const u8 = &.{ "id", "v" };
+    // The last `r` is the constant, not the rank.
+    const dup = try build(a, "SELECT rank() OVER (ORDER BY id) AS r, 100 AS r FROM t QUALIFY r = 100", &why, columns);
+    try std.testing.expectEqualStrings("(100 = 100)", dup.final_where);
+    // An alias of an expression with no window call.
+    const plain = try build(a, "SELECT id, v + 1 AS x, row_number() OVER (ORDER BY id) AS rn FROM t QUALIFY x > 15 AND rn <= 4 ORDER BY id", &why, columns);
+    try std.testing.expectEqualStrings("((\"c1\" > 15) AND (\"w0\" <= 4))", plain.final_where);
+    try std.testing.expect(std.mem.indexOf(u8, plain.input_sql, "v + 1 AS \"c1\"") != null);
+    // An alias inside a call.
+    const nested = try build(a, "SELECT id, rank() OVER (ORDER BY v) AS r FROM t QUALIFY abs(r) > 2 ORDER BY id", &why, columns);
+    try std.testing.expectEqualStrings("(abs(\"w0\") > 2)", nested.final_where);
+    // The window written in the select list and again through its alias is one column.
+    const once = try build(a, "SELECT rank() OVER (ORDER BY v) AS r FROM t QUALIFY r <= 2 AND rank() OVER (ORDER BY v) < 9", &why, columns);
+    try std.testing.expectEqual(@as(usize, 1), once.passes[0].calls.len);
+    // A window argument that is an alias is that expression.
+    const arg = try build(a, "SELECT id, v + 1 AS x FROM t QUALIFY sum(x) OVER (ORDER BY id) > 40", &why, columns);
+    try std.testing.expect(std.mem.indexOf(u8, arg.input_sql, "v + 1") != null);
+}
+
+test "QUALIFY comes before ORDER BY and LIMIT, and a window function must be somewhere in the query" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var why: Refusal = .{};
+    const columns: []const []const u8 = &.{ "id", "v" };
+    try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT id, rank() OVER (ORDER BY id) AS r FROM t ORDER BY id QUALIFY r > 2", &why, columns));
+    try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT id, rank() OVER (ORDER BY id) AS r FROM t LIMIT 3 QUALIFY r > 2", &why, columns));
+    try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT id, v + 1 AS x FROM t QUALIFY x > 20", &why, columns));
+    _ = try build(a, "SELECT id, rank() OVER (ORDER BY id) AS r FROM t QUALIFY id > 2", &why, columns);
 }

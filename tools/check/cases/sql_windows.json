@@ -15,6 +15,10 @@
   {
    "name": "wu",
    "path": "ci/fixtures/parquet/sql_windows_unsigned.parquet"
+  },
+  {
+   "name": "wa",
+   "path": "ci/fixtures/parquet/sql_windows_alias.parquet"
   }
  ],
  "cases": [
@@ -1784,6 +1788,308 @@
     "error": "ColumnsNotSupported",
     "diag": "needs one local table",
     "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:qualify-alias-non-window",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, v + 1 AS x, row_number() OVER (ORDER BY id) AS rn FROM '{fixture:wa}' QUALIFY x > 15 AND rn <= 4 ORDER BY id",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, v + 1 AS x, row_number() OVER (ORDER BY id) AS rn FROM '{fixture:wa}' QUALIFY x > 15 AND rn <= 4 ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-alias-nested-call",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (ORDER BY v) AS r FROM '{fixture:wa}' QUALIFY abs(r) > 2 ORDER BY id",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, rank() OVER (ORDER BY v) AS r FROM '{fixture:wa}' QUALIFY abs(r) > 2 ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-alias-later-item",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, row_number() OVER (ORDER BY id) AS rn, v + 1 AS x FROM '{fixture:wa}' QUALIFY x > 15 AND rn <= 4 ORDER BY id",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, row_number() OVER (ORDER BY id) AS rn, v + 1 AS x FROM '{fixture:wa}' QUALIFY x > 15 AND rn <= 4 ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-alias-in-window-argument",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, v + 1 AS x FROM '{fixture:wa}' QUALIFY sum(x) OVER (ORDER BY id) > 40 ORDER BY id",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, v + 1 AS x FROM '{fixture:wa}' QUALIFY sum(x) OVER (ORDER BY id) > 40 ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-alias-in-partition-by",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, g + 1 AS x FROM '{fixture:wa}' QUALIFY row_number() OVER (PARTITION BY x ORDER BY id) = 1 ORDER BY id",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, g + 1 AS x FROM '{fixture:wa}' QUALIFY row_number() OVER (PARTITION BY x ORDER BY id) = 1 ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-alias-window-expression",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (ORDER BY id) + 1 AS r1 FROM '{fixture:wa}' QUALIFY r1 > 4 ORDER BY id",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, rank() OVER (ORDER BY id) + 1 AS r1 FROM '{fixture:wa}' QUALIFY r1 > 4 ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-alias-case-and-quotes",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (ORDER BY id) AS \"R\" FROM '{fixture:wa}' QUALIFY r <= 3 AND \"r\" >= 2 ORDER BY id",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, rank() OVER (ORDER BY id) AS \"R\" FROM '{fixture:wa}' QUALIFY r <= 3 AND \"r\" >= 2 ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-column-over-alias",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id AS v, rank() OVER (ORDER BY id) AS r FROM '{fixture:wa}' QUALIFY v > 25 ORDER BY id",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id AS v, rank() OVER (ORDER BY id) AS r FROM '{fixture:wa}' QUALIFY v > 25 ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-no-window-in-condition",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (ORDER BY id) AS r FROM '{fixture:wa}' QUALIFY id > 2 ORDER BY id",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, rank() OVER (ORDER BY id) AS r FROM '{fixture:wa}' QUALIFY id > 2 ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-alias-shares-the-window",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (ORDER BY v, id) AS r FROM '{fixture:wa}' QUALIFY r <= 4 AND rank() OVER (ORDER BY v, id) > 1 ORDER BY id",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, rank() OVER (ORDER BY v, id) AS r FROM '{fixture:wa}' QUALIFY r <= 4 AND rank() OVER (ORDER BY v, id) > 1 ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-alias-logic",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, v + 1 AS x, rank() OVER (PARTITION BY g ORDER BY id) AS r FROM '{fixture:wa}' QUALIFY NOT (x BETWEEN 15 AND 25) AND (abs(r - 2) <= 1 OR x IS NULL) ORDER BY id",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, v + 1 AS x, rank() OVER (PARTITION BY g ORDER BY id) AS r FROM '{fixture:wa}' QUALIFY NOT (x BETWEEN 15 AND 25) AND (abs(r - 2) <= 1 OR x IS NULL) ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:qualify-duplicate-output-name",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT rank() OVER (ORDER BY id) AS r, 100 AS r FROM '{fixture:wa}' QUALIFY r = 100",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "DuplicateOutputColumn",
+    "diag": "defined more than once",
+    "exit": 1
+   }
+  },
+  {
+   "id": "sql_windows:refuse:qualify-after-order-by",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (ORDER BY id) AS r FROM '{fixture:wa}' ORDER BY id QUALIFY r > 2",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "QUALIFY must come before",
+    "exit": 2,
+    "binder_sql": "SELECT id, rank() OVER (ORDER BY id) AS r FROM '{fixture:wa}' ORDER BY id QUALIFY r > 2",
+    "duck_error": "Parser Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:qualify-after-limit",
+   "fixture": "wa",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (ORDER BY id) AS r FROM '{fixture:wa}' LIMIT 3 QUALIFY r > 2",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "QUALIFY must come before",
+    "exit": 2,
+    "binder_sql": "SELECT id, rank() OVER (ORDER BY id) AS r FROM '{fixture:wa}' LIMIT 3 QUALIFY r > 2",
+    "duck_error": "Parser Error:"
    }
   }
  ]

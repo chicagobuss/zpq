@@ -103,7 +103,8 @@
   `repeat` and `position(needle IN s)`. `ln`, `exp`, `pow`,
   `sin` and their kin stay refused: DuckDB's math library differs from a current one's in the last digit for many inputs.
 - **QUALIFY, `SELECT *` beside window calls, `ntile`, `first_value`, `last_value` and `nth_value`.** The usual `row_number() OVER (PARTITION
-  BY g ORDER BY x) <= N` shape runs, with the output names of window items usable in it; `SELECT *` (and `* EXCLUDE (..)`) expands to
+  BY g ORDER BY x) <= N` shape runs, with the aliases of select items usable in it, as DuckDB binds them (a column of the table first, then the
+  last item of that alias; in a call or a window's argument too); `SELECT *` (and `* EXCLUDE (..)`) expands to
   the table's columns. Checked against DuckDB 2.0.0 on ~900 fuzzed queries.
 - **Window functions in SQL.** `row_number()`, `rank()`, `dense_rank()`, `lag` / `lead`, and `sum`, `count`, `avg`, `min`, `max`
   `OVER (PARTITION BY .. ORDER BY .. [ROWS BETWEEN ..])` (the default frame and `ROWS` frames), over rows or over a GROUP BY's

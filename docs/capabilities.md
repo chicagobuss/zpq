@@ -138,8 +138,10 @@ windows read) in memory, drawn on a ledger: past `--max-memory` it is "the query
 an ORDER BY are in input order; DuckDB's row_number and ROWS frames over ties are unspecified, so a query that depends on them should
 break its ties.
 `QUALIFY <condition>` keeps the rows whose condition holds after the windows are computed: comparisons, AND / OR / NOT, IS [NOT] NULL,
-BETWEEN and IN over window calls, the columns the query reads and arithmetic, and the output names of window items (a column of the table
-of that name is read first, as in DuckDB), with or without WHERE, GROUP BY and HAVING; it applies before ORDER BY / LIMIT. `SELECT *` and
+BETWEEN and IN over window calls, the columns the query reads and arithmetic, and the aliases of select items, window or not (a column of
+the table of that name is read first, then the last item of that alias, as in DuckDB; the alias stands for the item's expression wherever it
+is written, inside a call or a window's argument), with or without WHERE, GROUP BY and HAVING. It goes before ORDER BY / LIMIT (after
+them is DuckDB's syntax error, and refused), and the select list or the condition must hold a window call. `SELECT *` and
 `SELECT * EXCLUDE (..)` may stand beside window calls, from one local table (`t.*` is refused). `ntile`'s frame is ignored by DuckDB and
 refused here; `first_value` / `last_value` / `nth_value` follow the frame (the default frame's last row is the row's last peer).
 Refused by name: `percent_rank`, `cume_dist` and the rest (`WindowNotSupported`);

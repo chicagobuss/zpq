@@ -103,8 +103,14 @@ fn floatOrder(a: anytype, b: @TypeOf(a)) std.math.Order {
     return std.math.order(a, b);
 }
 
-/// Rows `i` and `j`, neither NULL, in value order (NaN above every number, as DuckDB orders it).
-fn orderAt(c: Column, i: usize, j: usize) std.math.Order {
+/// Rows `i` and `j`, neither NULL, in value order (NaN above every number, as DuckDB orders it). An unsigned integer sits in
+/// its signed lane as raw bits, and is ordered as the unsigned number it is.
+fn orderAt(c: Column, i: usize, j: usize, unsigned: bool) std.math.Order {
+    if (unsigned) switch (c) {
+        .i32 => |x| return std.math.order(@as(u32, @bitCast(x.values[i])), @as(u32, @bitCast(x.values[j]))),
+        .i64 => |x| return std.math.order(@as(u64, @bitCast(x.values[i])), @as(u64, @bitCast(x.values[j]))),
+        else => {},
+    };
     return switch (c) {
         .f32 => |x| floatOrder(x.values[i], x.values[j]),
         .f64 => |x| floatOrder(x.values[i], x.values[j]),
@@ -308,6 +314,7 @@ fn compute(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Out
         .min, .max => {
             const ci = try argOf(call);
             const c = t.cols[ci];
+            const unsigned = ci < t.elems.len and schema.isUnsignedInt(t.elems[ci]);
             const pick = try a.alloc(i64, n);
             const queue = try a.alloc(u32, n);
             const want: std.math.Order = if (call.func == .min) .lt else .gt;
@@ -325,7 +332,7 @@ fn compute(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Out
                         // A later value at least as good as the ones queued behind it replaces them.
                         while (tail > head) {
                             const back = queue[tail - 1];
-                            const o = orderAt(c, added, back);
+                            const o = orderAt(c, added, back, unsigned);
                             if (o == want or o == .eq) tail -= 1 else break;
                         }
                         queue[tail] = @intCast(added);
@@ -676,7 +683,7 @@ const Ledgered = struct {
     }
 };
 
-const SortIdx = struct { col: usize, descending: bool, nulls_first: bool };
+const SortIdx = struct { col: usize, descending: bool, nulls_first: bool, unsigned: bool = false };
 
 const SortOrder = struct {
     cols: []const Column,
@@ -692,7 +699,7 @@ const SortOrder = struct {
                 if (nx and ny) continue;
                 return if (nx) k.nulls_first else !k.nulls_first;
             }
-            const o = orderAt(c, x, y);
+            const o = orderAt(c, x, y, k.unsigned);
             if (o == .eq) continue;
             return (o == .lt) != k.descending;
         }
@@ -764,7 +771,10 @@ fn runLedgered(gpa: std.mem.Allocator, req: Request) !void {
     const order = try a.alloc(usize, req.pass.order.len);
     for (req.pass.order, order) |n, *p| p.* = try indexOf(names, n);
     const keys = try a.alloc(SortIdx, req.pass.sort.len);
-    for (req.pass.sort, keys) |k, *out| out.* = .{ .col = try indexOf(names, k.column), .descending = k.descending, .nulls_first = k.nulls_first orelse false };
+    for (req.pass.sort, keys) |k, *out| {
+        const col = try indexOf(names, k.column);
+        out.* = .{ .col = col, .descending = k.descending, .nulls_first = k.nulls_first orelse false, .unsigned = schema.isUnsignedInt(meta.schema.items[col + 1]) };
+    }
     const calls = try a.alloc(Call, req.pass.calls.len);
     for (req.pass.calls, calls) |nc, *c| c.* = .{
         .func = nc.func,
@@ -995,5 +1005,27 @@ test "window: sums slide per frame and do not overflow across partitions or step
     const fits = try columns(a, wt, .{ .partition = &.{0}, .order = &.{}, .calls = &.{current} });
     try T.expectEqualSlices(i64, &.{ std.math.maxInt(i64), 1, 5 }, fits[0].col.i64.values);
     try T.expectError(error.WindowSumOverflow, columns(a, wt, .{ .partition = &.{0}, .order = &.{}, .calls = &.{.{ .func = .sum, .arg = 1 }} }));
+}
+
+test "window: unsigned integers order as the unsigned numbers their raw bits are" {
+    const T = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // UINT64 values 1, 2^63 and 2^64 - 1 sit in the i64 lane as 1, minInt and -1; UINT32 2^31 as minInt of i32.
+    const wide = [_]i64{ 1, std.math.minInt(i64), -1 };
+    const narrow = [_]i32{ 1, std.math.minInt(i32), -1 };
+    const cols = [_]Column{ .{ .i64 = .{ .values = &wide } }, .{ .i32 = .{ .values = &narrow } } };
+    try T.expectEqual(std.math.Order.lt, orderAt(cols[0], 0, 1, true));
+    try T.expectEqual(std.math.Order.lt, orderAt(cols[0], 1, 2, true));
+    try T.expectEqual(std.math.Order.gt, orderAt(cols[0], 0, 1, false));
+    try T.expectEqual(std.math.Order.lt, orderAt(cols[1], 0, 1, true));
+    const keys64 = [_]SortIdx{.{ .col = 0, .descending = false, .nulls_first = false, .unsigned = true }};
+    try T.expectEqualSlices(u32, &.{ 0, 1, 2 }, try sortedRows(a, &cols, &keys64, 3));
+    const desc32 = [_]SortIdx{.{ .col = 1, .descending = true, .nulls_first = false, .unsigned = true }};
+    try T.expectEqualSlices(u32, &.{ 2, 1, 0 }, try sortedRows(a, &cols, &desc32, 3));
+    // Signed, the same bits sort the other way round.
+    const signed = [_]SortIdx{.{ .col = 0, .descending = false, .nulls_first = false }};
+    try T.expectEqualSlices(u32, &.{ 1, 2, 0 }, try sortedRows(a, &cols, &signed, 3));
 }
 

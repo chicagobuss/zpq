@@ -11,6 +11,10 @@
   {
    "name": "wc",
    "path": "ci/fixtures/parquet/sql_windows_const.parquet"
+  },
+  {
+   "name": "wu",
+   "path": "ci/fixtures/parquet/sql_windows_unsigned.parquet"
   }
  ],
  "cases": [
@@ -1163,6 +1167,90 @@
     "error": "ExceededMemoryBudget",
     "diag": "needs more memory",
     "exit": 1
+   }
+  },
+  {
+   "id": "sql_windows:unsigned:order-by",
+   "fixture": "wu",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, row_number() OVER (ORDER BY u64) AS a, rank() OVER (ORDER BY u32) AS b, row_number() OVER (ORDER BY u64 DESC NULLS FIRST) AS c, dense_rank() OVER (PARTITION BY g ORDER BY u32 DESC) AS e FROM '{fixture:wu}' ORDER BY id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, row_number() OVER (ORDER BY u64) AS a, rank() OVER (ORDER BY u32) AS b, row_number() OVER (ORDER BY u64 DESC NULLS FIRST) AS c, dense_rank() OVER (PARTITION BY g ORDER BY u32 DESC) AS e FROM '{fixture:wu}' ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:unsigned:min-max",
+   "fixture": "wu",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, min(u64) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS lo, max(u64) OVER (PARTITION BY g) AS hi, min(u32) OVER (PARTITION BY g) AS lo32, max(u32) OVER (ORDER BY id) AS hi32 FROM '{fixture:wu}' ORDER BY id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, min(u64) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS lo, max(u64) OVER (PARTITION BY g) AS hi, min(u32) OVER (PARTITION BY g) AS lo32, max(u32) OVER (ORDER BY id) AS hi32 FROM '{fixture:wu}' ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:unsigned:running-and-offsets",
+   "fixture": "wu",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(id) OVER (ORDER BY u64 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s, lag(id) OVER (ORDER BY u32) AS p, lead(u64) OVER (ORDER BY u64) AS nx FROM '{fixture:wu}' ORDER BY id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, sum(id) OVER (ORDER BY u64 ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s, lag(id) OVER (ORDER BY u32) AS p, lead(u64) OVER (ORDER BY u64) AS nx FROM '{fixture:wu}' ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:unsigned:partition-by-unsigned",
+   "fixture": "wu",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, row_number() OVER (PARTITION BY u32 ORDER BY id) AS a, count(*) OVER (PARTITION BY u64) AS c FROM '{fixture:wu}' ORDER BY id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, row_number() OVER (PARTITION BY u32 ORDER BY id) AS a, count(*) OVER (PARTITION BY u64) AS c FROM '{fixture:wu}' ORDER BY id"
    }
   }
  ]

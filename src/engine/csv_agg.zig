@@ -1,0 +1,526 @@
+//! An aggregate over a CSV file, folded during the parse: the query is bound as a Parquet aggregate query is, against
+//! the file's fields as a schema (`csv_write.fileSchema`); each chunk parses only the fields it reads and folds its
+//! rows into its own aggregate states, which merge in chunk order into one answer (`Ordered`). Types are settled as a
+//! filter's are: a query that does not bind to the sample's types binds to the file's, and a value wider than its
+//! column's type starts the fold again on the widened types.
+//!
+//! The chunks are cut as for one worker at any parallelism, so which rows fold into which state, and the order the
+//! states merge in, are the file's and not the host's: the answer is the same at every `-j`.
+
+const std = @import("std");
+const csv_write = @import("csv_write.zig");
+const aggregate = @import("aggregate.zig");
+const engine_types = @import("types.zig");
+const schema = @import("../core/schema.zig");
+const consumer = @import("../core/consumer.zig");
+const core_memory = @import("../core/memory.zig");
+const blocking = @import("../core/blocking.zig");
+const system = @import("../core/system.zig");
+const csv_scan = @import("../core/csv/scan.zig");
+const filter_ast = @import("../core/filter/ast.zig");
+const filter_eval = @import("../core/filter/eval.zig");
+const filter_selection = @import("../core/filter/selection.zig");
+const expr_ast = @import("../core/expr/ast.zig");
+const expr_agg = @import("../core/expr/agg.zig");
+const expr_eval = @import("../core/expr/eval.zig");
+const agg_coded = @import("../core/expr/agg_coded.zig");
+const scan = @import("../core/scan.zig");
+const execute = @import("../core/scan/execute.zig");
+const scan_types = @import("../core/scan/types.zig");
+const scan_rows = @import("../core/scan/rows.zig");
+const key_decode = @import("../core/scan/key_decode.zig");
+const owned_merge = @import("../core/scan/owned_merge.zig");
+const slot_sort = @import("../core/scan/slot_sort.zig");
+const binding = @import("../core/scan/binding.zig");
+const owner_support = @import("../core/scan/owner_support.zig");
+const output_values = @import("../core/scan/output_values.zig");
+const MergedSlot = @import("../core/scan/count_cut.zig").MergedSlot;
+const local_fs = @import("../local_fs.zig");
+const nowMonoNs = @import("../clock.zig").monoNs;
+
+const Context = engine_types.Context;
+const QueryArgs = engine_types.QueryArgs;
+const AggResult = engine_types.AggResult;
+const Plan = csv_write.Plan;
+const Source = csv_write.Source;
+const Type = csv_write.Type;
+
+/// Whether `args` asks for an aggregate this path folds: anything that needs the rows or the groups in an order (ORDER
+/// BY, LIMIT, OFFSET), a join, or a column order is refused by name.
+pub fn refused(args: QueryArgs) bool {
+    if (args.column_order != null or args.join != null) return true;
+    const order = args.result_order;
+    if (order.keys.len > 0 or order.rows.len > 0 or order.limit != null or order.offset != 0 or order.hidden.len > 0)
+        return true;
+    if (args.select != null or args.columns != null) return true;
+    if (args.plan_source) |ps| {
+        const q = @import("syntax_plan.zig").syntaxOf(ps) orelse return true;
+        if (q.join != null or q.row_keys.len > 0 or q.hidden.len > 0) return true;
+    }
+    return false;
+}
+
+/// The aggregate `args` asks of the CSV file at `path`, its refusal on `args.diag` (`csv_write.describe`).
+pub fn query(ctx: Context, args: QueryArgs, path: []const u8) !AggResult {
+    if (refused(args)) return error.CsvQueryNotSupported;
+    var local: csv_write.Report = .{};
+    const report = args.csv_report orelse &local;
+    var scratch = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer scratch.deinit();
+    const alloc = args.csv_report_alloc orelse scratch.allocator();
+    if (args.diag) |d| d.execution_started = true;
+    return run(ctx, args, path, report, alloc) catch |e| {
+        if (args.diag) |d| csv_write.describe(d, args, path, e, report);
+        return e;
+    };
+}
+
+/// The query bound to the file's fields: its calls, filter, keys and outputs, and per field whether a chunk parses it.
+const Bound = struct {
+    meta: *const schema.FileMetaData,
+    q: execute.BoundQueryPhase,
+    fetch: []bool,
+
+    fn of(a: std.mem.Allocator, args: QueryArgs, all: *const Plan, p: ?*const Plan) !Bound {
+        const meta = try csv_write.fileSchema(a, all, p);
+        const cache = try a.create(engine_types.bound_plan.Cache);
+        cache.* = .{};
+        const with_cache = args.withPlanCache(cache);
+        var margs: scan.MultiAggArgs = .{
+            .inputs = &.{},
+            .aggregate = args.aggregate orelse "",
+            .filter = args.filter,
+            .group_by = args.group_by,
+            .select_cols = args.select_cols,
+            .result_order = args.result_order,
+            .diag = args.diag,
+            // A key a GROUP BY holds that another determines is still a key here: the fold has no plan that skips it.
+            .dependent_keys = false,
+        };
+        margs.bound_aggregate = with_cache.boundAggregate(a, meta) catch |e| return switch (e) {
+            error.InvalidBoundPlan => error.CsvQueryNotSupported,
+            else => e,
+        };
+        const q = try execute.bindAggregateQuery(a, margs, meta);
+        const n = all.fields.len;
+        const fetch = try a.alloc(bool, n);
+        @memset(fetch, false);
+        var list: std.ArrayList(usize) = .empty;
+        for (q.calls) |call| {
+            if (call.arg) |e| e.collectColumns(fetch);
+            if (call.arg2) |e| e.collectColumns(fetch);
+            if (call.where) |w| try w.collectColumns(&list, a);
+        }
+        for (q.keys orelse &.{}) |k| k.collectColumns(fetch);
+        if (q.filter) |f| try f.collectColumns(&list, a);
+        for (list.items) |ci| if (ci < n) {
+            fetch[ci] = true;
+        };
+        // COUNT(*) alone reads no field; the parse still frames every record, and counts them by its first.
+        if (std.mem.indexOfScalar(bool, fetch, true) == null and n > 0) fetch[0] = true;
+        return .{ .meta = meta, .q = q, .fetch = fetch };
+    }
+
+    fn fetchedNames(b: *const Bound, a: std.mem.Allocator, fields: []const []const u8) ![]const []const u8 {
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (fields, b.fetch) |name, f| if (f) try out.append(a, name);
+        return out.items;
+    }
+};
+
+fn run(ctx: Context, args: QueryArgs, path: []const u8, report: *csv_write.Report, report_alloc: std.mem.Allocator) !AggResult {
+    const opts = args.csv;
+    const failure = &report.failure;
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    if (std.mem.startsWith(u8, path, "s3://")) return error.CsvRemoteInput;
+    const t_open = nowMonoNs();
+    const mapped = local_fs.mapFile(path) catch |e| switch (e) {
+        error.EmptyFile => {
+            failure.* = .{ .kind = .empty, .line = 1 };
+            return error.CsvEmpty;
+        },
+        else => return e,
+    };
+    defer mapped.unmap();
+    const workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
+    // Cut as for one worker at any `-j` (see the top of the file).
+    const chunk = csv_write.chunkBytes(opts, args, 1, mapped.bytes.len);
+
+    var every = opts;
+    every.columns = null;
+    var all = try csv_write.plan(arena, mapped.bytes, every, failure);
+    var settled = false;
+    const first = Bound.of(arena, args, &all, null) catch |e| retry: {
+        // As a filter settles them (`csv_write.run`): the sample's types are provisional, the file's are not.
+        if (e == error.CsvQueryNotSupported or e == error.OutOfMemory or opts.strict) return e;
+        const seen = try csv_write.classifyFile(ctx, arena, &all, chunk, workers, failure);
+        for (all.types, seen, all.pinned) |*t, s, pinned| if (!pinned) {
+            t.* = t.join(s);
+        };
+        settled = true;
+        break :retry try Bound.of(arena, args, &all, null);
+    };
+    var parsed = opts;
+    parsed.columns = try first.fetchedNames(arena, all.fields);
+    var p = try csv_write.plan(arena, mapped.bytes, parsed, failure);
+    if (settled) for (p.slot, 0..) |slot, ci| if (slot) |o| {
+        p.types[o] = all.types[ci];
+    };
+    const fields = try report_alloc.alloc([]const u8, p.fields.len);
+    for (fields, p.fields) |*d, n| d.* = try report_alloc.dupe(u8, n);
+    report.fields = fields;
+
+    while (true) {
+        var pass_state = std.heap.ArenaAllocator.init(ctx.gpa);
+        defer pass_state.deinit();
+        const pass = pass_state.allocator();
+        // Bound again each pass: a widened column changes what its calls and keys are.
+        const b = try Bound.of(pass, args, &all, &p);
+        return foldOnce(ctx, pass, args, path, &b, &p, chunk, workers, mapped, report, t_open) catch |e| {
+            if (e != error.CsvTypeChanged or opts.strict) return e;
+            const seen = try csv_write.classifyFile(ctx, pass, &p, chunk, workers, failure);
+            for (p.types, seen, p.pinned) |*t, s, pinned| if (!pinned) {
+                t.* = t.join(s);
+            };
+            report.restarts += 1;
+            if (report.restarts > 2) return e; // the join of the whole file holds every value
+            continue;
+        };
+    }
+}
+
+/// Chunk states merged strictly in chunk order, each as soon as every chunk before it has (`scan.BlockMerge`'s
+/// discipline, for scalar states as for group tables): a chunk starts only within `ahead` chunks of the first unmerged
+/// one, so at most `ahead` chunks' states are alive beside the merged one.
+const Fold = struct {
+    gpa: std.mem.Allocator,
+    calls: []const expr_agg.AggCall,
+    keys: ?[]const expr_ast.Expr,
+    filter: ?filter_ast.Filter,
+    /// Per field: its position among the parsed columns.
+    lookup: []const ?usize,
+    evaluated: []const bool,
+    matched: std.atomic.Value(u64) = .init(0),
+    /// Scalar: each chunk's states, and the merged ones.
+    chunk_accs: [][]expr_agg.Accumulator,
+    accs: []expr_agg.Accumulator,
+    /// Grouped: each chunk's table, and the merged one.
+    tables: []expr_agg.GroupTable,
+    merged: *expr_agg.GroupTable,
+    done: []std.atomic.Value(bool),
+    next: std.atomic.Value(usize) = .init(0),
+    ahead: usize,
+    lock: std.Io.Mutex = .init,
+    failed_from: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
+    moved: std.atomic.Value(u32) = .init(0),
+    /// Per chunk, an error that stopped it other than a refusal of its text (`Source.failures` holds those).
+    errs: []?anyerror,
+
+    fn awaitTurn(f: *Fold, b: usize) bool {
+        while (true) {
+            const seen = f.moved.load(.acquire);
+            if (b >= f.failed_from.load(.acquire)) return false;
+            if (b < f.next.load(.acquire) + f.ahead) return true;
+            blocking.io.futexWaitUncancelable(u32, &f.moved.raw, seen);
+        }
+    }
+
+    fn failFrom(f: *Fold, b: usize) void {
+        _ = f.failed_from.fetchMin(b, .acq_rel);
+        f.wake();
+    }
+
+    fn wake(f: *Fold) void {
+        _ = f.moved.fetchAdd(1, .release);
+        blocking.io.futexWake(u32, &f.moved.raw, std.math.maxInt(u32));
+    }
+
+    /// Chunk `b`'s states are complete: merge them, and any finished after them, once every earlier chunk has merged.
+    fn finish(f: *Fold, b: usize) !void {
+        f.done[b].store(true, .release);
+        f.lock.lockUncancelable(blocking.io);
+        defer f.lock.unlock(blocking.io);
+        var n = f.next.load(.monotonic);
+        while (n < f.done.len and f.done[n].load(.acquire)) : (n += 1) {
+            if (f.keys == null) {
+                for (f.accs, f.chunk_accs[n]) |*d, *s| try owned_merge.mergeOwnedAccumulator(d, s, f.gpa);
+                owned_merge.freeOwnedAccumulatorStrings(f.gpa, f.chunk_accs[n]);
+                f.gpa.free(f.chunk_accs[n]);
+                f.chunk_accs[n] = &.{};
+            } else {
+                const src = &f.tables[n];
+                const len = f.calls.len;
+                for (0..src.groupCount()) |g| {
+                    const id = try f.merged.getOrInsert(src.keyAt(g), f.calls, src.first.items[g]);
+                    const dst = f.merged.accumulators.items[@as(usize, id) * len ..][0..len];
+                    for (dst, src.accumulators.items[g * len ..][0..len]) |*d, *sa| {
+                        try expr_agg.mergePersistent(d, sa, f.gpa, owned_merge.mergeOwnedAccumulator);
+                    }
+                }
+                src.deinit();
+                src.* = expr_agg.GroupTable.init(f.gpa, 0);
+            }
+            f.next.store(n + 1, .release);
+            f.wake();
+        }
+    }
+
+    /// Chunk `i`'s parsed fields (`Source.Fold`), on `a`, freed when it returns.
+    fn foldErased(ctx: *anyopaque, p: *const Plan, parsed: *const consumer.OutputAggregator, a: std.mem.Allocator, i: usize) anyerror!void {
+        const f: *Fold = @ptrCast(@alignCast(ctx));
+        const cb = try csv_write.ChunkBatch.of(p, parsed, f.lookup, f.evaluated, a);
+        var batch: *const filter_eval.Batch = &cb.batch;
+        const rows = parsed.num_rows;
+        var sel = try filter_selection.SelectionVector.init(a, rows);
+        if (f.filter) |flt| try filter_eval.evaluate(flt, batch, &sel, f.lookup, a);
+        _ = f.matched.fetchAdd(sel.count(), .monotonic);
+        if (f.keys) |keys| {
+            // The grouped fold reads values: a string column parsed as dictionary codes alone is expanded first, as a
+            // row group's is (`consumer.scanRGForAgg`).
+            const cols = try a.dupe(filter_eval.Batch.Column, batch.cols);
+            for (cols) |*c| if (switch (c.*) {
+                inline else => |x| x.codesOnly(),
+            }) {
+                c.* = try agg_coded.materialize(a, c.*);
+            };
+            const flat: filter_eval.Batch = .{ .cols = cols, .num_rows = batch.num_rows };
+            batch = &flat;
+            const key_cols = try a.alloc(filter_eval.Batch.Column, keys.len);
+            const restricted = batch.restrictedTo(&sel);
+            for (keys, key_cols) |k, *c| c.* = try expr_eval.evalGroupKeyExpr(a, &restricted, f.lookup, k);
+            var resolver = expr_agg.GroupKeyResolver.init(key_cols);
+            defer resolver.deinit(a);
+            const ids = try a.alloc(u32, rows);
+            @memset(ids, 0);
+            try consumer.foldGroupedBatch(a, f.gpa, &resolver, &f.tables[i], f.calls, key_cols, batch, f.lookup, &sel, ids, expr_agg.firstPosition(i, 0), .{});
+        } else {
+            const accs = try f.gpa.alloc(expr_agg.Accumulator, f.calls.len);
+            for (accs, f.calls) |*acc, call| acc.* = .init(call);
+            f.chunk_accs[i] = accs;
+            const handled = try a.alloc(bool, f.calls.len);
+            @memset(handled, false);
+            if (!try expr_agg.updateSharedInteger(a, f.calls, accs, handled, batch, f.lookup, &sel)) {
+                for (f.calls, accs) |call, *acc| try expr_agg.updateOneWithCharge(a, f.gpa, acc, call, batch, f.lookup, &sel, null);
+            }
+        }
+        try f.finish(i);
+    }
+
+    fn deinit(f: *Fold) void {
+        for (f.chunk_accs) |accs| {
+            owned_merge.freeOwnedAccumulatorStrings(f.gpa, accs);
+            f.gpa.free(accs);
+        }
+        for (f.tables) |*t| t.deinit();
+    }
+};
+
+fn foldOnce(
+    ctx: Context,
+    pass: std.mem.Allocator,
+    args: QueryArgs,
+    path: []const u8,
+    b: *const Bound,
+    p: *const Plan,
+    chunk: usize,
+    workers: usize,
+    mapped: local_fs.Mapped,
+    report: *csv_write.Report,
+    t_open: i64,
+) !AggResult {
+    const gpa = ctx.gpa;
+    var t: engine_types.Timings = .{};
+    t.read_ns = @intCast(nowMonoNs() - t_open);
+    var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
+    defer if (args.profiler) |pr| pr.noteLedger(ledger.peak.load(.monotonic), args.max_memory);
+    var scratch_charge: core_memory.Charged = .{ .child = gpa, .budget = &ledger };
+
+    var source = try Source.init(pass, p, chunk);
+    source.opts = args.csv;
+    report.chunks = source.count;
+    const n = b.meta.schema.items.len - 1;
+    const lookup = try pass.alloc(?usize, n);
+    for (lookup, p.slot) |*l, s| l.* = if (s) |o| o else null;
+    const calls = b.q.calls;
+    const keys = b.q.keys;
+    const fixed_stride: u8 = if (keys) |ks| expr_agg.fixedGroupStride(ks) orelse 0 else 0;
+    var merged = expr_agg.GroupTable.init(gpa, 0);
+    merged.shared = &ledger;
+    merged.fixed_stride = fixed_stride;
+    defer merged.deinit();
+    const tables = try pass.alloc(expr_agg.GroupTable, if (keys != null) source.count else 0);
+    for (tables) |*gt| {
+        gt.* = expr_agg.GroupTable.init(gpa, 0);
+        gt.shared = &ledger;
+        gt.fixed_stride = fixed_stride;
+    }
+    const chunk_accs = try pass.alloc([]expr_agg.Accumulator, if (keys == null) source.count else 0);
+    @memset(chunk_accs, &.{});
+    const accs = try pass.alloc(expr_agg.Accumulator, if (keys == null) calls.len else 0);
+    for (accs, 0..) |*acc, ci| acc.* = .init(calls[ci]);
+    var accs_owned = true;
+    defer if (accs_owned) owned_merge.freeOwnedAccumulatorStrings(gpa, accs);
+    const done = try pass.alloc(std.atomic.Value(bool), source.count);
+    @memset(done, .init(false));
+    const errs = try pass.alloc(?anyerror, source.count);
+    @memset(errs, null);
+    // Every field a chunk parses is one its calls, keys or filter read: each DECIMAL gets its scaled view.
+    const evaluated = try pass.alloc(bool, n);
+    for (evaluated, lookup) |*e, l| e.* = l != null;
+    var fold: Fold = .{
+        .gpa = gpa,
+        .calls = calls,
+        .keys = keys,
+        .filter = b.q.filter,
+        .lookup = lookup,
+        .evaluated = evaluated,
+        .chunk_accs = chunk_accs,
+        .accs = accs,
+        .tables = tables,
+        .merged = &merged,
+        .done = done,
+        .ahead = @max(1, workers),
+        .errs = errs,
+    };
+    defer fold.deinit();
+    source.fold = .{ .ctx = &fold, .scratch = scratch_charge.allocator(), .fold = Fold.foldErased };
+
+    const t_scan = nowMonoNs();
+    {
+        var threaded: std.Io.Threaded = .init(gpa, .{ .async_limit = .limited(@max(1, workers)) });
+        defer threaded.deinit();
+        const io = threaded.io();
+        const Task = struct {
+            fn stats(s: *Source, t_io: std.Io, i: usize) void {
+                s.stats[i] = csv_scan.chunkStats(s.plan.bytes[s.bound(i)..s.bound(i + 1)], s.plan.dialect.quote);
+                s.ready[i].set(t_io);
+            }
+            fn foldChunk(s: *Source, f: *Fold, t_io: std.Io, i: usize) void {
+                if (!f.awaitTurn(i)) return;
+                s.produce(t_io, null, i) catch |e| {
+                    if (!s.failed[i]) f.errs[i] = e;
+                    f.failFrom(i);
+                };
+            }
+        };
+        {
+            var group: std.Io.Group = .init;
+            for (0..source.count) |i| group.async(io, Task.stats, .{ &source, io, i });
+            group.await(io) catch {};
+        }
+        {
+            var group: std.Io.Group = .init;
+            for (0..source.count) |i| group.async(io, Task.foldChunk, .{ &source, &fold, io, i });
+            group.await(io) catch {};
+        }
+    }
+    t.decode_wall_ns = @intCast(nowMonoNs() - t_scan);
+    // The earliest chunk to stop says why, a refusal of its text or another error.
+    for (0..source.count) |i| {
+        if (source.failed[i]) {
+            report.failure = source.failures[i];
+            return switch (source.failures[i].kind) {
+                .malformed => error.CsvMalformed,
+                .field_count => error.CsvFieldCount,
+                .type_changed => error.CsvTypeChanged,
+                .pinned_type => error.CsvPinnedType,
+                .utf16 => error.CsvUtf16,
+                .empty => error.CsvEmpty,
+            };
+        }
+        if (errs[i]) |e| return e;
+    }
+
+    var output: scan.AggOutput = .{};
+    errdefer output.deinit(gpa);
+    var group_col_types: ?[]const scan.GroupColType = null;
+    if (keys) |ks| {
+        const outputs = b.q.outputs.?;
+        const key_types = try pass.alloc(key_decode.KeyType, ks.len);
+        for (ks, key_types) |k, *kt| kt.* = key_decode.keyTypeFromExpr(k);
+        const col_types = try pass.alloc(scan.GroupColType, outputs.len);
+        for (outputs, col_types) |out, *ct| ct.* = switch (out.source) {
+            .key => |k_idx| .{
+                .nullable = true,
+                .lane = switch (key_types[k_idx]) {
+                    .i64, .u64 => .i64,
+                    .f64 => .f64,
+                    .string => .string,
+                    .dec => .dec,
+                },
+                .dec = if (key_types[k_idx] == .dec) key_types[k_idx].dec else null,
+                .source = if (out.derived != null) null else if (ks[k_idx] == .col_ref)
+                    binding.leafSchemaElem(b.meta, ks[k_idx].col_ref.col_idx)
+                else
+                    owner_support.computedAnswer(ks[k_idx]),
+            },
+            .agg => |a_idx| scan.GroupColType.ofAgg(calls[a_idx], b.q.sources[a_idx]),
+        };
+        group_col_types = col_types;
+        const slots = try pass.alloc(MergedSlot, merged.groupCount());
+        for (slots, 0..) |*s, g| s.* = .{ .key = merged.keyAt(g), .first = merged.first.items[g], .idx = g };
+        if (!args.unordered) try slot_sort.sortSlotsByFirst(pass, slots, @max(1, workers));
+        var row_src: scan_rows.RowSource = .{
+            .slots = slots,
+            .outputs = outputs,
+            .calls = calls,
+            .key_types = key_types,
+            .key_exprs = ks,
+            .accs = merged.accumulators.items,
+            .folded = false,
+            .single = &merged,
+            .fixed_keys = merged.fixed_stride != 0,
+        };
+        const kept = scan_rows.pruneHaving(&row_src, slots, args.result_order.having);
+        row_src.slots = slots[0..kept];
+        const rows = try gpa.alloc([]const output_values.AggValue, kept);
+        @memset(rows, &.{});
+        output.group_rows = rows;
+        try scan_rows.buildGroupRows(gpa, &output.slab, row_src, rows, @max(1, workers));
+        const cols = try gpa.alloc([]const u8, outputs.len);
+        @memset(cols, "");
+        output.group_cols = cols;
+        for (outputs, cols) |out, *col| col.* = try gpa.dupe(u8, out.name);
+    } else {
+        const items = try gpa.alloc(output_values.AggOutputItem, calls.len);
+        @memset(items, .{ .alias = "", .value = .null_val });
+        output.aggs = items;
+        for (calls, items, accs) |call, *item, acc| {
+            item.alias = try gpa.dupe(u8, call.alias);
+            item.value = try scan.materializeOne(gpa, call, acc);
+        }
+    }
+
+    const rows_in: i64 = @intCast(source.rows.load(.monotonic));
+    var r: scan.MultiAggResult = .{
+        .files_in = 1,
+        .rows_in = rows_in,
+        .rows_scanned = rows_in,
+        .rows_matched = @intCast(fold.matched.load(.monotonic)),
+        .bytes_in = mapped.bytes.len,
+        .row_groups_in = 0,
+        .row_groups_pruned = 0,
+        .cols_stat_pruned = 0,
+        .timings = .{},
+        .output = output,
+        .state = .{
+            .accumulators = accs,
+            .agg_calls = calls,
+            .group_col_types = group_col_types,
+            .agg_sources = b.q.sources,
+        },
+    };
+    accs_owned = false;
+    const Check = struct {
+        mapped: local_fs.Mapped,
+        path: []const u8,
+        fn check(c: *const anyopaque) anyerror!void {
+            const self: *const @This() = @ptrCast(@alignCast(c));
+            try self.mapped.intact(self.path);
+        }
+    };
+    const check: Check = .{ .mapped = mapped, .path = path };
+    return aggregate.answerAggregate(ctx, pass, args, &r, &ledger, &t, .{}, .{ .ctx = &check, .check = Check.check }, null);
+}

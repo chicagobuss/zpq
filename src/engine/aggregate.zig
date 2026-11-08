@@ -187,6 +187,7 @@ const runPrintSink = engine_print.runPrintSink;
 const pageIndexTestChunk = engine_s3_rebase.pageIndexTestChunk;
 const profile_summary = @import("../profile_summary.zig");
 const csv_write = @import("csv_write.zig");
+const csv_agg = @import("csv_agg.zig");
 const fake_s3 = @import("../io/fake_s3.zig");
 
 pub fn runQuery(caller_ctx: Context, args: QueryArgs) !QueryResult {
@@ -194,9 +195,12 @@ pub fn runQuery(caller_ctx: Context, args: QueryArgs) !QueryResult {
     const span = profile.Span.begin(profile.threadOf(args.profiler, .main));
     defer span.end(.query, profile.args(.{}));
     if (args.inputs.len == 0) return error.NoInputs;
-    // A CSV input is written to Parquet whole; any other query reads the Parquet it writes.
-    if (try csv_write.queryInput(args)) |path|
+    // A CSV input is written to Parquet whole, filtered or projected, or aggregated during its parse (`csv_agg`).
+    if (try csv_write.csvInput(args)) |path| {
+        if (args.kind() != .rows) return .{ .aggregate = try csv_agg.query(ctx, args, path) };
+        _ = try csv_write.queryInput(args);
         return .{ .write = try csv_write.writeQuery(ctx, args, path, args.output.?) };
+    }
     if (args.kind() != .rows and (args.select != null or args.columns != null)) {
         return error.AggregateMutexWithSelect;
     }
@@ -511,6 +515,36 @@ fn executeAggregateOver(
     probed.add(r.membership);
     if (args.footer_resident_peak) |p| p.* = opened.footer_resident_peak;
 
+    const intact: Intact = .{ .ctx = &opened, .check = struct {
+        fn check(c: *const anyopaque) anyerror!void {
+            const o: *const engine_input.OpenedInputs = @ptrCast(@alignCast(c));
+            try o.intact();
+        }
+    }.check };
+    const fingerprint = if (metas) |ms| if (ms.len > 0) metadata.valuesFingerprint(ms[0].schema.items) else null else null;
+    return answerAggregate(ctx, arena, args, &r, &ledger, &t, probed, intact, fingerprint);
+}
+
+/// Where an aggregate's input is checked unchanged before its answer is printed (`OpenedInputs.intact`, or a CSV
+/// mapping's).
+pub const Intact = struct {
+    ctx: *const anyopaque,
+    check: *const fn (ctx: *const anyopaque) anyerror!void,
+};
+
+/// The answer of a scan's (or a CSV parse's, `csv_agg`) aggregate: the result program (HAVING, the SELECT list), then
+/// the Parquet file, columnar sink, text or aggregate sink the query asked for. Owns `r`'s state from here on.
+pub fn answerAggregate(
+    ctx: Context,
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    r: *scan.MultiAggResult,
+    ledger: *core_memory.SharedBudget,
+    t: *Timings,
+    probed: membership.Stats,
+    intact: Intact,
+    fingerprint: ?[16]u8,
+) !AggResult {
     defer r.state.deinit(ctx.gpa);
     errdefer r.output.deinit(ctx.gpa);
     // ORDER BY keys index the SELECT list then the hidden terms, which GROUP BY rows follow column for column; with
@@ -518,7 +552,7 @@ fn executeAggregateOver(
     const post = args.result_order.post;
     if (!post) if (r.output.group_cols) |cols| for (args.result_order.keys) |key| std.debug.assert(key.column < cols.len);
     const grouped = r.output.group_rows != null;
-    if (post and !grouped) try scalarAsRows(ctx.gpa, &r);
+    if (post and !grouped) try scalarAsRows(ctx.gpa, r);
     const program: ResultProgram = .{
         .grouped = grouped,
         .order = args.result_order,
@@ -540,15 +574,15 @@ fn executeAggregateOver(
 
     // 3. Optional 1-row parquet output. Aggregate output is local-only;
     //    S3 writes use the row-group streaming path.
-    var bytes_out = try writeAggregateParquet(ctx, arena, args, &r, n_aggs, &ledger, &t);
+    var bytes_out = try writeAggregateParquet(ctx, arena, args, r, n_aggs, ledger, t);
 
     if (args.columnar_sink) |cs| {
-        try exportAggregateColumns(ctx.gpa, arena, cs, r, n_aggs, args.empty_scalar);
+        try exportAggregateColumns(ctx.gpa, arena, cs, r.*, n_aggs, args.empty_scalar);
         releaseStreamAnswer(&r.output);
     }
 
     // Text used to print only after runQuery returned: preserve its input/error check before the first byte.
-    try opened.intact();
+    try intact.check(intact.ctx);
     if (args.output == null) if (args.text_output) |text| {
         t.output_started_ns = nowMonoNs();
         var writer: StdoutWriter = .{ .fd = text.fd, .sink = text.sink };
@@ -571,11 +605,11 @@ fn executeAggregateOver(
         .row_groups_full_match = r.row_groups_full_match,
         .cols_stat_pruned = r.cols_stat_pruned,
         .membership = probed,
-        .timings = t,
+        .timings = t.*,
         .output = r.output,
         .text_kinds = text_kinds,
         .answer_types = answer_types,
-        .schema_fingerprint = if (metas) |ms| if (ms.len > 0) metadata.valuesFingerprint(ms[0].schema.items) else null else null,
+        .schema_fingerprint = fingerprint,
     };
     if (args.output == null) if (args.aggregate_sink) |sink| {
         try sink.write_fn(sink.ctx, answer);

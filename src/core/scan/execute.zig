@@ -547,7 +547,7 @@ pub fn prepareAggregate(
     };
 }
 
-const BoundQueryPhase = struct {
+pub const BoundQueryPhase = struct {
     calls: []expr_agg.AggCall,
     filter: ?filter_ast.Filter,
     keys: ?[]const expr_ast.Expr,
@@ -579,7 +579,7 @@ fn validateAggregateSchemas(args: MultiAggArgs, metas: []const schema.FileMetaDa
     }
 }
 
-fn bindAggregateQuery(arena: std.mem.Allocator, args: MultiAggArgs, meta0: *const schema.FileMetaData) !BoundQueryPhase {
+pub fn bindAggregateQuery(arena: std.mem.Allocator, args: MultiAggArgs, meta0: *const schema.FileMetaData) !BoundQueryPhase {
     // 2. Parse aggregate + filter against meta0 (column indexes resolved
     //    against file 0; valid for all files because schemas match).
     const agg_calls: []expr_agg.AggCall = if (args.bound_aggregate) |bound|

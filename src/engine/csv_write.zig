@@ -337,6 +337,98 @@ fn isNull(t: csv_scan.Text, nulls: []const []const u8) bool {
 // ---------------------------------------------------------------- the chunks
 
 /// The window's piece source over a planned file: chunk `i` is bytes `[data_start + i * chunk, ...)`.
+/// The file's fields as a Parquet schema, which a query over it is bound to as a Parquet query is: every field of
+/// `all` (planned with no column list), each typed as `p` has it where `p` parses it.
+pub fn fileSchema(a: std.mem.Allocator, all: *const Plan, p: ?*const Plan) !*schema.FileMetaData {
+    var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
+    try items.append(a, .{
+        .name = "schema",
+        .type = null,
+        .repetition_type = null,
+        .type_length = null,
+        .num_children = @intCast(all.fields.len),
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    });
+    for (all.fields, 0..) |name, ci| {
+        const t = if (p) |pp| if (pp.slot[ci]) |o| pp.types[o] else all.types[ci] else all.types[ci];
+        try items.append(a, csv_types.schemaElement(name, t));
+    }
+    const meta = try a.create(schema.FileMetaData);
+    meta.* = .{
+        .version = 2,
+        .schema = items,
+        .num_rows = 0,
+        .created_by = schema.ZPQ_CREATED_BY,
+        .row_groups = .empty,
+    };
+    return meta;
+}
+
+/// A chunk's parsed columns as the batch filters, expressions and aggregates read (`lookup`: per field, its parsed
+/// position), and per field what an exact output takes in its place: a DECIMAL's unscaled integers (the lossless
+/// lane), where the batch has its scaled view. A DECIMAL no filter, expression or aggregate reads (`evaluated`) gets
+/// no view.
+pub const ChunkBatch = struct {
+    batch: filter_eval.Batch,
+    exact: []?filter_eval.Batch.Column,
+
+    pub fn of(
+        p: *const Plan,
+        parsed: *const consumer.OutputAggregator,
+        lookup: []const ?usize,
+        evaluated: []const bool,
+        scratch: std.mem.Allocator,
+    ) !ChunkBatch {
+        const rows = parsed.num_rows;
+        const cols = try scratch.alloc(filter_eval.Batch.Column, parsed.cols.len);
+        const exact = try scratch.alloc(?filter_eval.Batch.Column, lookup.len);
+        @memset(exact, null);
+        for (lookup, 0..) |l, ci| {
+            const k = l orelse continue;
+            const raw = consumer.bufRows(parsed.cols[k], 0, rows);
+            const t = p.types[k];
+            if (t.kind != .decimal) {
+                cols[k] = raw;
+                continue;
+            }
+            const unscaled: filter_eval.ColumnT(i128) = switch (raw) {
+                .i128 => |x| x,
+                .i64 => |x| blk: {
+                    const v = try scratch.alloc(i128, x.values.len);
+                    for (v, x.values) |*d, e| d.* = e;
+                    break :blk .{ .values = v, .def_levels = x.def_levels, .max_def = x.max_def, .has_nulls = x.has_nulls };
+                },
+                else => unreachable,
+            };
+            exact[ci] = .{ .i128 = unscaled };
+            // A DECIMAL only passed through is written from its integers, exactly; one a filter or an expression
+            // reads gets its scaled view too, as a Parquet DECIMAL decodes to one (`decimal.decodeColumnAsF64`). Past
+            // 18 digits it converts value by value from i128, as a FIXED_LEN_BYTE_ARRAY DECIMAL's does.
+            if (!evaluated[ci]) {
+                cols[k] = .{ .i128 = unscaled };
+                continue;
+            }
+            var view = if (raw == .i64)
+                try decimal_mod.scaledF64FromI128(scratch, unscaled, t.scale)
+            else blk: {
+                const v = try scratch.alloc(f64, unscaled.values.len);
+                for (v, unscaled.values) |*d, u| d.* = decimal_mod.applyScaleI128(u, t.scale);
+                break :blk filter_eval.ColumnT(f64){
+                    .values = v,
+                    .def_levels = unscaled.def_levels,
+                    .max_def = unscaled.max_def,
+                    .has_nulls = unscaled.has_nulls,
+                };
+            };
+            view.unscaled = .{ .i128 = unscaled.values };
+            cols[k] = .{ .f64 = view };
+        }
+        return .{ .batch = .{ .cols = cols, .num_rows = rows }, .exact = exact };
+    }
+};
+
 /// A filter or computed SELECT over the file, bound as a Parquet query is (`projection.planProjection`) against the
 /// file's columns as a schema: each chunk parses only the columns it reads (`fetch`), filters them, and writes its
 /// kept rows' outputs, as `consumer.ProjectedRG` writes a row group's.
@@ -379,31 +471,7 @@ pub const Projection = struct {
     /// Bound against every field of `all` (planned with no column list), each typed as `p` has it where `p` parses it.
     pub fn bind(a: std.mem.Allocator, args: QueryArgs, all: *const Plan, p: ?*const Plan) !Projection {
         const n = all.fields.len;
-        var items: std.ArrayListUnmanaged(schema.SchemaElement) = .empty;
-        try items.append(a, .{
-            .name = "schema",
-            .type = null,
-            .repetition_type = null,
-            .type_length = null,
-            .num_children = @intCast(n),
-            .scale = null,
-            .precision = null,
-            .field_id = null,
-        });
-        for (all.fields, 0..) |name, ci| {
-            const t = if (p) |pp| if (pp.slot[ci]) |o| pp.types[o] else all.types[ci] else all.types[ci];
-            try items.append(a, csv_types.schemaElement(name, t));
-        }
-        const meta = try a.create(schema.FileMetaData);
-        meta.* = .{
-            .version = 2,
-            .schema = items,
-            .num_rows = 0,
-            .created_by = schema.ZPQ_CREATED_BY,
-            .row_groups = .empty,
-        };
-        // A query bound as an aggregate (a GROUP BY, or a DISTINCT rewritten as one) needs more than a row at a time:
-        // refused by name, as `queryInput` refuses the ones its syntax shows.
+        const meta = try fileSchema(a, all, p);
         // A SQL query binds through a plan cache, as a Parquet query does (`QueryArgs.withPlanCache`); this one lives
         // with the projection, bound against this pass's types.
         const cache = try a.create(engine_types.bound_plan.Cache);
@@ -481,51 +549,10 @@ pub const Projection = struct {
         parsed: *const consumer.OutputAggregator,
         scratch: std.mem.Allocator,
     ) !void {
+        const cb = try ChunkBatch.of(p, parsed, pr.lookup, pr.evaluated, scratch);
+        const batch = cb.batch;
+        const pass = cb.exact;
         const rows = parsed.num_rows;
-        const cols = try scratch.alloc(filter_eval.Batch.Column, parsed.cols.len);
-        const pass = try scratch.alloc(?filter_eval.Batch.Column, pr.lookup.len);
-        @memset(pass, null);
-        for (pr.lookup, 0..) |l, ci| {
-            const k = l orelse continue;
-            const raw = consumer.bufRows(parsed.cols[k], 0, rows);
-            const t = p.types[k];
-            if (t.kind != .decimal) {
-                cols[k] = raw;
-                continue;
-            }
-            const unscaled: filter_eval.ColumnT(i128) = switch (raw) {
-                .i128 => |x| x,
-                .i64 => |x| blk: {
-                    const v = try scratch.alloc(i128, x.values.len);
-                    for (v, x.values) |*d, e| d.* = e;
-                    break :blk .{ .values = v, .def_levels = x.def_levels, .max_def = x.max_def, .has_nulls = x.has_nulls };
-                },
-                else => unreachable,
-            };
-            pass[ci] = .{ .i128 = unscaled };
-            // A DECIMAL only passed through is written from its integers, exactly; one a filter or an expression
-            // reads gets its scaled view too, as a Parquet DECIMAL decodes to one (`decimal.decodeColumnAsF64`). Past
-            // 18 digits it converts value by value from i128, as a FIXED_LEN_BYTE_ARRAY DECIMAL's does.
-            if (!pr.evaluated[ci]) {
-                cols[k] = .{ .i128 = unscaled };
-                continue;
-            }
-            var view = if (raw == .i64)
-                try decimal_mod.scaledF64FromI128(scratch, unscaled, t.scale)
-            else blk: {
-                const v = try scratch.alloc(f64, unscaled.values.len);
-                for (v, unscaled.values) |*d, u| d.* = decimal_mod.applyScaleI128(u, t.scale);
-                break :blk filter_eval.ColumnT(f64){
-                    .values = v,
-                    .def_levels = unscaled.def_levels,
-                    .max_def = unscaled.max_def,
-                    .has_nulls = unscaled.has_nulls,
-                };
-            };
-            view.unscaled = .{ .i128 = unscaled.values };
-            cols[k] = .{ .f64 = view };
-        }
-        const batch: filter_eval.Batch = .{ .cols = cols, .num_rows = rows };
         var sel = try filter_selection.SelectionVector.init(scratch, rows);
         if (pr.filter) |f| try filter_eval.evaluate(f, &batch, &sel, pr.lookup, scratch);
         const surviving = sel.count();
@@ -568,6 +595,15 @@ pub const Source = struct {
     opts: Options = .{},
     /// A filter or computed SELECT: each chunk's fields are parsed into scratch and its kept rows projected.
     proj: ?*const Projection = null,
+    /// An aggregate: each chunk's fields are parsed into scratch on `scratch` and handed to `fold` (`csv_agg`).
+    fold: ?Fold = null,
+
+    pub const Fold = struct {
+        ctx: *anyopaque,
+        scratch: std.mem.Allocator,
+        /// Chunk `i`'s parsed columns, on `scratch_alloc`, freed when it returns.
+        fold: *const fn (ctx: *anyopaque, p: *const Plan, parsed: *const consumer.OutputAggregator, scratch_alloc: std.mem.Allocator, i: usize) anyerror!void,
+    };
 
     pub fn init(a: std.mem.Allocator, p: *const Plan, chunk: usize) !Source {
         const data = p.bytes.len - p.data_start;
@@ -609,7 +645,7 @@ pub const Source = struct {
         return s.count *| per_chunk +| s.elems.len * per_column;
     }
 
-    fn bound(s: *const Source, i: usize) usize {
+    pub fn bound(s: *const Source, i: usize) usize {
         return @min(s.plan.bytes.len, s.plan.data_start + i * s.chunk);
     }
 
@@ -695,12 +731,14 @@ pub const Source = struct {
         var builder: Builder = undefined;
         // Under a projection the fields are parsed into scratch, on the piece's ledger-backed allocator, and only the
         // kept rows' outputs go into the piece (`project`).
+        // An aggregate's chunks (`fold`) parse into scratch too, folded and freed chunk by chunk.
         var parse_state: ?std.heap.ArenaAllocator = null;
         defer if (parse_state) |*ps| ps.deinit();
         var parsed: consumer.OutputAggregator = undefined;
         if (piece) |pc| if (s.proj != null) {
             parse_state = .init(pc.arena.child_allocator);
         };
+        if (s.fold) |f| parse_state = .init(f.scratch);
         const a: std.mem.Allocator = if (parse_state) |*ps| ps.allocator() else if (piece) |pc|
             pc.arena.allocator()
         else
@@ -708,9 +746,10 @@ pub const Source = struct {
         const agg: *consumer.OutputAggregator = if (piece) |pc| (if (s.proj != null) &parsed else &pc.agg) else &parsed;
         const seen: []Type = if (s.classify) s.seen[i * nout ..][0..nout] else &.{};
         if (s.classify) @memset(seen, .{});
-        if (piece) |_| try builder.init(a, agg, s, span.hi - span.lo);
+        const parses = piece != null or s.fold != null;
+        if (parses) try builder.init(a, agg, s, span.hi - span.lo);
         if (span.lo >= span.hi) {
-            if (piece) |pc| try s.finishPiece(&builder, a, agg, pc, i);
+            if (parses) try s.finish(&builder, a, agg, piece, i);
             return;
         }
         const ascii = !hasHighBit(bytes[span.lo..span.hi]);
@@ -797,19 +836,21 @@ pub const Source = struct {
             .malformed = .inconsistent_quotes,
             .offset = span.hi,
         }, span.lines, lo_b);
-        if (piece) |pc| try s.finishPiece(&builder, a, agg, pc, i);
+        if (parses) try s.finish(&builder, a, agg, piece, i);
     }
 
-    /// The chunk's columns done: the piece holds them, or, under a projection, the outputs of its kept rows.
-    fn finishPiece(
+    /// The chunk's columns done: the piece holds them, or, under a projection, the outputs of its kept rows; or an
+    /// aggregate folds them (`fold`).
+    fn finish(
         s: *Source,
         builder: *Builder,
         a: std.mem.Allocator,
         agg: *consumer.OutputAggregator,
-        pc: *window_mod.Piece,
+        piece: ?*window_mod.Piece,
         i: usize,
     ) !void {
         try builder.finish(a, agg, s, i);
+        const pc = piece orelse return s.fold.?.fold(s.fold.?.ctx, s.plan, agg, a, i);
         if (s.proj) |pr| try pr.project(s.plan, pc, agg, a);
         pc.bits_prefix = try consumer.plainBitsPrefix(pc.arena.allocator(), &pc.agg);
     }
@@ -1088,7 +1129,7 @@ fn columnLane(t: Type) std.meta.Tag(consumer.OutputAggregator.ColumnBuf) {
 
 /// Chunk size: small enough that a window of chunks per worker stays well inside the budget, large enough that
 /// per-chunk work (a quote count, a record search, a piece) is noise. Never changes the output's bytes.
-fn chunkBytes(opts: Options, args: QueryArgs, workers: usize, file_bytes: usize) usize {
+pub fn chunkBytes(opts: Options, args: QueryArgs, workers: usize, file_bytes: usize) usize {
     if (opts.chunk_bytes) |c| return @max(c, 1);
     const per_worker = args.max_memory / 16 / @max(1, workers);
     return std.math.clamp(@min(per_worker, file_bytes / @max(1, workers) + 1), 256 << 10, 4 << 20);
@@ -1221,7 +1262,7 @@ pub fn run(
 }
 
 /// Every chunk's types, joined: the quote parities first (each chunk alone), then every chunk's records.
-fn classifyFile(
+pub fn classifyFile(
     ctx: Context,
     arena: std.mem.Allocator,
     p: *const Plan,
@@ -1576,6 +1617,25 @@ pub const QueryError = error{ CsvQueryNotSupported, CsvOneInput, CsvMixedInputs 
 /// The CSV input of a query, or null when its inputs are Parquet. A CSV input is converted whole to Parquet
 /// (`zpq query data.csv -o data.parquet`): one file, no filter, selection or aggregate.
 pub fn queryInput(args: QueryArgs) !?[]const u8 {
+    const path = (try csvInput(args)) orelse return null;
+    // Written whole, by column, or filtered and projected row by row (`Projection`). An aggregate folds during the
+    // parse (`csv_agg`); anything else that needs more than one row at a time (a sort, a cut) is refused.
+    if (args.output == null or args.aggregate != null or args.group_by != null or
+        args.column_order != null or args.result_order.keys.len > 0 or args.result_order.rows.len > 0 or
+        args.result_order.limit != null or args.result_order.offset != 0)
+        return error.CsvQueryNotSupported;
+    if (args.columns != null and args.select != null) return error.CsvQueryNotSupported;
+    if (args.plan_source) |ps| {
+        // SQL: the statement's own syntax, a SELECT list with or without a WHERE.
+        const q = syntax_plan.syntaxOf(ps) orelse return error.CsvQueryNotSupported;
+        if (q.aggregate or q.calls.len > 0 or q.join != null or q.keys != null or q.row_keys.len > 0 or q.hidden.len > 0)
+            return error.CsvQueryNotSupported;
+    }
+    return path;
+}
+
+/// The CSV input of a query, or null when its inputs are Parquet: one file, never beside another input.
+pub fn csvInput(args: QueryArgs) !?[]const u8 {
     if (args.inputs.len == 0) return null;
     var csv: ?[]const u8 = null;
     for (args.inputs) |in| {
@@ -1590,19 +1650,6 @@ pub fn queryInput(args: QueryArgs) !?[]const u8 {
     }
     const path = csv orelse return null;
     if (args.inputs.len > 1) return error.CsvMixedInputs;
-    // Written whole, by column, or filtered and projected row by row (`Projection`): anything that needs more than
-    // one row at a time (an aggregate, a sort, a cut) reads the Parquet it writes.
-    if (args.output == null or args.aggregate != null or args.group_by != null or
-        args.column_order != null or args.result_order.keys.len > 0 or args.result_order.rows.len > 0 or
-        args.result_order.limit != null or args.result_order.offset != 0)
-        return error.CsvQueryNotSupported;
-    if (args.columns != null and args.select != null) return error.CsvQueryNotSupported;
-    if (args.plan_source) |ps| {
-        // SQL: the statement's own syntax, a SELECT list with or without a WHERE.
-        const q = syntax_plan.syntaxOf(ps) orelse return error.CsvQueryNotSupported;
-        if (q.aggregate or q.calls.len > 0 or q.join != null or q.keys != null or q.row_keys.len > 0 or q.hidden.len > 0)
-            return error.CsvQueryNotSupported;
-    }
     return path;
 }
 
@@ -1673,7 +1720,7 @@ pub fn writeQuery(ctx: Context, args: QueryArgs, path: []const u8, out_path: []c
 }
 
 /// A refusal's place and reason, for the frontend's message.
-fn describe(d: *Diag, args: QueryArgs, path: []const u8, err: anyerror, report: *const Report) void {
+pub fn describe(d: *Diag, args: QueryArgs, path: []const u8, err: anyerror, report: *const Report) void {
     const f = &report.failure;
     d.input = path;
     const reason: []const u8 = switch (err) {

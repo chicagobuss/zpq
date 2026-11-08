@@ -138,6 +138,7 @@ pub const RecordSink = target_module.RecordSink;
 
 const scan_module = @import("consumer/scan.zig");
 pub const scanRGForAgg = scan_module.scanRGForAgg;
+pub const foldGroupedBatch = scan_module.foldGroupedBatch;
 pub const probeDecodeFailure = scan_module.probeDecodeFailure;
 pub const canonicalDecodeFailure = scan_module.canonicalDecodeFailure;
 const automaticCacheRows = scan_module.automaticCacheRows;

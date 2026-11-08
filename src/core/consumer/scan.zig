@@ -115,7 +115,7 @@ fn emitRecords(
 /// Group keys and aggregates over the rows `sel` kept. A sparse selection is gathered first, so `resolveBatch`
 /// walks survivors and each group's first row stays the original ordinal (`pos + ordinals[i]`). A sketch clears
 /// the caller's selection as it counts, which a gathered copy would not, so that path keeps the mask.
-fn foldGroupedBatch(
+pub fn foldGroupedBatch(
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
     resolver: *expr_agg.GroupKeyResolver,

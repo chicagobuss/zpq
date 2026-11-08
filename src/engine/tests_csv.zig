@@ -422,10 +422,16 @@ test "csv query: inputs are told apart by content, then by name, and a CSV is wr
     const r = try runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .csv_report = &report, .csv_report_alloc = a });
     try testing.expectEqual(@as(i64, 2), r.write.rows_matched);
     try testing.expectEqualStrings("b", report.names[1]);
-    // Anything but a whole conversion reads the Parquet it writes.
+    // Anything but a whole conversion, a filter or projection, or an aggregate reads the Parquet it writes.
     // A filter writes the rows it keeps (`csv_write.Projection`).
     try testing.expectEqual(@as(i64, 1), (try runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .filter = "a > 1" })).write.rows_matched);
-    try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .aggregate = "count(*)" }));
+    // An aggregate folds during the parse (`csv_agg`); one that orders or cuts its answer is refused by name.
+    {
+        var answer = try runQuery(ctx, .{ .inputs = &.{csv}, .aggregate = "count(*)" });
+        defer answer.deinit(testing.allocator);
+        try testing.expectEqual(@as(i128, 2), answer.aggregate.output.aggs[0].value.i);
+    }
+    try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .aggregate = "count(*)", .group_by = "a", .result_order = .{ .limit = 1 } }));
     // The Parquet it wrote, renamed .csv, is still Parquet: content first.
     try std.Io.Dir.cwd().copyFile(out, std.Io.Dir.cwd(), disguised, testing.io, .{});
     try testing.expectEqual(csv_write.InputFormat.parquet, try csv_write.inputFormat(disguised, .auto));
@@ -496,7 +502,7 @@ test "csv query: a column projection writes the columns named, in order, and fra
     try testing.expectEqual(@as(u64, 3), diag.detail.csv.line);
 }
 
-test "csv query: SQL over a CSV is a column list, a filter or expressions, or a refusal, never a dropped clause" {
+test "csv query: SQL over a CSV is a column list, a filter, expressions or an aggregate, or a refusal, never a dropped clause" {
     const sql = @import("../core/expr/sql_parser.zig");
     if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
     const syntax_plan = @import("syntax_plan.zig");
@@ -523,8 +529,6 @@ test "csv query: SQL over a CSV is a column list, a filter or expressions, or a 
         .{ .text = "SELECT a AS z FROM 's.csv'", .names = &.{"a"} },
         .{ .text = "SELECT a FROM 's.csv' ORDER BY a", .names = null },
         .{ .text = "SELECT a FROM 's.csv' LIMIT 1", .names = null },
-        .{ .text = "SELECT DISTINCT a FROM 's.csv'", .names = null },
-        .{ .text = "SELECT count(*) FROM 's.csv'", .names = null },
     }) |case| {
         const parsed = try sql.parseSqlPlan(testing.allocator, case.text);
         defer parsed.deinit(testing.allocator);
@@ -546,6 +550,33 @@ test "csv query: SQL over a CSV is a column list, a filter or expressions, or a 
         try testing.expectEqual(case.rows, r.write.rows_matched);
         try testing.expectEqual(want.len, report.names.len);
         for (want, report.names) |w, n| try testing.expectEqualStrings(w, n);
+    }
+    // An aggregate folds during the parse (`csv_agg`): a count, a DISTINCT bound as a GROUP BY, a GROUP BY; ORDER BY
+    // and LIMIT over its groups are refused by name.
+    const Agg = struct { text: []const u8, groups: ?usize, count: ?i128 = null };
+    for ([_]Agg{
+        .{ .text = "SELECT count(*) FROM 's.csv'", .groups = null, .count = 2 },
+        .{ .text = "SELECT DISTINCT a FROM 's.csv'", .groups = 2 },
+        .{ .text = "SELECT b, sum(a) AS s FROM 's.csv' GROUP BY b", .groups = 2 },
+        .{ .text = "SELECT b, sum(a) AS s FROM 's.csv' GROUP BY b ORDER BY b", .groups = 0 },
+        .{ .text = "SELECT b, sum(a) AS s FROM 's.csv' GROUP BY b LIMIT 1", .groups = 0 },
+    }) |case| {
+        const parsed = try sql.parseSqlPlan(testing.allocator, case.text);
+        defer parsed.deinit(testing.allocator);
+        const args: engine_types.QueryArgs = .{
+            .inputs = &.{csv},
+            .plan_source = syntax_plan.source(parsed.syntax.?),
+            .select_cols = parsed.select_cols,
+            .result_order = parsed.result_order,
+        };
+        if (case.groups == 0) {
+            try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, args));
+            continue;
+        }
+        var r = try runQuery(ctx, args);
+        defer r.deinit(testing.allocator);
+        if (case.groups) |g| try testing.expectEqual(g, r.aggregate.output.group_rows.?.len);
+        if (case.count) |c| try testing.expectEqual(c, r.aggregate.output.aggs[0].value.i);
     }
 }
 

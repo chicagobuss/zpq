@@ -1368,6 +1368,7 @@ fn evalCall(
         .strlen => return evalStrlen(arena, batch, column_lookup, c.args[0].*),
         .make_date => return if (c.args.len == 3) evalMakeDate3(arena, batch, column_lookup, c) else evalTemporal(arena, batch, column_lookup, c),
         .epoch_ms, .date_trunc, .date_part => return evalTemporal(arena, batch, column_lookup, c),
+        .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => return evalEpoch(arena, batch, column_lookup, c),
         .date_diff => return evalDateDiff(arena, batch, column_lookup, c),
         .strftime => return evalStrftime(arena, batch, column_lookup, c),
         .regexp_replace => return evalRegexpReplace(arena, batch, column_lookup, c, false),
@@ -1376,7 +1377,13 @@ fn evalCall(
         .length => return evalLength(arena, batch, column_lookup, c.args[0].*),
         .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract => return evalStringFn(arena, batch, column_lookup, c),
         .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp => return evalCast(arena, batch, column_lookup, c),
-        .floor, .ceil, .sqrt, .round => return evalMath(arena, batch, column_lookup, c),
+        .floor, .ceil, .sqrt, .round, .trunc => return evalMath(arena, batch, column_lookup, c),
+        .math => return evalMathFn(arena, batch, column_lookup, c),
+        .str_test, .regexp_matches => return evalStringTest(arena, batch, column_lookup, c),
+        .strpos => return evalStrpos(arena, batch, column_lookup, c),
+        .concat_ws => return evalConcatWs(arena, batch, column_lookup, c),
+        .date_name, .last_day => return evalDateName(arena, batch, column_lookup, c),
+        .sign => return evalSign(arena, batch, column_lookup, c),
         .least, .greatest => return evalLeastGreatest(arena, batch, column_lookup, c),
     }
 }
@@ -1655,6 +1662,141 @@ fn evalStringFn(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []
     return .{ .string = .{ .values = values, .def_levels = s.def_levels, .max_def = s.max_def, .has_nulls = s.has_nulls } };
 }
 
+/// `starts_with`, `ends_with`, `contains` and `regexp_matches` of a text against a constant: a BOOLEAN lane (0 or 1) that is
+/// NULL where the text is. A coded column is tested once per dictionary entry.
+fn evalStringTest(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const arg = try stringArgument(arena, batch, column_lookup, c.args[0].*);
+    const s = arg.s;
+    var scratch: regex.Scratch = .init(arena);
+    const needle: []const u8 = if (c.func == .str_test) c.args[1].literal.str else "";
+    const tested: []const []const u8 = if (s.codes != null) s.dict else s.values;
+    const results = try arena.alloc(i64, tested.len);
+    for (tested, results, 0..) |text, *r, i| {
+        r.* = 0;
+        // A NULL or unselected row's text is a placeholder.
+        if (s.codes == null and (rowIsNull(arg.col, i) or (batch.sel != null and !batch.sel.?.isActive(i)))) continue;
+        r.* = @intFromBool(if (c.func == .str_test) c.str_test.?.holds(text, needle) else try c.match.?.apply(&scratch, text));
+    }
+    const out = if (s.codes) |codes| blk: {
+        const o = try arena.alloc(i64, codes.len);
+        for (codes, o) |code, *x| x.* = if (code < results.len) results[code] else 0;
+        break :blk o;
+    } else results;
+    return .{ .i64 = .{ .values = out, .def_levels = s.def_levels, .max_def = s.max_def, .has_nulls = s.has_nulls } };
+}
+
+const day_names = [_][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+const month_names = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
+
+fn isInfiniteTime(unit: ast.Temporal, v: i64) bool {
+    return if (unit == .date) v == std.math.maxInt(i32) or v == -std.math.maxInt(i32) else v == std.math.maxInt(i64) or v == -std.math.maxInt(i64);
+}
+
+/// `dayname(t)`, `monthname(t)` and `last_day(t)`; an infinite time is NULL.
+fn evalDateName(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const arg = c.args[0].*;
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    if (col != .i64) return error.TypeMismatch;
+    const in = col.i64;
+    if (in.max_rep > 0) return error.NestedNotSupported;
+    const unit = arg.temporal().?;
+    const n = in.values.len;
+    const def = try arena.alloc(u32, n);
+    const names: [][]const u8 = if (c.func == .date_name) try arena.alloc([]const u8, n) else &.{};
+    const days: []i64 = if (c.func == .last_day) try arena.alloc(i64, n) else &.{};
+    var any_null = false;
+    for (0..n) |i| {
+        def[i] = 0;
+        if (c.func == .date_name) names[i] = "" else days[i] = 0;
+        if (rowIsNull(col, i) or isInfiniteTime(unit, in.values[i])) {
+            any_null = true;
+            continue;
+        }
+        const v = in.values[i];
+        if (c.func == .date_name) {
+            names[i] = switch (c.part.?) {
+                .dow => day_names[@intCast(try calendar.part(.dow, unit, v))],
+                else => month_names[@intCast(try calendar.part(.month, unit, v) - 1)],
+            };
+        } else {
+            const day = try temporalCast(true, unit, arg.isUtc(), false, v);
+            const civil = calendar.civilFromDays(day);
+            const next = if (civil.m == 12) calendar.daysFromCivil(civil.y + 1, 1, 1) else calendar.daysFromCivil(civil.y, civil.m + 1, 1);
+            // The first day of the next month must be a DATE, as DuckDB computes it.
+            if (next > std.math.maxInt(i32) - 1) {
+                if (batch.sel != null and !batch.sel.?.isActive(i)) {
+                    any_null = true;
+                    continue;
+                }
+                return error.ConversionOutOfRange;
+            }
+            days[i] = next - 1;
+        }
+        def[i] = 1;
+    }
+    if (c.func == .date_name) return .{ .string = .{ .values = names, .def_levels = def, .max_def = 1, .has_nulls = any_null } };
+    return .{ .i64 = .{ .values = days, .def_levels = def, .max_def = 1, .has_nulls = any_null } };
+}
+
+/// `strpos(s, 'x')`: the 1-based character position of the first `x`, 0 for none; an empty `x` is at 1.
+fn evalStrpos(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const arg = try stringArgument(arena, batch, column_lookup, c.args[0].*);
+    const s = arg.s;
+    const needle = c.args[1].literal.str;
+    const tested: []const []const u8 = if (s.codes != null) s.dict else s.values;
+    const results = try arena.alloc(i64, tested.len);
+    for (tested, results) |text, *r| {
+        r.* = if (std.mem.indexOf(u8, text, needle)) |at| @intCast(charCount(text[0..at]) + 1) else 0;
+    }
+    const out = if (s.codes) |codes| blk: {
+        const o = try arena.alloc(i64, codes.len);
+        for (codes, o) |code, *x| x.* = if (code < results.len) results[code] else 0;
+        break :blk o;
+    } else results;
+    return .{ .i64 = .{ .values = out, .def_levels = s.def_levels, .max_def = s.max_def, .has_nulls = s.has_nulls } };
+}
+
+/// `concat_ws('sep', a, b, ...)`: the non-NULL arguments joined by the separator, empty where all are NULL.
+fn evalConcatWs(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const sep = c.args[0].literal.str;
+    const n = batch.num_rows;
+    const parts = try arena.alloc(StringRows, c.args.len - 1);
+    for (c.args[1..], parts) |a, *p| p.* = try stringRows(arena, batch, column_lookup, a.*);
+    var bytes: std.ArrayList(u8) = .empty;
+    const ends = try arena.alloc(usize, n);
+    for (0..n) |i| {
+        var first = true;
+        for (parts) |p| {
+            if (rowIsNull(p.col, i)) continue;
+            if (!first) try bytes.appendSlice(arena, sep);
+            try bytes.appendSlice(arena, p.values[i]);
+            first = false;
+        }
+        ends[i] = bytes.items.len;
+    }
+    const values = try arena.alloc([]const u8, n);
+    var start: usize = 0;
+    for (values, ends) |*v, end| {
+        v.* = bytes.items[start..end];
+        start = end;
+    }
+    return .{ .string = .{ .values = values } };
+}
+
+const StringRows = struct { col: Batch.Column, values: []const []const u8 };
+
+/// The text of every row of a text argument, a coded column expanded.
+fn stringRows(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, a: ast.Expr) Error!StringRows {
+    const arg = try stringArgument(arena, batch, column_lookup, a);
+    const s = arg.s;
+    if (s.codes) |codes| {
+        const out = try arena.alloc([]const u8, codes.len);
+        for (codes, out) |code, *o| o.* = if (code < s.dict.len) s.dict[code] else "";
+        return .{ .col = arg.col, .values = out };
+    }
+    return .{ .col = arg.col, .values = s.values };
+}
+
 /// `length(s)`: characters of each text, once per dictionary entry where the chunk is coded.
 fn evalLength(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, arg_expr: ast.Expr) Error!Batch.Column {
     const arg = try stringArgument(arena, batch, column_lookup, arg_expr);
@@ -1822,6 +1964,7 @@ fn evalMath(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
             r.* = switch (c.func) {
                 .floor => @divFloor(x, divisor),
                 .ceil => -@divFloor(-x, divisor),
+                .trunc => @divTrunc(x, divisor),
                 else => ast.roundDecimal(x, spec.scale, digits) catch {
                     if (quietDecimalRow(batch, rows.nulls, i)) {
                         r.* = 0;
@@ -1840,7 +1983,7 @@ fn evalMath(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
     switch (col) {
         .i64 => |in| {
             if (in.max_rep > 0) return error.NestedNotSupported;
-            if (c.func == .round) return col;
+            if (c.func == .round or c.func == .trunc) return col;
             const out = try arena.alloc(f64, n);
             for (in.values, out) |v, *r| {
                 const x: f64 = @floatFromInt(v);
@@ -1855,9 +1998,112 @@ fn evalMath(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
                 .sqrt => @sqrt(v),
                 .floor => @floor(v),
                 .ceil => @ceil(v),
+                .trunc => @trunc(v),
                 else => ast.roundDouble(v, digits),
             };
             return f64Column(out, in.def_levels, in.max_def, in.has_nulls);
+        },
+        else => return error.TypeMismatch,
+    }
+}
+
+const libm = struct {
+    extern "c" fn cbrt(x: f64) f64;
+    extern "c" fn asin(x: f64) f64;
+    extern "c" fn acos(x: f64) f64;
+    extern "c" fn atan(x: f64) f64;
+    extern "c" fn sinh(x: f64) f64;
+    extern "c" fn cosh(x: f64) f64;
+    extern "c" fn tanh(x: f64) f64;
+    extern "c" fn atan2(y: f64, x: f64) f64;
+};
+
+/// `x` and `y` through the C library's function, as DuckDB calls it (`MathFn` names the ones it agrees with).
+fn mathOf(m: ast.MathFn, x: f64, y: f64) f64 {
+    return switch (m) {
+        .cbrt => libm.cbrt(x),
+        .asin => libm.asin(x),
+        .acos => libm.acos(x),
+        .atan => libm.atan(x),
+        .sinh => libm.sinh(x),
+        .cosh => libm.cosh(x),
+        .tanh => libm.tanh(x),
+        .degrees => x * (180.0 / std.math.pi),
+        .radians => x * (std.math.pi / 180.0),
+        .atan2 => libm.atan2(x, y),
+    };
+}
+
+/// One argument of a `math` call as doubles: integers and DECIMALs convert, a DOUBLE is as it is.
+fn doubleArg(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, a: ast.Expr) Error!struct { values: []const f64, nulls: Batch.Column } {
+    const n = batch.num_rows;
+    if (a.typeOf() == .dec) {
+        const spec = a.decSpec().?;
+        const rows = try decRows(arena, batch, column_lookup, a, spec.scale);
+        const vals = try arena.alloc(f64, n);
+        for (rows.v, vals) |x, *r| r.* = ast.decimalToDouble(x, spec.scale);
+        return .{ .values = vals, .nulls = rows.nulls orelse .{ .f64 = .{ .values = &.{} } } };
+    }
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, a);
+    switch (col) {
+        .i64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            const vals = try arena.alloc(f64, n);
+            for (in.values, vals) |v, *r| r.* = @floatFromInt(v);
+            return .{ .values = vals, .nulls = col };
+        },
+        .f64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            return .{ .values = in.values, .nulls = col };
+        },
+        else => return error.TypeMismatch,
+    }
+}
+
+/// `ln`, `exp`, `pow`, ... of numbers: a row is NULL if any argument is.
+fn evalMathFn(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const n = batch.num_rows;
+    const first = try doubleArg(arena, batch, column_lookup, c.args[0].*);
+    const second = if (c.args.len == 2) try doubleArg(arena, batch, column_lookup, c.args[1].*) else null;
+    const out = try arena.alloc(f64, n);
+    const def = try arena.alloc(u32, n);
+    var any_null = false;
+    for (out, def, 0..) |*o, *d, i| {
+        if (rowIsNull(first.nulls, i) or (second != null and rowIsNull(second.?.nulls, i))) {
+            o.* = 0;
+            d.* = 0;
+            any_null = true;
+            continue;
+        }
+        o.* = mathOf(c.math.?, first.values[i], if (second) |sc| sc.values[i] else 0);
+        d.* = 1;
+    }
+    return f64Column(out, def, 1, any_null);
+}
+
+/// `sign(x)`: -1, 0 or 1, 0 for NaN and either zero.
+fn evalSign(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const arg = c.args[0].*;
+    const n = batch.num_rows;
+    const out = try arena.alloc(i64, n);
+    if (arg.typeOf() == .dec) {
+        const spec = arg.decSpec().?;
+        const rows = try decRows(arena, batch, column_lookup, arg, spec.scale);
+        for (rows.v, out) |x, *r| r.* = if (x > 0) 1 else if (x < 0) -1 else 0;
+        const def = rows.def;
+        return .{ .i64 = .{ .values = out, .def_levels = def, .max_def = if (def != null) 1 else 0, .has_nulls = def != null } };
+    }
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    switch (col) {
+        .i64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            for (in.values, out) |v, *r| r.* = if (v > 0) 1 else if (v < 0) -1 else 0;
+            return .{ .i64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
+        },
+        .f64 => |in| {
+            if (in.max_rep > 0) return error.NestedNotSupported;
+            for (in.values, out) |v, *r| r.* = if (v > 0) 1 else if (v < 0) -1 else 0;
+            return .{ .i64 = .{ .values = out, .def_levels = in.def_levels, .max_def = in.max_def, .has_nulls = in.has_nulls } };
         },
         else => return error.TypeMismatch,
     }
@@ -2238,6 +2484,106 @@ fn evalDateDiff(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []
     return .{ .i64 = .{ .values = out, .def_levels = def, .max_def = 1, .has_nulls = any_null } };
 }
 
+/// The count `func` (`to_epoch_ms`, `_us` or `_ns`) gives for the time `v` counted in `unit`, as DuckDB 2.0 counts it, or
+/// null for an infinite time. A DATE counts its own days (an error where microseconds or nanoseconds overflow); a
+/// TIMESTAMP_MS and a TIMESTAMP_NS reach microseconds first (milliseconds exactly, nanoseconds to the nearest, a tie
+/// away from zero), and milliseconds round half away from zero from those; only a TIMESTAMP_NS gives its own
+/// nanoseconds.
+fn epochCount(func: ast.Func, unit: ast.Temporal, v: i64) error{ConversionOutOfRange}!?i64 {
+    if (unit == .date) {
+        if (v == std.math.maxInt(i32) or v == -std.math.maxInt(i32)) return null;
+        return switch (func) {
+            .to_epoch_ms => v * (us_per_day / 1000),
+            .to_epoch_us => std.math.mul(i64, v, us_per_day) catch error.ConversionOutOfRange,
+            .to_epoch_ns => std.math.mul(i64, v, ns_per_day) catch error.ConversionOutOfRange,
+            else => unreachable,
+        };
+    }
+    if (v == std.math.maxInt(i64) or v == -std.math.maxInt(i64)) return null;
+    if (func == .to_epoch_ns and unit == .ts_ns) return v;
+    const us: i64 = switch (unit) {
+        .ts_us => v,
+        .ts_ms => std.math.mul(i64, v, 1000) catch return error.ConversionOutOfRange,
+        .ts_ns => roundDivAway(v, 1000),
+        .date => unreachable,
+    };
+    return switch (func) {
+        .to_epoch_us => us,
+        // DuckDB goes through TIMESTAMP_MS and back, so a count whose microseconds do not fit is an error.
+        .to_epoch_ms => blk: {
+            const ms = roundDivAway(us, 1000);
+            _ = std.math.mul(i64, ms, 1000) catch return error.ConversionOutOfRange;
+            break :blk ms;
+        },
+        .to_epoch_ns => std.math.mul(i64, us, 1000) catch error.ConversionOutOfRange,
+        else => unreachable,
+    };
+}
+
+/// `epoch(t)`: the seconds since the epoch as a double, a TIMESTAMP's microseconds over a million and a DATE's days times
+/// a day's seconds; null for an infinite time.
+fn epochSeconds(unit: ast.Temporal, utc: bool, v: i64) error{ConversionOutOfRange}!?f64 {
+    if (unit == .date) {
+        if (v == std.math.maxInt(i32) or v == -std.math.maxInt(i32)) return null;
+        return @as(f64, @floatFromInt(v)) * 86_400.0;
+    }
+    const us = (try epochCount(.to_epoch_us, unit, v)) orelse return null;
+    // A TIMESTAMP WITH TIME ZONE adds its whole milliseconds, over a thousand, to the rest of its microseconds, over a million.
+    // The rest is the floor remainder: `ms * 1000` is past the minimum for the earliest finite times.
+    if (utc) {
+        const ms = @divFloor(us, 1000);
+        return @as(f64, @floatFromInt(ms)) / 1000.0 + @as(f64, @floatFromInt(@mod(us, 1000))) / 1e6;
+    }
+    return @as(f64, @floatFromInt(us)) / 1e6;
+}
+
+/// `epoch`, `epoch_ms`, `epoch_us` and `epoch_ns` of a time. An infinite time is NULL; a row a selection leaves out
+/// raises no error.
+fn evalEpoch(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
+    const arg = c.args[0].*;
+    const col = try evalGroupKeyExpr(arena, batch, column_lookup, arg);
+    if (col != .i64) return error.TypeMismatch;
+    const in = col.i64;
+    if (in.max_rep > 0) return error.NestedNotSupported;
+    const unit = arg.temporal().?;
+    const n = in.values.len;
+    const def = try arena.alloc(u32, n);
+    const ints: []i64 = if (c.func == .epoch) &.{} else try arena.alloc(i64, n);
+    const floats: []f64 = if (c.func == .epoch) try arena.alloc(f64, n) else &.{};
+    var any_null = false;
+    for (0..n) |i| {
+        def[i] = 0;
+        if (c.func == .epoch) floats[i] = 0 else ints[i] = 0;
+        if (rowIsNull(col, i)) {
+            any_null = true;
+            continue;
+        }
+        const got: ?union(enum) { i: i64, f: f64 } = blk: {
+            if (c.func == .epoch) {
+                const r = epochSeconds(unit, arg.isUtc(), in.values[i]) catch |err| {
+                    if (batch.sel != null and !batch.sel.?.isActive(i)) break :blk null;
+                    return err;
+                };
+                break :blk if (r) |f| .{ .f = f } else null;
+            }
+            const r = epochCount(c.func, unit, in.values[i]) catch |err| {
+                if (batch.sel != null and !batch.sel.?.isActive(i)) break :blk null;
+                return err;
+            };
+            break :blk if (r) |k| .{ .i = k } else null;
+        };
+        if (got) |g| {
+            switch (g) {
+                .i => |k| ints[i] = k,
+                .f => |f| floats[i] = f,
+            }
+            def[i] = 1;
+        } else any_null = true;
+    }
+    if (c.func == .epoch) return .{ .f64 = .{ .values = floats, .def_levels = def, .max_def = 1, .has_nulls = any_null } };
+    return .{ .i64 = .{ .values = ints, .def_levels = def, .max_def = 1, .has_nulls = any_null } };
+}
+
 const roundDivAway = calendar.roundDivAway;
 
 /// `CAST(v AS DATE)` (`to_date`) or `CAST(v AS TIMESTAMP)` of `v` counted in `unit`, as DuckDB 2.0 casts it. A day is the
@@ -2273,6 +2619,42 @@ fn temporalCast(to_date: bool, unit: ast.Temporal, utc: bool, check_min: bool, v
     };
     if (check_min and unit == .ts_ms and !to_date and us < ts_min_us) return error.ConversionOutOfRange;
     return if (to_date) @divFloor(us, us_per_day) else us;
+}
+
+test "epoch counts and seconds are DuckDB 2.0.0's, an infinite time is NULL" {
+    const T = std.testing;
+    const inf = std.math.maxInt(i64);
+    try T.expectEqual(@as(?i64, 1577836800123), try epochCount(.to_epoch_ms, .ts_us, 1577836800123456));
+    try T.expectEqual(@as(?i64, 0), try epochCount(.to_epoch_ms, .ts_us, -1));
+    try T.expectEqual(@as(?i64, 1), try epochCount(.to_epoch_ms, .ts_us, 500));
+    try T.expectEqual(@as(?i64, -1), try epochCount(.to_epoch_ms, .ts_us, -500));
+    // Nanoseconds reach microseconds first, then milliseconds, each half away from zero.
+    try T.expectEqual(@as(?i64, 0), try epochCount(.to_epoch_ms, .ts_ns, 499_499));
+    try T.expectEqual(@as(?i64, 1), try epochCount(.to_epoch_ms, .ts_ns, 499_500));
+    try T.expectEqual(@as(?i64, -1), try epochCount(.to_epoch_us, .ts_ns, -500));
+    try T.expectEqual(@as(?i64, 1577836800123456789), try epochCount(.to_epoch_ns, .ts_ns, 1577836800123456789));
+    try T.expectEqual(@as(?i64, 1577836800000), try epochCount(.to_epoch_ms, .date, 18262));
+    try T.expectEqual(@as(?i64, null), try epochCount(.to_epoch_us, .ts_us, inf));
+    try T.expectEqual(@as(?i64, null), try epochCount(.to_epoch_ms, .date, std.math.maxInt(i32)));
+    // What does not fit, or cannot go back to microseconds, is an error.
+    try T.expectError(error.ConversionOutOfRange, epochCount(.to_epoch_us, .date, 200_000_000));
+    try T.expectError(error.ConversionOutOfRange, epochCount(.to_epoch_ns, .ts_us, 9_223_372_036_854_776));
+    try T.expectError(error.ConversionOutOfRange, epochCount(.to_epoch_ms, .ts_us, 9_223_372_036_854_775_500));
+    try T.expectEqual(@as(?f64, 1577836800.123456), try epochSeconds(.ts_us, false, 1577836800123456));
+    try T.expectEqual(@as(?f64, -1e-06), try epochSeconds(.ts_us, false, -1));
+    try T.expectEqual(@as(?f64, 1577836800.0), try epochSeconds(.date, false, 18262));
+    // A UTC-adjusted time adds its whole milliseconds, over a thousand, to the rest of its microseconds, over a million.
+    try T.expectEqual(@as(?f64, 4724991793.3989935), try epochSeconds(.ts_us, true, 4724991793398994));
+    try T.expectEqual(@as(?f64, 4724991793.398994), try epochSeconds(.ts_us, false, 4724991793398994));
+    try T.expectEqual(@as(?f64, null), try epochSeconds(.ts_us, false, -inf));
+    // The earliest finite times: `ms * 1000` of the floor quotient is past the minimum there, the remainder is not.
+    try T.expectEqual(@as(?f64, -9223372036854.775), try epochSeconds(.ts_us, true, -9223372036854775806));
+    try T.expectEqual(@as(?f64, -9223372036854.775), try epochSeconds(.ts_us, true, -9223372036854775805));
+    try T.expectEqual(@as(?f64, -9223372036854.773), try epochSeconds(.ts_us, true, -9223372036854775001));
+    try T.expectEqual(@as(?f64, -9223372036854.775), try epochSeconds(.ts_us, true, -9223372036854775000));
+    try T.expectEqual(@as(?f64, -9223372036854.775), try epochSeconds(.ts_us, false, -9223372036854775806));
+    try T.expectEqual(@as(?f64, null), try epochSeconds(.ts_us, true, -inf));
+    try T.expectEqual(@as(?f64, 9223372036854.775), try epochSeconds(.ts_us, true, 9223372036854775806));
 }
 
 test "negating a DOUBLE flips its sign bit, a zero's and a NaN's included" {
@@ -2592,7 +2974,7 @@ fn evalTemporal(
                 }
             }.f, t),
         },
-        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest => unreachable,
+        .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .math, .sign, .trunc, .str_test, .regexp_matches, .strpos, .concat_ws, .date_name, .last_day => unreachable,
     }
     return .{ .i64 = .{
         .values = out,

@@ -319,6 +319,15 @@ pub const Func = enum {
     make_date,
     /// `epoch_ms(ms)`: the TIMESTAMP `ms` milliseconds after the epoch, held in microseconds as DuckDB holds it.
     epoch_ms,
+    /// `epoch(t)`, which `date_part('epoch', t)` and `EXTRACT(epoch FROM t)` are: the seconds since the epoch of a DATE or
+    /// TIMESTAMP, a DOUBLE; NULL for an infinite time.
+    epoch,
+    /// `epoch_ms(t)`, `epoch_us(t)` and `epoch_ns(t)` of a DATE or TIMESTAMP: the count since the epoch in that unit, a
+    /// BIGINT (milliseconds rounded half away from zero); NULL for an infinite time. (`epoch_ms` of an integer is
+    /// `epoch_ms` above, the TIMESTAMP.)
+    to_epoch_ms,
+    to_epoch_us,
+    to_epoch_ns,
     /// `date_trunc('part', t)`: `t` floored to the part, a TIMESTAMP in microseconds (a DATE argument too, as DuckDB).
     date_trunc,
     /// `date_part('part', t)`, which `EXTRACT(part FROM t)` is: the part's BIGINT value.
@@ -388,6 +397,85 @@ pub const Func = enum {
     /// are), numbers only; NaN is above every number.
     least,
     greatest,
+    /// A DOUBLE function of one or two numbers, which `Call.math` names (`cbrt`, `atan2`, ...). Integers and DECIMALs
+    /// convert to DOUBLE first, as DuckDB's overloads do; the result is a DOUBLE, NaN or infinite where the C library's is.
+    math,
+    /// `sign(x)`: -1, 0 or 1 as DuckDB's TINYINT, 0 for NaN and the zeros.
+    sign,
+    /// `trunc(x)`: toward zero. A DOUBLE gives a DOUBLE, a DECIMAL(p, s) DECIMAL(p, 0), an integer itself.
+    trunc,
+    /// `starts_with(s, 'x')`, `ends_with`, `contains` (and `prefix`, `suffix`), which `Call.str_test` names: a BOOLEAN of
+    /// a text against a constant text; NULL for NULL.
+    str_test,
+    /// `regexp_matches(s, 'pattern' [, 'options'])`: whether the pattern matches anywhere in the text, a BOOLEAN.
+    regexp_matches,
+    /// `dayname(t)` and `monthname(t)` (`Call.part` is `dow` or `month`): the English name of a DATE's or TIMESTAMP's day of
+    /// the week or month; NULL for an infinite time.
+    date_name,
+    /// `last_day(t)`: the last day of the month of a DATE or TIMESTAMP, a DATE; NULL for an infinite time, an error past
+    /// DuckDB's last DATE.
+    last_day,
+    /// `strpos(s, 'x')` / `instr`: the 1-based character position of the first `x` in `s`, 0 where there is none, a BIGINT.
+    strpos,
+    /// `concat_ws('sep', a, b, ...)`: the non-NULL texts joined by the constant separator; empty where all are NULL.
+    concat_ws,
+};
+
+/// The string tests `Func.str_test` stands for.
+pub const StrTest = enum {
+    starts_with,
+    ends_with,
+    contains,
+
+    pub fn parse(name: []const u8) ?StrTest {
+        const table = [_]struct { name: []const u8, test_: StrTest }{
+            .{ .name = "starts_with", .test_ = .starts_with },
+            .{ .name = "prefix", .test_ = .starts_with },
+            .{ .name = "ends_with", .test_ = .ends_with },
+            .{ .name = "suffix", .test_ = .ends_with },
+            .{ .name = "contains", .test_ = .contains },
+        };
+        for (table) |t| if (std.ascii.eqlIgnoreCase(name, t.name)) return t.test_;
+        return null;
+    }
+
+    pub fn holds(self: StrTest, text: []const u8, needle: []const u8) bool {
+        return switch (self) {
+            .starts_with => std.mem.startsWith(u8, text, needle),
+            .ends_with => std.mem.endsWith(u8, text, needle),
+            .contains => std.mem.indexOf(u8, text, needle) != null,
+        };
+    }
+};
+
+/// The DOUBLE functions `Func.math` stands for: the ones whose C-library results DuckDB 2.0.0's agree with on millions of
+/// fuzzed inputs. `ln`, `log2`, `log10`, `exp`, `sin`, `cos`, `tan` and `pow` are not here: DuckDB's differ from a current
+/// C library's in the last digit for a few percent of inputs (and in the sign of a NaN), and `pow(-8, 27)` is twice what
+/// it should be, so they are refused as unknown functions.
+pub const MathFn = enum {
+    cbrt,
+    asin,
+    acos,
+    atan,
+    sinh,
+    cosh,
+    tanh,
+    degrees,
+    radians,
+    atan2,
+
+    pub fn arity(self: MathFn) usize {
+        return switch (self) {
+            .atan2 => 2,
+            else => 1,
+        };
+    }
+
+    pub fn parse(name: []const u8) ?MathFn {
+        var buf: [8]u8 = undefined;
+        if (name.len > buf.len) return null;
+        return std.meta.stringToEnum(MathFn, std.ascii.lowerString(&buf, name));
+    }
 };
 
 /// What an integer value stands for in time, so the date/time functions read it in its unit. Output keeps printing
@@ -483,6 +571,12 @@ pub const Call = struct {
     int: ?IntType = null,
     /// A `TRY_CAST`: a value that does not convert is NULL, not an error.
     lenient: bool = false,
+    /// Which DOUBLE function a `math` call is.
+    math: ?MathFn = null,
+    /// Which test a `str_test` call is.
+    str_test: ?StrTest = null,
+    /// `regexp_matches`'s pattern and options, compiled from its literal arguments.
+    match: ?*const regex.Match = null,
 };
 
 /// Searched `CASE WHEN cond THEN value ... [ELSE value] END`: per row, the first WHEN whose condition is TRUE gives
@@ -733,9 +827,13 @@ pub const Expr = union(enum) {
                 }
                 break :blk any;
             },
-            .call => |c| c.func == .coalesce and for (c.args) |a| {
-                if (!a.isBoolean()) break false;
-            } else true,
+            .call => |c| switch (c.func) {
+                .str_test, .regexp_matches => true,
+                .coalesce => for (c.args) |a| {
+                    if (!a.isBoolean()) break false;
+                } else true,
+                else => false,
+            },
         };
     }
 
@@ -777,7 +875,14 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .floor, .ceil, .sqrt, .round => c.args[0].mayBeNull(),
+                .strlen, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .floor, .ceil, .sqrt, .round, .sign, .trunc => c.args[0].mayBeNull(),
+                .math => for (c.args) |a| {
+                    if (a.mayBeNull()) break true;
+                } else false,
+                .str_test, .regexp_matches, .strpos => c.args[0].mayBeNull(),
+                // Infinite times give NULL whatever the columns say.
+                .date_name, .last_day => true,
+                .concat_ws => false,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp => c.lenient or c.args[0].mayBeNull(),
                 // Any of the three can be NULL (a literal year over a nullable month).
                 .make_date => for (c.args) |a| {
@@ -785,7 +890,7 @@ pub const Expr = union(enum) {
                 } else false,
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
                 // Infinite times give NULL whatever the columns say.
-                .date_diff => true,
+                .date_diff, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => true,
                 .coalesce, .least, .greatest => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;
                 } else true,
@@ -1236,4 +1341,19 @@ test "an expression's FLOAT typing as DuckDB binds it" {
     try std.testing.expectEqual(Expr.Float32.computed, call.of(.round, &.{&f}).float32());
     try std.testing.expectEqual(Expr.Float32.none, call.bin(&f, &d).float32());
     try std.testing.expectEqual(Expr.Float32.none, call.of(.cast_double, &.{&f}).float32());
+}
+
+test "the math functions offered are the ones DuckDB's results agree with, and the string tests hold as it does" {
+    const T = std.testing;
+    try T.expectEqual(MathFn.atan2, MathFn.parse("ATAN2").?);
+    try T.expectEqual(@as(usize, 2), MathFn.atan2.arity());
+    for ([_][]const u8{ "ln", "log", "log2", "log10", "exp", "sin", "cos", "tan", "pow", "power" }) |name|
+        try T.expect(MathFn.parse(name) == null);
+    try T.expectEqual(StrTest.starts_with, StrTest.parse("PREFIX").?);
+    try T.expectEqual(StrTest.ends_with, StrTest.parse("suffix").?);
+    try T.expect(StrTest.contains.holds("abc", ""));
+    try T.expect(StrTest.starts_with.holds("", ""));
+    try T.expect(!StrTest.ends_with.holds("abc", "abcd"));
+    try T.expect(!StrTest.contains.holds("ABC", "b"));
+    try T.expect(StrTest.contains.holds("aéb", "é"));
 }

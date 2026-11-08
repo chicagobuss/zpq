@@ -78,7 +78,8 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8) Error!?setops.Compound 
 
     if (callsGrouping(c.having) or callsGrouping(c.tail)) return error.GroupingSetsGrouping;
     var leaves: std.ArrayList([]const u8) = .empty;
-    for (sets.items) |set| try leaves.append(arena, try leaf(arena, text, c, items, keys.items, set.items));
+    const qualifier = fromQualifier(text[c.from_start..c.where_end]);
+    for (sets.items) |set| try leaves.append(arena, try leaf(arena, text, c, items, keys.items, set.items, qualifier));
 
     // UNION ALL, left to right.
     var root: *const setops.Node = blk: {
@@ -93,7 +94,66 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8) Error!?setops.Compound 
         bin.* = .{ .bin = .{ .op = .union_all, .left = root, .right = right } };
         root = bin;
     }
-    return .{ .leaves = leaves.items, .root = root, .tail = try setops.normalizeTail(arena, c.tail) };
+    return .{ .leaves = leaves.items, .root = root, .tail = try setops.normalizeTail(arena, try withoutQualifier(arena, c.tail, qualifier)) };
+}
+
+/// What the FROM clause lets a column be qualified with: the alias of the one table, else the file's own name.
+fn fromQualifier(from: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    const first = setops.wordAt(from, 0);
+    i = first.len;
+    while (i < from.len and std.ascii.isWhitespace(from[i])) i += 1;
+    if (i >= from.len) return null;
+    var path: []const u8 = undefined;
+    if (from[i] == '\'' or from[i] == '"') {
+        const end = setops.quotedEnd(from, i);
+        path = from[i + 1 .. end - 1];
+        i = end;
+    } else {
+        path = setops.wordAt(from, i);
+        i += path.len;
+    }
+    const next = setops.nextWord(from, i);
+    var word = next.word;
+    if (setops.eql(word, "as")) word = setops.nextWord(from, next.end).word;
+    const keywords = [_][]const u8{ "where", "group", "having", "order", "limit", "offset", "join", "inner", "left", "cross", "window", "qualify", "union" };
+    if (word.len > 0) for (keywords) |k| if (std.ascii.eqlIgnoreCase(word, k)) {
+        word = "";
+        break;
+    };
+    if (word.len > 0) return word;
+    const base = std.fs.path.basename(path);
+    return if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
+}
+
+/// `text` without `qualifier.` before a name: the final query reads scratch files, where the table has no name.
+fn withoutQualifier(arena: std.mem.Allocator, text: []const u8, qualifier: ?[]const u8) ![]const u8 {
+    const q = qualifier orelse return text;
+    if (q.len == 0 or text.len == 0) return text;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = text[i];
+        if (ch == '\'' or ch == '"') {
+            const end = setops.quotedEnd(text, i);
+            try out.appendSlice(arena, text[i..end]);
+            i = end;
+            continue;
+        }
+        if (setops.startsWord(text, i)) {
+            const w = setops.wordAt(text, i);
+            if (std.ascii.eqlIgnoreCase(w, q) and i + w.len < text.len and text[i + w.len] == '.') {
+                i += w.len + 1;
+                continue;
+            }
+            try out.appendSlice(arena, w);
+            i += w.len;
+            continue;
+        }
+        try out.append(arena, ch);
+        i += 1;
+    }
+    return out.items;
 }
 
 const Clauses = struct {
@@ -242,7 +302,7 @@ fn callsGrouping(text: []const u8) bool {
 /// aggregate's arguments is the aggregate over no rows (`min(k) FILTER (WHERE k IS NULL AND k IS NOT NULL)`), NULL in the
 /// key's type; `HAVING a IS NOT NULL` then drops the grand-total row, as DuckDB's does. A mention inside a call
 /// (`count(a)`, `sum(a)`) is the column itself.
-fn havingForSet(arena: std.mem.Allocator, having: []const u8, keys: []const Key, set: []const usize) Error![]const u8 {
+fn havingForSet(arena: std.mem.Allocator, having: []const u8, keys: []const Key, set: []const usize, qualifier: ?[]const u8) Error![]const u8 {
     var absent = false;
     for (keys, 0..) |k, i| if (k.column != null and std.mem.indexOfScalar(usize, set, i) == null) {
         absent = true;
@@ -292,10 +352,16 @@ fn havingForSet(arena: std.mem.Allocator, having: []const u8, keys: []const Key,
                 break :blk after.len > 0 and after[0] == '(';
             };
             var replaced = false;
-            if (!skip and !followed_by_call and !preceded_by_dot) for (keys, 0..) |k, ki| {
+            if (!skip and !followed_by_call) for (keys, 0..) |k, ki| {
                 const col = k.column orelse continue;
                 if (std.mem.indexOfScalar(usize, set, ki) != null) continue;
                 if (!std.ascii.eqlIgnoreCase(w, k.name)) continue;
+                if (preceded_by_dot) {
+                    // The table's own qualifier before the dot is part of the mention.
+                    const q = qualifier orelse continue;
+                    if (out.items.len < q.len + 1 or !std.ascii.eqlIgnoreCase(out.items[out.items.len - 1 - q.len .. out.items.len - 1], q)) continue;
+                    out.shrinkRetainingCapacity(out.items.len - 1 - q.len);
+                }
                 try out.print(arena, "min({s}) FILTER (WHERE {s} IS NULL AND {s} IS NOT NULL)", .{ col, col, col });
                 replaced = true;
                 break;
@@ -515,7 +581,7 @@ fn quote(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
 }
 
 /// The SELECT for `set`.
-fn leaf(arena: std.mem.Allocator, text: []const u8, c: Clauses, items: []const Item, keys: []const Key, set: []const usize) Error![]const u8 {
+fn leaf(arena: std.mem.Allocator, text: []const u8, c: Clauses, items: []const Item, keys: []const Key, set: []const usize, qualifier: ?[]const u8) Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(arena, "SELECT ");
     for (items, 0..) |item, n| {
@@ -548,7 +614,7 @@ fn leaf(arena: std.mem.Allocator, text: []const u8, c: Clauses, items: []const I
     }
     if (c.having.len > 0) {
         try out.append(arena, ' ');
-        try out.appendSlice(arena, try havingForSet(arena, c.having, keys, set));
+        try out.appendSlice(arena, try havingForSet(arena, c.having, keys, set, qualifier));
     }
     return out.items;
 }
@@ -637,4 +703,17 @@ test "the tail of a grouping query is the SELECT grammar's, and a key a set leav
     try testing.expectEqualStrings("SELECT count(*) AS n FROM t GROUP BY a HAVING a IS NOT NULL AND count(a) > 1 AND sum(a) > 3 OR (a + 1) > 2", h.leaves[0]);
     const nul = "min(a) FILTER (WHERE a IS NULL AND a IS NOT NULL)";
     try testing.expectEqualStrings("SELECT count(*) AS n FROM t HAVING " ++ nul ++ " IS NOT NULL AND count(a) > 1 AND sum(a) > 3 OR (" ++ nul ++ " + 1) > 2", h.leaves[1]);
+}
+
+test "the query's own table name is dropped from the tail that runs over scratch files" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const r = (try expand(a, "SELECT t.g, count(*) AS c FROM 'dir/in.parquet' t WHERE t.id > 1 GROUP BY ROLLUP (t.g) ORDER BY t.g NULLS FIRST, c")).?;
+    try testing.expectEqualStrings("ORDER BY g NULLS FIRST, c", r.tail);
+    try testing.expectEqualStrings("SELECT t.g, count(*) AS c FROM 'dir/in.parquet' t WHERE t.id > 1 GROUP BY t.g", r.leaves[0]);
+    const f = (try expand(a, "SELECT in.g, count(*) AS c FROM 'dir/in.parquet' GROUP BY ROLLUP (in.g) ORDER BY in.g")).?;
+    try testing.expectEqualStrings("ORDER BY g", f.tail);
+    const q = (try expand(a, "SELECT g, count(*) AS c FROM 'x.parquet' AS tt GROUP BY ROLLUP (g) ORDER BY 'tt.g', tt.c")).?;
+    try testing.expectEqualStrings("ORDER BY 'tt.g', c", q.tail);
 }

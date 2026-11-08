@@ -87,7 +87,9 @@
     "review-u-d",
     "review-dec-f",
     "review-dec-d",
-    "review-uniq"
+    "review-uniq",
+    "review-rdec-f",
+    "review-rdec-d"
    ]
   }
  ],
@@ -1222,12 +1224,12 @@
    }
   },
   {
-   "id": "join:refuse:snowflake-cycle",
+   "id": "join:residual:snowflake-cycle",
    "fixture": "fact",
    "cli": [
     "query",
     "--query",
-    "SELECT gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.q = g.gk GROUP BY gname"
+    "SELECT gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.q = g.gk GROUP BY gname ORDER BY gname"
    ],
    "axes": [
     {
@@ -1235,11 +1237,24 @@
     },
     {
      "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
     }
    ],
-   "refuse": {
-    "error": "exit 1",
-    "diag": "a join condition reads both tables beyond its one key equality"
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.q = g.gk GROUP BY gname ORDER BY gname"
    }
   },
   {
@@ -1767,6 +1782,265 @@
      "key",
      "n"
     ]
+   }
+  },
+  {
+   "id": "join:residual:cycle-across-chain-and-star",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT gname, sgrp, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND d.grp = g.gk AND f.sfk = x.spk AND g.gk = x.sgrp GROUP BY gname, sgrp ORDER BY gname, sgrp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT gname, sgrp, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND d.grp = g.gk AND f.sfk = x.spk AND g.gk = x.sgrp GROUP BY gname, sgrp ORDER BY gname, sgrp"
+   }
+  },
+  {
+   "id": "join:residual:cycle-on-the-probe",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT gname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.q = g.gk GROUP BY gname ORDER BY gname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT gname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.q = g.gk GROUP BY gname ORDER BY gname"
+   }
+  },
+  {
+   "id": "join:residual:probe-against-build",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT kind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND f.q > d.grp GROUP BY kind ORDER BY kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT kind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND f.q > d.grp GROUP BY kind ORDER BY kind"
+   }
+  },
+  {
+   "id": "join:residual:or-across-tables",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT kind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND (d.w > 5000 OR f.amt < 2000) GROUP BY kind ORDER BY kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT kind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND (d.w > 5000 OR f.amt < 2000) GROUP BY kind ORDER BY kind"
+   }
+  },
+  {
+   "id": "join:residual:expression",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT grp, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND f.amt * 2 > d.w + f.id GROUP BY grp ORDER BY grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT grp, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND f.amt * 2 > d.w + f.id GROUP BY grp ORDER BY grp"
+   }
+  },
+  {
+   "id": "join:residual:group-join",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, kind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND f.q < d.grp GROUP BY f.fk, kind ORDER BY s DESC, f.fk LIMIT 10"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, kind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND f.q < d.grp GROUP BY f.fk, kind ORDER BY s DESC, f.fk LIMIT 10"
+   }
+  },
+  {
+   "id": "join:residual:beside-own-filters",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND d.grp = g.gk AND f.sfk = x.spk AND g.grk <> x.sgrp AND d.w > 100 AND f.q < 6 AND x.sgrp < 2 GROUP BY gname ORDER BY gname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:dim_sparse}' x WHERE f.fk = d.pk AND d.grp = g.gk AND f.sfk = x.spk AND g.grk <> x.sgrp AND d.w > 100 AND f.q < 6 AND x.sgrp < 2 GROUP BY gname ORDER BY gname"
+   }
+  },
+  {
+   "id": "join:refuse:residual-on-left",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT kind, count(*) AS n FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.q > d.grp GROUP BY kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a condition outside a LEFT JOIN's ON reads its table"
    }
   },
   {
@@ -3772,7 +4046,7 @@
    }
   },
   {
-   "id": "join:refuse:expr-across-tables",
+   "id": "join:residual:expr-across-tables",
    "fixture": "fact",
    "cli": [
     "query",
@@ -3787,9 +4061,239 @@
      "jobs": 4
     }
    ],
-   "refuse": {
-    "error": "exit 1",
-    "diag": "a join condition reads both tables beyond its one key equality"
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.amt > d.w"
+   }
+  },
+  {
+   "id": "review:jr1:decimal-residual-and-sum",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(f.p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' f JOIN '{fixture:review-rdec-d}' d ON f.fk = d.pk WHERE f.p > d.w"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 1,
+     "max_memory": "256K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(f.p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' f JOIN '{fixture:review-rdec-d}' d ON f.fk = d.pk WHERE f.p > d.w"
+   }
+  },
+  {
+   "id": "review:jr1:decimal-residual-or-grouped-sum",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, sum(f.p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' f JOIN '{fixture:review-rdec-d}' d ON f.fk = d.pk WHERE f.p > d.w OR f.p < 0 GROUP BY f.fk ORDER BY f.fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 1,
+     "max_memory": "256K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, sum(f.p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' f JOIN '{fixture:review-rdec-d}' d ON f.fk = d.pk WHERE f.p > d.w OR f.p < 0 GROUP BY f.fk ORDER BY f.fk"
+   }
+  },
+  {
+   "id": "review:jr1:single-table-columns",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p > fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 1,
+     "max_memory": "256K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p > fk"
+   }
+  },
+  {
+   "id": "review:jr1:single-table-arithmetic",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p * 1 > 0"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 1,
+     "max_memory": "256K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p * 1 > 0"
+   }
+  },
+  {
+   "id": "review:jr1:single-table-or",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p > fk OR p < 0"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 1,
+     "max_memory": "256K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p > fk OR p < 0"
    }
   }
  ]

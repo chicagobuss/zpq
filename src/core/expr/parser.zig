@@ -756,6 +756,9 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "strlen")) return .strlen;
     if (asciiEqIgnoreCase(name, "make_date")) return .make_date;
     if (asciiEqIgnoreCase(name, "epoch_ms")) return .epoch_ms;
+    if (asciiEqIgnoreCase(name, "epoch")) return .epoch;
+    if (asciiEqIgnoreCase(name, "epoch_us")) return .to_epoch_us;
+    if (asciiEqIgnoreCase(name, "epoch_ns")) return .to_epoch_ns;
     if (asciiEqIgnoreCase(name, "date_trunc")) return .date_trunc;
     if (asciiEqIgnoreCase(name, "date_part") or asciiEqIgnoreCase(name, "datepart")) return .date_part;
     if (asciiEqIgnoreCase(name, "regexp_replace")) return .regexp_replace;
@@ -779,6 +782,15 @@ pub fn resolveFunc(name: []const u8) ?ast.Func {
     if (asciiEqIgnoreCase(name, "floor")) return .floor;
     if (asciiEqIgnoreCase(name, "ceil") or asciiEqIgnoreCase(name, "ceiling")) return .ceil;
     if (asciiEqIgnoreCase(name, "sqrt")) return .sqrt;
+    if (ast.StrTest.parse(name) != null) return .str_test;
+    if (asciiEqIgnoreCase(name, "regexp_matches")) return .regexp_matches;
+    if (asciiEqIgnoreCase(name, "dayname") or asciiEqIgnoreCase(name, "monthname")) return .date_name;
+    if (asciiEqIgnoreCase(name, "last_day")) return .last_day;
+    if (asciiEqIgnoreCase(name, "strpos") or asciiEqIgnoreCase(name, "instr")) return .strpos;
+    if (asciiEqIgnoreCase(name, "concat_ws")) return .concat_ws;
+    if (asciiEqIgnoreCase(name, "sign")) return .sign;
+    if (asciiEqIgnoreCase(name, "trunc")) return .trunc;
+    if (ast.MathFn.parse(name) != null) return .math;
     if (asciiEqIgnoreCase(name, "round")) return .round;
     if (asciiEqIgnoreCase(name, "least")) return .least;
     if (asciiEqIgnoreCase(name, "greatest")) return .greatest;
@@ -876,6 +888,13 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             if (a.typeOf() != .i64 or a.temporal() != null or a.isBoolean()) return error.TypeMismatch;
             return .i64;
         },
+        .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => {
+            if (args.len != 1) return error.WrongArity;
+            const t = args[0].temporal() orelse return error.TypeMismatch;
+            // DuckDB has no epoch of a TIMESTAMPTZ_NS (UTC-adjusted nanoseconds).
+            if (t == .ts_ns and args[0].isUtc()) return error.TypeMismatch;
+            return if (func == .epoch) .f64 else .i64;
+        },
         .date_trunc, .date_part => {
             if (args.len != 2) return error.WrongArity;
             if (args[0].* != .literal or args[0].literal != .str) return error.TypeMismatch;
@@ -963,6 +982,49 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
             if (args.len != 1) return error.WrongArity;
             if (!plainNumber(args[0].*)) return error.TypeMismatch;
             return .f64;
+        },
+        .math => {
+            if (args.len == 0) return error.WrongArity;
+            for (args) |a| if (!plainNumber(a.*)) return error.TypeMismatch;
+            return .f64;
+        },
+        .date_name, .last_day => {
+            if (args.len != 1) return error.WrongArity;
+            const t = args[0].temporal() orelse return error.TypeMismatch;
+            if (t == .ts_ns and args[0].isUtc()) return error.TypeMismatch;
+            return if (func == .date_name) .str else .i64;
+        },
+        .strpos => {
+            if (args.len != 2) return error.WrongArity;
+            if (args[0].typeOf() != .str or !isStrLiteral(args[1].*)) return error.TypeMismatch;
+            return .i64;
+        },
+        .concat_ws => {
+            if (args.len < 2) return error.WrongArity;
+            if (!isStrLiteral(args[0].*)) return error.TypeMismatch;
+            for (args[1..]) |a| if (a.typeOf() != .str) return error.TypeMismatch;
+            return .str;
+        },
+        .str_test => {
+            if (args.len != 2) return error.WrongArity;
+            if (args[0].typeOf() != .str or !isStrLiteral(args[1].*)) return error.TypeMismatch;
+            return .i64;
+        },
+        .regexp_matches => {
+            if (args.len != 2 and args.len != 3) return error.WrongArity;
+            if (args[0].typeOf() != .str) return error.TypeMismatch;
+            for (args[1..]) |a| if (!isStrLiteral(a.*)) return error.TypeMismatch;
+            return .i64;
+        },
+        .sign => {
+            if (args.len != 1) return error.WrongArity;
+            if (!plainNumber(args[0].*)) return error.TypeMismatch;
+            return .i64;
+        },
+        .trunc => {
+            if (args.len != 1) return error.WrongArity;
+            if (!plainNumber(args[0].*)) return error.TypeMismatch;
+            return args[0].typeOf();
         },
         // The digits are a constant, as DuckDB's DECIMAL form needs; an integer rounds to tens and up only in its own
         // type, which zpq does not resolve for an expression, so it is refused there.
@@ -1523,8 +1585,9 @@ fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
             return arithInt(file, b.left.*, b.right.*);
         },
         .call => |c| switch (c.func) {
-            .abs, .cast_i8, .cast_i16, .cast_i32, .cast_i64 => return c.int,
-            .strlen, .length, .date_part, .date_diff => return .i64,
+            .abs, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .sign => return c.int,
+            .trunc => return intTypeOf(file, c.args[0].*),
+            .strlen, .length, .date_part, .date_diff, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .strpos => return .i64,
             .round => return intTypeOf(file, c.args[0].*),
             .coalesce, .least, .greatest => {
                 var br: IntBranches = .{ .file = file };
@@ -1544,9 +1607,24 @@ fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
 }
 
 /// `bindCall` of the function `name` spells; a `TRY_CAST` (`try_cast$integer`...) is the cast, lenient.
-fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, name: []const u8, func: ast.Func, args: []const *ast.Expr) Error!ast.Expr {
+fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, name: []const u8, func_named: ast.Func, args_named: []const *ast.Expr) Error!ast.Expr {
+    var func = func_named;
+    var args = args_named;
+    // `epoch_ms` of a time counts milliseconds (of an integer it makes the TIMESTAMP); `date_part('epoch', t)` is `epoch(t)`.
+    if (func == .epoch_ms and args.len == 1 and args[0].temporal() != null) func = .to_epoch_ms;
+    if (func == .date_part and args.len == 2 and args[0].* == .literal and args[0].literal == .str and
+        asciiEqIgnoreCase(args[0].literal.str, "epoch"))
+    {
+        func = .epoch;
+        args = args[1..];
+    }
+    const math: ?ast.MathFn = if (func == .math) ast.MathFn.parse(name) else null;
+    if (math) |m| if (args.len != m.arity()) return error.WrongArity;
     var e = try bindCall(arena, file, func, args);
     if (isTryCast(name)) e.call.lenient = true;
+    e.call.math = math;
+    if (func == .str_test) e.call.str_test = ast.StrTest.parse(name);
+    if (func == .date_name) e.call.part = if (asciiEqIgnoreCase(name, "dayname")) .dow else .month;
     return e;
 }
 
@@ -1560,7 +1638,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
     var dec: ?ast.Dec = null;
     if (func == .cast_dec) {
         dec = .{ .precision = @intCast(args[1].literal.i64), .scale = @intCast(args[2].literal.i64) };
-    } else if ((func == .floor or func == .ceil) and result_type == .dec) {
+    } else if ((func == .floor or func == .ceil or func == .trunc) and result_type == .dec) {
         dec = .{ .precision = args[0].decSpec().?.precision, .scale = 0 };
     } else if (func == .round and result_type == .dec) {
         dec = ast.roundedDec(args[0].decSpec().?, if (args.len == 2) @intCast(args[1].literal.i64) else 0);
@@ -1585,15 +1663,17 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
             .depth = depth,
             .dec = dec,
             .temporal = switch (func) {
-                .make_date, .cast_date => .date,
+                .make_date, .cast_date, .last_day => .date,
                 .epoch_ms, .date_trunc, .cast_timestamp => .ts_us,
                 // Values of one unit (and one time zone) keep it; `resolveCallType` refuses a mix.
                 .coalesce => args[0].temporal(),
                 .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,
+                .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => null,
                 .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad => null,
                 .split_part, .regexp_extract, .date_diff, .strftime => null,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec => null,
-                .floor, .ceil, .sqrt, .round, .least, .greatest => null,
+                .floor, .ceil, .sqrt, .round, .least, .greatest, .math, .sign, .trunc, .str_test, .regexp_matches => null,
+                .date_name, .strpos, .concat_ws => null,
             },
             // A truncated or coalesced TIMESTAMP is as UTC-adjusted as its argument, DuckDB's TIMESTAMP WITH TIME ZONE;
             // every cast and `epoch_ms` give a plain TIMESTAMP.
@@ -1608,6 +1688,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                 .cast_i16 => .i16,
                 .cast_i32 => .i32,
                 .cast_i64 => .i64,
+                .sign => .i8,
                 else => null,
             },
             .part = switch (func) {
@@ -1628,6 +1709,11 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
                     error.InvalidFormat => error.TypeMismatch,
                 };
                 break :blk f;
+            } else null,
+            .match = if (func == .regexp_matches) blk: {
+                const m = try arena.create(regex.Match);
+                m.* = try .compile(arena, args[1].literal.str, if (args.len == 3) args[2].literal.str else "");
+                break :blk m;
             } else null,
             .extract = if (func == .regexp_extract) blk: {
                 const r = try arena.create(regex.Extract);
@@ -2501,9 +2587,17 @@ test "parse: date/time functions bind DuckDB's argument types and carry their un
     _ = try parseExprOnly(a, "make_date(coalesce(-i * 2 + 1, 0))", &file, null);
     for ([_][]const u8{
         "make_date(b)",                      "make_date(2147483648)", "make_date(make_date(i))", "make_date(i + b)",
-        "make_date(date_part('year', tms))", "epoch_ms(tms)",         "date_trunc('minute', b)", "date_part(s, tms)",
+        "make_date(date_part('year', tms))", "epoch(b)",              "date_trunc('minute', b)", "date_part(s, tms)",
     }) |src|
         try testing.expectError(error.TypeMismatch, parseExprOnly(a, src, &file, null));
+    // `epoch_ms` of a time counts milliseconds, a BIGINT; of an integer it makes the TIMESTAMP.
+    const counted = try parseExprOnly(a, "epoch_ms(tms)", &file, null);
+    try testing.expectEqual(ast.Func.to_epoch_ms, counted.call.func);
+    try testing.expectEqual(ast.Type.i64, counted.typeOf());
+    try testing.expect(counted.temporal() == null);
+    try testing.expectEqual(ast.Func.epoch_ms, (try parseExprOnly(a, "epoch_ms(b)", &file, null)).call.func);
+    try testing.expectEqual(ast.Type.f64, (try parseExprOnly(a, "epoch(tms)", &file, null)).typeOf());
+    try testing.expectEqual(ast.Func.epoch, (try parseExprOnly(a, "date_part('epoch', tms)", &file, null)).call.func);
     try testing.expectError(error.UnsupportedDatePart, parseExprOnly(a, "date_trunc('dow', tms)", &file, null));
     try testing.expectError(error.UnsupportedDatePart, parseExprOnly(a, "date_part('fortnight', tms)", &file, null));
     try testing.expectError(error.WrongArity, parseExprOnly(a, "date_part('minute')", &file, null));

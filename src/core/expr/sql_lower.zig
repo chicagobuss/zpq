@@ -113,6 +113,14 @@ pub const Lower = struct {
                         .left = try self.ptr(f.args.items[0] orelse return error.SqlParseError, depth + 1),
                         .right = try self.ptr(f.args.items[1] orelse return error.SqlParseError, depth + 1),
                     } };
+                // `mod(a, b)` is `a % b`.
+                if (std.ascii.eqlIgnoreCase(name_, "mod") and f.args.count == 2 and f.over == null and f.distinct == 0 and
+                    f.filter == null and f.order_by.count == 0)
+                    break :blk .{ .binary = .{
+                        .op = .mod,
+                        .left = try self.ptr(f.args.items[0] orelse return error.SqlParseError, depth + 1),
+                        .right = try self.ptr(f.args.items[1] orelse return error.SqlParseError, depth + 1),
+                    } };
                 if (try self.sugarCall(f, name_, depth)) |rewritten| break :blk rewritten;
                 if (parser.resolveFunc(name_) != null) {
                     if (f.order_by.count != 0) return error.ExpectedRParen;
@@ -192,6 +200,7 @@ pub const Lower = struct {
             .{ .name = "quarter", .part = "quarter" },
             .{ .name = "month", .part = "month" },
             .{ .name = "week", .part = "week" },
+            .{ .name = "weekofyear", .part = "week" },
             .{ .name = "day", .part = "day" },
             .{ .name = "dayofmonth", .part = "day" },
             .{ .name = "hour", .part = "hour" },
@@ -557,6 +566,19 @@ pub const Lower = struct {
                 sides[0] = try self.expression(left, depth + 1);
                 sides[1] = try self.expression(right, depth + 1);
                 break :blk .{ .expr_compare = .{ .left = &sides[0], .op = op, .right = &sides[1] } };
+            },
+            // A function that is a BOOLEAN (`starts_with(s, 'x')`) is true where it is: a comparison of the expression with 1.
+            c.LP_EXPR_FUNCTION => blk: {
+                const f = node.u.function;
+                const name_ = std.mem.span(f.name);
+                if (parser.resolveFunc(name_)) |func| {
+                    if (func != .str_test and func != .regexp_matches) return error.BadOperator;
+                } else return error.BadOperator;
+                if (f.over != null or f.distinct != 0 or f.filter != null or f.order_by.count != 0) return error.ExpectedRParen;
+                const sides = try self.arena.alloc(syntax.Expr, 2);
+                sides[0] = try self.expression(node, depth + 1);
+                sides[1] = .{ .number = .{ .token = "1", .floating = false } };
+                break :blk .{ .expr_compare = .{ .left = &sides[0], .op = .Eq, .right = &sides[1] } };
             },
             c.LP_EXPR_IN => blk: {
                 const list = node.u.in;

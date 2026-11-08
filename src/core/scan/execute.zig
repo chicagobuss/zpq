@@ -2308,7 +2308,19 @@ fn prepareAggregateWithMetas(
             const fetches = for (outputs) |out| {
                 if (out.derived) |d| if (d == .col_ref and d.col_ref.fetch != null) break true;
             } else false;
-            try buildGroupRows(gpa, &output.slab, row_src, rows, n_workers, if (fetches) .{
+            // Under a LIMIT they wait for the cut instead: the cells hold the key, and the caller fetches the few
+            // rows the cut keeps (`AggOutput.deferred_fetch`).
+            const late = fetches and args.defer_fetches;
+            if (late) {
+                const deferred = try gpa.alloc(?expr_ast.Expr, outputs.len);
+                for (outputs, deferred) |out, *d| d.* = if (out.derived) |e|
+                    (if (e == .col_ref and e.col_ref.fetch != null) e else null)
+                else
+                    null;
+                output.deferred_fetch = deferred;
+                row_src.defer_fetch = true;
+            }
+            try buildGroupRows(gpa, &output.slab, row_src, rows, n_workers, if (fetches and !late) .{
                 .out = &output,
                 .budget = if (args.ledger != null) group_budget else null,
                 .charge = &answer_charge,

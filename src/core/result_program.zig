@@ -406,6 +406,63 @@ pub const ResultProgram = struct {
         if (threads == 1 or !@import("spawn.zig").runTree(Task, tasks, .{ .stack_size = 1 << 20 }, Task.run)) tasks[0].run();
     }
 
+    /// The scan's column result column `j` (the SELECT list, then the hidden terms) is, or null for one computed here.
+    pub fn scanColumn(self: ResultProgram, j: usize) ?usize {
+        if (!self.order.post) return j;
+        if (self.column(j).role == .derived) return null;
+        var raw: usize = 0;
+        for (0..j) |i| raw += @intFromBool(self.column(i).role != .derived);
+        return raw;
+    }
+
+    /// How many columns the finished answer shows, of the scan's `scan_cols`.
+    pub fn shownColumns(self: ResultProgram, scan_cols: usize) usize {
+        return if (self.order.post) self.select.len else self.visible orelse scan_cols;
+    }
+
+    /// Whether the ranking, HAVING or a computed column reads scan column `raw`: one whose value `finish` needs.
+    pub fn readsScanColumn(self: ResultProgram, raw: usize) bool {
+        for (self.order.keys) |k| if (self.readsThrough(k.column, raw, 0)) return true;
+        if (self.order.having) |h| {
+            const Hit = struct {
+                p: ResultProgram,
+                raw: usize,
+                hit: *bool,
+                fn mark(c: @This(), at: usize) void {
+                    if (c.p.readsThrough(at, c.raw, 0)) c.hit.* = true;
+                }
+            };
+            var hit = false;
+            h.eachColumn(Hit{ .p = self, .raw = raw, .hit = &hit }, Hit.mark);
+            if (hit) return true;
+        }
+        if (self.order.post) {
+            const width = self.select.len + self.order.hidden.len;
+            for (0..width) |j| if (self.column(j).role == .derived and self.readsThrough(j, raw, 0)) return true;
+        }
+        return false;
+    }
+
+    /// Whether result column `j` is scan column `raw`, or a computed column reading it, however deep.
+    fn readsThrough(self: ResultProgram, j: usize, raw: usize, depth: usize) bool {
+        if (self.scanColumn(j)) |r| return r == raw;
+        const width = self.select.len + self.order.hidden.len;
+        if (depth > width or j >= width) return true;
+        const post = self.column(j).post orelse return false;
+        return self.postReads(post, raw, depth + 1);
+    }
+
+    fn postReads(self: ResultProgram, e: *const expr_ast.PostExpr, raw: usize, depth: usize) bool {
+        return switch (e.*) {
+            .col => |c| self.readsThrough(c.column, raw, depth),
+            .number => false,
+            .neg, .abs => |x| self.postReads(x, raw, depth),
+            .binary => |b| self.postReads(b.left, raw, depth) or self.postReads(b.right, raw, depth),
+            .round => |r| self.postReads(r.value, raw, depth),
+            .nullif => |n| self.postReads(n.value, raw, depth) or self.postReads(n.other, raw, depth),
+        };
+    }
+
     fn column(self: ResultProgram, j: usize) expr_ast.SelectColumn {
         return if (j < self.select.len) self.select[j] else self.order.hidden[j - self.select.len];
     }
@@ -1779,4 +1836,32 @@ test "finish with computed columns leaves the answer whole when it runs out of m
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
+
+test "a result column's scan column, and whether ranking, HAVING or a computed column reads one" {
+    // SELECT k, name, sum(x) AS s, round(s / 2) AS r ... ORDER BY r: r is computed here, over s.
+    const s_col: expr_ast.PostExpr = .{ .col = .{ .column = 2 } };
+    const two: expr_ast.PostExpr = .{ .number = "2" };
+    const half: expr_ast.PostExpr = .{ .binary = .{ .op = .div, .left = &s_col, .right = &two } };
+    const rounded: expr_ast.PostExpr = .{ .round = .{ .value = &half } };
+    const select = [_]expr_ast.SelectColumn{
+        .{ .expr = "k", .role = .key },
+        .{ .expr = "name", .role = .key },
+        .{ .expr = "sum(x)", .alias = "s", .role = .agg },
+        .{ .expr = "round(s / 2)", .alias = "r", .role = .derived, .post = &rounded },
+    };
+    const by_r = [_]expr_ast.OrderKey{.{ .column = 3, .descending = true }};
+    const p: ResultProgram = .{ .order = .{ .keys = &by_r, .limit = 10, .post = true }, .select = &select, .grouped = true };
+    try std.testing.expectEqual(@as(?usize, 0), p.scanColumn(0));
+    try std.testing.expectEqual(@as(?usize, 2), p.scanColumn(2));
+    try std.testing.expectEqual(@as(?usize, null), p.scanColumn(3));
+    try std.testing.expectEqual(@as(usize, 4), p.shownColumns(3));
+    // The ranking reads r, which reads s: s is needed before the cut, name is not.
+    try std.testing.expect(p.readsScanColumn(2));
+    try std.testing.expect(!p.readsScanColumn(1));
+    try std.testing.expect(!p.readsScanColumn(0));
+    // Ranked by name itself, it is.
+    const by_name = [_]expr_ast.OrderKey{.{ .column = 1, .descending = false }};
+    const q: ResultProgram = .{ .order = .{ .keys = &by_name, .limit = 10, .post = true }, .select = &select, .grouped = true };
+    try std.testing.expect(q.readsScanColumn(1));
 }

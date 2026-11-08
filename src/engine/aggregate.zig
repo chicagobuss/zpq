@@ -12,6 +12,7 @@ const engine_write = @import("write.zig");
 const engine_env = @import("env.zig");
 const engine_print = @import("print.zig");
 const std = @import("std");
+const scan_rows = @import("../core/scan/rows.zig");
 const nowMonoNs = @import("../clock.zig").monoNs;
 const profile = @import("../profile.zig");
 const local_fs = @import("../local_fs.zig");
@@ -266,6 +267,38 @@ fn executeAggregate(
         if (changed) error.InputChanged else err;
 }
 
+/// A GROUP BY answer whose fetched values wait as their keys (`AggOutput.deferred_fetch`) gets them now when the
+/// result program reads one before its cut (an ORDER BY, HAVING or computed column over it). True when they can
+/// wait for the cut instead (`fetchAfterCut`).
+fn fetchBeforeCut(gpa: std.mem.Allocator, out: *scan.AggOutput, program: ResultProgram) !bool {
+    const deferred = out.deferred_fetch;
+    if (deferred.len == 0) return false;
+    const rows = out.group_rows orelse return false;
+    const needed = for (deferred, 0..) |d, raw| {
+        if (d != null and program.readsScanColumn(raw)) break true;
+    } else false;
+    if (!needed) return true;
+    try scan_rows.fillDeferred(gpa, rows, deferred);
+    gpa.free(deferred);
+    out.deferred_fetch = &.{};
+    return false;
+}
+
+/// The cut answer's fetched values, for the rows it kept: each shown column the scan's fetched column is.
+fn fetchAfterCut(gpa: std.mem.Allocator, out: *scan.AggOutput, program: ResultProgram) !void {
+    const deferred = out.deferred_fetch;
+    defer {
+        gpa.free(deferred);
+        out.deferred_fetch = &.{};
+    }
+    const rows = out.group_rows orelse return;
+    const shown = program.shownColumns(deferred.len);
+    const fetches = try gpa.alloc(?@import("../core/expr/ast.zig").Expr, shown);
+    defer gpa.free(fetches);
+    for (fetches, 0..) |*f, j| f.* = if (program.scanColumn(j)) |raw| (if (raw < deferred.len) deferred[raw] else null) else null;
+    try scan_rows.fillDeferred(gpa, rows, fetches);
+}
+
 /// `changed`: set on an error when a local input changed under the query (`OpenedInputs.whole`).
 fn executeAggregateOver(
     ctx: Context,
@@ -494,7 +527,9 @@ fn executeAggregateOver(
         .sources = r.state.agg_sources,
         .workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env),
     };
+    const late = try fetchBeforeCut(ctx.gpa, &r.output, program);
     try program.finish(ctx.gpa, &r.output, &r.state.group_col_types);
+    if (late) try fetchAfterCut(ctx.gpa, &r.output, program);
     const text_kinds = try answerTextKinds(ctx.gpa, r.output, r.state, args.output == null, args.diag);
     errdefer ctx.gpa.free(text_kinds);
     const answer_types = try answerTypes(ctx.gpa, r.output, r.state);
@@ -599,6 +634,8 @@ inline fn aggregateScanArgs(
             0,
         .auto_decode_batches = decode_rows_env == null,
         .dependent_keys = !envDisables(ctx.env, "ZPQ_GROUP_KEY_FD"),
+        // Under a LIMIT, fetched values wait for the cut (`fetchAfterCut`).
+        .defer_fetches = args.result_order.limit != null and !envDisables(ctx.env, "ZPQ_LATE_FETCH"),
         .expr_batch_rows = if (ctx.env.getPosix("ZPQ_EXPR_BATCH_ROWS")) |v|
             std.fmt.parseInt(usize, v, 10) catch null
         else

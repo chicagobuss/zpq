@@ -4589,6 +4589,423 @@
    }
   },
   {
+   "id": "join:late:after-the-cut",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, kind, w, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind, w ORDER BY s DESC, f.fk LIMIT 7"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, kind, w, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind, w ORDER BY s DESC, f.fk LIMIT 7"
+   }
+  },
+  {
+   "id": "join:late:cut-inside-a-tie",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, kind, w, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind, w ORDER BY dq DESC LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "tied_rows",
+    "sql": "SELECT f.fk, kind, w, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind, w ORDER BY dq DESC LIMIT 5",
+    "ranks": [
+     3
+    ]
+   }
+  },
+  {
+   "id": "join:late:offset",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, kind, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY s DESC, f.fk LIMIT 3 OFFSET 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, kind, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY s DESC, f.fk LIMIT 3 OFFSET 2"
+   }
+  },
+  {
+   "id": "join:late:hidden-order-term",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, kind, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY sum(amt) DESC, f.fk LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, kind, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY sum(amt) DESC, f.fk LIMIT 4"
+   }
+  },
+  {
+   "id": "join:late:computed-column",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, kind, round(sum(amt) / 3, 1) AS r, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY r DESC, f.fk LIMIT 6"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, kind, round(sum(amt) / 3, 1) AS r, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY r DESC, f.fk LIMIT 6"
+   }
+  },
+  {
+   "id": "join:late:through-a-chain",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, gname, rname, count(DISTINCT q) AS dq, round(sum(amt), 2) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:snow_region}' r WHERE f.fk = d.pk AND d.grp = g.gk AND g.grk = r.rk GROUP BY d.grp, gname, rname ORDER BY s DESC LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, gname, rname, count(DISTINCT q) AS dq, round(sum(amt), 2) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g, '{fixture:snow_region}' r WHERE f.fk = d.pk AND d.grp = g.gk AND g.grk = r.rk GROUP BY d.grp, gname, rname ORDER BY s DESC LIMIT 2"
+   }
+  },
+  {
+   "id": "join:late:null-fetched-values",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, kind, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk AND d.grp < 2 GROUP BY f.fk, kind ORDER BY s DESC, f.fk NULLS FIRST LIMIT 9"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, kind, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk AND d.grp < 2 GROUP BY f.fk, kind ORDER BY s DESC, f.fk NULLS FIRST LIMIT 9"
+   }
+  },
+  {
+   "id": "join:late:ranked-by-a-fetched-column",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, kind, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY kind DESC, f.fk LIMIT 6"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, kind, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY kind DESC, f.fk LIMIT 6"
+   }
+  },
+  {
+   "id": "join:late:having-a-fetched-column",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, w, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, w HAVING w > 3000 ORDER BY s DESC, f.fk LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "2M"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, w, count(DISTINCT q) AS dq, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, w HAVING w > 3000 ORDER BY s DESC, f.fk LIMIT 5"
+   }
+  },
+  {
    "id": "review:fd:uint32-dependent",
    "fixture": "review-fact",
    "cli": [

@@ -56,6 +56,9 @@ pub const RowSource = struct {
     owner: ?OwnerRows = null,
     identity: ?*const key_pack.Plan = null,
     borrowed_strings: []const BorrowedSpan = &.{},
+    /// A fetched value (`expr_ast.Fetch`) is left as the value of the key that determines it, for the answer's
+    /// caller to fetch once it is cut (`fillDeferred`).
+    defer_fetch: bool = false,
 
     /// Each emitted string aggregate owns a fresh copy beside the still-live source winner.
     pub fn winnerStringBytes(s: *const RowSource) usize {
@@ -112,7 +115,8 @@ pub const RowSource = struct {
                 .i => |v| .{ .i = v },
                 .s => |v| .{ .s = try gpa.dupe(u8, v) },
             };
-            if (out.derived) |e| if (e == .col_ref and e.col_ref.fetch != null) return fetched(gpa, e, value, strings);
+            if (out.derived) |e| if (e == .col_ref and e.col_ref.fetch != null)
+                return if (s.defer_fetch) value else fetched(gpa, e, value, strings);
             return value;
         }
         var buf: [48]u8 = undefined;
@@ -122,8 +126,12 @@ pub const RowSource = struct {
 
     fn keyValue(s: *const RowSource, gpa: std.mem.Allocator, bytes: []const u8, out: BoundOutputColumn, strings: ?*FetchStrings) !AggValue {
         const e = out.derived orelse return deserializeKeyColumnMode(gpa, bytes, out.source.key, s.key_types, s.borrowed_strings.len != 0);
-        if (e == .col_ref and e.col_ref.fetch != null)
-            return fetched(gpa, e, try deserializeKeyColumnMode(gpa, bytes, out.source.key, s.key_types, true), strings);
+        if (e == .col_ref and e.col_ref.fetch != null) {
+            const base = try deserializeKeyColumnMode(gpa, bytes, out.source.key, s.key_types, true);
+            // The key's value stands in the cell until the answer is cut; an integer, it owns nothing.
+            if (s.defer_fetch) return base;
+            return fetched(gpa, e, base, strings);
+        }
         const Reader = struct {
             src: *const RowSource,
             gpa: std.mem.Allocator,
@@ -279,6 +287,16 @@ fn fetched(gpa: std.mem.Allocator, e: expr_ast.Expr, base: AggValue, strings: ?*
         .dec => |spec| .{ .dec = .{ .v = v.int, .spec = spec } },
         .f64 => .{ .f = v.float },
         .string => .{ .s = if (strings) |st| try st.dupe(v.bytes) else try gpa.dupe(u8, v.bytes) },
+    };
+}
+
+/// Fill the cells a row build left as a fetch's key (`RowSource.defer_fetch`): for each of `rows`' columns that
+/// `fetches` gives a fetch for, its value, as the row build would have fetched it. Strings are the answer's own.
+pub fn fillDeferred(gpa: std.mem.Allocator, rows: []const []const AggValue, fetches: []const ?expr_ast.Expr) !void {
+    for (rows) |row| for (@constCast(row), 0..) |*cell, j| {
+        if (j >= fetches.len) break;
+        const e = fetches[j] orelse continue;
+        cell.* = try fetched(gpa, e, cell.*, null);
     };
 }
 

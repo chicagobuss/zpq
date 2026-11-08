@@ -159,6 +159,9 @@ pub const MultiAggArgs = struct {
     expr_batch_rows: ?usize = null,
     /// Drop fault-free integer expressions fixed by retained bare GROUP BY keys; false forces legacy grouping.
     dependent_keys: bool = true,
+    /// A dropped key's fetched value (`expr_ast.Fetch`) may be left in its row as the key that determines it, for the
+    /// caller to fetch once the answer is cut (`AggOutput.deferred_fetch`): set under a LIMIT.
+    defer_fetches: bool = false,
     /// Forced flat decode windows; zero keeps ordinary memory admission.
     decode_batch_rows: usize = 0,
     auto_decode_batches: bool = false,

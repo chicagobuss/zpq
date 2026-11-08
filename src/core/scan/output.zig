@@ -34,6 +34,9 @@ pub const AggOutput = struct {
     integer_stream: ?IntegerStream = null,
     byte_stream: ?ByteStream = null,
     string_arenas: []*expr_agg.KeyArena = &.{},
+    /// By the scan's column: the fetch (`expr_ast.Fetch`) whose key value its cells hold until the caller fetches it,
+    /// once the answer is cut (`rows.fillDeferred`); empty when no cell waits. On `gpa`.
+    deferred_fetch: []const ?expr_ast.Expr = &.{},
     /// Blocks holding strings fetched for the rows (`rows.FetchStrings`), owned here, each among `borrowed_strings`.
     fetched_blocks: [][]u8 = &.{},
     borrowed_strings: []BorrowedSpan = &.{},
@@ -72,6 +75,7 @@ pub const AggOutput = struct {
             gpa.destroy(strings);
         }
         gpa.free(self.string_arenas);
+        gpa.free(self.deferred_fetch);
         for (self.fetched_blocks) |b| gpa.free(b);
         gpa.free(self.fetched_blocks);
         gpa.free(self.borrowed_strings);

@@ -152,6 +152,11 @@ def main(out):
     write(out, "stray_quote.csv", lines([b'a,b', b'1,ab"c', b'2,d']), cases,
           {"rows": 2, "cells": [[0, "b", 'ab"c']], "note": "a quote inside an unquoted field: lenient readers keep it"})
 
+    # Aggregate state past a small budget (review of csv-agg P1-1, P1-2): 200,000 distinct 40-byte strings, a
+    # count(DISTINCT)'s set; 4,000 groups of one 2 KiB string each, whose min/max winners outgrow their slots.
+    write(out, "distinct_strings.csv", lines([b"s"] + [b"value-%034d" % i for i in range(200_000)]), cases, {})
+    write(out, "long_winners.csv", lines([b"k,s"] + [b"%d,%s%d" % (i, b"x" * 2048, i) for i in range(4000)]), cases, {})
+
     # Everything survivable at once, at size: BOM, CRLF, quotes, embedded newlines, NULL vs "", late breaks,
     # leading zeros and a 3 MiB field.
     rows = [b"\xef\xbb\xbfid,zip,qty,price,day,note,flag"]

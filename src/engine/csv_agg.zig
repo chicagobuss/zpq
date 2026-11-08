@@ -157,7 +157,10 @@ const Bound = struct {
     fetch: []bool,
 
     fn of(a: std.mem.Allocator, args: QueryArgs, all: *const Plan, p: ?*const Plan) !Bound {
-        const meta = try csv_write.fileSchema(a, all, p);
+        return ofMeta(a, args, all.fields.len, try csv_write.fileSchema(a, all, p));
+    }
+
+    fn ofMeta(a: std.mem.Allocator, args: QueryArgs, n: usize, meta: *const schema.FileMetaData) !Bound {
         const cache = try a.create(engine_types.bound_plan.Cache);
         cache.* = .{};
         const with_cache = args.withPlanCache(cache);
@@ -177,7 +180,6 @@ const Bound = struct {
             else => e,
         };
         const q = try execute.bindAggregateQuery(a, margs, meta);
-        const n = all.fields.len;
         const fetch = try a.alloc(bool, n);
         @memset(fetch, false);
         var list: std.ArrayList(usize) = .empty;
@@ -313,6 +315,9 @@ const Fold = struct {
     lock: std.Io.Mutex = .init,
     failed_from: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
     moved: std.atomic.Value(u32) = .init(0),
+    /// The query's ledger, which a count(DISTINCT)'s set spills against, and the charge string min/max winners draw.
+    ledger: *core_memory.SharedBudget,
+    winners: *expr_agg.WinnerCharge,
     /// Per chunk, an error that stopped it other than a refusal of its text (`Source.failures` holds those).
     errs: []?anyerror,
 
@@ -343,7 +348,11 @@ const Fold = struct {
         var n = f.next.load(.monotonic);
         while (n < f.done.len and f.done[n].load(.acquire)) : (n += 1) {
             if (f.keys == null) {
-                for (f.accs, f.chunk_accs[n]) |*d, *s| try owned_merge.mergeOwnedAccumulator(d, s, f.gpa);
+                for (f.accs, f.chunk_accs[n]) |*d, *s| {
+                    const before = ownedWinner(d.*) +| ownedWinner(s.*);
+                    try owned_merge.mergeOwnedAccumulator(d, s, f.gpa);
+                    try f.winners.adjust(before, ownedWinner(d.*) +| ownedWinner(s.*));
+                }
                 owned_merge.freeOwnedAccumulatorStrings(f.gpa, f.chunk_accs[n]);
                 f.gpa.free(f.chunk_accs[n]);
                 f.chunk_accs[n] = &.{};
@@ -354,7 +363,9 @@ const Fold = struct {
                     const id = try f.merged.getOrInsert(src.keyAt(g), f.calls, src.first.items[g]);
                     const dst = f.merged.accumulators.items[@as(usize, id) * len ..][0..len];
                     for (dst, src.accumulators.items[g * len ..][0..len]) |*d, *sa| {
+                        const before = ownedWinner(d.*) +| ownedWinner(sa.*);
                         try expr_agg.mergePersistent(d, sa, f.gpa, owned_merge.mergeOwnedAccumulator);
+                        try f.winners.adjust(before, ownedWinner(d.*) +| ownedWinner(sa.*));
                     }
                 }
                 src.deinit();
@@ -392,15 +403,15 @@ const Fold = struct {
             defer resolver.deinit(a);
             const ids = try a.alloc(u32, rows);
             @memset(ids, 0);
-            try consumer.foldGroupedBatch(a, f.gpa, &resolver, &f.tables[i], f.calls, key_cols, batch, f.lookup, &sel, ids, expr_agg.firstPosition(i, 0), .{});
+            try consumer.foldGroupedBatch(a, f.gpa, &resolver, &f.tables[i], f.calls, key_cols, batch, f.lookup, &sel, ids, expr_agg.firstPosition(i, 0), .{ .winner_charge = f.winners });
         } else {
             const accs = try f.gpa.alloc(expr_agg.Accumulator, f.calls.len);
-            for (accs, f.calls) |*acc, call| acc.* = .init(call);
+            for (accs, f.calls) |*acc, call| acc.* = initAcc(call, f.ledger);
             f.chunk_accs[i] = accs;
             const handled = try a.alloc(bool, f.calls.len);
             @memset(handled, false);
             if (!try expr_agg.updateSharedInteger(a, f.calls, accs, handled, batch, f.lookup, &sel)) {
-                for (f.calls, accs) |call, *acc| try expr_agg.updateOneWithCharge(a, f.gpa, acc, call, batch, f.lookup, &sel, null);
+                for (f.calls, accs) |call, *acc| try expr_agg.updateOneWithCharge(a, f.gpa, acc, call, batch, f.lookup, &sel, f.winners);
             }
         }
         try f.finish(i);
@@ -414,6 +425,50 @@ const Fold = struct {
         for (f.tables) |*t| t.deinit();
     }
 };
+
+/// A call's empty state. A count(DISTINCT)'s set spills against `ledger`, as a Parquet scan's does
+/// (`runMultiAggregate`): a set past `--max-memory` is refused, not grown.
+fn initAcc(call: expr_agg.AggCall, ledger: *core_memory.SharedBudget) expr_agg.Accumulator {
+    const acc: expr_agg.Accumulator = .init(call);
+    return if (acc == .distinct) .{ .distinct = .initEmpty(ledger) } else acc;
+}
+
+/// The bytes a string min/max winner owns, as `WinnerCharge` drew them; a merge gives back the losers'.
+fn ownedWinner(acc: expr_agg.Accumulator) usize {
+    return switch (acc) {
+        .min_bytes, .max_bytes => |v| if (v) |s| expr_agg.winnerBytes(s.len) else 0,
+        else => 0,
+    };
+}
+
+/// The query bound again at each DECIMAL's data precision, as the footer of the Parquet this file writes to carries it
+/// (`csv_write.run`), once the fold has seen every value: an avg's extra digits (`avgDec`) and a min/max's type follow
+/// it, as over that Parquet. `b` itself when no precision moved, or when a call's state would not read the same.
+fn atDataPrecision(a: std.mem.Allocator, args: QueryArgs, b: *const Bound, p: *const Plan, source: *const Source) !Bound {
+    const items = try a.dupe(schema.SchemaElement, b.meta.schema.items);
+    var moved = false;
+    for (p.slot, 0..) |slot, ci| if (slot) |o| {
+        const t = p.types[o];
+        if (t.kind != .decimal) continue;
+        var max: u128 = 0;
+        for (0..source.count) |i| max = @max(max, source.max_abs[i * p.names.len + o]);
+        const prec = csv_write.decimalPrecisionOf(t, p.pinned[o], max);
+        const e = &items[ci + 1];
+        if (e.precision == prec) continue;
+        e.precision = prec;
+        e.logical_type = .{ .DECIMAL = .{ .scale = t.scale, .precision = prec } };
+        moved = true;
+    };
+    if (!moved) return b.*;
+    const meta = try a.create(schema.FileMetaData);
+    meta.* = b.meta.*;
+    meta.schema = .fromOwnedSlice(items);
+    const again = try Bound.ofMeta(a, args, b.fetch.len, meta);
+    if (again.q.calls.len != b.q.calls.len) return b.*;
+    for (again.q.calls, b.q.calls) |x, y| if (x.func != y.func or x.result != y.result)
+        return b.*;
+    return again;
+}
 
 fn foldOnce(
     ctx: Context,
@@ -434,6 +489,7 @@ fn foldOnce(
     var ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     defer if (args.profiler) |pr| pr.noteLedger(ledger.peak.load(.monotonic), args.max_memory);
     var scratch_charge: core_memory.Charged = .{ .child = gpa, .budget = &ledger };
+    var winners: expr_agg.WinnerCharge = .{ .ledger = &ledger };
 
     var source = try Source.init(pass, p, chunk);
     source.opts = args.csv;
@@ -457,7 +513,7 @@ fn foldOnce(
     const chunk_accs = try pass.alloc([]expr_agg.Accumulator, if (keys == null) source.count else 0);
     @memset(chunk_accs, &.{});
     const accs = try pass.alloc(expr_agg.Accumulator, if (keys == null) calls.len else 0);
-    for (accs, 0..) |*acc, ci| acc.* = .init(calls[ci]);
+    for (accs, 0..) |*acc, ci| acc.* = initAcc(calls[ci], &ledger);
     var accs_owned = true;
     defer if (accs_owned) owned_merge.freeOwnedAccumulatorStrings(gpa, accs);
     const done = try pass.alloc(std.atomic.Value(bool), source.count);
@@ -480,6 +536,8 @@ fn foldOnce(
         .merged = &merged,
         .done = done,
         .ahead = @max(1, workers),
+        .ledger = &ledger,
+        .winners = &winners,
         .errs = errs,
     };
     defer fold.deinit();
@@ -530,12 +588,14 @@ fn foldOnce(
         }
         if (errs[i]) |e| return scratch_charge.refusal(e);
     }
+    const ab = try atDataPrecision(pass, args, b, p, &source);
+    const out_calls = ab.q.calls;
 
     var output: scan.AggOutput = .{};
     errdefer output.deinit(gpa);
     var group_col_types: ?[]const scan.GroupColType = null;
-    if (keys) |ks| {
-        const outputs = b.q.outputs.?;
+    if (ab.q.keys) |ks| {
+        const outputs = ab.q.outputs.?;
         const key_types = try pass.alloc(key_decode.KeyType, ks.len);
         for (ks, key_types) |k, *kt| kt.* = key_decode.keyTypeFromExpr(k);
         const col_types = try pass.alloc(scan.GroupColType, outputs.len);
@@ -550,11 +610,11 @@ fn foldOnce(
                 },
                 .dec = if (key_types[k_idx] == .dec) key_types[k_idx].dec else null,
                 .source = if (out.derived != null) null else if (ks[k_idx] == .col_ref)
-                    binding.leafSchemaElem(b.meta, ks[k_idx].col_ref.col_idx)
+                    binding.leafSchemaElem(ab.meta, ks[k_idx].col_ref.col_idx)
                 else
                     owner_support.computedAnswer(ks[k_idx]),
             },
-            .agg => |a_idx| scan.GroupColType.ofAgg(calls[a_idx], b.q.sources[a_idx]),
+            .agg => |a_idx| scan.GroupColType.ofAgg(out_calls[a_idx], ab.q.sources[a_idx]),
         };
         group_col_types = col_types;
         const slots = try pass.alloc(MergedSlot, merged.groupCount());
@@ -563,7 +623,7 @@ fn foldOnce(
         var row_src: scan_rows.RowSource = .{
             .slots = slots,
             .outputs = outputs,
-            .calls = calls,
+            .calls = out_calls,
             .key_types = key_types,
             .key_exprs = ks,
             .accs = merged.accumulators.items,
@@ -588,10 +648,10 @@ fn foldOnce(
         output.group_cols = cols;
         for (outputs, cols) |out, *col| col.* = try gpa.dupe(u8, out.name);
     } else {
-        const items = try gpa.alloc(output_values.AggOutputItem, calls.len);
+        const items = try gpa.alloc(output_values.AggOutputItem, out_calls.len);
         @memset(items, .{ .alias = "", .value = .null_val });
         output.aggs = items;
-        for (calls, items, accs) |call, *item, acc| {
+        for (out_calls, items, accs) |call, *item, acc| {
             item.alias = try gpa.dupe(u8, call.alias);
             item.value = try scan.materializeOne(gpa, call, acc);
         }
@@ -611,9 +671,9 @@ fn foldOnce(
         .output = output,
         .state = .{
             .accumulators = accs,
-            .agg_calls = calls,
+            .agg_calls = out_calls,
             .group_col_types = group_col_types,
-            .agg_sources = b.q.sources,
+            .agg_sources = ab.q.sources,
         },
     };
     accs_owned = false;

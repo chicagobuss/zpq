@@ -876,3 +876,70 @@ test "csv aggregate: --explain plans the fold, the fields each chunk parses and 
     try testing.expectEqualStrings("b", e2.fields[0]);
     try testing.expectError(error.CsvQueryNotSupported, csv_agg.explain(ctx, a, .{ .inputs = &.{csv}, .aggregate = "count(*) AS n", .group_by = "b", .result_order = .{ .limit = 1 } }, csv));
 }
+
+test "csv aggregate: a scalar count(DISTINCT) and string min/max winners draw from the ledger (review P1-1, P1-2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    const distinct = try tmpPath(&b1, &tmp, "d.csv");
+    const winners = try tmpPath(&b2, &tmp, "w.csv");
+    // 200,000 distinct 40-byte strings: a set of them is past a 4 MiB budget, one chunk's parse is not.
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(a, "s\n");
+    for (0..200_000) |i| try text.print(a, "value-{d:0>34}\n", .{i});
+    try writeFile(distinct, text.items);
+    // 4,000 groups of one 2 KiB string each: the slots fit a 4 MiB budget, their winners (8 MiB) do not.
+    text.clearRetainingCapacity();
+    try text.appendSlice(a, "k,s\n");
+    const long_arr: [2048]u8 = @splat('x');
+    const long: []const u8 = &long_arr;
+    for (0..4000) |i| try text.print(a, "{d},{s}{d}\n", .{ i, long, i });
+    try writeFile(winners, text.items);
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    const cases = [_]engine_types.QueryArgs{
+        .{ .inputs = &.{distinct}, .aggregate = "count(DISTINCT s) AS d" },
+        .{ .inputs = &.{winners}, .aggregate = "min(s) AS lo", .group_by = "k" },
+        .{ .inputs = &.{winners}, .aggregate = "max(s) AS hi" },
+    };
+    for (cases) |args| {
+        var r = try runQuery(ctx, args);
+        r.deinit(testing.allocator);
+        var tight = args;
+        tight.max_memory = 4 << 20;
+        tight.parallelism = 1;
+        // The scalar max holds one winner at a time: it fits.
+        if (args.group_by == null and args.inputs[0].ptr == winners.ptr) {
+            var ok = try runQuery(ctx, tight);
+            ok.deinit(testing.allocator);
+            continue;
+        }
+        try testing.expectError(error.ExceededMemoryBudget, runQuery(ctx, tight));
+    }
+}
+
+test "csv aggregate: avg of a DECIMAL past 18 digits keeps the digits the data's precision gives, as over its Parquet (review P2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    var b2: [128]u8 = undefined;
+    const csv = try tmpPath(&b1, &tmp, "a.csv");
+    const pq = try tmpPath(&b2, &tmp, "a.parquet");
+    try writeFile(csv, "d\n10000000000000000.00\n10000000000000000.00\n10000000000000000.01\n");
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    _ = try runQuery(ctx, .{ .inputs = &.{csv}, .output = pq });
+    var over_csv = try runQuery(ctx, .{ .inputs = &.{csv}, .aggregate = "avg(d) AS m" });
+    defer over_csv.deinit(testing.allocator);
+    var over_pq = try runQuery(ctx, .{ .inputs = &.{pq}, .aggregate = "avg(d) AS m" });
+    defer over_pq.deinit(testing.allocator);
+    const got = over_csv.aggregate.output.aggs[0].value;
+    try testing.expectEqualDeep(over_pq.aggregate.output.aggs[0].value, got);
+    // DECIMAL(19,2): four more digits, 10000000000000000.003333.
+    try testing.expectEqual(@as(i128, 10000000000000000003333), got.dec.v);
+    try testing.expectEqual(@as(u8, 6), got.dec.spec.scale);
+}

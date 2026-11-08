@@ -1110,7 +1110,7 @@ fn decimalCap(t: Type, pinned: bool) u8 {
 }
 
 /// A DECIMAL column's precision in the footer and the report: the declared one when pinned, else the data's.
-fn decimalPrecisionOf(t: Type, pinned: bool, max_abs: u128) i32 {
+pub fn decimalPrecisionOf(t: Type, pinned: bool, max_abs: u128) i32 {
     return if (pinned) @intCast(t.precision()) else csv_types.decimalPrecision(t, max_abs);
 }
 

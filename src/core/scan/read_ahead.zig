@@ -31,9 +31,9 @@
 //!   delay is the whole cost.
 //!
 //! Residency and advice go through each file's descriptor (`Config.fds`): `cachestat` and `fadvise`, where the
-//! mapping's `mincore` and `madvise` also take the address space's lock, which the workers' region maps write. On
-//! granite that was 4-6% of a 3 GB cold scan (ClickBench Q21) and even elsewhere; per call, the two cost about the
-//! same. A mapping kept without a descriptor uses the mapping's calls.
+//! mapping's `mincore` and `madvise` also take the address space's lock, which the workers' region maps write. That
+//! lock cost 4-6% of a 3 GB cold scan on a many-core host; per call, the two cost about the same. A mapping kept
+//! without a descriptor uses the mapping's calls.
 //!
 //! What a claim releases: the bytes advised for every item up to it, which a worker is decoding or has decoded.
 //! Advice changes when pages arrive, never what is decoded: answers and refusals are those of the mapping.
@@ -606,8 +606,8 @@ test "a gated column's kept pages are advised within the window and the ledger, 
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const page = std.heap.pageSize();
-    // The reviewer's chunk: two PLAIN INT32 data pages of 256 OS pages (1 MiB) each, the gate keeping every row of
-    // the first and none of the second.
+    // Two PLAIN INT32 data pages of 256 OS pages (1 MiB) each, the gate keeping every row of the first and none of
+    // the second: the advice must follow the pages the gate keeps, not the chunk.
     const payload_len = 256 * page;
     const rows = payload_len / @sizeOf(i32);
     var header = thrift.Writer.init(a);

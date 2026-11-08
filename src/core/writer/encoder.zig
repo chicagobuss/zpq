@@ -3248,7 +3248,7 @@ test "a coded string column past the dictionary's byte limit encodes to the same
 }
 
 test "a string dictionary never outgrows one dictionary page, at any row-group size" {
-    // The review's case: one row group of 131072 rows, 32768 distinct incompressible 131072-byte strings, each four
+    // One row group of 131072 rows, 32768 distinct incompressible 131072-byte strings, each four
     // times. A quarter of the values and of their bytes, so the quarter rule admits it, but its PLAIN length is one
     // past u32 and `encodePlainBytes` refused the whole column.
     const plain_total: usize = 131072 * (131072 + 4);
@@ -3256,7 +3256,7 @@ test "a string dictionary never outgrows one dictionary page, at any row-group s
     try testing.expect(dict_bytes > std.math.maxInt(u32));
     try testing.expect(dict_bytes <= plain_total / 4);
     try testing.expect(stringDictMaxBytes(plain_total) < dict_bytes);
-    // The second case: 262144 distinct 8192-byte strings, each four times, a 2 GiB dictionary that used to be built
+    // And 262144 distinct 8192-byte strings, each four times, a 2 GiB dictionary that used to be built
     // and then refused by the page limit.
     const dict_2g: usize = 262144 * (8192 + 4);
     try testing.expect(dict_2g > std.math.maxInt(i32));

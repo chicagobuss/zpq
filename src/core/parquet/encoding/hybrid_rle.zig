@@ -1351,7 +1351,7 @@ test "regression: encode splits bit-packed runs at the format's run-length limit
     for (1..6) |max_groups| for (0..400) |iter| {
         _ = arena_state.reset(.retain_capacity);
         const bw: u8 = @intCast(1 + r.uintLessThan(u8, 32));
-        // Lengths at the limit and around it (the review's 2^31-1 alternating levels, scaled down), then random.
+        // Lengths at the limit and around it (`max_groups` stands in for `max_run_groups`, scaled down), then random.
         const n = if (iter < 20) max_groups * 8 - 1 + iter else r.uintLessThan(usize, 300);
         const vals = try a.alloc(u32, n);
         const maxv: u32 = @intCast((@as(u64, 1) << @intCast(bw)) - 1);

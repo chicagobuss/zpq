@@ -599,7 +599,7 @@ def _wire(raw):
 
 
 class InvokeFixTest(unittest.TestCase):
-    """The review's reproducers: account-bearing names, a closed connection's waiters, a leaked pool slot,
+    """Regressions in the invoke path: account-bearing names, a closed connection's waiters, a leaked pool slot,
     a retry's stale signature, and an omitted region. No AWS calls."""
 
     def tearDown(self):

@@ -265,6 +265,15 @@ pub const Prepared = struct {
                 if (x.virtualPayload(ci) != null) break x;
             } else continue;
             const q = j.virtualPayload(ci).?;
+            // Only a value read back exactly as the scan reads the column: a signed one, from a dictionary of its own
+            // lane (a DECIMAL stored as bytes, or an unsigned INT32 the scan zero-extends, stays a key).
+            if (k.col_ref.unsigned_32 or k.col_ref.unsigned_64) continue;
+            const lane_ok = switch (j.payloads[q].dict) {
+                .string => k.col_ref.expr_type == .str,
+                .f64 => k.col_ref.expr_type == .f64,
+                .i32, .i64 => k.col_ref.expr_type == .i64 or k.col_ref.expr_type == .dec,
+            };
+            if (!lane_ok) continue;
             const via = j.payloads[q].via;
             const f: expr_ast.Fetch = if (via != null and isKey(keys, j.virtual_base + via.?.fk))
                 .{ .base = j.virtual_base + via.?.fk, .ctx = via.?.inner, .payload = via.?.p, .value = lookup.fetch }

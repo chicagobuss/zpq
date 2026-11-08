@@ -2193,7 +2193,11 @@ fn prepareAggregateWithMetas(
             const fetches = for (outputs) |out| {
                 if (out.derived) |d| if (d == .col_ref and d.col_ref.fetch != null) break true;
             } else false;
-            try buildGroupRows(gpa, &output.slab, row_src, rows, n_workers, if (fetches) &output else null);
+            try buildGroupRows(gpa, &output.slab, row_src, rows, n_workers, if (fetches) .{
+                .out = &output,
+                .budget = if (args.ledger != null) group_budget else null,
+                .charge = &answer_charge,
+            } else null);
         }
 
         const cols = try gpa.alloc([]const u8, outputs.len);

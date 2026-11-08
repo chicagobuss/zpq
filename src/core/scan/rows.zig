@@ -1,4 +1,5 @@
 const std = @import("std");
+const core_memory = @import("../memory.zig");
 const testing = std.testing;
 const expr_agg = @import("../expr/agg.zig");
 const expr_ast = @import("../expr/ast.zig");
@@ -281,12 +282,75 @@ fn fetched(gpa: std.mem.Allocator, e: expr_ast.Expr, base: AggValue, strings: ?*
     };
 }
 
+/// Where a row build's fetched strings go: the answer that adopts their blocks, the ledger they are drawn from, and
+/// the answer's charge, which holds the drawn bytes as long as the answer does (released with it on an error).
+pub const Adopt = struct {
+    out: *AggOutput,
+    budget: ?*core_memory.SharedBudget,
+    charge: *usize,
+};
+
+/// Every task's fetched-string blocks to the answer in one step, which a built row's strings may point into. If that
+/// step fails, the rows' strings in them are taken out first (NULL), so the answer's teardown frees none of them,
+/// and then the blocks and what they drew go back.
+fn adoptAll(gpa: std.mem.Allocator, ad: Adopt, tasks: []RowBuildTask, rows: [][]const AggValue) !void {
+    return adoptAllOn(gpa, gpa, ad, tasks, rows);
+}
+
+/// `adoptAll` with the adoption's own lists on `lists` (a test fails them).
+fn adoptAllOn(gpa: std.mem.Allocator, lists: std.mem.Allocator, ad: Adopt, tasks: []RowBuildTask, rows: [][]const AggValue) !void {
+    var n: usize = 0;
+    var drawn: usize = 0;
+    for (tasks) |*t| if (t.strings) |st| {
+        n += st.blocks.items.len;
+        drawn += st.drawn;
+    };
+    defer for (tasks) |*t| if (t.strings) |*st| st.blocks.deinit(gpa);
+    if (n == 0) return;
+    adopt: {
+        const all = lists.alloc([]u8, n) catch break :adopt;
+        defer lists.free(all);
+        var at: usize = 0;
+        for (tasks) |*t| if (t.strings) |st| {
+            @memcpy(all[at..][0..st.blocks.items.len], st.blocks.items);
+            at += st.blocks.items.len;
+        };
+        ad.out.adoptFetchedOn(gpa, lists, all) catch break :adopt;
+        ad.charge.* += drawn;
+        return;
+    }
+    for (rows) |row| for (@constCast(row)) |*v| if (v.* == .s) {
+        const inside = for (tasks) |*t| {
+            const st = t.strings orelse continue;
+            if (BorrowedSpanOf.within(st.blocks.items, v.s)) break true;
+        } else false;
+        if (inside) v.* = .null_val;
+    };
+    for (tasks) |*t| if (t.strings) |st| for (st.blocks.items) |b| gpa.free(b);
+    if (ad.budget) |b| b.release(drawn);
+    return error.OutOfMemory;
+}
+
+const BorrowedSpanOf = struct {
+    fn within(blocks: []const []u8, s: []const u8) bool {
+        const p = @intFromPtr(s.ptr);
+        for (blocks) |b| {
+            const lo = @intFromPtr(b.ptr);
+            if (p >= lo and p + s.len <= lo + b.len) return true;
+        }
+        return false;
+    }
+};
+
 /// Strings one row-build task fetched (`fetched`), in blocks the answer takes over (`AggOutput.adoptFetched`): a row,
 /// kept or cut, frees none on its own, and the answer frees the blocks at once.
 pub const FetchStrings = struct {
     gpa: std.mem.Allocator,
+    /// The query's ledger, each block drawn from it as it is allocated (`drawn`); null without `--max-memory`.
+    budget: ?*core_memory.SharedBudget = null,
     blocks: std.ArrayList([]u8) = .empty,
     used: usize = 0,
+    drawn: usize = 0,
 
     fn dupe(f: *FetchStrings, v: []const u8) ![]const u8 {
         const last = if (f.blocks.items.len == 0) null else f.blocks.items[f.blocks.items.len - 1];
@@ -294,7 +358,13 @@ pub const FetchStrings = struct {
             // Each block twice the last, so a task holds a few blocks, never one per string.
             const size = @max(v.len, if (last) |l| l.len * 2 else 1 << 16);
             try f.blocks.ensureUnusedCapacity(f.gpa, 1);
-            f.blocks.appendAssumeCapacity(try f.gpa.alloc(u8, size));
+            if (f.budget) |b| _ = b.drawExact(size) orelse return error.ExceededMemoryBudget;
+            const block = f.gpa.alloc(u8, size) catch |err| {
+                if (f.budget) |b| b.release(size);
+                return err;
+            };
+            if (f.budget != null) f.drawn += size;
+            f.blocks.appendAssumeCapacity(block);
             f.used = 0;
         }
         const block = f.blocks.items[f.blocks.items.len - 1];
@@ -404,8 +474,8 @@ pub fn buildGroupRows(
     src: RowSource,
     rows: [][]const AggValue,
     n_workers: usize,
-    /// When set, the rows' fetched strings (`expr_ast.Fetch`) go into blocks it takes over, failed or not.
-    adopt: ?*AggOutput,
+    /// When set, the rows' fetched strings (`expr_ast.Fetch`) go into blocks the answer takes over, failed or not.
+    adopt: ?Adopt,
 ) !void {
     std.debug.assert(rows.len == src.slots.len);
     if (rows.len == 0) return;
@@ -416,17 +486,11 @@ pub fn buildGroupRows(
     const tasks = try gpa.alloc(RowBuildTask, n_threads);
     defer gpa.free(tasks);
     var cursor: std.atomic.Value(usize) = .init(0);
-    for (tasks) |*t| t.* = .{ .gpa = gpa, .src = &src, .rows = rows, .cells = cells, .cursor = &cursor, .strings = if (adopt != null) .{ .gpa = gpa } else null };
+    for (tasks) |*t| t.* = .{ .gpa = gpa, .src = &src, .rows = rows, .cells = cells, .cursor = &cursor, .strings = if (adopt) |ad| .{ .gpa = gpa, .budget = ad.budget } else null };
     const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
     if (tasks.len == 1 or !spawn_util.runTree(RowBuildTask, tasks, config, RowBuildTask.run)) RowBuildTask.run(&tasks[0]);
     // Adopted before any error returns: a row built so far may hold them, and its release must not free them.
-    if (adopt) |out| for (tasks) |*t| if (t.strings) |*st| {
-        defer st.blocks.deinit(gpa);
-        out.adoptFetched(gpa, st.blocks.items) catch |e| {
-            for (st.blocks.items) |b| gpa.free(b);
-            return e;
-        };
-    };
+    if (adopt) |ad| try adoptAll(gpa, ad, tasks, rows);
     // Every block below the lowest failing row was claimed and built whole, so that row's error is a serial build's.
     var failed: ?*const RowBuildTask = null;
     for (tasks) |*t| if (t.err != null and (failed == null or t.err_row < failed.?.err_row)) {
@@ -1176,4 +1240,53 @@ test "pruneHaving: state predicates agree with built rows, NULLs, hidden aggrega
         }
         try testing.expectEqualDeep(answers[0].group_rows, answers[1].group_rows);
     }
+}
+
+test "a failed adoption of fetched strings takes them out of the rows, so the answer's teardown frees none" {
+    const gpa = testing.allocator;
+    // Two tasks' blocks, the rows' strings inside them; the second allocation of the adoption fails.
+    var tasks: [2]RowBuildTask = undefined;
+    var cursor: std.atomic.Value(usize) = .init(0);
+    var rows_buf = [_][]const AggValue{ &.{}, &.{} };
+    var cells = [_]AggValue{ .null_val, .null_val, .null_val, .null_val };
+    for (&tasks) |*t| t.* = .{ .gpa = gpa, .src = undefined, .rows = &rows_buf, .cells = &cells, .cursor = &cursor, .strings = .{ .gpa = gpa } };
+    const a = try tasks[0].strings.?.dupe("alpha");
+    const b = try tasks[1].strings.?.dupe("beta");
+    cells[0] = .{ .s = a };
+    cells[1] = .{ .i = 7 };
+    cells[2] = .{ .s = b };
+    rows_buf[0] = cells[0..2];
+    rows_buf[1] = cells[2..4];
+    var out: AggOutput = .{};
+    defer out.deinit(gpa);
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 1 });
+    var charge: usize = 0;
+    // The block list and the blocks themselves are on `gpa`; the adoption's own lists fail on `failing`.
+    const ad: Adopt = .{ .out = &out, .budget = null, .charge = &charge };
+    try testing.expectError(error.OutOfMemory, adoptAllOn(gpa, failing.allocator(), ad, &tasks, &rows_buf));
+    try testing.expect(cells[0] == .null_val);
+    try testing.expect(cells[2] == .null_val);
+    try testing.expectEqual(@as(i128, 7), cells[1].i);
+    try testing.expectEqual(@as(usize, 0), out.fetched_blocks.len);
+    try testing.expectEqual(@as(usize, 0), charge);
+}
+
+test "fetched strings draw their blocks from the query's ledger, and refuse past it" {
+    const gpa = testing.allocator;
+    var budget: core_memory.SharedBudget = .{ .limit = 100 * 1024 };
+    var f: FetchStrings = .{ .gpa = gpa, .budget = &budget };
+    defer {
+        for (f.blocks.items) |b| gpa.free(b);
+        f.blocks.deinit(gpa);
+        budget.release(f.drawn);
+    }
+    const big = try gpa.alloc(u8, 70 * 1024);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    _ = try f.dupe(big);
+    try testing.expectEqual(@as(usize, 70 * 1024), f.drawn);
+    // The next block is twice the last: past the ledger, refused, and nothing more drawn.
+    try testing.expectError(error.ExceededMemoryBudget, f.dupe(big));
+    try testing.expectEqual(@as(usize, 70 * 1024), f.drawn);
+    try testing.expectEqual(@as(usize, 1), f.blocks.items.len);
 }

@@ -13,8 +13,9 @@ pub fn dependency(expr: ast.Expr, keys: []const ast.Expr) ?usize {
     if (expr == .col_ref) {
         const f = expr.col_ref.fetch orelse return null;
         return for (keys, 0..) |k, i| {
+            // A signed key: an unsigned one widens with a zero-extend, where the build looks it up sign-extended.
             if (k == .col_ref and k.col_ref.col_idx == f.base and k.col_ref.fetch == null and k.col_ref.expr_type == .i64 and
-                !k.col_ref.unsigned_64) break i;
+                !k.col_ref.unsigned_64 and !k.col_ref.unsigned_32) break i;
         } else null;
     }
     if (expr != .binop) return null;

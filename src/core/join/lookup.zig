@@ -1726,9 +1726,11 @@ pub const GroupJoin = struct {
                 const leaf = g.keys[k];
                 const p = j.virtualPayload(leaf) orelse return .{ .i = keyOfSlot(j, s) };
                 const code = j.payloads[p].codes.get(s);
+                // An unsigned column's lane holds its bits: read as the scan reads it, zero-extended.
+                const unsigned = if (KeyDomain.of(j.payloads[p].element)) |dom| dom == .unsigned else false;
                 return switch (j.payloads[p].dict) {
-                    .i32 => |d| .{ .i = d[code] },
-                    .i64 => |d| .{ .i = d[code] },
+                    .i32 => |d| .{ .i = if (unsigned) @as(u32, @bitCast(d[code])) else d[code] },
+                    .i64 => |d| .{ .i = if (unsigned) @as(u64, @bitCast(d[code])) else d[code] },
                     .f64 => |d| .{ .f = d[code] },
                     .string => |d| .{ .s = if (gpa) |a| try a.dupe(u8, d[code]) else d[code] },
                 };

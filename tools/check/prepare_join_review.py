@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 
 def main():
     out = [pathlib.Path(p) for p in sys.argv[1:]]
-    fact, dim, dup, long_string, ts_f, ts_d, u_f, u_d, dec_f, dec_d, uniq, rdec_f, rdec_d = out
+    fact, dim, dup, long_string, ts_f, ts_d, u_f, u_d, dec_f, dec_d, uniq, rdec_f, rdec_d, u32_f, u32_d, u32_g = out
     pq.write_table(pa.table({
         "id": range(48),
         "fk": pa.array([None if i % 11 == 0 else i % 6 for i in range(48)], type=pa.int64()),
@@ -47,6 +47,17 @@ def main():
     }), rdec_f, use_dictionary=True, store_decimal_as_integer=True)
     pq.write_table(pa.table({"pk": pa.array([0], type=pa.int64()), "w": pa.array([0], type=pa.int32())}), rdec_d,
                    use_dictionary=True)
+
+    # Review of feat/joins-fd: a UINT32 build column at and past 2^31, as a dependent key and as a snowflake's key.
+    pq.write_table(pa.table({"fk": pa.array([1, 1, 2, 3], type=pa.int64()), "q": pa.array([1, 2, 3, 4], type=pa.int64())}),
+                   u32_f)
+    pq.write_table(pa.table({
+        "pk": pa.array([1, 2, 3], type=pa.int64()),
+        "u": pa.array([3000000000, 5, 2147483648], type=pa.uint32()),
+        "ug": pa.array([3000000000, 7, 2147483648], type=pa.uint32()),
+    }), u32_d)
+    pq.write_table(pa.table({"gk": pa.array([3000000000, 7, 2147483648], type=pa.uint32()), "gname": ["big", "small", "edge"]}),
+                   u32_g)
 
 
 if __name__ == "__main__":

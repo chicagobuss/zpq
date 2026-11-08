@@ -133,10 +133,16 @@ pub const AggOutput = struct {
 
     /// Take over `blocks` (the strings rows were fetched into) and borrow every string in them.
     pub fn adoptFetched(self: *AggOutput, gpa: std.mem.Allocator, blocks: []const []u8) !void {
+        return self.adoptFetchedOn(gpa, gpa, blocks);
+    }
+
+    /// `adoptFetched` drawing its two lists from `lists`, which must free into `gpa` (`deinit` frees them there); a
+    /// test passes a failing one.
+    pub fn adoptFetchedOn(self: *AggOutput, gpa: std.mem.Allocator, lists: std.mem.Allocator, blocks: []const []u8) !void {
         if (blocks.len == 0) return;
-        const owned = try std.mem.concat(gpa, []u8, &.{ self.fetched_blocks, @constCast(blocks) });
-        errdefer gpa.free(owned);
-        const spans = try gpa.alloc(BorrowedSpan, self.borrowed_strings.len + blocks.len);
+        const owned = try std.mem.concat(lists, []u8, &.{ self.fetched_blocks, @constCast(blocks) });
+        errdefer lists.free(owned);
+        const spans = try lists.alloc(BorrowedSpan, self.borrowed_strings.len + blocks.len);
         @memcpy(spans[0..self.borrowed_strings.len], self.borrowed_strings);
         for (blocks, spans[self.borrowed_strings.len..]) |b, *sp| sp.* = .{ .lo = @intFromPtr(b.ptr), .hi = @intFromPtr(b.ptr) + b.len };
         std.mem.sortUnstable(BorrowedSpan, spans, {}, struct {

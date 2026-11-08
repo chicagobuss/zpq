@@ -89,7 +89,10 @@
     "review-dec-d",
     "review-uniq",
     "review-rdec-f",
-    "review-rdec-d"
+    "review-rdec-d",
+    "review-u32-f",
+    "review-u32-d",
+    "review-u32-g"
    ]
   }
  ],
@@ -4384,6 +4387,138 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk GROUP BY gname ORDER BY gname"
+   }
+  },
+  {
+   "id": "review:fd:uint32-dependent",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, u, count(*) AS n FROM '{fixture:review-u32-f}' f JOIN '{fixture:review-u32-d}' d ON f.fk = d.pk GROUP BY f.fk, u ORDER BY f.fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, u, count(*) AS n FROM '{fixture:review-u32-f}' f JOIN '{fixture:review-u32-d}' d ON f.fk = d.pk GROUP BY f.fk, u ORDER BY f.fk"
+   }
+  },
+  {
+   "id": "review:fd:uint32-dependent-not-group-join",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, u, count(DISTINCT q) AS dq FROM '{fixture:review-u32-f}' f JOIN '{fixture:review-u32-d}' d ON f.fk = d.pk GROUP BY f.fk, u ORDER BY f.fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, u, count(DISTINCT q) AS dq FROM '{fixture:review-u32-f}' f JOIN '{fixture:review-u32-d}' d ON f.fk = d.pk GROUP BY f.fk, u ORDER BY f.fk"
+   }
+  },
+  {
+   "id": "review:fd:uint32-dependent-having",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, u, count(DISTINCT q) AS dq FROM '{fixture:review-u32-f}' f JOIN '{fixture:review-u32-d}' d ON f.fk = d.pk GROUP BY f.fk, u HAVING u > 2000000000 ORDER BY f.fk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, u, count(DISTINCT q) AS dq FROM '{fixture:review-u32-f}' f JOIN '{fixture:review-u32-d}' d ON f.fk = d.pk GROUP BY f.fk, u HAVING u > 2000000000 ORDER BY f.fk"
+   }
+  },
+  {
+   "id": "review:fd:uint32-snowflake-key",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.ug, gname, count(DISTINCT q) AS dq FROM '{fixture:review-u32-f}' f, '{fixture:review-u32-d}' d, '{fixture:review-u32-g}' g WHERE f.fk = d.pk AND d.ug = g.gk GROUP BY d.ug, gname ORDER BY d.ug"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.ug, gname, count(DISTINCT q) AS dq FROM '{fixture:review-u32-f}' f, '{fixture:review-u32-d}' d, '{fixture:review-u32-g}' g WHERE f.fk = d.pk AND d.ug = g.gk GROUP BY d.ug, gname ORDER BY d.ug"
    }
   },
   {

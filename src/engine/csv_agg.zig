@@ -588,6 +588,11 @@ fn foldOnce(
         }
         if (errs[i]) |e| return scratch_charge.refusal(e);
     }
+    // The fold has merged every chunk: what is left is the answer. As past a Parquet scan (`runMultiAggregate`), it
+    // may hold the ceiling's slack past the limit (`memory.finalize_allowance`), so an answer of groups the fold
+    // admitted never refuses the query; the slack is taken back before the answer is encoded or printed, which adds
+    // its own (`writeAggregateParquet`).
+    ledger.limit += core_memory.finalize_allowance;
     const ab = try atDataPrecision(pass, args, b, p, &source);
     const out_calls = ab.q.calls;
 
@@ -634,8 +639,8 @@ fn foldOnce(
         const kept = scan_rows.pruneHaving(&row_src, slots, args.result_order.having);
         row_src.slots = slots[0..kept];
         // The answer is drawn from the ledger before it is built, beside the merged table it is built from, as a
-        // Parquet aggregate's is (`runMultiAggregate`), and stays drawn while the query holds it: a group count past
-        // `--max-memory` is refused, not built.
+        // Parquet aggregate's is (`runMultiAggregate`), within the finalize allowance added above, and stays drawn while
+        // the query holds it. A group count past `--max-memory` is refused while the fold admits its groups.
         const answer_bytes = scan_rows.answerBytesParallel(row_src.slots, col_types, key_types, false, @max(1, workers)) +|
             row_src.winnerStringBytes();
         _ = ledger.drawExact(answer_bytes) orelse return error.ExceededMemoryBudget;
@@ -686,5 +691,6 @@ fn foldOnce(
         }
     };
     const check: Check = .{ .mapped = mapped, .path = path };
+    ledger.limit -= core_memory.finalize_allowance;
     return aggregate.answerAggregate(ctx, pass, args, &r, &ledger, &t, .{}, .{ .ctx = &check, .check = Check.check }, null);
 }

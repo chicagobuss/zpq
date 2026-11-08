@@ -943,3 +943,49 @@ test "csv aggregate: avg of a DECIMAL past 18 digits keeps the digits the data's
     try testing.expectEqual(@as(i128, 10000000000000000003333), got.dec.v);
     try testing.expectEqual(@as(u8, 6), got.dec.spec.scale);
 }
+
+test "csv aggregate: a GROUP BY whose fold fits the budget answers, its answer within the finalize allowance (review P1)" {
+    const sql = @import("../core/expr/sql_parser.zig");
+    if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
+    const syntax_plan = @import("syntax_plan.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    const csv = try tmpPath(&b1, &tmp, "k.csv");
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(a, "k\n");
+    for (0..20_000) |i| try text.print(a, "{d}\n", .{i});
+    try writeFile(csv, text.items);
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    const Probe = struct {
+        fn fits(c: Context, args: engine_types.QueryArgs, budget: usize) !bool {
+            var at = args;
+            at.max_memory = budget;
+            var r = runQuery(c, at) catch |e| return if (e == error.ExceededMemoryBudget) false else e;
+            r.deinit(testing.allocator);
+            return true;
+        }
+    };
+    // The same fold twice: one answer of 20,000 groups, one HAVING keeps none of.
+    const plain_q = try sql.parseSqlPlan(testing.allocator, "SELECT k, count(*) AS c FROM 'k.csv' GROUP BY k");
+    defer plain_q.deinit(testing.allocator);
+    const empty_q = try sql.parseSqlPlan(testing.allocator, "SELECT k, count(*) AS c FROM 'k.csv' GROUP BY k HAVING count(*) > 1");
+    defer empty_q.deinit(testing.allocator);
+    const plain: engine_types.QueryArgs = .{ .inputs = &.{csv}, .parallelism = 1, .plan_source = syntax_plan.source(plain_q.syntax.?), .select_cols = plain_q.select_cols, .result_order = plain_q.result_order };
+    const empty: engine_types.QueryArgs = .{ .inputs = &.{csv}, .parallelism = 1, .plan_source = syntax_plan.source(empty_q.syntax.?), .select_cols = empty_q.select_cols, .result_order = empty_q.result_order };
+    // The least budget the fold fits.
+    var lo: usize = 64 << 10;
+    var hi: usize = 256 << 20;
+    if (!try Probe.fits(ctx, empty, hi)) return error.FoldNeverFits;
+    if (try Probe.fits(ctx, empty, lo)) return error.FoldFitsAnyBudget;
+    while (hi - lo > 4096) {
+        const mid = lo + (hi - lo) / 2;
+        if (try Probe.fits(ctx, empty, mid)) hi = mid else lo = mid;
+    }
+    // Its answer, far under the finalize allowance, is built past the limit as a Parquet GROUP BY's is
+    // (`runMultiAggregate`): a budget that holds the fold answers.
+    try testing.expect(try Probe.fits(ctx, plain, hi));
+}

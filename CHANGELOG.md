@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Two-key GROUP BY counts and sums are faster at the default thread count.** An exact `GROUP BY a, b` with
+  `count(*)` or an integer `sum` now runs on one worker per L2 cache when more workers would push it off the dense plan,
+  and the merge of the workers' tables runs in parallel. On a Ryzen 9 9950X, `SELECT a, b, count(*), sum(v) ... GROUP BY
+  a, b` over a Zipf-distributed file is 47% faster (319 ms to 170 ms). `--threads N` keeps the plan it had.
 - **`LIKE` filters with a `MIN`, `MAX` or `COUNT(DISTINCT)` of the same string column read it once.** When a cheaper
   condition runs first, zpq now keeps the strings it already decoded for the rows that pass and replays them for the
   aggregate instead of reading those pages again. On a Ryzen 9 9950X, ClickBench Q21 is 64% faster and Q22 70% faster
@@ -21,10 +25,6 @@
   file's speed with 0.5.1's re-encode and 1.08× and 1.11× now (PyArrow 26: 1.09×); the Title column is 1.7× to 2.9×
   faster, and the file is 98.7 MB where 0.5.1 wrote 116.3 MB and the original is 122.4 MB. Values don't change; file
   bytes do.
-- **Two-key GROUP BY counts and sums are faster at the default thread count.** An exact `GROUP BY a, b` with
-  `count(*)` or an integer `sum` now runs on one worker per L2 cache when more workers would push it off the dense plan
-  or crowd its tables out of cache. On a Ryzen 9 9950X, `SELECT a, b, count(*), sum(v) ... GROUP BY a, b` over a
-  Zipf-distributed file is 44% faster (319 ms to 178 ms). `--threads N` keeps the plan it had.
 - **Writes take one pass for column statistics.** A column chunk's statistics are merged from its pages' instead of
   read from a second scan of the values: the same statistics, 2–4% less CPU when writing ClickBench or TPC-H data.
 - **String filters read dictionaries, not rows.** A filter on a dictionary-encoded string column (`=`, `<>`, `IN`) now

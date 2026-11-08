@@ -663,36 +663,6 @@
    }
   },
   {
-   "id": "sql_windows:refuse:ntile",
-   "fixture": "wn",
-   "cli": [
-    "query",
-    "--query",
-    "SELECT id, ntile(4) OVER (ORDER BY id) AS q FROM '{fixture:wn}'",
-    "--summary=json"
-   ],
-   "refuse": {
-    "error": "WindowNotSupported",
-    "diag": "ntile is not supported",
-    "exit": 2
-   }
-  },
-  {
-   "id": "sql_windows:refuse:first-value",
-   "fixture": "wn",
-   "cli": [
-    "query",
-    "--query",
-    "SELECT id, first_value(v) OVER (PARTITION BY g ORDER BY id) AS f FROM '{fixture:wn}'",
-    "--summary=json"
-   ],
-   "refuse": {
-    "error": "WindowNotSupported",
-    "diag": "first_value is not supported",
-    "exit": 2
-   }
-  },
-  {
    "id": "sql_windows:refuse:range-offset",
    "fixture": "wn",
    "cli": [
@@ -799,21 +769,6 @@
     "exit": 2,
     "binder_sql": "SELECT id FROM '{fixture:wn}' WHERE row_number() OVER (ORDER BY id) < 3",
     "duck_error": "Binder Error:"
-   }
-  },
-  {
-   "id": "sql_windows:refuse:star",
-   "fixture": "wn",
-   "cli": [
-    "query",
-    "--query",
-    "SELECT *, row_number() OVER (ORDER BY id) AS r FROM '{fixture:wn}'",
-    "--summary=json"
-   ],
-   "refuse": {
-    "error": "WindowNotSupported",
-    "diag": "SELECT * with a window function",
-    "exit": 2
    }
   },
   {
@@ -1251,6 +1206,584 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT id, row_number() OVER (PARTITION BY u32 ORDER BY id) AS a, count(*) OVER (PARTITION BY u64) AS c FROM '{fixture:wu}' ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-top-n",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, g, v FROM '{fixture:wn}' QUALIFY row_number() OVER (PARTITION BY g ORDER BY v DESC, id) <= 2",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, g, v FROM '{fixture:wn}' QUALIFY row_number() OVER (PARTITION BY g ORDER BY v DESC, id) <= 2"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-alias",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, g, rank() OVER (PARTITION BY g ORDER BY v, id) AS r FROM '{fixture:wn}' QUALIFY r <= 3",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, g, rank() OVER (PARTITION BY g ORDER BY v, id) AS r FROM '{fixture:wn}' QUALIFY r <= 3"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-where-group-by",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g, sum(v) AS s FROM '{fixture:wn}' WHERE v IS NOT NULL GROUP BY g QUALIFY rank() OVER (ORDER BY sum(v) DESC, g) <= 3",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT g, sum(v) AS s FROM '{fixture:wn}' WHERE v IS NOT NULL GROUP BY g QUALIFY rank() OVER (ORDER BY sum(v) DESC, g) <= 3"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-having",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g, count(*) AS c FROM '{fixture:wn}' GROUP BY g HAVING count(*) > 20 QUALIFY dense_rank() OVER (ORDER BY count(*), g) <= 4",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT g, count(*) AS c FROM '{fixture:wn}' GROUP BY g HAVING count(*) > 20 QUALIFY dense_rank() OVER (ORDER BY count(*), g) <= 4"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-logic",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, v FROM '{fixture:wn}' QUALIFY (dense_rank() OVER (ORDER BY v) <= 3 OR v > 6) AND NOT (row_number() OVER (ORDER BY id) = 1)",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, v FROM '{fixture:wn}' QUALIFY (dense_rank() OVER (ORDER BY v) <= 3 OR v > 6) AND NOT (row_number() OVER (ORDER BY id) = 1)"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-between-in",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id FROM '{fixture:wn}' QUALIFY row_number() OVER (ORDER BY id) BETWEEN 3 AND 9 OR rank() OVER (ORDER BY v, id) IN (1, 2)",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id FROM '{fixture:wn}' QUALIFY row_number() OVER (ORDER BY id) BETWEEN 3 AND 9 OR rank() OVER (ORDER BY v, id) IN (1, 2)"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-arithmetic",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS total FROM '{fixture:wn}' QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) * 2 <= 6 AND total IS NOT NULL",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS total FROM '{fixture:wn}' QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) * 2 <= 6 AND total IS NOT NULL"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-two-windows-equal",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id FROM '{fixture:wn}' QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) = rank() OVER (PARTITION BY g ORDER BY id)",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id FROM '{fixture:wn}' QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) = rank() OVER (PARTITION BY g ORDER BY id)"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-value-functions",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, g FROM '{fixture:wn}' QUALIFY first_value(v) OVER (PARTITION BY g ORDER BY id) > 0 AND ntile(4) OVER (ORDER BY id) = 1",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, g FROM '{fixture:wn}' QUALIFY first_value(v) OVER (PARTITION BY g ORDER BY id) > 0 AND ntile(4) OVER (ORDER BY id) = 1"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-order-limit",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, g FROM '{fixture:wn}' QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) <= 2 ORDER BY id LIMIT 5 OFFSET 1"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, g FROM '{fixture:wn}' QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) <= 2 ORDER BY id LIMIT 5 OFFSET 1"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-input-order",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, g FROM '{fixture:wn}' QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) = 1"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, g FROM (SELECT id, g, file_row_number, row_number() OVER (PARTITION BY g ORDER BY id) AS rn FROM read_parquet('{fixture:wn}', file_row_number=true)) WHERE rn = 1 ORDER BY file_row_number"
+   }
+  },
+  {
+   "id": "sql_windows:star",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT *, row_number() OVER (ORDER BY id) AS rn FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT *, row_number() OVER (ORDER BY id) AS rn FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:star-exclude",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT * EXCLUDE (d, s, m, dc4, wide, dt, b), rank() OVER (PARTITION BY g ORDER BY v, id) AS r, sum(v) OVER (PARTITION BY h) AS t FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT * EXCLUDE (d, s, m, dc4, wide, dt, b), rank() OVER (PARTITION BY g ORDER BY v, id) AS r, sum(v) OVER (PARTITION BY h) AS t FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:star-and-qualify",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT *, sum(v) OVER (PARTITION BY g ORDER BY id) AS run FROM '{fixture:wn}' QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) <= 2",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT *, sum(v) OVER (PARTITION BY g ORDER BY id) AS run FROM '{fixture:wn}' QUALIFY row_number() OVER (PARTITION BY g ORDER BY id) <= 2"
+   }
+  },
+  {
+   "id": "sql_windows:first-last-value",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, first_value(v) OVER (PARTITION BY g ORDER BY id) AS a, last_value(v) OVER (PARTITION BY g ORDER BY id) AS b, first_value(s) OVER (PARTITION BY h ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS c, last_value(m) OVER (PARTITION BY h ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS e FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, first_value(v) OVER (PARTITION BY g ORDER BY id) AS a, last_value(v) OVER (PARTITION BY g ORDER BY id) AS b, first_value(s) OVER (PARTITION BY h ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS c, last_value(m) OVER (PARTITION BY h ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS e FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:first-last-value-types",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, first_value(d) OVER (ORDER BY id) AS a, last_value(dt) OVER (PARTITION BY g ORDER BY id) AS b, first_value(b) OVER (PARTITION BY h ORDER BY id) AS c, last_value(dc4) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS e, first_value(wide) OVER (PARTITION BY g ORDER BY id) AS f, last_value(si) OVER (PARTITION BY h ORDER BY id) AS g2 FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, first_value(d) OVER (ORDER BY id) AS a, last_value(dt) OVER (PARTITION BY g ORDER BY id) AS b, first_value(b) OVER (PARTITION BY h ORDER BY id) AS c, last_value(dc4) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS e, first_value(wide) OVER (PARTITION BY g ORDER BY id) AS f, last_value(si) OVER (PARTITION BY h ORDER BY id) AS g2 FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:nth-value",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, nth_value(v, 2) OVER (PARTITION BY g ORDER BY id) AS a, nth_value(s, 3) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 4 FOLLOWING) AS b, nth_value(m, 1) OVER (ORDER BY id) AS c, nth_value(v, 99) OVER (PARTITION BY h ORDER BY id) AS e FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, nth_value(v, 2) OVER (PARTITION BY g ORDER BY id) AS a, nth_value(s, 3) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 4 FOLLOWING) AS b, nth_value(m, 1) OVER (ORDER BY id) AS c, nth_value(v, 99) OVER (PARTITION BY h ORDER BY id) AS e FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:ntile",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, ntile(4) OVER (ORDER BY id) AS q, ntile(3) OVER (PARTITION BY g ORDER BY id) AS q3, ntile(1000) OVER (PARTITION BY h ORDER BY id) AS big, ntile(1) OVER (PARTITION BY g ORDER BY v DESC, id) AS one FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, ntile(4) OVER (ORDER BY id) AS q, ntile(3) OVER (PARTITION BY g ORDER BY id) AS q3, ntile(1000) OVER (PARTITION BY h ORDER BY id) AS big, ntile(1) OVER (PARTITION BY g ORDER BY v DESC, id) AS one FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:ntile-uneven",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, ntile(7) OVER (PARTITION BY g ORDER BY id) AS q, ntile(2) OVER (ORDER BY v, id) AS h FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, ntile(7) OVER (PARTITION BY g ORDER BY id) AS q, ntile(2) OVER (ORDER BY v, id) AS h FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:ntile-zero",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, ntile(0) OVER (ORDER BY id) AS q FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "at least 1",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:nth-value-zero",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, nth_value(v, 0) OVER (ORDER BY id) AS q FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "at least 1",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:ntile-frame",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, ntile(2) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS q FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "a frame on ntile",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:star-qualified",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT t.*, row_number() OVER (ORDER BY id) AS q FROM '{fixture:wn}' t",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "SELECT * with a window function",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:qualify-without-window",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id FROM '{fixture:wn}' QUALIFY id > 3",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "SqlParseError",
+    "diag": "invalid SQL",
+    "exit": 2,
+    "binder_sql": "SELECT id FROM '{fixture:wn}' QUALIFY id > 3",
+    "duck_error": "Binder Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:qualify-subquery",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id FROM '{fixture:wn}' QUALIFY row_number() OVER (ORDER BY id) IN (SELECT 1)",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "subquery in QUALIFY",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:qualify-group-by-rollup",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g, sum(v) AS s FROM '{fixture:wn}' GROUP BY ROLLUP (g) QUALIFY rank() OVER (ORDER BY sum(v)) <= 3",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "SqlParseError",
+    "diag": "invalid SQL",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:qualify-column-before-output-name",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s FROM '{fixture:wn}' QUALIFY s IS NOT NULL AND row_number() OVER (PARTITION BY g ORDER BY id) <= 3",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s FROM '{fixture:wn}' QUALIFY s IS NOT NULL AND row_number() OVER (PARTITION BY g ORDER BY id) <= 3"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:star-over-subquery",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT * FROM (SELECT id, rank() OVER (ORDER BY id) AS r FROM '{fixture:wn}') t",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "ColumnsNotSupported",
+    "diag": "needs one local table",
+    "exit": 2
    }
   }
  ]

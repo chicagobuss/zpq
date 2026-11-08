@@ -62,6 +62,11 @@ const Builder = struct {
     lp: *c.arena_t,
     why: *Refusal,
     inputs: std.ArrayList([]const u8) = .empty,
+    /// The select items that hold a window call, by alias: QUALIFY may name them.
+    aliases: std.ArrayList(struct { name: []const u8, lowered: []const u8 }) = .empty,
+    alias_used: bool = false,
+    /// The table's column names, when they are known: in QUALIFY a column of the table is read before a select alias of that name.
+    columns: ?[]const []const u8 = null,
     wins: std.ArrayList(Win) = .empty,
     passes: std.ArrayList(PassB) = .empty,
 
@@ -104,13 +109,13 @@ const Builder = struct {
                     c.LP_OP_CONCAT => "||",
                     else => return self.why.set("a window function inside this operation is not supported", .{}),
                 };
-                const left = try self.lower(b.left orelse return error.SqlParseError);
-                const right = try self.lower(b.right orelse return error.SqlParseError);
+                const left = try self.operand(b.left orelse return error.SqlParseError);
+                const right = try self.operand(b.right orelse return error.SqlParseError);
                 return std.fmt.allocPrint(self.arena, "({s} {s} {s})", .{ left, op, right });
             },
             c.LP_EXPR_UNARY_OP => {
                 if (node.u.unary.op != c.LP_UOP_MINUS) return self.why.set("a window function inside this operation is not supported", .{});
-                return std.fmt.allocPrint(self.arena, "(-{s})", .{try self.lower(node.u.unary.operand orelse return error.SqlParseError)});
+                return std.fmt.allocPrint(self.arena, "(-{s})", .{try self.operand(node.u.unary.operand orelse return error.SqlParseError)});
             },
             c.LP_EXPR_FUNCTION => {
                 const f = node.u.function;
@@ -118,15 +123,94 @@ const Builder = struct {
                 var args: std.ArrayList(u8) = .empty;
                 for (0..@intCast(f.args.count)) |i| {
                     if (i > 0) try args.appendSlice(self.arena, ", ");
-                    try args.appendSlice(self.arena, try self.lower(f.args.items[i] orelse return error.SqlParseError));
+                    try args.appendSlice(self.arena, try self.operand(f.args.items[i] orelse return error.SqlParseError));
                 }
                 return std.fmt.allocPrint(self.arena, "{s}({s})", .{ std.mem.span(f.name), args.items });
             },
             c.LP_EXPR_CAST => return std.fmt.allocPrint(self.arena, "CAST({s} AS {s})", .{
-                try self.lower(node.u.cast.expr orelse return error.SqlParseError),
+                try self.operand(node.u.cast.expr orelse return error.SqlParseError),
                 std.mem.span(node.u.cast.type_name),
             }),
             else => return self.why.set("a window function inside this expression is not supported", .{}),
+        }
+    }
+
+    /// An operand of an operation: a literal stays in place, anything else is lowered.
+    fn operand(self: *Builder, node: *c.LpNode) Error![]const u8 {
+        if (node.kind == c.LP_EXPR_COLUMN_REF and node.u.column_ref.table == null and node.u.column_ref.schema == null) {
+            const name = std.mem.span(node.u.column_ref.column);
+            for (self.aliases.items) |al| if (std.ascii.eqlIgnoreCase(al.name, name)) {
+                // DuckDB reads a column of the table before an output name in QUALIFY. Without the table's columns it cannot be
+                // told which this is.
+                const cols = self.columns orelse return self.why.set("QUALIFY names the output column {s}, and the table's columns are not known to tell it from one", .{name});
+                var is_column = false;
+                for (cols) |col| is_column = is_column or std.ascii.eqlIgnoreCase(col, name);
+                if (!is_column) {
+                    self.alias_used = true;
+                    return al.lowered;
+                }
+            };
+        }
+        switch (node.kind) {
+            c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT, c.LP_EXPR_LITERAL_STRING, c.LP_EXPR_LITERAL_NULL => return self.unparse(node),
+            else => return self.lower(node),
+        }
+    }
+
+    /// A QUALIFY predicate for the final query's WHERE: comparisons, AND / OR / NOT, IS NULL, BETWEEN and IN over lowered
+    /// operands. A window call, or a column the query reads, is a column of the last file.
+    fn predicate(self: *Builder, node: *c.LpNode) Error![]const u8 {
+        switch (node.kind) {
+            c.LP_EXPR_BINARY_OP => {
+                const b = node.u.binary;
+                const op: []const u8 = switch (b.op) {
+                    c.LP_OP_EQ => "=",
+                    c.LP_OP_NE => "<>",
+                    c.LP_OP_LT => "<",
+                    c.LP_OP_LE => "<=",
+                    c.LP_OP_GT => ">",
+                    c.LP_OP_GE => ">=",
+                    c.LP_OP_IS => "IS",
+                    c.LP_OP_ISNOT => "IS NOT",
+                    c.LP_OP_AND, c.LP_OP_OR => {
+                        const l = try self.predicate(b.left orelse return error.SqlParseError);
+                        const r = try self.predicate(b.right orelse return error.SqlParseError);
+                        return std.fmt.allocPrint(self.arena, "({s} {s} {s})", .{ l, if (b.op == c.LP_OP_AND) "AND" else "OR", r });
+                    },
+                    else => return self.operand(node),
+                };
+                const l = try self.operand(b.left orelse return error.SqlParseError);
+                const r = try self.operand(b.right orelse return error.SqlParseError);
+                return std.fmt.allocPrint(self.arena, "({s} {s} {s})", .{ l, op, r });
+            },
+            c.LP_EXPR_UNARY_OP => {
+                if (node.u.unary.op != c.LP_UOP_NOT) return self.operand(node);
+                return std.fmt.allocPrint(self.arena, "(NOT {s})", .{try self.predicate(node.u.unary.operand orelse return error.SqlParseError)});
+            },
+            c.LP_EXPR_BETWEEN => {
+                const t = node.u.between;
+                return std.fmt.allocPrint(self.arena, "({s} {s}BETWEEN {s} AND {s})", .{
+                    try self.operand(t.expr orelse return error.SqlParseError),
+                    if (t.is_not != 0) "NOT " else "",
+                    try self.operand(t.low orelse return error.SqlParseError),
+                    try self.operand(t.high orelse return error.SqlParseError),
+                });
+            },
+            c.LP_EXPR_IN => {
+                const t = node.u.in;
+                if (t.select != null) return self.why.set("a subquery in QUALIFY is not supported", .{});
+                var list: std.ArrayList(u8) = .empty;
+                for (0..@intCast(t.values.count)) |i| {
+                    if (i > 0) try list.appendSlice(self.arena, ", ");
+                    try list.appendSlice(self.arena, try self.operand(t.values.items[i] orelse return error.SqlParseError));
+                }
+                return std.fmt.allocPrint(self.arena, "({s} {s}IN ({s}))", .{
+                    try self.operand(t.expr orelse return error.SqlParseError),
+                    if (t.is_not != 0) "NOT " else "",
+                    list.items,
+                });
+            },
+            else => return self.operand(node),
         }
     }
 
@@ -187,7 +271,7 @@ const Builder = struct {
 
         const nargs: usize = @intCast(f.args.count);
         var call: wp.Call = .{ .func = undefined };
-        const Kind = enum { ranking, offset, aggregate };
+        const Kind = enum { ranking, offset, aggregate, value, tile };
         const kind: Kind = blk: {
             if (std.mem.eql(u8, name, "row_number")) call.func = .row_number else if (std.mem.eql(u8, name, "rank")) call.func = .rank else if (std.mem.eql(u8, name, "dense_rank")) call.func = .dense_rank else if (std.mem.eql(u8, name, "lag")) {
                 call.func = .lag;
@@ -210,7 +294,19 @@ const Builder = struct {
             } else if (std.mem.eql(u8, name, "max")) {
                 call.func = .max;
                 break :blk .aggregate;
-            } else return self.why.set("the window function {s} is not supported (row_number, rank, dense_rank, lag, lead, sum, count, avg, min and max are)", .{raw});
+            } else if (std.mem.eql(u8, name, "first_value")) {
+                call.func = .first_value;
+                break :blk .value;
+            } else if (std.mem.eql(u8, name, "last_value")) {
+                call.func = .last_value;
+                break :blk .value;
+            } else if (std.mem.eql(u8, name, "nth_value")) {
+                call.func = .nth_value;
+                break :blk .value;
+            } else if (std.mem.eql(u8, name, "ntile")) {
+                call.func = .ntile;
+                break :blk .tile;
+            } else return self.why.set("the window function {s} is not supported (row_number, rank, dense_rank, ntile, lag, lead, first_value, last_value, nth_value, sum, count, avg, min and max are)", .{raw});
             break :blk .ranking;
         };
         switch (kind) {
@@ -220,6 +316,20 @@ const Builder = struct {
                 call.arg = try self.column(f.args.items[0] orelse return error.SqlParseError, "argument");
                 if (nargs >= 2) call.offset = try self.literalInt(f.args.items[1], "the offset of lag / lead");
                 if (nargs == 3) call.default = try self.default(f.args.items[2] orelse return error.SqlParseError);
+            },
+            .value => {
+                const want: usize = if (call.func == .nth_value) 2 else 1;
+                if (nargs != want) return self.why.set("{s} takes {d} argument(s)", .{ raw, want });
+                call.arg = try self.column(f.args.items[0] orelse return error.SqlParseError, "argument");
+                if (call.func == .nth_value) {
+                    call.offset = try self.literalInt(f.args.items[1], "the n of nth_value");
+                    if (call.offset < 1) return self.why.set("the n of nth_value must be at least 1", .{});
+                }
+            },
+            .tile => {
+                if (nargs != 1) return self.why.set("ntile takes the number of buckets", .{});
+                call.offset = try self.literalInt(f.args.items[0], "the number of buckets of ntile");
+                if (call.offset < 1) return self.why.set("the number of buckets of ntile must be at least 1", .{});
             },
             .aggregate => {
                 const first_arg: ?*c.LpNode = if (nargs > 0) f.args.items[0] else null;
@@ -259,7 +369,7 @@ const Builder = struct {
         if (try self.frame(wd.frame)) |fr| {
             // The grammar hands every window a frame; the default one is no frame at all.
             const is_default = !fr.rows and fr.start == .unbounded_preceding and fr.end == .current_row;
-            if (kind != .aggregate and !is_default) return self.why.set("a frame on {s} is not supported", .{raw});
+            if (kind != .aggregate and kind != .value and !is_default) return self.why.set("a frame on {s} is not supported", .{raw});
             call.frame = fr;
         }
 
@@ -290,11 +400,11 @@ const Builder = struct {
                 return self.why.set("the default of lag / lead is not a number", .{}) },
             c.LP_EXPR_LITERAL_STRING => return .{ .string = try self.arena.dupe(u8, std.mem.span(node.u.literal.value)) },
             c.LP_EXPR_UNARY_OP => {
-                const operand: *c.LpNode = node.u.unary.operand orelse return error.SqlParseError;
-                if (node.u.unary.op == c.LP_UOP_MINUS) switch (operand.kind) {
-                    c.LP_EXPR_LITERAL_INT => return .{ .int = -(std.fmt.parseInt(i64, std.mem.span(operand.u.literal.value), 10) catch
+                const inner: *c.LpNode = node.u.unary.operand orelse return error.SqlParseError;
+                if (node.u.unary.op == c.LP_UOP_MINUS) switch (inner.kind) {
+                    c.LP_EXPR_LITERAL_INT => return .{ .int = -(std.fmt.parseInt(i64, std.mem.span(inner.u.literal.value), 10) catch
                         return self.why.set("the default of lag / lead is out of range", .{})) },
-                    c.LP_EXPR_LITERAL_FLOAT => return .{ .float = -(std.fmt.parseFloat(f64, std.mem.span(operand.u.literal.value)) catch
+                    c.LP_EXPR_LITERAL_FLOAT => return .{ .float = -(std.fmt.parseFloat(f64, std.mem.span(inner.u.literal.value)) catch
                         return self.why.set("the default of lag / lead is not a number", .{})) },
                     else => {},
                 };
@@ -346,7 +456,7 @@ fn hasWindow(node: *c.LpNode) bool {
 
 /// Where the main clauses start in `text`, at the top level (outside parentheses and quoted text): the FROM, the
 /// ORDER BY and the LIMIT / OFFSET after it.
-const Clauses = struct { from: ?usize = null, order: ?usize = null, tail: ?usize = null };
+const Clauses = struct { from: ?usize = null, order: ?usize = null, tail: ?usize = null, qualify: ?usize = null };
 
 fn clauses(text: []const u8) Clauses {
     var out: Clauses = .{};
@@ -363,6 +473,7 @@ fn clauses(text: []const u8) Clauses {
         if (depth == 0 and sql_setops.startsWord(text, i)) {
             const word = sql_setops.wordAt(text, i);
             if (sql_setops.eql(word, "from") and out.from == null) out.from = i;
+            if (sql_setops.eql(word, "qualify") and out.from != null and out.qualify == null) out.qualify = i;
             if (sql_setops.eql(word, "order") and out.from != null) {
                 const next = sql_setops.nextWord(text, i + word.len);
                 if (sql_setops.eql(next.word, "by")) out.order = i;
@@ -388,10 +499,19 @@ fn quoteName(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
 }
 
 /// Plan the query `text` (a NUL-terminated SELECT as the parser reads it). Strings of the plan are allocated from `arena`.
-pub fn build(arena: std.mem.Allocator, text: [:0]const u8, why: *Refusal) Error!wp.Plan {
+pub fn build(arena: std.mem.Allocator, full_text: [:0]const u8, why: *Refusal, columns: ?[]const []const u8) Error!wp.Plan {
     const lp = c.arena_create(64 * 1024) orelse return error.OutOfMemory;
     defer c.arena_destroy(lp);
     var error_msg: [*c]const u8 = null;
+    // QUALIFY is no clause of the grammar: its predicate is read apart, and the query without it is the query.
+    var text: [:0]const u8 = full_text;
+    var qualify_text: ?[]const u8 = null;
+    const whole = clauses(full_text);
+    if (whole.qualify) |at| {
+        const end = whole.order orelse whole.tail orelse full_text.len;
+        qualify_text = std.mem.trim(u8, full_text[at + "qualify".len .. end], " \t\r\n;");
+        text = try std.fmt.allocPrintSentinel(arena, "{s} {s}", .{ full_text[0..at], full_text[end..] }, 0);
+    }
     const stmts = c.lp_parse_all(text.ptr, lp, &error_msg);
     if (stmts == null or stmts.*.count != 1) return error.SqlParseError;
     const root: *c.LpNode = stmts.*.items[0] orelse return error.SqlParseError;
@@ -405,7 +525,7 @@ pub fn build(arena: std.mem.Allocator, text: [:0]const u8, why: *Refusal) Error!
     for (0..@intCast(sel.group_by.count)) |i| if (sel.group_by.items[i]) |g| if (hasWindow(g))
         return why.set("a window function in GROUP BY is not supported", .{});
 
-    var b: Builder = .{ .arena = arena, .lp = lp, .why = why };
+    var b: Builder = .{ .arena = arena, .lp = lp, .why = why, .columns = columns };
     const cl = clauses(text);
     const from_at = cl.from orelse return why.set("a window query needs a FROM clause", .{});
     const order_at = cl.order;
@@ -439,10 +559,26 @@ pub fn build(arena: std.mem.Allocator, text: [:0]const u8, why: *Refusal) Error!
             break :blk try quoteName(arena, name);
         };
         try aliases.append(arena, if (alias) |al| al else shown);
+        if (windowed) if (alias) |al| try b.aliases.append(arena, .{ .name = if (al.len >= 2 and al[0] == '"') al[1 .. al.len - 1] else al, .lowered = lowered });
         if (i > 0) try items.appendSlice(arena, ", ");
         try items.print(arena, "{s} AS {s}", .{ lowered, shown });
     }
-    if (!any_window) return why.set("no window function found", .{});
+    if (!any_window and qualify_text == null) return why.set("no window function found", .{});
+
+    // QUALIFY: the predicate over the window columns, which filters the last file's rows.
+    var where_text: []const u8 = "";
+    if (qualify_text) |predicate_text| {
+        if (predicate_text.len == 0) return error.SqlParseError;
+        const wrapped = try std.fmt.allocPrintSentinel(arena, "SELECT {s} FROM t", .{predicate_text}, 0);
+        const pstmts = c.lp_parse_all(wrapped.ptr, lp, &error_msg);
+        if (pstmts == null or pstmts.*.count != 1) return error.SqlParseError;
+        const proot: *c.LpNode = pstmts.*.items[0] orelse return error.SqlParseError;
+        if (proot.*.kind != c.LP_STMT_SELECT or proot.*.u.select.result_columns.count != 1) return error.SqlParseError;
+        const prc: *c.LpNode = proot.*.u.select.result_columns.items[0] orelse return error.SqlParseError;
+        const pexpr: *c.LpNode = if (prc.kind == c.LP_RESULT_COLUMN) prc.u.result_column.expr orelse return error.SqlParseError else prc;
+        where_text = try b.predicate(pexpr);
+        if (!hasWindow(pexpr) and !b.alias_used) return why.set("QUALIFY needs a window function in its condition", .{});
+    }
 
     // The outer ORDER BY: a position or an output name stays, any other expression is read like a select item.
     var tail: std.ArrayList(u8) = .empty;
@@ -499,7 +635,7 @@ pub fn build(arena: std.mem.Allocator, text: [:0]const u8, why: *Refusal) Error!
         _ = pi;
         out.* = .{ .sort = pb.sort, .partition = pb.partition, .order = pb.order, .calls = calls, .results = results };
     }
-    return .{ .input_sql = input.items, .passes = passes, .final_items = items.items, .final_tail = tail.items };
+    return .{ .input_sql = input.items, .passes = passes, .final_items = items.items, .final_where = where_text, .final_tail = tail.items };
 }
 
 test "windows with the same sort and a different split are different passes" {
@@ -509,7 +645,7 @@ test "windows with the same sort and a different split are different passes" {
     var why: Refusal = .{};
     const text: [:0]const u8 = "SELECT sum(v) OVER (ORDER BY a, b) AS s1, sum(v) OVER (PARTITION BY a ORDER BY b) AS s2, " ++
         "sum(v) OVER (PARTITION BY a, b) AS s3, rank() OVER (PARTITION BY a ORDER BY b) AS r FROM t";
-    const plan = try build(a, text, &why);
+    const plan = try build(a, text, &why, null);
     try std.testing.expectEqual(@as(usize, 3), plan.passes.len);
     try std.testing.expectEqual(@as(usize, 0), plan.passes[0].partition.len);
     try std.testing.expectEqual(@as(usize, 1), plan.passes[1].partition.len);
@@ -520,3 +656,23 @@ test "windows with the same sort and a different split are different passes" {
     try std.testing.expect(std.mem.indexOf(u8, plan.input_sql, "ORDER BY") == null);
 }
 
+test "QUALIFY is the final query's WHERE over the window columns, and a column of the table wins over an output name" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var why: Refusal = .{};
+    const text: [:0]const u8 = "SELECT id, rank() OVER (PARTITION BY g ORDER BY v) AS r FROM t QUALIFY r <= 2 AND row_number() OVER (ORDER BY id) BETWEEN 1 AND 9 ORDER BY id LIMIT 3";
+    const plan = try build(a, text, &why, &.{ "id", "g", "v" });
+    try std.testing.expectEqualStrings("((\"w0\" <= 2) AND (\"w1\" BETWEEN 1 AND 9))", plan.final_where);
+    try std.testing.expectEqual(@as(usize, 2), plan.passes.len);
+    try std.testing.expect(std.mem.indexOf(u8, plan.final_tail, "LIMIT 3") != null);
+    // `r` is a column of this table: QUALIFY reads the column, not the window call that is called `r`.
+    const column_first = try build(a, text, &why, &.{ "id", "g", "v", "r" });
+    try std.testing.expect(std.mem.indexOf(u8, column_first.final_where, "\"w0\" <= 2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, column_first.final_where, "<= 2") != null);
+    // And with nothing but that column there is no window call in QUALIFY at all.
+    const only_column: [:0]const u8 = "SELECT id, rank() OVER (ORDER BY v) AS r FROM t QUALIFY r <= 2";
+    try std.testing.expectError(error.WindowNotSupported, build(a, only_column, &why, &.{ "id", "v", "r" }));
+    // Without the table's columns the name cannot be told, and is refused rather than guessed.
+    try std.testing.expectError(error.WindowNotSupported, build(a, text, &why, null));
+}

@@ -42,7 +42,8 @@ pub fn run(
         try window.run(gpa, .{ .input = current, .output = out, .pass = pass, .max_memory = max_memory });
         current = out;
     }
-    const sql = try std.fmt.allocPrint(arena, "SELECT {s} FROM '{s}' {s}", .{ plan.final_items, current, plan.final_tail });
+    const where = if (plan.final_where.len > 0) try std.fmt.allocPrint(arena, " WHERE {s}", .{plan.final_where}) else "";
+    const sql = try std.fmt.allocPrint(arena, "SELECT {s} FROM '{s}'{s} {s}", .{ plan.final_items, current, where, plan.final_tail });
     if (trace) stager.say(try std.fmt.allocPrint(arena, "window final: {s}\n", .{sql}));
     try stager.finish(stager.ptr, sql);
 }

@@ -20,7 +20,55 @@ pub const Schema = struct {
 /// What is not exact is refused: `COLUMNS` outside the SELECT list, two in one item, a lambda or a list of names, a table
 /// that is not one file or glob.
 pub fn expand(arena: std.mem.Allocator, sql: []const u8, schema: Schema) anyerror![]const u8 {
-    if (!mentions(sql)) return sql;
+    return expandWith(arena, sql, schema, false);
+}
+
+/// `expand`, and a select item that is `*` (or `* EXCLUDE (...)`) is written as the columns it stands for as well, for a query
+/// that cannot leave the star to the engine (a window query reads the columns it plans around).
+pub fn expandStars(arena: std.mem.Allocator, sql: []const u8, schema: Schema) anyerror![]const u8 {
+    return expandWith(arena, sql, schema, true);
+}
+
+/// The top-level column names of the one local table `sql` reads, or null where that is not known (a join, a subquery, S3, a
+/// missing file).
+pub fn tableColumns(arena: std.mem.Allocator, sql: []const u8, schema: Schema) ?[]const []const u8 {
+    const head = selectStart(sql) orelse return null;
+    var depth: usize = 0;
+    var i = head;
+    var from_at: ?usize = null;
+    while (i < sql.len) {
+        const ch = sql[i];
+        if (ch == '\'' or ch == '"') {
+            i = sql_setops.quotedEnd(sql, i);
+            continue;
+        }
+        if (ch == '(') depth += 1;
+        if (ch == ')' and depth > 0) depth -= 1;
+        if (depth == 0 and sql_setops.startsWord(sql, i)) {
+            const word = sql_setops.wordAt(sql, i);
+            if (sql_setops.eql(word, "from")) {
+                from_at = i;
+                break;
+            }
+            i += word.len;
+            continue;
+        }
+        i += 1;
+    }
+    const at = from_at orelse return null;
+    const table = tableOf(arena, sql[at + 4 ..]) catch return null;
+    return schema.names(schema.ctx, arena, table) catch null;
+}
+
+/// Whether the select item is a star, with or without an EXCLUDE list.
+fn isStar(item: []const u8) bool {
+    if (item.len == 0 or item[0] != '*') return false;
+    const rest = std.mem.trim(u8, item[1..], " \t\r\n");
+    return rest.len == 0 or sql_setops.eql(sql_setops.nextWord(rest, 0).word, "exclude");
+}
+
+fn expandWith(arena: std.mem.Allocator, sql: []const u8, schema: Schema, stars: bool) anyerror![]const u8 {
+    if (!stars and !mentions(sql)) return sql;
     const head = selectStart(sql) orelse return error.ColumnsNotSupported;
     var items: std.ArrayList([]const u8) = .empty;
     var depth: usize = 0;
@@ -65,6 +113,12 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8, schema: Schema) anyerro
     // The rest of the query reads the columns by name; COLUMNS there is a different feature.
     if (mentions(sql[from_at..])) return error.ColumnsNotSupported;
 
+    // With only stars to expand and none in the list, there is nothing to read the table for.
+    if (!mentions(sql)) {
+        var any_star = false;
+        for (items.items) |raw| any_star = any_star or isStar(std.mem.trim(u8, raw, " \t\r\n"));
+        if (!any_star) return sql;
+    }
     const table = try tableOf(arena, sql[from_at + 4 ..]);
     var names: ?[]const []const u8 = null;
     var out: std.ArrayList(u8) = .empty;
@@ -73,13 +127,14 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8, schema: Schema) anyerro
     var first = true;
     for (items.items) |raw| {
         const item = std.mem.trim(u8, raw, " \t\r\n");
-        const call = find(item) orelse {
+        const star = stars and find(item) == null and isStar(item);
+        const call = find(item) orelse if (star) Call{ .start = 0, .end = item.len, .args_start = 0, .args_end = item.len } else {
             if (!first) try out.appendSlice(arena, ", ");
             first = false;
             try out.appendSlice(arena, item);
             continue;
         };
-        if (find(item[call.end..]) != null) return error.ColumnsNotSupported;
+        if (!star and find(item[call.end..]) != null) return error.ColumnsNotSupported;
         if (names == null) names = try schema.names(schema.ctx, arena, table);
         const matched = try select(arena, item[call.args_start..call.args_end], names.?);
         if (matched.len == 0) return error.ColumnsNoMatch;
@@ -168,6 +223,8 @@ fn tableOf(arena: std.mem.Allocator, rest: []const u8) Error![]const u8 {
     var i: usize = 0;
     while (i < rest.len and std.ascii.isWhitespace(rest[i])) i += 1;
     if (i >= rest.len) return error.ColumnsNotSupported;
+    // A subquery is no table to read the footer of.
+    if (rest[i] == '(') return error.ColumnsNotSupported;
     var table: []const u8 = undefined;
     var end: usize = undefined;
     if (rest[i] == '\'' or rest[i] == '"') {
@@ -403,3 +460,32 @@ test "COLUMNS: a name that looks like a keyword, an EXCLUDE, an alias with a spa
     // A pattern RE2 has and zpq does not is refused as such.
     try std.testing.expectError(error.UnsupportedRegex, expand(a, "SELECT COLUMNS('\\pL') FROM f", schema));
 }
+
+test "COLUMNS: a star beside a window call is the columns, and the table's columns can be asked for" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var dummy: u8 = 0;
+    const schema: Schema = .{ .ctx = &dummy, .names = testNames };
+    try std.testing.expectEqualStrings("SELECT \"id\", \"d\", \"dn\", \"tu\", \"tm\", \"tz\", row_number() OVER (ORDER BY id) AS r FROM f", try expandStars(a, "SELECT *, row_number() OVER (ORDER BY id) AS r FROM f", schema));
+    try std.testing.expectEqualStrings("SELECT \"tu\", \"tm\", \"tz\", rank() OVER () AS r FROM f", try expandStars(a, "SELECT * EXCLUDE (id, d, dn), rank() OVER () AS r FROM f", schema));
+    // No star: the text is the text, and the table is not read.
+    const none = "SELECT id, count(*) OVER () AS n FROM f WHERE x IN (SELECT 1)";
+    try std.testing.expectEqualStrings(none, try expandStars(a, none, schema));
+    // A qualified star is left to be refused, and COUNT(*) is no star.
+    const qualified = "SELECT t.*, count(*) OVER () AS n FROM f t";
+    try std.testing.expectEqualStrings(qualified, try expandStars(a, qualified, schema));
+    try std.testing.expectEqual(@as(usize, 6), tableColumns(a, "SELECT id FROM 'f.parquet' WHERE id > 1", schema).?.len);
+    try std.testing.expect(tableColumns(a, "SELECT id FROM f JOIN g ON f.a = g.a", schema) == null);
+}
+
+test "COLUMNS: a subquery in FROM is no table to read the columns of" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var dummy: u8 = 0;
+    const schema: Schema = .{ .ctx = &dummy, .names = testNames };
+    try std.testing.expectError(error.ColumnsNotSupported, expandStars(a, "SELECT * FROM (SELECT id, rank() OVER () AS r FROM f) t", schema));
+    try std.testing.expect(tableColumns(a, "SELECT id FROM (SELECT 1) t", schema) == null);
+}
+

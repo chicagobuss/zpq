@@ -71,6 +71,7 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8) Error!?setops.Compound 
         sets = next;
     }
     if (!grouped) return null;
+    if (c.trailing) return error.SqlParseError;
 
     const select_text = std.mem.trim(u8, text[c.select_start..c.from_start], " \t\r\n");
     if (setops.eql(setops.wordAt(select_text, 0), "distinct")) return error.GroupingSetsDistinct;
@@ -164,6 +165,8 @@ const Clauses = struct {
     group_end: usize,
     having: []const u8,
     tail: []const u8,
+    /// A QUALIFY or WINDOW clause follows the GROUP BY: the grouping sets cannot be rewritten around it.
+    trailing: bool = false,
 };
 
 /// The query's top-level clauses, or null when it is not a plain SELECT with a GROUP BY.
@@ -177,6 +180,7 @@ fn clauses(arena: std.mem.Allocator, text: []const u8) Error!?Clauses {
     var group_start: usize = 0;
     var having_at: ?usize = null;
     var tail_at: ?usize = null;
+    var trailing_at: ?usize = null;
     while (i < text.len) {
         const ch = text[i];
         if (ch == '\'' or ch == '"') {
@@ -200,7 +204,7 @@ fn clauses(arena: std.mem.Allocator, text: []const u8) Error!?Clauses {
             if (group_at != null and having_at == null and tail_at == null and setops.eql(w, "having")) having_at = i;
             if (group_at != null and tail_at == null and (setops.eql(w, "limit") or setops.eql(w, "offset") or
                 (setops.eql(w, "order") and setops.eql(setops.nextWord(text, i + w.len).word, "by")))) tail_at = i;
-            if (group_at != null and (setops.eql(w, "window") or setops.eql(w, "qualify"))) return error.SqlParseError;
+            if (group_at != null and trailing_at == null and (setops.eql(w, "window") or setops.eql(w, "qualify"))) trailing_at = i;
             i += w.len;
             continue;
         }
@@ -209,7 +213,7 @@ fn clauses(arena: std.mem.Allocator, text: []const u8) Error!?Clauses {
     const group = group_at orelse return null;
     const from = from_start orelse return null;
     const tail_start = tail_at orelse text.len;
-    const group_end = having_at orelse tail_start;
+    const group_end = @min(having_at orelse tail_start, trailing_at orelse text.len);
     return .{
         .select_start = select_end orelse return null,
         .from_start = from,
@@ -218,6 +222,7 @@ fn clauses(arena: std.mem.Allocator, text: []const u8) Error!?Clauses {
         .group_end = group_end,
         .having = if (having_at) |h| std.mem.trim(u8, text[h..tail_start], " \t\r\n") else "",
         .tail = std.mem.trim(u8, text[tail_start..], " \t\r\n"),
+        .trailing = trailing_at != null,
     };
 }
 
@@ -716,4 +721,12 @@ test "the query's own table name is dropped from the tail that runs over scratch
     try testing.expectEqualStrings("ORDER BY g", f.tail);
     const q = (try expand(a, "SELECT g, count(*) AS c FROM 'x.parquet' AS tt GROUP BY ROLLUP (g) ORDER BY 'tt.g', tt.c")).?;
     try testing.expectEqualStrings("ORDER BY 'tt.g', c", q.tail);
+}
+
+test "a QUALIFY after GROUP BY is no grouping-set query, and with ROLLUP it is refused" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expect((try expand(a, "SELECT g, sum(v) FROM t GROUP BY g QUALIFY rank() OVER (ORDER BY sum(v)) <= 3 ORDER BY g")) == null);
+    try std.testing.expectError(error.SqlParseError, expand(a, "SELECT g, sum(v) FROM t GROUP BY ROLLUP (g) QUALIFY rank() OVER (ORDER BY sum(v)) <= 3"));
 }

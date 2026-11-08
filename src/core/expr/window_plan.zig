@@ -1,7 +1,7 @@
 //! What a query with window functions is made of, between the SQL layer that reads it (`sql_windows.zig`) and the
 //! pass that computes it (`engine/window.zig`): plain data, by column name.
 
-pub const Func = enum { row_number, rank, dense_rank, lag, lead, sum, count, count_star, avg, min, max };
+pub const Func = enum { row_number, rank, dense_rank, lag, lead, sum, count, count_star, avg, min, max, first_value, last_value, nth_value, ntile };
 
 pub const Bound = union(enum) {
     unbounded_preceding,
@@ -27,6 +27,7 @@ pub const Default = union(enum) { null, int: i64, float: f64, string: []const u8
 pub const Call = struct {
     func: Func,
     arg: ?[]const u8 = null,
+    /// `lag` / `lead`'s distance, `nth_value`'s n, `ntile`'s bucket count.
     offset: u32 = 1,
     default: Default = .null,
     frame: Frame = .{},
@@ -56,5 +57,7 @@ pub const Plan = struct {
     passes: []const Pass,
     /// The select list and the tail (ORDER BY / LIMIT / OFFSET) of the query over the last pass's file.
     final_items: []const u8,
+    /// The QUALIFY predicate over the last file's columns, or empty.
+    final_where: []const u8 = "",
     final_tail: []const u8,
 };

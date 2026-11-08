@@ -727,12 +727,22 @@ fn runParsed(
                 diagnosticPrint("zpq query: --explain is not supported for a query with window functions\n", .{});
                 return error.BadArgs;
             }
-            const text = (try zpq.core.expr.sql_parser.parserText(arena, stripped)) orelse {
+            // A star beside a window call is the columns it stands for: the stages are planned around them.
+            var star_names: ColumnNames = .{ .schemas = &column_schemas, .io = io, .env = env };
+            const starred = zpq.core.expr.sql_columns.expandStars(arena, stripped, .{ .ctx = &star_names, .names = ColumnNames.of }) catch |err| {
+                switch (err) {
+                    error.ColumnsNotSupported => diagnosticPrint("sql: SELECT * with a window function needs one local table\n", .{}),
+                    error.ColumnsExcludeMissing => diagnosticPrint("sql: a column in the EXCLUDE list of * is not found\n", .{}),
+                    else => {},
+                }
+                return err;
+            };
+            const text = (try zpq.core.expr.sql_parser.parserText(arena, starred)) orelse {
                 diagnosticPrint("sql: window functions are not supported with typed literals, ILIKE or GROUP BY ALL yet\n", .{});
                 return error.WindowNotSupported;
             };
             var why: zpq.core.expr.sql_windows.Refusal = .{};
-            const plan = zpq.core.expr.sql_windows.build(arena, text, &why) catch |err| {
+            const plan = zpq.core.expr.sql_windows.build(arena, text, &why, zpq.core.expr.sql_columns.tableColumns(arena, starred, .{ .ctx = &star_names, .names = ColumnNames.of })) catch |err| {
                 switch (err) {
                     error.WindowNotSupported => diagnosticPrint("sql: {s}\n", .{why.text()}),
                     error.SelectAliasRequired => diagnosticPrint("sql: a select item of a window query needs an alias (AS name)\n", .{}),

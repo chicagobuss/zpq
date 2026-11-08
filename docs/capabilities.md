@@ -115,7 +115,8 @@ two in one item, one in WHERE or HAVING, or a join or S3 table is `ColumnsNotSup
 a comment is no call. A set operation or a grouping-set query expands each of its
 queries on its own.
 
-Window functions in the SELECT list: `row_number()`, `rank()`, `dense_rank()`, `lag` / `lead(x [, n [, default]])` and
+Window functions in the SELECT list: `row_number()`, `rank()`, `dense_rank()`, `ntile(n)`, `lag` / `lead(x [, n [, default]])`,
+`first_value` / `last_value(x)`, `nth_value(x, n)` (`n` and `ntile`'s count are constants of at least 1) and
 `sum` / `count` / `avg` / `min` / `max(x) OVER ([PARTITION BY ..] [ORDER BY ..] [frame])` (and `count(*)`), alone or inside
 arithmetic, a function call or a cast, over a row query or over the output of a GROUP BY (`rank() OVER (ORDER BY sum(x) DESC)`),
 with the query's own ORDER BY / LIMIT / OFFSET and a `UNION` of such queries. The frame is the default (the partition's start to the
@@ -136,10 +137,15 @@ holds the intermediate (every column the query reads, after WHERE and GROUP BY, 
 windows read) in memory, drawn on a ledger: past `--max-memory` it is "the query needs more memory than --max-memory allows". Ties in
 an ORDER BY are in input order; DuckDB's row_number and ROWS frames over ties are unspecified, so a query that depends on them should
 break its ties.
-Refused by name: `ntile`, `first_value` / `last_value` / `nth_value`, `percent_rank`, `cume_dist` and the rest (`WindowNotSupported`);
+`QUALIFY <condition>` keeps the rows whose condition holds after the windows are computed: comparisons, AND / OR / NOT, IS [NOT] NULL,
+BETWEEN and IN over window calls, the columns the query reads and arithmetic, and the output names of window items (a column of the table
+of that name is read first, as in DuckDB), with or without WHERE, GROUP BY and HAVING; it applies before ORDER BY / LIMIT. `SELECT *` and
+`SELECT * EXCLUDE (..)` may stand beside window calls, from one local table (`t.*` is refused). `ntile`'s frame is ignored by DuckDB and
+refused here; `first_value` / `last_value` / `nth_value` follow the frame (the default frame's last row is the row's last peer).
+Refused by name: `percent_rank`, `cume_dist` and the rest (`WindowNotSupported`);
 RANGE frames with an offset and GROUPS frames; `EXCLUDE`; a frame DuckDB's parser refuses; DISTINCT or FILTER on a window call;
-`IGNORE NULLS`; a named `WINDOW` clause; a window call in WHERE, GROUP BY or HAVING (QUALIFY is not supported); `SELECT DISTINCT` or
-`SELECT *` beside a window call; a window item with no alias; `lag` / `lead` defaults that do not fit the column; a window with
+`IGNORE NULLS`; a named `WINDOW` clause; a window call in WHERE, GROUP BY or HAVING (use QUALIFY); a subquery in QUALIFY; QUALIFY
+with ROLLUP, CUBE or GROUPING SETS; `SELECT DISTINCT` or `t.*` beside a window call; a window item with no alias; `lag` / `lead` defaults that do not fit the column; a window with
 typed literals, ILIKE or GROUP BY ALL in the query; and **`sum` / `avg` of a DOUBLE or FLOAT** (`WindowFloatAggregate`): DuckDB adds a
 frame in a segment tree's order and averages with compensated sums, so the last bits would differ from a left-to-right sum.
 

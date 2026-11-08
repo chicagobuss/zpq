@@ -345,6 +345,38 @@ fn compute(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Out
             }
             return .{ .col = try gather(a, c, pick, .null), .physical = elemType(t, ci), .from = ci, .dec = t.decs[ci], .nullable = true };
         },
+        .first_value, .last_value, .nth_value => {
+            const ci = try argOf(call);
+            const pick = try a.alloc(i64, n);
+            for (pick, 0..) |*p, i| {
+                const s = frameOf(call.frame, ordered, r, i);
+                if (s.lo >= s.hi) {
+                    p.* = -1;
+                    continue;
+                }
+                p.* = switch (call.func) {
+                    .first_value => @intCast(s.lo),
+                    .last_value => @intCast(s.hi - 1),
+                    else => if (call.offset - 1 < s.hi - s.lo) @as(i64, @intCast(s.lo + call.offset - 1)) else -1,
+                };
+            }
+            return .{ .col = try gather(a, t.cols[ci], pick, .null), .physical = elemType(t, ci), .from = ci, .dec = t.decs[ci], .nullable = true };
+        },
+        .ntile => {
+            // DuckDB's (SQLite's): the first `rows % buckets` buckets hold one row more than the rest; more buckets than
+            // rows is a bucket a row.
+            const out = try a.alloc(i64, n);
+            for (out, 0..) |*o, i| {
+                const total: i64 = @as(i64, r.pend[i]) - r.pstart[i];
+                const buckets: i64 = @min(@as(i64, call.offset), total);
+                const size = @divTrunc(total, buckets);
+                const large = total - buckets * size;
+                const small_from = large * (size + 1);
+                const idx: i64 = @as(i64, @intCast(i)) - r.pstart[i];
+                o.* = if (idx < small_from) 1 + @divTrunc(idx, size + 1) else 1 + large + @divTrunc(idx - small_from, size);
+            }
+            return i64Out(out, null, false);
+        },
         .count_star, .count => {
             const out = try a.alloc(i64, n);
             if (call.func == .count_star) {
@@ -1029,3 +1061,38 @@ test "window: unsigned integers order as the unsigned numbers their raw bits are
     try T.expectEqualSlices(u32, &.{ 1, 2, 0 }, try sortedRows(a, &cols, &signed, 3));
 }
 
+test "window: ntile spreads the remainder over the first buckets, and the value functions read the frame" {
+    const T = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Partition 1 has five rows, partition 2 two.
+    const p = [_]i64{ 1, 1, 1, 1, 1, 2, 2 };
+    const v = [_]i64{ 10, 20, 30, 40, 50, 60, 70 };
+    const cols = [_]Column{ .{ .i64 = .{ .values = &p } }, .{ .i64 = .{ .values = &v } } };
+    const elems = [_]schema.SchemaElement{ intElem(), intElem() };
+    const t: Table = .{ .rows = 7, .cols = &cols, .elems = &elems, .decs = &.{ null, null } };
+    const calls = [_]Call{
+        .{ .func = .ntile, .offset = 2 },
+        .{ .func = .ntile, .offset = 9 },
+        .{ .func = .first_value, .arg = 1 },
+        .{ .func = .last_value, .arg = 1, .frame = .{ .rows = true, .start = .{ .preceding = 1 }, .end = .{ .following = 1 } } },
+        .{ .func = .nth_value, .arg = 1, .offset = 3 },
+        .{ .func = .nth_value, .arg = 1, .offset = 2, .frame = .{ .rows = true, .start = .current_row, .end = .unbounded_following } },
+    };
+    const out = try columns(a, t, .{ .partition = &.{0}, .order = &.{1}, .calls = &calls });
+    // Five rows in two buckets: three and two; two rows in two: one each; nine buckets of five rows: one row each.
+    try T.expectEqualSlices(i64, &.{ 1, 1, 1, 2, 2, 1, 2 }, out[0].col.i64.values);
+    try T.expectEqualSlices(i64, &.{ 1, 2, 3, 4, 5, 1, 2 }, out[1].col.i64.values);
+    try T.expectEqualSlices(i64, &.{ 10, 10, 10, 10, 10, 60, 60 }, out[2].col.i64.values);
+    // The frame is a row each side; the last row of each ends the partition.
+    try T.expectEqualSlices(i64, &.{ 20, 30, 40, 50, 50, 70, 70 }, out[3].col.i64.values);
+    // The default frame ends at the row's last peer: the third row of the partition exists from the third row on.
+    const third = out[4].col.i64;
+    try T.expectEqualSlices(u32, &.{ 0, 0, 1, 1, 1, 0, 0 }, third.def_levels.?);
+    try T.expectEqual(@as(i64, 30), third.values[2]);
+    // Two rows on from the current row: the next row, none for the last of a partition.
+    const second = out[5].col.i64;
+    try T.expectEqualSlices(u32, &.{ 1, 1, 1, 1, 0, 1, 0 }, second.def_levels.?);
+    try T.expectEqual(@as(i64, 20), second.values[0]);
+}

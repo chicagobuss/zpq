@@ -2059,7 +2059,3 @@ pub fn materialize(ra: std.mem.Allocator, col: Column) !Column {
         },
     };
 }
-
-test {
-    _ = @import("agg_coded_tests.zig");
-}

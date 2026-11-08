@@ -724,7 +724,7 @@ pub const Lanes = struct {
         return l.first.len != 0 or l.compact_sums.len != 0;
     }
 
-    fn seen(l: *const Lanes, id: usize) bool {
+    pub fn seen(l: *const Lanes, id: usize) bool {
         return if (l.compact_sums.len != 0) l.compact_sums[id].count() != 0 else l.first[id] != unseen;
     }
 
@@ -1391,22 +1391,43 @@ pub fn intoTable(
     }
 }
 
+/// A completed contiguous ID range, with the prefix and number of reached IDs for direct output.
+pub const MergeRange = struct { lo: usize, hi: usize, offset: usize, count: usize };
+pub const MergeResult = struct { lanes: *Lanes, ranges: []MergeRange };
+
 /// Completed lanes stay owned by their worker; callers can consume them without serializing or hashing keys.
 pub fn merge(gpa: std.mem.Allocator, arena: std.mem.Allocator, lanes: []Lanes, n_threads: usize) !?*Lanes {
+    const result = (try mergeRanges(gpa, arena, lanes, n_threads, false)) orelse return null;
+    return result.lanes;
+}
+
+/// Each exclusive range folds lanes in worker order. Direct output also retains its reached-group prefixes.
+pub fn mergeRanges(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    lanes: []Lanes,
+    n_threads: usize,
+    collect_ranges: bool,
+) !?MergeResult {
     var live: std.ArrayList(*Lanes) = .empty;
     for (lanes) |*l| if (l.allocated()) try live.append(arena, l);
     if (live.items.len == 0) return null;
-    const domain = live.items[0].domain;
-    const n = domain.ids();
+    const n = live.items[0].domain.ids();
 
-    var ctx: MergeCtx = .{ .lanes = live.items, .n = n, .gpa = gpa };
-    const tasks = try arena.alloc(MergeTask, @max(1, @min(n_threads, n / 16384)));
+    var ctx: MergeCtx = .{ .lanes = live.items, .n = n, .gpa = gpa, .collect_ranges = collect_ranges };
+    const tasks = try arena.alloc(MergeTask, @min(@max(1, n_threads), n));
+    const ranges: []MergeRange = if (collect_ranges) try arena.alloc(MergeRange, tasks.len) else &.{};
     for (tasks, 0..) |*t, i| t.* = .{ .ctx = &ctx, .lo = i * n / tasks.len, .hi = (i + 1) * n / tasks.len };
     if (tasks.len != 1) _ = spawn.runTree(MergeTask, tasks, .{ .stack_size = 1 << 20 }, MergeTask.run);
     // Partial pool startup can succeed while leaving exclusive ranges unrun.
     for (tasks) |*t| if (!t.ran) t.run();
     for (tasks) |t| if (t.err) |e| return e;
-    return live.items[0];
+    var offset: usize = 0;
+    if (collect_ranges) for (ranges, tasks) |*range, task| {
+        range.* = .{ .lo = task.lo, .hi = task.hi, .offset = offset, .count = task.reached };
+        offset += task.reached;
+    };
+    return .{ .lanes = live.items[0], .ranges = ranges };
 }
 
 /// Complete ranks only: SUM losers are never omitted before all selected rows have folded.
@@ -1454,7 +1475,7 @@ fn rankOrder(lanes: *const Lanes, a: u32, b: u32) std.math.Order {
     return std.math.order(lanes.firstOrdinal(b), lanes.firstOrdinal(a));
 }
 
-const MergeCtx = struct { lanes: []const *Lanes, n: usize, gpa: std.mem.Allocator };
+const MergeCtx = struct { lanes: []const *Lanes, n: usize, gpa: std.mem.Allocator, collect_ranges: bool };
 
 /// Folds ids `lo..hi` of every worker's lanes into the first worker's.
 const MergeTask = struct {
@@ -1463,11 +1484,16 @@ const MergeTask = struct {
     hi: usize,
     ran: bool = false,
     err: ?anyerror = null,
+    reached: usize = 0,
 
     fn run(t: *MergeTask) void {
         t.ran = true;
         t.runErr() catch |e| {
             t.err = e;
+            return;
+        };
+        if (t.ctx.collect_ranges) for (t.lo..t.hi) |id| {
+            t.reached += @intFromBool(t.ctx.lanes[0].seen(id));
         };
     }
 
@@ -2275,8 +2301,16 @@ test "dense merge recovers every exclusive range after partial spawn startup for
             }
             spawn.injectFailureAfter(allowed);
             defer spawn.resetFailure();
-            const merged = (try merge(a, arena.allocator(), &lanes, 4)).?;
+            const result = (try mergeRanges(a, arena.allocator(), &lanes, 4, true)).?;
+            const merged = result.lanes;
             try testing.expect(spawn.failuresInjected() > 0);
+            try testing.expectEqual(@as(usize, 4), result.ranges.len);
+            for (result.ranges, 0..) |range, i| {
+                try testing.expectEqual(i * 16384, range.lo);
+                try testing.expectEqual((i + 1) * 16384, range.hi);
+                try testing.expectEqual(i, range.offset);
+                try testing.expectEqual(@as(usize, 1), range.count);
+            }
             try testing.expectEqual(@as(usize, 4), merged.groupCount());
             for (0..4) |range| {
                 const id = range * 16384 + 123;
@@ -2288,6 +2322,49 @@ test "dense merge recovers every exclusive range after partial spawn startup for
                     merged.accumulator(id, 1),
                 );
             }
+        }
+    }
+}
+
+test "dense merge ranges retain exact sums and ordinals at 1, 4 and 16 workers" {
+    var values: [256]u64 = @splat(0);
+    var axes = [_]Axis{.{ .values = .{ .int64 = &values }, .trans = &.{}, .file_base = &.{}, .bytes = 0 }};
+    const domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    var want: [257]CompactSum = undefined;
+    for ([_]usize{ 1, 4, 16 }, 0..) |workers, run| {
+        var cells: [4][257]CompactSum = @splat(@splat(.{}));
+        var lanes: [4]Lanes = undefined;
+        for (&lanes, &cells, 0..) |*lane, *mine, wi| {
+            lane.* = .{ .domain = &domain, .calls = &Fixture.calls, .compact_sums = mine, .global_ordinals = true };
+            for (mine, 0..) |*cell, id| {
+                if ((id + wi) % 5 == 0) continue;
+                const ordinal: u32 = @intCast(1000 - 3 * id - wi);
+                cell.add(if ((id + wi) % 7 == 0) null else @as(i64, @intCast(id)) - 2 * @as(i64, @intCast(wi)), ordinal);
+            }
+        }
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const got = (try mergeRanges(testing.allocator, arena.allocator(), &lanes, workers, true)).?;
+        try testing.expectEqual(workers, got.ranges.len);
+        var prefix: usize = 0;
+        for (got.ranges) |range| {
+            try testing.expectEqual(prefix, range.offset);
+            prefix += range.count;
+        }
+        try testing.expectEqual(got.lanes.groupCount(), prefix);
+        if (run == 0) {
+            @memcpy(&want, got.lanes.compact_sums);
+        } else {
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&want), std.mem.sliceAsBytes(got.lanes.compact_sums));
+        }
+        for (got.lanes.compact_sums, 0..) |cell, id| {
+            var expected: CompactSum = .{};
+            for (0..4) |wi| {
+                if ((id + wi) % 5 == 0) continue;
+                const ordinal: u32 = @intCast(1000 - 3 * id - wi);
+                expected.add(if ((id + wi) % 7 == 0) null else @as(i64, @intCast(id)) - 2 * @as(i64, @intCast(wi)), ordinal);
+            }
+            try testing.expectEqualDeep(expected, cell);
         }
     }
 }

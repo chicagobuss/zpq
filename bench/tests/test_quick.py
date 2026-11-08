@@ -6,9 +6,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import select
+import signal
 import sys
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -397,21 +400,66 @@ class Quick(unittest.TestCase):
                       for _ in range(3))
         self.assertLess(best - startup, 27_000_000)
 
-    def test_nested_native_process_group_is_drained_at_deadline(self):
-        run = quick.Run(self.out, time.monotonic() + 0.3)
-        pid = self.root / "child.pid"
-        command = ("import subprocess,time,pathlib,sys;"
-                   "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
-                   "pathlib.Path(sys.argv[1]).write_text(str(p.pid));time.sleep(30)")
-        with self.assertRaises(quick.BudgetExpired):
-            run.command([sys.executable, "-c", command, str(pid)], self.out / "o", self.out / "e")
-        if Path("/proc").exists() and pid.exists():
-            # Killed, the nested child is a zombie, dying or already reaped; any other state means it still runs.
+    # How long the next test waits for an event that has to happen (a child's pid, a child's exit) before it reports
+    # that it never did. A hang guard, not a budget: nothing in the test is timed against it.
+    hang_guard_s = 60
+
+    def exited(self, pid, pidfd):
+        """Whether a process that is not our child is gone: a pidfd (Linux) turns readable at its exit."""
+        if pidfd is not None:
+            return bool(select.select([pidfd], [], [], self.hang_guard_s)[0])
+        give_up = time.monotonic() + self.hang_guard_s
+        while time.monotonic() < give_up:
             try:
-                state = (Path("/proc") / pid.read_text() / "stat").read_text().split()[2]
-            except (FileNotFoundError, ProcessLookupError):  # reaped between the open and the read
-                state = None
-            self.assertIn(state, ("Z", "X", None))
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            time.sleep(0.001)
+        return False
+
+    def test_nested_native_process_group_is_drained_at_deadline(self):
+        # Both ends are events of the process group, not times: the deadline passes when the command's nested child
+        # exists (a fixed deadline can pass before it is even started, on a loaded host), and the test then waits for
+        # that child to exit (a process killed on a loaded host can still be runnable when the kill returns).
+        run = quick.Run(self.out, time.monotonic() + 3600)
+        pid_file = self.root / "child.pid"
+        command = ("import subprocess,time,pathlib,sys;"
+                   "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(120)']);"
+                   "pathlib.Path(sys.argv[1]).write_text(str(p.pid));time.sleep(120)")
+        nested = {}
+
+        def expire_once_the_nested_child_exists():
+            try:
+                give_up = time.monotonic() + self.hang_guard_s
+                while time.monotonic() < give_up:
+                    with contextlib.suppress(FileNotFoundError):
+                        if (text := pid_file.read_text()).isdigit():
+                            # Taken before the kill, so it names this process even if its pid is later reused.
+                            nested["fd"] = os.pidfd_open(int(text)) if hasattr(os, "pidfd_open") else None
+                            nested["pid"] = int(text)
+                            break
+                    time.sleep(0.001)
+            finally:
+                run.deadline = time.monotonic()  # whatever happened above, the command must not outlive the test
+
+        watcher = threading.Thread(target=expire_once_the_nested_child_exists, daemon=True)
+        watcher.start()
+        try:
+            with self.assertRaises(quick.BudgetExpired):
+                run.command([sys.executable, "-c", command, str(pid_file)], self.out / "o", self.out / "e")
+            watcher.join()
+            self.assertIn("pid", nested, "the command never started its nested child")
+            self.assertTrue(self.exited(nested["pid"], nested["fd"]), "the nested child outlived the drain")
+            nested.pop("pid")  # gone: nothing left to clean up
+        finally:
+            if "pid" in nested:
+                with contextlib.suppress(ProcessLookupError):
+                    if nested["fd"] is not None:
+                        signal.pidfd_send_signal(nested["fd"], signal.SIGKILL)
+                    else:
+                        os.kill(nested["pid"], signal.SIGKILL)
+            if nested.get("fd") is not None:
+                os.close(nested["fd"])
         self.assertFalse((self.out / "active.json").exists())
 
     def test_partial_counts_and_flags_are_deterministic(self):

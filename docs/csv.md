@@ -1,25 +1,32 @@
 # CSV input
 
-zpq writes a CSV file to Parquet whole:
+zpq reads a CSV file directly. It can write it to Parquet, whole or filtered and projected, or aggregate it:
 
 ```sh
 zpq query data.csv -o data.parquet
-zpq query --query "SELECT * FROM 'data.csv'" -o data.parquet
+zpq query --query "SELECT a, b * 2 AS c FROM 'data.csv' WHERE a > 0" -o out.parquet
+zpq query --query "SELECT k, count(*) AS n, sum(v) AS s FROM 'data.csv' GROUP BY k"
 ```
 
-Every writer option applies (`--codec`, `--row-group-size`, `--row-group-bytes`, `--bloom-filter`, `-j`,
-`--max-memory`, `--summary=json`). Columns are chosen by name, in the order given, with `--columns a,b` or
-`SELECT a, b FROM 'data.csv'`; the fields not written are still framed (a malformed one is refused) but not typed.
-Filters, expressions and renames run row by row as the file is parsed (`--filter`, `--select`, or
-`SELECT a, b * 2 AS c FROM 'data.csv' WHERE ...`): only the fields they read are typed, and a DECIMAL keeps the
-file column's type. ORDER BY, LIMIT, DISTINCT and aggregates are refused: they read the Parquet it writes.
+What a CSV query can do today:
+
+| query | over a CSV |
+|---|---|
+| the whole file to Parquet | yes |
+| columns by name (`--columns a,b`, `SELECT a, b`) | yes, in the order given |
+| filters, expressions, renames (`--filter`, `--select`, `WHERE`, `SELECT b * 2 AS c`) | yes, row by row as the file is parsed |
+| aggregates, with or without `GROUP BY`, with `HAVING`, `FILTER (WHERE ...)` and `DISTINCT` | yes, folded as the file is parsed |
+| `ORDER BY`, `LIMIT`, `OFFSET` | refused |
+| joins, more than one input, S3 input | refused |
+
+A refused query says so by name, and the way round it is to write the Parquet first and query that:
+`zpq query data.csv -o data.parquet`, then the query over `data.parquet`.
 
 ## Which inputs are CSV
 
 A file whose first and last four bytes are `PAR1` is Parquet, whatever its name. Any other local file is CSV when it
 is named `.csv`, `.tsv` or `.txt` (any case), or when `--input-format csv` is given; anything else is read as Parquet
-and refused as Parquet when it is not. One CSV
-input per query; S3 CSV input is not supported yet.
+and refused as Parquet when it is not. One CSV input per query; S3 CSV input is not supported yet.
 
 ## Dialect
 
@@ -54,9 +61,44 @@ reinterpreted:
 | BLOB | a column with bytes that are not UTF-8 |
 
 Types are sampled from the start of the file and checked on every value. A later value its column's type cannot hold
-stops the write; the whole file is classified, the column widens to the least type holding everything, and the write
-starts again, so the file is the one a whole-file sample writes. `--csv-strict` refuses instead, and
+stops the query; the whole file is classified, the column widens to the least type holding everything, and the query
+starts again, so the answer is the one a whole-file sample gives. `--csv-strict` refuses instead, and
 `--csv-types COL:TYPE,...` pins a column's type, refusing a value that does not fit it.
+
+A query that does not bind to the sampled types (a column NULL throughout the sample, say, that a filter compares with
+a number) is bound again to the types of the whole file before it runs; one that still does not bind is refused as it
+would be over Parquet.
+
+## Filters, expressions and columns
+
+Columns named with `--columns` or a plain `SELECT a, b` are written in the order given. The fields not written are
+still framed (a malformed one is refused) but not typed.
+
+Filters, expressions and renames are bound as they would be over the Parquet the file writes to, and run on each
+parsed chunk: only the fields they read are typed. A DECIMAL keeps the file column's type, past 18 digits as well.
+
+## Aggregates
+
+An aggregate over a CSV is bound as it would be over the Parquet the file writes to, and folded as the file is parsed:
+each chunk parses only the fields the query reads (its calls, keys and filter) and folds its rows into its own
+aggregate states, which then merge in file order. Nothing is written. The answer is the one the same query gives over
+that Parquet, and the same at every `-j`: the chunks a file is cut into, and the order their states merge in, do not
+depend on the number of workers. A floating-point result (a sum of DOUBLEs, a variance) can differ from the one over
+Parquet in its last digits, since its values are added in a different order.
+
+- Functions: `count`, `count(DISTINCT)`, `sum`, `min`, `max`, `avg`, `var_samp`, `var_pop`, `stddev_samp`,
+  `stddev_pop`, `approx_count_distinct`, `quantile_cont`, `string_agg`, `arg_max`, `arg_min`, as over Parquet.
+- Exact sums: integer sums are exact, and a DECIMAL's sum is exact to 38 digits (`DECIMAL(38, s)`); `avg` of a
+  DECIMAL adds up to four digits past its scale, from the data's precision, as over Parquet.
+- `GROUP BY` takes columns and expressions, groups come out in the order they first appear (unless `--unordered`),
+  and `HAVING` filters them.
+  `SELECT DISTINCT` is a `GROUP BY` of its columns.
+- `count(*)` alone still frames every record (a malformed one is refused), and parses only the first field.
+- `--explain` prints the plan of the fold instead of running it: the fields each chunk parses and their types, the
+  number of chunks and workers, and the budget. Its types are the sample's, unless binding settled them; a later value
+  can still widen one when the query runs.
+
+`ORDER BY`, `LIMIT` and `OFFSET` over an aggregate's answer are refused, as are joins.
 
 ## Refusals
 
@@ -66,11 +108,17 @@ column where a field is: the malformed field, the value that does not fit its ty
 wrong number of fields, the first field missing or the first past the header's (named `columnN` there, 0-based). An
 empty or UTF-16 file is refused as a whole: the message names the file, and no line, byte or column.
 
-## Memory and speed
+A query shape a CSV input does not run (above) is refused before the file is read, by name
+(`CsvQueryNotSupported`).
+
+## Memory
 
 A cold file is read ahead of the parse through the local reader (`O_DIRECT` io_uring where the file system allows it);
 a file already in the page cache is read through its mapping. Chunks of the file are parsed in parallel, each finding
-its first record from the exact quote state at its first byte, and written through the same encoder as a Parquet
-rewrite. Bytes in flight are drawn from `--max-memory`; a write the budget refuses runs again on fewer workers.
-Row groups are cut at a sixteenth of the budget at most, which below a 1 GiB budget makes them smaller than the
-default target.
+its first record from the exact quote state at its first byte.
+
+Everything a CSV query holds is drawn from `--max-memory`: the bytes in flight, a write's row groups, and an
+aggregate's chunk states, group tables, count(DISTINCT) sets, string min/max values and answer. A write the budget
+refuses runs again on fewer workers. An aggregate the budget refuses (more groups or distinct values than it holds) is
+refused by name (`ExceededMemoryBudget`), not grown past it. Row groups are cut at a sixteenth of the budget at most,
+which below a 1 GiB budget makes them smaller than the default target.

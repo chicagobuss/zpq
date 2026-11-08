@@ -94,6 +94,14 @@
     "review-u32-d",
     "review-u32-g"
    ]
+  },
+  {
+   "name": "not_fact",
+   "copy": "COPY (SELECT * FROM (VALUES (1::BIGINT, 0::BIGINT), (2, 5), (3, 0), (4, 9)) t(fk, q)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
+   "name": "not_dim",
+   "copy": "COPY (SELECT * FROM (VALUES (1::BIGINT, 1::BIGINT, 0::BIGINT), (2, 5, 2), (3, 5, 2), (4, 9, 1)) t(pk, grp, w)) TO '{path}' (FORMAT PARQUET)"
   }
  ],
  "cases": [
@@ -4749,6 +4757,87 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT sum(p) AS s, count(*) AS n FROM '{fixture:review-rdec-f}' WHERE p > fk OR p < 0"
+   }
+  },
+  {
+   "id": "join:not-over-or-in-a-build-filter",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE f.fk = d.pk AND NOT (d.grp = 1 OR d.w = 2)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE f.fk = d.pk AND NOT (d.grp = 1 OR d.w = 2)"
+   }
+  },
+  {
+   "id": "join:not-over-and-in-a-build-filter",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(q) AS s FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE f.fk = d.pk AND NOT (d.grp = 5 AND d.w = 2)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(q) AS s FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE f.fk = d.pk AND NOT (d.grp = 5 AND d.w = 2)"
+   }
+  },
+  {
+   "id": "join:not-over-or-in-a-residual",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE f.fk = d.pk AND NOT (d.grp = 1 OR f.q < 3)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE f.fk = d.pk AND NOT (d.grp = 1 OR f.q < 3)"
    }
   }
  ]

@@ -460,7 +460,7 @@ fn rejectColumnComparisons(root: *c.LpNode, where_expressions: bool) error{BadVa
 /// `(NOT a) AND b`: a different predicate. With NOT only above leaves, every unparsed predicate (WHERE, aggregate
 /// FILTER) means what it was written as. Rewriting at enter, before the walker reads the node's children, means the
 /// NOTs it creates are visited and pushed further in turn.
-fn pushNotsDown(root: *c.LpNode, lp_arena: *c.arena_t) error{OutOfMemory}!void {
+pub fn pushNotsDown(root: *c.LpNode, lp_arena: *c.arena_t) error{OutOfMemory}!void {
     const Visit = struct {
         failed: bool = false,
         arena: *anyopaque,

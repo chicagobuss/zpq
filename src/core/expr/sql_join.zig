@@ -97,6 +97,9 @@ fn parse(sql: [:0]const u8) Error!Parsed {
     if (stmts == null or stmts.*.count != 1) return error.SqlParseError;
     const root = stmts.*.items[0] orelse return error.SqlParseError;
     if (root.*.kind != c.LP_STMT_SELECT) return error.SqlParseError;
+    // The plan's pieces are unparsed and read back (`toSql`): with NOT only above leaves they mean what was written,
+    // as the single-table parser's do, however the planner regroups the conditions (`hoistOrs`).
+    @import("sql_parser.zig").pushNotsDown(root, arena) catch return error.OutOfMemory;
     return .{ .arena = arena, .root = root };
 }
 

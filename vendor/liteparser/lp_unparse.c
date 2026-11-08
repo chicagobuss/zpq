@@ -285,7 +285,18 @@ static void sql_expr(LpNode *node, LpBuf *out, int parent_prec) {
                     sql_expr(node->u.unary.operand, out, 99);
                     break;
                 case LP_UOP_PLUS:   lp_buf_putc(out, '+'); sql_expr(node->u.unary.operand, out, 99); break;
-                case LP_UOP_NOT:    lp_buf_puts(out, "NOT "); sql_expr(node->u.unary.operand, out, 0); break;
+                case LP_UOP_NOT: {
+                    /* NOT binds tighter than AND/OR: an AND or OR under it keeps its parentheses, or NOT (a OR b)
+                       would read back as (NOT a) OR b. */
+                    const LpNode *operand = node->u.unary.operand;
+                    int group = operand && operand->kind == LP_EXPR_BINARY_OP &&
+                                (operand->u.binary.op == LP_OP_AND || operand->u.binary.op == LP_OP_OR);
+                    lp_buf_puts(out, "NOT ");
+                    if (group) lp_buf_putc(out, '(');
+                    sql_expr(operand, out, 0);
+                    if (group) lp_buf_putc(out, ')');
+                    break;
+                }
                 case LP_UOP_BITNOT: lp_buf_putc(out, '~'); sql_expr(node->u.unary.operand, out, 99); break;
             }
             break;

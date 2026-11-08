@@ -234,7 +234,7 @@ fn validity(
     var first: usize = 0;
     while (first < n_words and @popCount(presentBits(rows, first, max_def)) == wordRows(rows, first)) first += 1;
     if (first == n_words) return .{ .words = null, .nulls = 0 };
-    // Charged as the (n + 7) / 8 bytes Arrow reads, as before the bits came a word at a time.
+    // Charged as the (n + 7) / 8 bytes Arrow reads, however the bits were built.
     try charge.add((rows.len + 7) / 8);
     const words = try a.alloc(u64, n_words);
     @memset(words[0..first], ~@as(u64, 0));

@@ -17,8 +17,8 @@ const MAX_SUBMIT_WAIT_NS: i64 = 5 * std.time.ns_per_ms;
 /// `std.Io.Threaded` counts a worker as busy until it re-locks the pool after its task returns, which is after the
 /// task's group has woken its awaiter. A stage that awaits one group and at once fills the next up to the limit can
 /// therefore find finished workers still counted. That lag lasts microseconds, so the caller first waits, up to
-/// `MAX_SUBMIT_WAIT_NS` of real time. If the executor still has no room (every worker genuinely busy, or a thread the OS
-/// will not create), the caller handles one item itself and then tries again, so the batch keeps its other loops and
+/// `MAX_SUBMIT_WAIT_NS` of real time. If the executor still has no room (every worker genuinely busy, or a thread the
+/// OS will not create), the caller handles one item itself and then tries again, so the batch keeps its other loops and
 /// gains the rest as soon as workers free up. Returns once every loop is started or the cursor is drained; the caller
 /// still awaits `group`.
 pub fn startWorkers(

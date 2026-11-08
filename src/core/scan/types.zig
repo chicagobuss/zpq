@@ -74,17 +74,17 @@ pub const FastPath = enum {
 
 pub const RowGroupGate = @import("contracts.zig").RowGroupGate;
 
-/// Asks for the bytes planning reads from input `file` (`ndv.probeRanges`) to be read first: the reader reads them ahead
-/// of every row group (`Input.dict_wait`); a mapped file is advised to read them in at once rather than fault them one
-/// by one. Called for every probe range before `ReadStart`.
+/// Asks for the bytes planning reads from input `file` (`ndv.probeRanges`) to be read first: the reader reads them
+/// ahead of every row group (`Input.dict_wait`); a mapped file is advised to read them in at once rather than fault
+/// them one by one. Called for every probe range before `ReadStart`.
 pub const DictProbe = struct {
     ctx: *anyopaque,
     add: *const fn (ctx: *anyopaque, file: usize, rg: usize, start: u64, end: u64) anyerror!void,
 };
 
-/// Starts the reads the scan's gates wait on (`Input.gate`). Called once every `DictProbe` range is asked for and before
-/// planning reads any of them: planning never reads a reader's input through its mapping, so its reads queue behind
-/// nothing but the probes. Idempotent; a scan given none reads as its inputs are.
+/// Starts the reads the scan's gates wait on (`Input.gate`). Called once every `DictProbe` range is asked for and
+/// before planning reads any of them: planning never reads a reader's input through its mapping, so its reads queue
+/// behind nothing but the probes. Idempotent; a scan given none reads as its inputs are.
 pub const ReadStart = struct {
     ctx: *anyopaque,
     start: *const fn (ctx: *anyopaque) anyerror!void,

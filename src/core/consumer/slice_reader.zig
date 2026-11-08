@@ -23,11 +23,11 @@ const valuesCol = @import("column.zig").valuesCol;
 const codedCol = @import("column.zig").codedCol;
 const chunkDictionary = @import("column.zig").chunkDictionary;
 
-/// The values a first pass copied out of a byte-array chunk's pages for the rows that can still reach the fold: the rows
-/// the filter had not rejected when the pages were read, that satisfy a LIKE every kept row satisfies. The second pass
-/// replays them (`SliceReader.replay`) instead of decompressing the chunk again. Rows ascend. A row that is alive but
-/// NULL, with no LIKE to reject it, is kept as a NULL (`nulls`): the replay gives it back as one. Every other row is
-/// an empty string in the replay, and no fold reads one. Bounded by `cap`, which counts what the lists hold too: a
+/// The values a first pass copied out of a byte-array chunk's pages for the rows that can still reach the fold: the
+/// rows the filter had not rejected when the pages were read, that satisfy a LIKE every kept row satisfies. The second
+/// pass replays them (`SliceReader.replay`) instead of decompressing the chunk again. Rows ascend. A row that is alive
+/// but NULL, with no LIKE to reject it, is kept as a NULL (`nulls`): the replay gives it back as one. Every other row
+/// is an empty string in the replay, and no fold reads one. Bounded by `cap`, which counts what the lists hold too: a
 /// pass that would pass it stops keeping, sets `overflow`, and the second pass reads the pages as before.
 pub const Kept = struct {
     rows: std.ArrayList(u32) = .empty,

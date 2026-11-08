@@ -418,7 +418,8 @@ fn foldGroupedWindows(
         var win_sel = try selWindow(wa, sel, off, n);
         defer win_sel.deinit();
         const pos = g.pos_base + @as(u64, @intCast(off));
-        // A local table that is not reducing the rows is pure overhead: hash each key once, straight into its partition.
+        // A local table that is not reducing the rows is pure overhead: hash each key once, straight into its
+        // partition.
         if (local.abandoned) {
             try scatterGrouped(wa, ra, gpa, g, part, local, cols, lookup, &win_sel, consumed, &prepared_values, pos, off, n, ctx);
             off += n;

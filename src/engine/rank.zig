@@ -456,8 +456,8 @@ pub const RankedRG = struct {
     rg: u32,
     best: ?SortCell,
 
-    /// Most promising first, so the heap fills with good rows early and its cutoff rules more row groups out. Row groups
-    /// without a bound go first, in input order: they are read whatever the cutoff.
+    /// Most promising first, so the heap fills with good rows early and its cutoff rules more row groups out. Row
+    /// groups without a bound go first, in input order: they are read whatever the cutoff.
     fn sooner(key: RowSortKey, a: RankedRG, b: RankedRG) bool {
         const x = a.best orelse return b.best != null;
         const y = b.best orelse return false;

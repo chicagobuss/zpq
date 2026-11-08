@@ -1681,7 +1681,8 @@ test "a streamed string the fold also reads is kept by the first pass and replay
             .parallelism = 1,
         });
         defer gpa.free(whole);
-        // A use that is not the bare value leaves the string to the whole-row-group decode: nothing kept, nothing replayed.
+        // A use that is not the bare value leaves the string to the whole-row-group decode: nothing kept, nothing
+        // replayed.
         try std.testing.expectEqual(replays_mid, slice_reader.test_replays.load(.monotonic));
         try std.testing.expectEqual(overflows_mid, slice_reader.test_overflows.load(.monotonic));
         // Each group row of `whole` is `lo,hi,c,l,`: without its last field it is a row of `fused`.
@@ -1753,7 +1754,8 @@ test "a NULL that survives the filter comes back NULL from the replay, whatever 
         }
     }
     // A dense earlier conjunct keeps enough strings to overflow the first pass, so the replay is bypassed in that row
-    // group and, for that worker, in the later ones. Which worker that is must not change an answer (PF-1 depended on it).
+    // group and, for that worker, in the later ones. Which worker that is must not change an answer (PF-1 depended on
+    // it).
     for ([_]usize{ 1, 4 }) |jobs| {
         const overflows_before = slice_reader.test_overflows.load(.monotonic);
         const got = try sortedGroupText(gpa, ctx, .{

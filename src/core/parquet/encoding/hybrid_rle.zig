@@ -849,7 +849,8 @@ fn putRleRun(out: []u8, o: usize, value: u32, count: usize, value_bytes: usize) 
     return p;
 }
 
-/// `putBitPackedRun` as runs of at most `max_groups` groups. Only the last group may be padded, so it ends the last run.
+/// `putBitPackedRun` as runs of at most `max_groups` groups. Only the last group may be padded, so it ends the last
+/// run.
 fn putBitPackedRuns(out: []u8, o: usize, values: []const u32, groups: usize, bit_width: u8, max_groups: usize) usize {
     var p = o;
     var rest = values;

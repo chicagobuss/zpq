@@ -217,8 +217,8 @@ fn pruneNumeric(
 }
 
 /// Whether a chunk is known to hold no NaN: a nan_count of zero, a NaN probe of its values (`nanprobe.zig`), or,
-/// under `--trust-stats` (`trust_nan`), no count at all. Float bounds leave NaN out, so without one a NaN row may pass a
-/// comparison no bound does (see `encoded.rangeIntersects`).
+/// under `--trust-stats` (`trust_nan`), no count at all. Float bounds leave NaN out, so without one a NaN row may pass
+/// a comparison no bound does (see `encoded.rangeIntersects`).
 fn nanFree(chunk: *const schema.ColumnChunk, trust_nan: bool) bool {
     if (chunk.nan_free) return true;
     const stats = (chunk.meta_data orelse return false).statistics orelse return false;

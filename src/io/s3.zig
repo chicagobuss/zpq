@@ -618,7 +618,8 @@ pub fn getViaPoolWithOpts(
 }
 
 pub const RequestOpts = struct {
-    /// See `retry.Request.idempotent`; decides whether a dead pooled connection is retried at once or fails the request.
+    /// See `retry.Request.idempotent`; decides whether a dead pooled connection is retried at once or fails the
+    /// request.
     idempotent: bool,
     /// Records the request, every attempt included, as one span of `kind` when set.
     prof: ?*profile.Thread = null,

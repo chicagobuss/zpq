@@ -267,8 +267,9 @@ fn deflateFree(p: ?*anyopaque) callconv(.c) void {
     pageFree(null, p);
 }
 
-/// libzstd's (and libdeflate's) allocator for the thread contexts: page-backed blocks behind a header holding their length. A context is
-/// made once per thread and its workspace regrown rarely, so this costs system calls per thread, not per page.
+/// libzstd's (and libdeflate's) allocator for the thread contexts: page-backed blocks behind a header holding their
+/// length. A context is made once per thread and its workspace regrown rarely, so this costs system calls per thread,
+/// not per page.
 const page_mem: c_zstd.ZSTD_customMem = .{ .customAlloc = pageAlloc, .customFree = pageFree, .@"opaque" = null };
 const page_head = 64;
 
@@ -550,7 +551,8 @@ pub fn decompressInto(
 /// order (ARROW-9177): Hadoop framing (parquet-mr) only if every length validates, else a bare block (older
 /// parquet-cpp); then, as arrow-rs also does, an LZ4 frame (older arrow-rs) when its magic announces one. A bare
 /// block cannot parse a standard frame (its first token matches at offset 0x4D22 into empty output), so trying
-/// the block first costs nothing. Every attempt writes `out` from the start, so the one that succeeds overwrites a failed one's bytes.
+/// the block first costs nothing. Every attempt writes `out` from the start, so the one that succeeds overwrites a
+/// failed one's bytes.
 fn decompressLz4Legacy(src: []const u8, out: []u8) Error!void {
     if (lz4.uncompressHadoop(src, out)) |_| return else |_| {}
     if (lz4.uncompress(src, out)) |n| {

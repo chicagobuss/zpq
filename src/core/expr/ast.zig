@@ -369,8 +369,8 @@ pub const Expr = union(enum) {
     }
 
     /// Whether `a` and `b` are the same bound expression: the same columns, operators, functions and literals, the
-    /// literals compared by their exact value (a string's bytes, a DECIMAL's unscaled digits and type, a double's bits).
-    /// What GROUP BY binding compares, never the text either was written as.
+    /// literals compared by their exact value (a string's bytes, a DECIMAL's unscaled digits and type, a double's
+    /// bits). What GROUP BY binding compares, never the text either was written as.
     pub fn eql(a: Expr, b: Expr) bool {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {

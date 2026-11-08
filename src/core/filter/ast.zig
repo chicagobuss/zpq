@@ -184,7 +184,8 @@ fn charLen(str: []const u8, i: usize) usize {
 /// once, and only positions where both match are checked in full, instead of a byte-by-byte search from every position.
 /// The positions left after the last whole block (fewer than 32) are covered by one more block laid over the end of the
 /// range, which re-tests a few positions the earlier blocks already ruled out; a shorter range uses 16 or 8 lanes the
-/// same way. Only a range under 8 positions is left to the byte loop. On URL-sized values the byte loop was half the time.
+/// same way. Only a range under 8 positions is left to the byte loop. On URL-sized values the byte loop was half the
+/// time.
 pub fn containsBytes(hay: []const u8, needle: []const u8) bool {
     const n = needle.len;
     if (n == 0) return true;
@@ -202,8 +203,8 @@ pub fn containsBytes(hay: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// `containsBytes` over starting positions [0, end), `end >= lanes`, in blocks of `lanes`. A block at `i` reads the last
-/// byte of position `i + lanes - 1` at `i + n - 1 + lanes - 1`, which `i + lanes <= end` keeps inside `hay`.
+/// `containsBytes` over starting positions [0, end), `end >= lanes`, in blocks of `lanes`. A block at `i` reads the
+/// last byte of position `i + lanes - 1` at `i + n - 1 + lanes - 1`, which `i + lanes <= end` keeps inside `hay`.
 fn containsBlocks(comptime lanes: usize, hay: []const u8, needle: []const u8, end: usize) bool {
     const V = @Vector(lanes, u8);
     const M = @Int(.unsigned, lanes);

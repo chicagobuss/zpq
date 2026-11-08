@@ -302,11 +302,12 @@ fn executeAggregateOver(
     var io_policy = local_reader.Policy.fromEnv(ctx.env);
     io_policy.cache = args.cache;
     // A GROUP BY cut by a plain COUNT or a count(DISTINCT) first and descending (sketch, census), or by a LIMIT with
-    // no ORDER BY (first keys), reads the input twice: the mapping serves both passes (the first warms the page cache for the second),
-    // where the explicit reader reads each row group once and so rules those cuts out. Even cold, the two cheap
-    // passes beat one full grouping; when the cut then declines, the mapping costs little. Only `auto` is steered:
-    // an explicit pread/io_uring keeps its exact fallback. What the strategies may cut by is `ResultProgram.cutOrder`
-    // (under HAVING, no limit), and the shape is decided from the query bound to the footer, as the scan binds it.
+    // no ORDER BY (first keys), reads the input twice: the mapping serves both passes (the first warms the page cache
+    // for the second), where the explicit reader reads each row group once and so rules those cuts out. Even cold, the
+    // two cheap passes beat one full grouping; when the cut then declines, the mapping costs little. Only `auto` is
+    // steered: an explicit pread/io_uring keeps its exact fallback. What the strategies may cut by is
+    // `ResultProgram.cutOrder` (under HAVING, no limit), and the shape is decided from the query bound to the footer,
+    // as the scan binds it.
     var cut_args = args;
     cut_args.result_order = ResultProgram.cutOrder(args.result_order);
     // The footers, parsed once here when the cut shape needs one, serve the scan below as well.

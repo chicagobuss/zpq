@@ -360,8 +360,8 @@ pub fn streamByteArray(in: AggRowGroup, target: AggTarget, ci: usize) bool {
     const filtered = if (in.filter) |f| filterMentions(f, ci) else false;
     // A filter-only string with a dictionary is compared once per dictionary entry from its codes, a few bytes a row:
     // streaming it reads every value instead, and saves no faulted string bytes. Its pages say whether the dictionary
-    // covers the chunk (a coded decode falls back to values on a page that is not), so a chunk need only say it has one:
-    // Polars writes no encoding stats, and its dictionary page's PLAIN reads as a possible fallback.
+    // covers the chunk (a coded decode falls back to values on a page that is not), so a chunk need only say it has
+    // one: Polars writes no encoding stats, and its dictionary page's PLAIN reads as a possible fallback.
     if (filtered and !columnFeedsFold(target, ci))
         return !@import("../filter/membership.zig").dictionaryLikely(&cm);
     // DISTINCT sets and string winners reuse a whole batch's prepared values. Streaming a key forces their

@@ -72,7 +72,6 @@ pub const OutputAggregator = output.OutputAggregator;
 pub const initOutputAggregator = output.initOutputAggregator;
 pub const resetAggregator = output.resetAggregator;
 
-pub const appendProjectedRG = output.appendProjectedRG;
 pub const appendProjectedRGWithOptions = output.appendProjectedRGWithOptions;
 pub const ProjectedRG = output.ProjectedRG;
 pub const Survivors = output.Survivors;

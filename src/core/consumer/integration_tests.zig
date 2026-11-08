@@ -62,7 +62,6 @@ const output = @import("output.zig");
 const OutputAggregator = output.OutputAggregator;
 const initOutputAggregator = output.initOutputAggregator;
 const resetAggregator = output.resetAggregator;
-const appendProjectedRG = output.appendProjectedRG;
 const appendProjectedRGWithOptions = output.appendProjectedRGWithOptions;
 const ProjectedRG = output.ProjectedRG;
 const Survivors = output.Survivors;

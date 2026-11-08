@@ -851,31 +851,6 @@ test "regression: a renamed passthrough is its leaf renamed and flat, NULL where
 /// it outlives the source RG.
 ///
 /// Returns the number of surviving rows added.
-pub fn appendProjectedRG(
-    agg: *OutputAggregator,
-    gpa: std.mem.Allocator,
-    rg: *const schema.RowGroup,
-    meta: *const schema.FileMetaData,
-    src: RGSrc,
-    filter: ?filter_ast.Filter,
-    fetch_set: []const bool,
-    output_specs: []const OutputCol,
-    timings: *Timings,
-) !usize {
-    return appendProjectedRGWithOptions(
-        agg,
-        gpa,
-        rg,
-        meta,
-        src,
-        filter,
-        fetch_set,
-        output_specs,
-        timings,
-        .{},
-    );
-}
-
 pub fn appendProjectedRGWithOptions(
     agg: *OutputAggregator,
     gpa: std.mem.Allocator,

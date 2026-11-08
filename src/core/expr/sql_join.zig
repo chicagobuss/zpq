@@ -367,6 +367,114 @@ fn reduce(a: std.mem.Allocator, sel: anytype, tables_in: []*c.LpNode, conjuncts:
     return null;
 }
 
+/// `x OR y`'s branches, nested ORs flattened.
+fn flattenOr(n: *c.LpNode, list: *std.ArrayList(*c.LpNode), a: std.mem.Allocator) !void {
+    if (n.kind == c.LP_EXPR_BINARY_OP and n.u.binary.op == c.LP_OP_OR) {
+        try flattenOr(n.u.binary.left, list, a);
+        try flattenOr(n.u.binary.right, list, a);
+        return;
+    }
+    try list.append(a, n);
+}
+
+fn binaryOf(a: std.mem.Allocator, op: c_uint, l: *c.LpNode, r: *c.LpNode) !*c.LpNode {
+    const node = try create(a, c.LP_EXPR_BINARY_OP);
+    node.u.binary.op = @intCast(op);
+    node.u.binary.left = l;
+    node.u.binary.right = r;
+    return node;
+}
+
+/// Whether two key equalities join the same columns of the same tables, either way round.
+fn sameEquality(s: Sides, x: *c.LpNode, y: *c.LpNode) !bool {
+    const ex = try keyEquality(s, x) orelse return false;
+    const ey = try keyEquality(s, y) orelse return false;
+    const lx = span(ex.l_ref.*.u.column_ref.column);
+    const rx = span(ex.x_ref.*.u.column_ref.column);
+    const ly = span(ey.l_ref.*.u.column_ref.column);
+    const ry = span(ey.x_ref.*.u.column_ref.column);
+    const same = ex.l == ey.l and ex.x == ey.x and std.mem.eql(u8, lx, ly) and std.mem.eql(u8, rx, ry);
+    const crossed = ex.l == ey.x and ex.x == ey.l and std.mem.eql(u8, lx, ry) and std.mem.eql(u8, rx, ly);
+    return same or crossed;
+}
+
+/// PDS-H q19's shape: `(k AND a1 AND b1) OR (k AND a2 AND b2)`, with `k` a key equality every branch holds, is
+/// `k AND (a1 OR a2) AND ((a1 AND b1) OR (a2 AND b2))`, where `a` are one table's conditions. Pulled out, `k` joins.
+/// Each table every branch holds a condition of gets their OR as a condition of its own (`(a1 OR a2)`, a build's
+/// filter or the probe's), which the OR implies, so its rows narrow before the join. What is left of the OR reads
+/// both tables and narrows after the lookups (a residual). Null when no OR has such a key. The implied conditions
+/// are copies: the planner rewrites a condition's column references in place, as the table it lands on reads them.
+fn hoistOrs(a: std.mem.Allocator, p: Parsed, s: Sides, conjuncts: []*c.LpNode) Error!?std.ArrayList(*c.LpNode) {
+    var out: std.ArrayList(*c.LpNode) = .empty;
+    var changed = false;
+    for (conjuncts) |node| {
+        if (node.kind != c.LP_EXPR_BINARY_OP or node.u.binary.op != c.LP_OP_OR) {
+            try out.append(a, node);
+            continue;
+        }
+        var branches: std.ArrayList(*c.LpNode) = .empty;
+        try flattenOr(node, &branches, a);
+        const terms = try a.alloc(std.ArrayList(*c.LpNode), branches.items.len);
+        for (branches.items, terms) |b, *ts| {
+            ts.* = .empty;
+            try flatten(b, ts, a);
+        }
+        // The key equalities of the first branch that every other branch holds too.
+        var keys: std.ArrayList(*c.LpNode) = .empty;
+        for (terms[0].items) |eq| {
+            if (try keyEquality(s, eq) == null) continue;
+            const everywhere = for (terms[1..]) |ts| {
+                const found = for (ts.items) |other| {
+                    if (try sameEquality(s, eq, other)) break true;
+                } else false;
+                if (!found) break false;
+            } else true;
+            if (everywhere) try keys.append(a, eq);
+        }
+        if (keys.items.len == 0) {
+            try out.append(a, node);
+            continue;
+        }
+        changed = true;
+        try out.appendSlice(a, keys.items);
+        // Each branch without them; a branch they were all of is TRUE, and the OR with it.
+        var rest: ?*c.LpNode = null;
+        var always = false;
+        for (terms) |*ts| {
+            var kept: std.ArrayList(*c.LpNode) = .empty;
+            for (ts.items) |term| {
+                const is_key = for (keys.items) |k| {
+                    if (try sameEquality(s, k, term)) break true;
+                } else false;
+                if (!is_key) try kept.append(a, term);
+            }
+            ts.* = kept;
+            const branch = try andOf(a, kept.items) orelse {
+                always = true;
+                break;
+            };
+            rest = if (rest) |r| try binaryOf(a, c.LP_OP_OR, r, branch) else branch;
+        }
+        if (always) continue;
+        // Each table's own conditions, ORed across the branches when every branch has some.
+        for (0..s.tables.len) |ti| {
+            const bit = @as(u64, 1) << @intCast(ti);
+            var implied: ?*c.LpNode = null;
+            const all = for (terms) |ts| {
+                var mine: std.ArrayList(*c.LpNode) = .empty;
+                for (ts.items) |term| if ((try s.reads(term, a)) == bit) {
+                    try mine.append(a, c.lp_node_clone(p.arena, term) orelse return error.OutOfMemory);
+                };
+                const branch = try andOf(a, mine.items) orelse break false;
+                implied = if (implied) |acc| try binaryOf(a, c.LP_OP_OR, acc, branch) else branch;
+            } else true;
+            if (all) try out.append(a, implied.?);
+        }
+        try out.append(a, rest.?);
+    }
+    return if (changed) out else null;
+}
+
 fn andOf(a: std.mem.Allocator, nodes: []const *c.LpNode) !?*c.LpNode {
     if (nodes.len == 0) return null;
     var acc = nodes[0];
@@ -407,6 +515,15 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
     var live: std.ArrayList(usize) = .empty;
     for (0..list.items.len) |i| try live.append(a, i);
     var reduced = false;
+    // An OR whose every branch holds one key equality joins by it (`hoistOrs`): the WHERE then holds the equality,
+    // each table's own conditions the branches imply, and the rest of the OR as a condition across tables.
+    {
+        const all: Sides = .{ .t = t, .tables = live.items, .aliases = aliases };
+        if (try hoistOrs(a, p, all, conjuncts.items)) |rewritten| {
+            conjuncts = rewritten;
+            sel.where = try andOf(a, conjuncts.items);
+        }
+    }
     // A LEFT JOIN's null-supplying table is read by its ON alone: a WHERE or INNER ON condition on it would need its
     // NULL rows, and one joining it to a third table would stack a join on the join. Having no conjunct, it never reduces.
     var null_set: u64 = 0;
@@ -720,4 +837,27 @@ test "a snowflake plans as a tree: a dimension's dimension under its build, its 
     // A second edge to a table already in the tree is a cycle: a residual of the probe, over the published key.
     const cyc = try plan(a, "SELECT gname, count(*) AS n FROM 'f.parquet' f, 'd.parquet' d, 'g.parquet' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.amt = g.gk GROUP BY gname", t);
     try std.testing.expect(std.mem.indexOf(u8, cyc.probe_sql, "WHERE grp = amt") != null);
+}
+
+test "an OR whose every branch holds a key equality joins by it, with each table's implied conditions its own" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const Cols = struct {
+        const of = [_][]const []const u8{ &.{ "fk", "amt", "q" }, &.{ "pk", "grp", "w" } };
+        fn has(_: *const anyopaque, table: usize, name: []const u8) bool {
+            for (of[table]) |col| if (std.mem.eql(u8, col, name)) return true;
+            return false;
+        }
+    };
+    const t: Tables = .{ .paths = &.{ "f.parquet", "d.parquet" }, .has = Cols.has, .rows = &.{ 1000, 100 }, .ctx = undefined };
+    const p = try plan(a, "SELECT sum(amt) AS s FROM 'f.parquet' f, 'd.parquet' d WHERE (f.fk = d.pk AND d.grp = 1 AND f.q < 3) OR (d.pk = f.fk AND d.w > 7)", t);
+    try std.testing.expectEqualStrings("fk", p.fk);
+    try std.testing.expectEqualStrings("pk", p.build_key);
+    // The build narrows by the OR of its own conditions; the probe keeps the whole OR (a residual) and no FK equality.
+    try std.testing.expect(std.mem.indexOf(u8, p.build_where.?, "OR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.probe_sql, "OR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, p.probe_sql, "= pk") == null);
+    // Without the key in every branch there is no join to find.
+    try std.testing.expectError(error.JoinKeyNotFound, plan(a, "SELECT sum(amt) AS s FROM 'f.parquet' f, 'd.parquet' d WHERE (f.fk = d.pk AND d.grp = 1) OR d.grp = 2", t));
 }

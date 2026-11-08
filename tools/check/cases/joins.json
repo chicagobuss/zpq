@@ -4078,6 +4078,197 @@
    }
   },
   {
+   "id": "join:or-key:q19-shape",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE (f.fk = d.pk AND d.grp = 1 AND f.q < 3) OR (f.fk = d.pk AND d.grp = 2 AND f.q >= 3 AND d.w < 5000) OR (d.pk = f.fk AND d.w > 7000)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE (f.fk = d.pk AND d.grp = 1 AND f.q < 3) OR (f.fk = d.pk AND d.grp = 2 AND f.q >= 3 AND d.w < 5000) OR (d.pk = f.fk AND d.w > 7000)"
+   }
+  },
+  {
+   "id": "join:or-key:grouped",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT kind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE (f.fk = d.pk AND d.grp = 1 AND f.q < 3) OR (f.fk = d.pk AND d.grp = 3) GROUP BY kind ORDER BY kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT kind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE (f.fk = d.pk AND d.grp = 1 AND f.q < 3) OR (f.fk = d.pk AND d.grp = 3) GROUP BY kind ORDER BY kind"
+   }
+  },
+  {
+   "id": "join:or-key:a-branch-of-the-key-alone",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE (f.fk = d.pk AND d.grp = 1) OR f.fk = d.pk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE (f.fk = d.pk AND d.grp = 1) OR f.fk = d.pk"
+   }
+  },
+  {
+   "id": "join:or-key:nulls",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g, count(*) AS n, sum(x) AS s FROM '{fixture:nullfact}' n, '{fixture:nulldim}' d WHERE (n.fk = d.pk AND n.x > 100) OR (n.fk = d.pk AND d.g = 2 AND n.y IS NULL) OR (n.fk = d.pk AND n.z = 3) GROUP BY g ORDER BY g"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT g, count(*) AS n, sum(x) AS s FROM '{fixture:nullfact}' n, '{fixture:nulldim}' d WHERE (n.fk = d.pk AND n.x > 100) OR (n.fk = d.pk AND d.g = 2 AND n.y IS NULL) OR (n.fk = d.pk AND n.z = 3) GROUP BY g ORDER BY g"
+   }
+  },
+  {
+   "id": "join:or-key:across-two-dimensions",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT kind, sgrp, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_sparse}' x WHERE f.sfk = x.spk AND ((f.fk = d.pk AND d.grp = 1) OR (f.fk = d.pk AND x.sgrp = 2)) GROUP BY kind, sgrp ORDER BY kind, sgrp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 4,
+     "max_memory": "512K"
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT kind, sgrp, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_sparse}' x WHERE f.sfk = x.spk AND ((f.fk = d.pk AND d.grp = 1) OR (f.fk = d.pk AND x.sgrp = 2)) GROUP BY kind, sgrp ORDER BY kind, sgrp"
+   }
+  },
+  {
+   "id": "join:refuse:or-key-not-in-every-branch",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE (f.fk = d.pk AND d.grp = 1) OR (d.grp = 2)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a join needs one key equality between its tables"
+   }
+  },
+  {
    "id": "join:fd:chain-key-determines-its-table",
    "fixture": "fact",
    "cli": [

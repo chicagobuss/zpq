@@ -183,23 +183,8 @@ def pinned_version(function, region=None):
     return account, region, name, qualifier
 
 
-# One Lambda client per (region, pool) for the life of the process, so a warm coordinator keeps its connections.
-_CLIENTS = {}
 _EXECUTOR = None
 _EXECUTOR_N = 0
-
-
-def cached_client(region, pool):
-    key = (region, pool)
-    found = _CLIENTS.get(key)
-    if found is not None:
-        return found
-    import boto3
-    from botocore.config import Config
-    found = boto3.client("lambda", region_name=region, config=Config(
-        read_timeout=900, connect_timeout=10, retries={"total_max_attempts": 1}, max_pool_connections=pool))
-    _CLIENTS[key] = found
-    return found
 
 
 def executor(n):

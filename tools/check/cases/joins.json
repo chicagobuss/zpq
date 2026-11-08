@@ -5030,6 +5030,87 @@
     "compare": "ordered",
     "sql": "SELECT count(*) AS n FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE f.fk = d.pk AND NOT (d.grp = 1 OR f.q < 3)"
    }
+  },
+  {
+   "id": "review:q19:not-over-or-in-the-residual",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE (f.fk = d.pk AND NOT (d.grp = 1 OR f.q < 3)) OR (f.fk = d.pk AND d.w = 1)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE (f.fk = d.pk AND NOT (d.grp = 1 OR f.q < 3)) OR (f.fk = d.pk AND d.w = 1)"
+   }
+  },
+  {
+   "id": "review:q19:not-over-or-in-the-build",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE (f.fk = d.pk AND NOT (d.grp = 1 OR d.w = 2) AND f.q = 0) OR (f.fk = d.pk AND d.grp = 9 AND f.q = 0)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE (f.fk = d.pk AND NOT (d.grp = 1 OR d.w = 2) AND f.q = 0) OR (f.fk = d.pk AND d.grp = 9 AND f.q = 0)"
+   }
+  },
+  {
+   "id": "review:q19:not-over-and",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(q) AS s FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE (f.fk = d.pk AND NOT (d.grp = 5 AND d.w = 2)) OR (f.fk = d.pk AND NOT (f.q = 9 OR d.w > 0))"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(q) AS s FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE (f.fk = d.pk AND NOT (d.grp = 5 AND d.w = 2)) OR (f.fk = d.pk AND NOT (f.q = 9 OR d.w > 0))"
+   }
   }
  ]
 }

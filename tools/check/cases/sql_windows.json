@@ -1,0 +1,917 @@
+{
+ "fixtures": [
+  {
+   "name": "wn",
+   "path": "ci/fixtures/parquet/sql_windows.parquet"
+  }
+ ],
+ "cases": [
+  {
+   "id": "sql_windows:row-number",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, row_number() OVER (ORDER BY id) AS a, row_number() OVER (PARTITION BY g ORDER BY id) AS b, row_number() OVER (PARTITION BY g, h ORDER BY v DESC, id) AS c FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, row_number() OVER (ORDER BY id) AS a, row_number() OVER (PARTITION BY g ORDER BY id) AS b, row_number() OVER (PARTITION BY g, h ORDER BY v DESC, id) AS c FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:rank-ties",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (PARTITION BY g ORDER BY v) AS r, dense_rank() OVER (PARTITION BY g ORDER BY v) AS dr, rank() OVER (ORDER BY v DESC NULLS FIRST) AS rn, dense_rank() OVER (ORDER BY s) AS ds FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, rank() OVER (PARTITION BY g ORDER BY v) AS r, dense_rank() OVER (PARTITION BY g ORDER BY v) AS dr, rank() OVER (ORDER BY v DESC NULLS FIRST) AS rn, dense_rank() OVER (ORDER BY s) AS ds FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:rank-no-order",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (PARTITION BY h) AS r, dense_rank() OVER () AS dr, count(*) OVER () AS n, sum(v) OVER () AS total FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, rank() OVER (PARTITION BY h) AS r, dense_rank() OVER () AS dr, count(*) OVER () AS n, sum(v) OVER () AS total FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:lag-lead",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, lag(v) OVER (PARTITION BY g ORDER BY id) AS a, lead(v, 2) OVER (PARTITION BY g ORDER BY id) AS b, lag(v, 3, -99) OVER (ORDER BY id) AS c, lead(v, 0) OVER (ORDER BY id) AS d0 FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, lag(v) OVER (PARTITION BY g ORDER BY id) AS a, lead(v, 2) OVER (PARTITION BY g ORDER BY id) AS b, lag(v, 3, -99) OVER (ORDER BY id) AS c, lead(v, 0) OVER (ORDER BY id) AS d0 FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:lag-lead-types",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, lag(s) OVER (ORDER BY id) AS a, lead(s, 1, 'end') OVER (PARTITION BY h ORDER BY id) AS b, lag(d, 2, 0.5) OVER (ORDER BY id) AS c, lead(m) OVER (PARTITION BY g ORDER BY id) AS e, lag(dc4, 1) OVER (ORDER BY id) AS f, lead(dt) OVER (PARTITION BY h ORDER BY id) AS g2, lag(b) OVER (ORDER BY id) AS h2, lead(si, 1, 7) OVER (ORDER BY id) AS i2, lag(wide) OVER (ORDER BY id) AS j2 FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, lag(s) OVER (ORDER BY id) AS a, lead(s, 1, 'end') OVER (PARTITION BY h ORDER BY id) AS b, lag(d, 2, 0.5) OVER (ORDER BY id) AS c, lead(m) OVER (PARTITION BY g ORDER BY id) AS e, lag(dc4, 1) OVER (ORDER BY id) AS f, lead(dt) OVER (PARTITION BY h ORDER BY id) AS g2, lag(b) OVER (ORDER BY id) AS h2, lead(si, 1, 7) OVER (ORDER BY id) AS i2, lag(wide) OVER (ORDER BY id) AS j2 FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:running-int",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s, count(*) OVER (PARTITION BY g ORDER BY id) AS c, count(v) OVER (PARTITION BY g ORDER BY id) AS cv, avg(v) OVER (PARTITION BY g ORDER BY id) AS a, min(v) OVER (PARTITION BY g ORDER BY id) AS lo, max(v) OVER (PARTITION BY g ORDER BY id) AS hi FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s, count(*) OVER (PARTITION BY g ORDER BY id) AS c, count(v) OVER (PARTITION BY g ORDER BY id) AS cv, avg(v) OVER (PARTITION BY g ORDER BY id) AS a, min(v) OVER (PARTITION BY g ORDER BY id) AS lo, max(v) OVER (PARTITION BY g ORDER BY id) AS hi FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:running-peers",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY v) AS s, count(*) OVER (ORDER BY h) AS c, avg(si) OVER (ORDER BY v) AS a, max(v) OVER (PARTITION BY h ORDER BY g) AS hi FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY v) AS s, count(*) OVER (ORDER BY h) AS c, avg(si) OVER (ORDER BY v) AS a, max(v) OVER (PARTITION BY h ORDER BY g) AS hi FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:whole-partition",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (PARTITION BY g) AS s, count(v) OVER (PARTITION BY h) AS c, avg(v) OVER (PARTITION BY g, h) AS a, min(s) OVER (PARTITION BY g) AS lo, max(dt) OVER (PARTITION BY h) AS hi FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (PARTITION BY g) AS s, count(v) OVER (PARTITION BY h) AS c, avg(v) OVER (PARTITION BY g, h) AS a, min(s) OVER (PARTITION BY g) AS lo, max(dt) OVER (PARTITION BY h) AS hi FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:rows-frames",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS a, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS b, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS c, sum(v) OVER (PARTITION BY h ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS d, sum(v) OVER (ORDER BY id ROWS 3 PRECEDING) AS e FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS a, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS b, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS c, sum(v) OVER (PARTITION BY h ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS d, sum(v) OVER (ORDER BY id ROWS 3 PRECEDING) AS e FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:rows-minmax",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, min(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS lo, max(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS hi, min(s) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS slo, max(m) OVER (PARTITION BY h ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS mhi, max(d) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS dhi FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, min(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS lo, max(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) AS hi, min(s) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS slo, max(m) OVER (PARTITION BY h ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS mhi, max(d) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS dhi FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:rows-counts-avg",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 4 FOLLOWING) AS a, count(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING) AS b, avg(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS c, avg(m) OVER (PARTITION BY h ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS d FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, count(*) OVER (ORDER BY id ROWS BETWEEN 2 FOLLOWING AND 4 FOLLOWING) AS a, count(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING) AS b, avg(v) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS c, avg(m) OVER (PARTITION BY h ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS d FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:frame-ends",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 100 PRECEDING AND 100 FOLLOWING) AS a, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 5 FOLLOWING AND 9 FOLLOWING) AS b, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 9 PRECEDING AND 5 PRECEDING) AS c, count(*) OVER (PARTITION BY g ORDER BY id RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS d FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 100 PRECEDING AND 100 FOLLOWING) AS a, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 5 FOLLOWING AND 9 FOLLOWING) AS b, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 9 PRECEDING AND 5 PRECEDING) AS c, count(*) OVER (PARTITION BY g ORDER BY id RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS d FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:decimals",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(m) OVER (PARTITION BY g ORDER BY id) AS s, avg(m) OVER (PARTITION BY g ORDER BY id) AS a, sum(dc4) OVER (PARTITION BY h) AS s4, avg(dc4) OVER (PARTITION BY h) AS a4, sum(wide) OVER (ORDER BY id) AS sw, avg(wide) OVER (PARTITION BY g) AS aw, min(m) OVER (PARTITION BY g) AS lo, max(dc4) OVER (ORDER BY id) AS hi FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(m) OVER (PARTITION BY g ORDER BY id) AS s, avg(m) OVER (PARTITION BY g ORDER BY id) AS a, sum(dc4) OVER (PARTITION BY h) AS s4, avg(dc4) OVER (PARTITION BY h) AS a4, sum(wide) OVER (ORDER BY id) AS sw, avg(wide) OVER (PARTITION BY g) AS aw, min(m) OVER (PARTITION BY g) AS lo, max(dc4) OVER (ORDER BY id) AS hi FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:small-ints",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(si) OVER (PARTITION BY g ORDER BY id) AS s, avg(si) OVER (PARTITION BY g ORDER BY id) AS a, min(si) OVER (PARTITION BY h) AS lo FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(si) OVER (PARTITION BY g ORDER BY id) AS s, avg(si) OVER (PARTITION BY g ORDER BY id) AS a, min(si) OVER (PARTITION BY h) AS lo FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:floats-exact",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, min(d) OVER (PARTITION BY g ORDER BY id) AS lo, max(d) OVER (PARTITION BY g ORDER BY id) AS hi, count(d) OVER (PARTITION BY h) AS c, lag(d) OVER (PARTITION BY g ORDER BY id) AS pv FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, min(d) OVER (PARTITION BY g ORDER BY id) AS lo, max(d) OVER (PARTITION BY g ORDER BY id) AS hi, count(d) OVER (PARTITION BY h) AS c, lag(d) OVER (PARTITION BY g ORDER BY id) AS pv FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:booleans-dates",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, min(b) OVER (PARTITION BY g) AS bl, max(b) OVER (PARTITION BY h) AS bh, min(dt) OVER (ORDER BY id) AS dl, max(dt) OVER (PARTITION BY g ORDER BY id) AS dh FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, min(b) OVER (PARTITION BY g) AS bl, max(b) OVER (PARTITION BY h) AS bh, min(dt) OVER (ORDER BY id) AS dl, max(dt) OVER (PARTITION BY g ORDER BY id) AS dh FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:two-specs",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, row_number() OVER (ORDER BY v, id) AS a, rank() OVER (PARTITION BY g ORDER BY v) AS b, sum(v) OVER (PARTITION BY h ORDER BY id) AS c, lag(v) OVER (ORDER BY id) AS d FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, row_number() OVER (ORDER BY v, id) AS a, rank() OVER (PARTITION BY g ORDER BY v) AS b, sum(v) OVER (PARTITION BY h ORDER BY id) AS c, lag(v) OVER (ORDER BY id) AS d FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:expressions",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) / 2 AS half, v - lag(v) OVER (ORDER BY id) AS delta, abs(row_number() OVER (ORDER BY id) - 10) AS dist, sum(v * 2) OVER (PARTITION BY g % 3 ORDER BY id) AS dbl, CAST(rank() OVER (ORDER BY v) AS VARCHAR) AS rk FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) / 2 AS half, v - lag(v) OVER (ORDER BY id) AS delta, abs(row_number() OVER (ORDER BY id) - 10) AS dist, sum(v * 2) OVER (PARTITION BY g % 3 ORDER BY id) AS dbl, CAST(rank() OVER (ORDER BY v) AS VARCHAR) AS rk FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:over-group-by",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g, sum(v) AS s, rank() OVER (ORDER BY sum(v) DESC, g) AS r, sum(sum(v)) OVER (ORDER BY g) AS running, count(*) AS c, avg(count(*)) OVER () AS mean FROM '{fixture:wn}' GROUP BY g",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT g, sum(v) AS s, rank() OVER (ORDER BY sum(v) DESC, g) AS r, sum(sum(v)) OVER (ORDER BY g) AS running, count(*) AS c, avg(count(*)) OVER () AS mean FROM '{fixture:wn}' GROUP BY g"
+   }
+  },
+  {
+   "id": "sql_windows:over-group-by-partition",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g, h, count(*) AS c, sum(count(*)) OVER (PARTITION BY g) AS total, row_number() OVER (PARTITION BY g ORDER BY count(*) DESC, h) AS rn FROM '{fixture:wn}' GROUP BY g, h",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT g, h, count(*) AS c, sum(count(*)) OVER (PARTITION BY g) AS total, row_number() OVER (PARTITION BY g ORDER BY count(*) DESC, h) AS rn FROM '{fixture:wn}' GROUP BY g, h"
+   }
+  },
+  {
+   "id": "sql_windows:filter-then-window",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, g, row_number() OVER (PARTITION BY g ORDER BY id) AS rn, sum(v) OVER (PARTITION BY g ORDER BY id) AS s FROM '{fixture:wn}' WHERE v > 0 AND g IS NOT NULL",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, g, row_number() OVER (PARTITION BY g ORDER BY id) AS rn, sum(v) OVER (PARTITION BY g ORDER BY id) AS s FROM '{fixture:wn}' WHERE v > 0 AND g IS NOT NULL"
+   }
+  },
+  {
+   "id": "sql_windows:empty-input",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, row_number() OVER (ORDER BY id) AS r, sum(v) OVER (PARTITION BY g) AS s, lag(s) OVER (ORDER BY id) AS p FROM '{fixture:wn}' WHERE id < 0",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, row_number() OVER (ORDER BY id) AS r, sum(v) OVER (PARTITION BY g) AS s, lag(s) OVER (ORDER BY id) AS p FROM '{fixture:wn}' WHERE id < 0"
+   }
+  },
+  {
+   "id": "sql_windows:one-row-partitions",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (PARTITION BY id ORDER BY v) AS r, sum(v) OVER (PARTITION BY id ORDER BY id) AS s, lag(v) OVER (PARTITION BY id ORDER BY id) AS p, avg(v) OVER (PARTITION BY id) AS a FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, rank() OVER (PARTITION BY id ORDER BY v) AS r, sum(v) OVER (PARTITION BY id ORDER BY id) AS s, lag(v) OVER (PARTITION BY id ORDER BY id) AS p, avg(v) OVER (PARTITION BY id) AS a FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:plain-items",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, g, v + 1, upper(s), row_number() OVER (ORDER BY id) AS rn FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, g, v + 1, upper(s), row_number() OVER (ORDER BY id) AS rn FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:order-limit",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, row_number() OVER (ORDER BY v, id) AS r FROM '{fixture:wn}' ORDER BY r DESC LIMIT 7",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, row_number() OVER (ORDER BY v, id) AS r FROM '{fixture:wn}' ORDER BY r DESC LIMIT 7"
+   }
+  },
+  {
+   "id": "sql_windows:order-window-expression",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s FROM '{fixture:wn}' ORDER BY id LIMIT 9 OFFSET 4",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s FROM '{fixture:wn}' ORDER BY id LIMIT 9 OFFSET 4"
+   }
+  },
+  {
+   "id": "sql_windows:set-operation",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, row_number() OVER (ORDER BY id) AS r FROM '{fixture:wn}' WHERE id < 5 UNION ALL SELECT id, rank() OVER (ORDER BY id DESC) AS r FROM '{fixture:wn}' WHERE id >= 235",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, row_number() OVER (ORDER BY id) AS r FROM '{fixture:wn}' WHERE id < 5 UNION ALL SELECT id, rank() OVER (ORDER BY id DESC) AS r FROM '{fixture:wn}' WHERE id >= 235"
+   }
+  },
+  {
+   "id": "sql_windows:sort-directions",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, row_number() OVER (ORDER BY v DESC NULLS LAST, id) AS a, row_number() OVER (ORDER BY v ASC NULLS FIRST, id) AS b, rank() OVER (ORDER BY s DESC, id) AS c, row_number() OVER (PARTITION BY g ORDER BY d NULLS FIRST, id) AS e FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, row_number() OVER (ORDER BY v DESC NULLS LAST, id) AS a, row_number() OVER (ORDER BY v ASC NULLS FIRST, id) AS b, rank() OVER (ORDER BY s DESC, id) AS c, row_number() OVER (PARTITION BY g ORDER BY d NULLS FIRST, id) AS e FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:ntile",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, ntile(4) OVER (ORDER BY id) AS q FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "ntile is not supported",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:first-value",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, first_value(v) OVER (PARTITION BY g ORDER BY id) AS f FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "first_value is not supported",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY id RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "RANGE frames are supported only",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:groups-frame",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "GROUPS frames",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:frame-reversed",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) AS f FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "starts after it ends",
+    "exit": 2,
+    "binder_sql": "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) AS f FROM '{fixture:wn}'",
+    "duck_error": "Parser Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:distinct-arg",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(DISTINCT v) OVER (PARTITION BY g) AS f FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "DISTINCT in a window function",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:filter-clause",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) FILTER (WHERE v > 0) OVER (PARTITION BY g) AS f FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "FILTER on a window function",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:window-clause",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER w AS f FROM '{fixture:wn}' WINDOW w AS (PARTITION BY g ORDER BY id)",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "WINDOW clause",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:in-where",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id FROM '{fixture:wn}' WHERE row_number() OVER (ORDER BY id) < 3",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "window function in WHERE",
+    "exit": 2,
+    "binder_sql": "SELECT id FROM '{fixture:wn}' WHERE row_number() OVER (ORDER BY id) < 3",
+    "duck_error": "Binder Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:star",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT *, row_number() OVER (ORDER BY id) AS r FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "SELECT * with a window function",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:distinct-select",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT DISTINCT g, row_number() OVER (ORDER BY g) AS r FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "SELECT DISTINCT with a window function",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:double-sum",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(d) OVER (PARTITION BY g ORDER BY id) AS f FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowFloatAggregate",
+    "diag": "SUM and AVG of a DOUBLE",
+    "exit": 1
+   }
+  },
+  {
+   "id": "sql_windows:refuse:double-avg",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, avg(d) OVER (PARTITION BY g) AS f FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowFloatAggregate",
+    "diag": "SUM and AVG of a DOUBLE",
+    "exit": 1
+   }
+  },
+  {
+   "id": "sql_windows:refuse:sum-of-text",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(s) OVER (PARTITION BY g) AS f FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowArgumentType",
+    "diag": "does not take that type",
+    "exit": 1,
+    "binder_sql": "SELECT id, sum(s) OVER (PARTITION BY g) AS f FROM '{fixture:wn}'",
+    "duck_error": "Binder Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:sum-of-date",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(dt) OVER (PARTITION BY g) AS f FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowArgumentType",
+    "diag": "does not take that type",
+    "exit": 1,
+    "binder_sql": "SELECT id, sum(dt) OVER (PARTITION BY g) AS f FROM '{fixture:wn}'",
+    "duck_error": "Binder Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:lag-default-type",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, lag(v, 1, 'x') OVER (ORDER BY id) AS f FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowDefaultType",
+    "diag": "default of lag / lead",
+    "exit": 1
+   }
+  },
+  {
+   "id": "sql_windows:refuse:unaliased-window",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, row_number() OVER (ORDER BY id) FROM '{fixture:wn}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "SelectAliasRequired",
+    "diag": "needs an alias",
+    "exit": 2
+   }
+  }
+ ]
+}

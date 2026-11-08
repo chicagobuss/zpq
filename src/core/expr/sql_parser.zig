@@ -1522,12 +1522,9 @@ fn namableItems(allocator: std.mem.Allocator, root: *c.LpNode, folded_sql: []con
     return out;
 }
 
-/// A query `fold` rewrote, read with the markers it chose: a join's probe and build queries are its pieces.
-fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_sql: []const u8, markers: literals.Markers) !ParsedQuery {
-    const lp_arena = c.arena_create(64 * 1024) orelse return error.OutOfMemory;
-    defer c.arena_destroy(lp_arena);
-
-    var error_msg: [*c]const u8 = null;
+/// `folded_sql` with the text rewrites the grammar needs applied (POSITION, EXTRACT, the keyword forms of SUBSTRING, TRY_CAST,
+/// integer division).
+fn rewriteChain(allocator: std.mem.Allocator, folded_sql: []const u8) ![:0]u8 {
     const positioned = try positionAsStrpos(allocator, folded_sql);
     defer allocator.free(positioned);
     const extracted = try extractAsDatePart(allocator, positioned);
@@ -1536,7 +1533,27 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
     defer allocator.free(keyworded);
     const casted = try tryCasts(allocator, keyworded);
     defer allocator.free(casted);
-    const sql_c = try integerDivision(allocator, casted, 0);
+    return integerDivision(allocator, casted, 0);
+}
+
+/// `sql` as the parser reads it: comments gone, literals folded and every text rewrite made, for a caller that plans from
+/// the text. Null where the literal rewrite changed more than a `::` cast (a typed literal, ILIKE, GROUP BY ALL), whose
+/// markers a second parse would not recognise.
+pub fn parserText(allocator: std.mem.Allocator, sql: []const u8) !?[:0]u8 {
+    var report: literals.Report = .{};
+    const folded = try fold(allocator, sql, &report);
+    defer allocator.free(folded);
+    if (report.markers.rewrote) return null;
+    return try rewriteChain(allocator, folded);
+}
+
+/// A query `fold` rewrote, read with the markers it chose: a join's probe and build queries are its pieces.
+fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_sql: []const u8, markers: literals.Markers) !ParsedQuery {
+    const lp_arena = c.arena_create(64 * 1024) orelse return error.OutOfMemory;
+    defer c.arena_destroy(lp_arena);
+
+    var error_msg: [*c]const u8 = null;
+    const sql_c = try rewriteChain(allocator, folded_sql);
     defer allocator.free(sql_c);
 
     // lp_parse() silently stops at the first ';', so trailing statements/clauses

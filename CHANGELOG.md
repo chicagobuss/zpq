@@ -102,6 +102,12 @@
   BOOLEANs, in WHERE too; `dayname`, `monthname`, `last_day`, `weekofyear`, `strpos`, `concat_ws` and `mod`; `ascii`, `chr`,
   `repeat` and `position(needle IN s)`. `ln`, `exp`, `pow`,
   `sin` and their kin stay refused: DuckDB's math library differs from a current one's in the last digit for many inputs.
+- **Window functions in SQL.** `row_number()`, `rank()`, `dense_rank()`, `lag` / `lead`, and `sum`, `count`, `avg`, `min`, `max`
+  `OVER (PARTITION BY .. ORDER BY .. [ROWS BETWEEN ..])` (the default frame and `ROWS` frames), over rows or over a GROUP BY's
+  output, in expressions, with ORDER BY / LIMIT, match DuckDB 2.0.0 (fuzzed on ~1,000 queries). The query runs as stages, as set
+  operations do: the rows sorted by the window's keys into a scratch Parquet file, a pass that adds the window columns, and the query
+  over the result. The intermediate is held in memory (the bound of an ORDER BY with no LIMIT). `sum` / `avg` of a DOUBLE and the other
+  window functions (`ntile`, `first_value`, ...), RANGE offsets, QUALIFY and `SELECT *` beside a window call are refused by name.
 - **Unaliased computed columns are named as DuckDB names them.** `SELECT id, id + 1, upper(s) FROM t ORDER BY id` was refused
   as `missing --output or --aggregate`; its columns are now `id`, `(id + 1)` and `upper(s)`. Names were checked against DuckDB on
   over 500 generated expressions. What zpq rewrites before it reads, or prints differently from DuckDB (`CASE`, `//`, `EXTRACT`,

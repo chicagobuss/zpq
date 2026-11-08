@@ -42,6 +42,11 @@ pub const core = struct {
             struct {};
         pub const sql_setops = @import("core/expr/sql_setops.zig");
         pub const sql_columns = @import("core/expr/sql_columns.zig");
+        pub const window_plan = @import("core/expr/window_plan.zig");
+        pub const sql_windows = if (@import("build_options").enable_sql)
+            @import("core/expr/sql_windows.zig")
+        else
+            struct {};
         pub const sql_grouping = @import("core/expr/sql_grouping.zig");
         pub const sql_join = if (@import("build_options").enable_sql)
             @import("core/expr/sql_join.zig")

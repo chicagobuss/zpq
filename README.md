@@ -150,7 +150,7 @@ the site's [Benchmarks](https://zpq.chicagobuss.dev/numbers.html) page.
   binary, thread stacks or mapped input pages, so a query can go somewhat past it (a 256 MiB budget peaked at about
   284 MiB in testing). The answer stays exact, or the query refuses cleanly. For a hard ceiling, run zpq under a
   cgroup `memory.max` or `ulimit -v`.
-- No joins and no window functions; some other SQL is refused with exit 2 and a message.
+- Window functions run (see docs/capabilities.md); some other SQL is refused with exit 2 and a message.
 - JSON prints DATE and TIMESTAMP as their stored integers; CSV prints ISO text.
 - SQL through libzpq, Arrow results and the Spark data source are experimental; Windows is not built.
 

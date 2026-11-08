@@ -310,7 +310,7 @@ fn classify(arena: std.mem.Allocator, leaf: schema_tree.PrimitiveNode) !Kind {
 
 /// Where the scratch directory goes: in `dir_hint` (the output's directory, whose filesystem has room for the result) or
 /// the system's temporary one, but never in a directory a branch reads from: its files would sit among the inputs.
-fn scratchParent(leaves: []const []const u8, dir_hint: ?[]const u8) []const u8 {
+pub fn scratchParent(leaves: []const []const u8, dir_hint: ?[]const u8) []const u8 {
     const preferred = dir_hint orelse "/tmp";
     if (!readsFrom(leaves, preferred)) return preferred;
     return if (!readsFrom(leaves, "/tmp")) "/tmp" else preferred;

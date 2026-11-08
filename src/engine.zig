@@ -26,6 +26,7 @@ pub const env = @import("engine/env.zig");
 pub const projection = @import("engine/projection.zig");
 pub const syntax_plan = @import("engine/syntax_plan.zig");
 pub const join = @import("engine/join.zig");
+pub const window = @import("engine/window.zig");
 pub const fanout_plan = @import("engine/fanout_plan.zig");
 pub const s3_rebase = @import("engine/s3_rebase.zig");
 pub const s3_fetch = @import("engine/s3_fetch.zig");

@@ -225,6 +225,16 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             "zpq query: the join compares {s} with a key of another SQL type; a join's keys must share one\n",
             .{diag.column.get()},
         ),
+        error.WindowFloatAggregate => diagnosticPrint(
+            "zpq query: SUM and AVG of a DOUBLE or FLOAT over a window are not supported: DuckDB adds a frame in a segment tree's\n" ++
+                "  order, not left to right, so the last bits would differ (integers and DECIMALs are exact)\n",
+            .{},
+        ),
+        error.WindowDefaultType => diagnosticPrint("zpq query: the default of lag / lead does not fit the type of its column\n", .{}),
+        error.WindowSumOverflow => diagnosticPrint("zpq query: a window SUM is out of range for its result type\n", .{}),
+        error.WindowColumnType => diagnosticPrint("zpq query: a column of a window query has a type zpq does not carry through a window (nested, INT96, fixed-length bytes)\n", .{}),
+        error.WindowTooManyRows => diagnosticPrint("zpq query: a window over more than 4294967294 rows is not supported\n", .{}),
+        error.WindowArgumentType => diagnosticPrint("zpq query: this window function does not take that type (SUM and AVG take integers and DECIMALs)\n", .{}),
         error.ExceededMemoryBudget => diagnosticPrint(
             "zpq query: the query needs more memory than --max-memory allows\n",
             .{},

@@ -115,6 +115,29 @@ two in one item, one in WHERE or HAVING, or a join or S3 table is `ColumnsNotSup
 a comment is no call. A set operation or a grouping-set query expands each of its
 queries on its own.
 
+Window functions in the SELECT list: `row_number()`, `rank()`, `dense_rank()`, `lag` / `lead(x [, n [, default]])` and
+`sum` / `count` / `avg` / `min` / `max(x) OVER ([PARTITION BY ..] [ORDER BY ..] [frame])` (and `count(*)`), alone or inside
+arithmetic, a function call or a cast, over a row query or over the output of a GROUP BY (`rank() OVER (ORDER BY sum(x) DESC)`),
+with the query's own ORDER BY / LIMIT / OFFSET and a `UNION` of such queries. The frame is the default (the partition's start to the
+row's last peer; the whole partition without an ORDER BY), `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW | UNBOUNDED FOLLOWING`,
+or `ROWS BETWEEN` `UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW | n FOLLOWING` and `n PRECEDING | CURRENT ROW | n FOLLOWING |
+UNBOUNDED FOLLOWING` (an empty frame has a NULL sum and a zero count). Results are DuckDB's: ranks and counts BIGINT, `lag` / `lead` /
+`min` / `max` the argument's type, integer sums BIGINT (an overflow is `WindowSumOverflow`), DECIMAL sums DECIMAL(38, s), averages
+of integers and DECIMALs DOUBLE, finalized as DuckDB does. Compared with DuckDB 2.0.0 on fuzzed data (ties, NULL keys and values,
+DESC / NULLS FIRST, frames past the partition's ends, one-row partitions) and in `sql_windows.json`.
+How it runs: the query without its window calls is an ordinary query whose rows are sorted by the first call's PARTITION BY and ORDER BY
+into a scratch Parquet file, each distinct `(PARTITION BY, ORDER BY)` is one pass over a sorted file (`engine/window.zig`) that adds
+its columns, and the SELECT list and ORDER BY / LIMIT read the last file, so every output format works. The sort and the pass hold the
+intermediate (the columns the query reads, after WHERE and GROUP BY) in memory, as an ORDER BY with no LIMIT does: past `--max-memory`
+it is "the query needs more memory than --max-memory allows". Ties in an ORDER BY are in input order; DuckDB's row_number and ROWS
+frames over ties are unspecified, so a query that depends on them should break its ties.
+Refused by name: `ntile`, `first_value` / `last_value` / `nth_value`, `percent_rank`, `cume_dist` and the rest (`WindowNotSupported`);
+RANGE frames with an offset and GROUPS frames; `EXCLUDE`; a frame DuckDB's parser refuses; DISTINCT or FILTER on a window call;
+`IGNORE NULLS`; a named `WINDOW` clause; a window call in WHERE, GROUP BY or HAVING (QUALIFY is not supported); `SELECT DISTINCT` or
+`SELECT *` beside a window call; a window item with no alias; `lag` / `lead` defaults that do not fit the column; a window with
+typed literals, ILIKE or GROUP BY ALL in the query; and **`sum` / `avg` of a DOUBLE or FLOAT** (`WindowFloatAggregate`): DuckDB adds a
+frame in a segment tree's order and averages with compensated sums, so the last bits would differ from a left-to-right sum.
+
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 
 **Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`), string concat (`||`),

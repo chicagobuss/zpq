@@ -34,6 +34,7 @@ const Diag = zpq.core.diag.Diag;
 
 const usage_text = @embedFile("help.txt");
 const setops = @import("setops.zig");
+const windows = @import("windows.zig");
 
 var machine_diagnostics = false;
 var diagnostic_buffer: [16 * 1024]u8 = undefined;
@@ -721,6 +722,31 @@ fn runParsed(
             }
             return err;
         };
+        if (combination == null and sets == null and zpq.core.expr.sql_windows.mentions(stripped)) {
+            if (explain) {
+                diagnosticPrint("zpq query: --explain is not supported for a query with window functions\n", .{});
+                return error.BadArgs;
+            }
+            const text = (try zpq.core.expr.sql_parser.parserText(arena, stripped)) orelse {
+                diagnosticPrint("sql: window functions are not supported with typed literals, ILIKE or GROUP BY ALL yet\n", .{});
+                return error.WindowNotSupported;
+            };
+            var why: zpq.core.expr.sql_windows.Refusal = .{};
+            const plan = zpq.core.expr.sql_windows.build(arena, text, &why) catch |err| {
+                switch (err) {
+                    error.WindowNotSupported => diagnosticPrint("sql: {s}\n", .{why.text()}),
+                    error.SelectAliasRequired => diagnosticPrint("sql: a select item of a window query needs an alias (AS name)\n", .{}),
+                    else => {},
+                }
+                return err;
+            };
+            var stager: SetopStager = .{ .init = init, .options = options, .diag = diag, .arena = arena };
+            const out_dir: ?[]const u8 = if (output) |o| blk: {
+                if (std.mem.eql(u8, o, "-") or std.mem.startsWith(u8, o, "s3://")) break :blk null;
+                break :blk std.fs.path.dirname(o) orelse ".";
+            } else null;
+            return windows.run(gpa, io, plan, out_dir, stager.interface(), max_memory orelse zpq.core.system.discoverAvailableMemory(env));
+        }
         if (combination orelse sets) |compound| {
             if (explain) {
                 diagnosticPrint("zpq query: --explain is not supported for a set operation\n", .{});
@@ -1166,7 +1192,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "UnsupportedStatement",        "SubqueryNotSupported",        "WindowNotSupported",           "ColumnMustBeGrouped",      "BadOutputUrl",         "BadOperator",
         "BadValue",                    "BloomFilterNeedsRows",        "BloomFilterUnsupportedColumn", "Unsigned64Operand",        "NullableNotSupported", "NestedNotSupported",
         "NestedRowOutputNotSupported", "UnbalancedParentheses",       "FilterTooDeep",                "AggregateInGroupBy",       "HavingTypeMismatch",   "UnsupportedCase",
-        "UnsupportedType",             "DecimalScaleTooLarge",        "MissingOutputOrAggregate", "SelectAliasRequired", "ColumnsNotSupported", "ColumnsNoMatch", "ColumnsExcludeMissing",     "MultipleStatements",       "CteNotSupported",      "AggregateInWhere",
+        "UnsupportedType",             "DecimalScaleTooLarge",        "MissingOutputOrAggregate", "SelectAliasRequired", "ColumnsNotSupported", "ColumnsNoMatch", "ColumnsExcludeMissing", "WindowFloatAggregate", "WindowArgumentType",     "MultipleStatements",       "CteNotSupported",      "AggregateInWhere",
         "MissingFromClause",           "MissingTableName",            "UnsupportedFromClause",        "UnsupportedAggType",       "UnsupportedCoalesce",  "UnsupportedColumnType",
         "UnlabelledColumn",            "INT96ReencodeNotSupported",   "NestedReencodeNotSupported",   "NestedFilterNotSupported", "ModuloNotSupported",   "ExpressionInPredicate",
         "NestedColumnSelected",        "NestedAggregateNotSupported", "NestedGroupKeyNotSupported",   "UnsupportedDatePart",      "InvalidRegex",         "UnsupportedRegex",

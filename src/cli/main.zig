@@ -907,7 +907,7 @@ fn runParsed(
             diagnosticPrint("zpq query: --explain requires an aggregate or GROUP BY query\n", .{});
             return error.BadArgs;
         }
-        const explanation = try engine.explainAggregate(.{ .gpa = gpa, .env = env, .io = io }, arena, .{
+        const explain_args: engine.QueryArgs = .{
             .inputs = inputs,
             .plan_source = plan_source,
             .output = if (fmt == .parquet) engine_output orelse "-" else null,
@@ -928,9 +928,20 @@ fn runParsed(
             .column_order = column_order,
             .diag = diag,
             .profiler = profiler,
-        });
+            .input_format = options.input_format,
+            .csv = csv_opts,
+        };
+        const ctx: engine.Context = .{ .gpa = gpa, .env = env, .io = io };
         var ws: StdoutWriter = .{ .fd = 1 };
         defer ws.flush() catch {};
+        // A CSV input's aggregate folds during the parse (`csv_agg`): its own plan, not a Parquet scan's.
+        if (try engine.csv_write.csvInput(explain_args)) |path| {
+            try (try engine.csv_agg.explain(ctx, arena, explain_args, path)).writeJson(&ws);
+            try ws.flush();
+            if (profiler) |p| try profile_out.emit(gpa, io, p);
+            return;
+        }
+        const explanation = try engine.explainAggregate(ctx, arena, explain_args);
         try engine.writeAggregateExplanationJson(&ws, explanation);
         try ws.flush();
         if (profiler) |p| try profile_out.emit(gpa, io, p);

@@ -11,6 +11,7 @@ const std = @import("std");
 const csv_write = @import("csv_write.zig");
 const aggregate = @import("aggregate.zig");
 const engine_types = @import("types.zig");
+const text = @import("text.zig");
 const schema = @import("../core/schema.zig");
 const consumer = @import("../core/consumer.zig");
 const core_memory = @import("../core/memory.zig");
@@ -75,6 +76,80 @@ pub fn query(ctx: Context, args: QueryArgs, path: []const u8) !AggResult {
     };
 }
 
+/// How a CSV aggregate runs, as `--explain` reports it: planned and bound as the query is, nothing folded. The types are
+/// the sample's, or the file's where binding settled them; a value past the sample can still widen one during the fold.
+pub const Explanation = struct {
+    grouped: bool,
+    calls: usize,
+    keys: usize,
+    filter: bool,
+    having: bool,
+    workers: usize,
+    chunks: usize,
+    chunk_bytes: usize,
+    max_memory: usize,
+    settled: bool,
+    /// The fields each chunk parses, in file order, and their types.
+    fields: []const []const u8,
+    types: []const Type,
+
+    pub fn writeJson(e: Explanation, writer: anytype) !void {
+        try writer.print(
+            "{{\"ok\":true,\"explain\":true,\"input\":\"csv\",\"strategy\":\"csv_fold\",\"merge\":\"ordered_chunks\"," ++
+                "\"grouped\":{},\"calls\":{d},\"keys\":{d},\"filter\":{},\"having\":{},\"workers\":{d},\"chunks\":{d}," ++
+                "\"chunk_bytes\":{d},\"max_memory\":{d},\"types_settled\":{},\"fields\":[",
+            .{ e.grouped, e.calls, e.keys, e.filter, e.having, e.workers, e.chunks, e.chunk_bytes, e.max_memory, e.settled },
+        );
+        for (e.fields, e.types, 0..) |name, t, i| {
+            if (i > 0) try writer.writeByte(',');
+            var buf: [64]u8 = undefined;
+            try writer.writeAll("{\"name\":\"");
+            try text.writeJsonString(writer, name);
+            try writer.writeAll("\",\"type\":\"");
+            try text.writeJsonString(writer, t.name(&buf));
+            try writer.writeAll("\"}");
+        }
+        try writer.writeAll("]}\n");
+    }
+};
+
+/// The plan of the aggregate `args` asks of the CSV file at `path`, on `arena`; its refusal on `args.diag`.
+pub fn explain(ctx: Context, arena: std.mem.Allocator, args: QueryArgs, path: []const u8) !Explanation {
+    if (refused(args)) return error.CsvQueryNotSupported;
+    var report: csv_write.Report = .{};
+    return explainOver(ctx, arena, args, path, &report) catch |e| {
+        if (args.diag) |d| csv_write.describe(d, args, path, e, &report);
+        return e;
+    };
+}
+
+fn explainOver(ctx: Context, arena: std.mem.Allocator, args: QueryArgs, path: []const u8, report: *csv_write.Report) !Explanation {
+    const mapped = try mapInput(path, &report.failure);
+    defer mapped.unmap();
+    var planned = try Planned.of(ctx, arena, args, mapped.bytes, &report.failure);
+    const p = &planned.p;
+    report.fields = p.fields;
+    const b = try Bound.of(arena, args, &planned.all, p);
+    // Names are slices of the mapping, which goes when this returns.
+    const fields = try arena.alloc([]const u8, p.names.len);
+    for (fields, p.names) |*d, n| d.* = try arena.dupe(u8, n);
+    const data = mapped.bytes.len - p.data_start;
+    return .{
+        .grouped = b.q.keys != null,
+        .calls = b.q.calls.len,
+        .keys = if (b.q.keys) |k| k.len else 0,
+        .filter = b.q.filter != null,
+        .having = args.result_order.having != null,
+        .workers = planned.workers,
+        .chunks = @max(1, std.math.divCeil(usize, data, planned.chunk) catch 1),
+        .chunk_bytes = planned.chunk,
+        .max_memory = args.max_memory,
+        .settled = planned.settled,
+        .fields = fields,
+        .types = try arena.dupe(Type, p.types),
+    };
+}
+
 /// The query bound to the file's fields: its calls, filter, keys and outputs, and per field whether a chunk parses it.
 const Bound = struct {
     meta: *const schema.FileMetaData,
@@ -128,46 +203,69 @@ const Bound = struct {
     }
 };
 
-fn run(ctx: Context, args: QueryArgs, path: []const u8, report: *csv_write.Report, report_alloc: std.mem.Allocator) !AggResult {
-    const opts = args.csv;
-    const failure = &report.failure;
-    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+/// The plans a CSV aggregate runs on: every field's (`all`, the query's schema) and the fetched fields' (`p`, what each
+/// chunk parses), with the types settled from the whole file when the sample's did not bind (`settled`).
+const Planned = struct {
+    all: Plan,
+    p: Plan,
+    chunk: usize,
+    workers: usize,
+    settled: bool,
+
+    fn of(ctx: Context, arena: std.mem.Allocator, args: QueryArgs, bytes: []const u8, failure: *csv_write.Failure) !Planned {
+        const opts = args.csv;
+        const workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
+        // Cut as for one worker at any `-j` (see the top of the file).
+        const chunk = csv_write.chunkBytes(opts, args, 1, bytes.len);
+        var every = opts;
+        every.columns = null;
+        var all = try csv_write.plan(arena, bytes, every, failure);
+        var settled = false;
+        const first = Bound.of(arena, args, &all, null) catch |e| retry: {
+            // As a filter settles them (`csv_write.run`): the sample's types are provisional, the file's are not.
+            if (e == error.CsvQueryNotSupported or e == error.OutOfMemory or opts.strict) return e;
+            const seen = try csv_write.classifyFile(ctx, arena, &all, chunk, workers, failure);
+            for (all.types, seen, all.pinned) |*t, s, pinned| if (!pinned) {
+                t.* = t.join(s);
+            };
+            settled = true;
+            break :retry try Bound.of(arena, args, &all, null);
+        };
+        var parsed = opts;
+        parsed.columns = try first.fetchedNames(arena, all.fields);
+        var p = try csv_write.plan(arena, bytes, parsed, failure);
+        if (settled) for (p.slot, 0..) |slot, ci| if (slot) |o| {
+            p.types[o] = all.types[ci];
+        };
+        return .{ .all = all, .p = p, .chunk = chunk, .workers = workers, .settled = settled };
+    }
+};
+
+fn mapInput(path: []const u8, failure: *csv_write.Failure) !local_fs.Mapped {
     if (std.mem.startsWith(u8, path, "s3://")) return error.CsvRemoteInput;
-    const t_open = nowMonoNs();
-    const mapped = local_fs.mapFile(path) catch |e| switch (e) {
+    return local_fs.mapFile(path) catch |e| switch (e) {
         error.EmptyFile => {
             failure.* = .{ .kind = .empty, .line = 1 };
             return error.CsvEmpty;
         },
         else => return e,
     };
-    defer mapped.unmap();
-    const workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
-    // Cut as for one worker at any `-j` (see the top of the file).
-    const chunk = csv_write.chunkBytes(opts, args, 1, mapped.bytes.len);
+}
 
-    var every = opts;
-    every.columns = null;
-    var all = try csv_write.plan(arena, mapped.bytes, every, failure);
-    var settled = false;
-    const first = Bound.of(arena, args, &all, null) catch |e| retry: {
-        // As a filter settles them (`csv_write.run`): the sample's types are provisional, the file's are not.
-        if (e == error.CsvQueryNotSupported or e == error.OutOfMemory or opts.strict) return e;
-        const seen = try csv_write.classifyFile(ctx, arena, &all, chunk, workers, failure);
-        for (all.types, seen, all.pinned) |*t, s, pinned| if (!pinned) {
-            t.* = t.join(s);
-        };
-        settled = true;
-        break :retry try Bound.of(arena, args, &all, null);
-    };
-    var parsed = opts;
-    parsed.columns = try first.fetchedNames(arena, all.fields);
-    var p = try csv_write.plan(arena, mapped.bytes, parsed, failure);
-    if (settled) for (p.slot, 0..) |slot, ci| if (slot) |o| {
-        p.types[o] = all.types[ci];
-    };
+fn run(ctx: Context, args: QueryArgs, path: []const u8, report: *csv_write.Report, report_alloc: std.mem.Allocator) !AggResult {
+    const opts = args.csv;
+    const failure = &report.failure;
+    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t_open = nowMonoNs();
+    const mapped = try mapInput(path, failure);
+    defer mapped.unmap();
+    var planned = try Planned.of(ctx, arena, args, mapped.bytes, failure);
+    const all = &planned.all;
+    const p = &planned.p;
+    const chunk = planned.chunk;
+    const workers = planned.workers;
     const fields = try report_alloc.alloc([]const u8, p.fields.len);
     for (fields, p.fields) |*d, n| d.* = try report_alloc.dupe(u8, n);
     report.fields = fields;
@@ -177,10 +275,10 @@ fn run(ctx: Context, args: QueryArgs, path: []const u8, report: *csv_write.Repor
         defer pass_state.deinit();
         const pass = pass_state.allocator();
         // Bound again each pass: a widened column changes what its calls and keys are.
-        const b = try Bound.of(pass, args, &all, &p);
-        return foldOnce(ctx, pass, args, path, &b, &p, chunk, workers, mapped, report, t_open) catch |e| {
+        const b = try Bound.of(pass, args, all, p);
+        return foldOnce(ctx, pass, args, path, &b, p, chunk, workers, mapped, report, t_open) catch |e| {
             if (e != error.CsvTypeChanged or opts.strict) return e;
-            const seen = try csv_write.classifyFile(ctx, pass, &p, chunk, workers, failure);
+            const seen = try csv_write.classifyFile(ctx, pass, p, chunk, workers, failure);
             for (p.types, seen, p.pinned) |*t, s, pinned| if (!pinned) {
                 t.* = t.join(s);
             };
@@ -430,7 +528,7 @@ fn foldOnce(
                 .empty => error.CsvEmpty,
             };
         }
-        if (errs[i]) |e| return e;
+        if (errs[i]) |e| return scratch_charge.refusal(e);
     }
 
     var output: scan.AggOutput = .{};
@@ -475,6 +573,12 @@ fn foldOnce(
         };
         const kept = scan_rows.pruneHaving(&row_src, slots, args.result_order.having);
         row_src.slots = slots[0..kept];
+        // The answer is drawn from the ledger before it is built, beside the merged table it is built from, as a
+        // Parquet aggregate's is (`runMultiAggregate`), and stays drawn while the query holds it: a group count past
+        // `--max-memory` is refused, not built.
+        const answer_bytes = scan_rows.answerBytesParallel(row_src.slots, col_types, key_types, false, @max(1, workers)) +|
+            row_src.winnerStringBytes();
+        _ = ledger.drawExact(answer_bytes) orelse return error.ExceededMemoryBudget;
         const rows = try gpa.alloc([]const output_values.AggValue, kept);
         @memset(rows, &.{});
         output.group_rows = rows;

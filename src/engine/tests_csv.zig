@@ -824,3 +824,55 @@ test "csv query: a DECIMAL past 18 digits filters, passes through and computes w
         try testing.expectEqual(c.rows, r.write.rows_matched);
     };
 }
+
+test "csv aggregate: a group count past --max-memory is refused by name, and answers under a budget that holds it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    const csv = try tmpPath(&b1, &tmp, "g.csv");
+    // Every row its own group, each key a string: the merged table and its answer grow with the row count.
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(a, "k,v\n");
+    const n = 200_000;
+    for (0..n) |i| try text.print(a, "key-{d:0>12},{d}\n", .{ i, i });
+    try writeFile(csv, text.items);
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    const args: engine_types.QueryArgs = .{ .inputs = &.{csv}, .aggregate = "count(*) AS c, sum(v) AS s", .group_by = "k" };
+    {
+        var r = try runQuery(ctx, args);
+        defer r.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, n), r.aggregate.output.group_rows.?.len);
+    }
+    var tight = args;
+    tight.max_memory = 24 << 20;
+    try testing.expectError(error.ExceededMemoryBudget, runQuery(ctx, tight));
+}
+
+test "csv aggregate: --explain plans the fold, the fields each chunk parses and their types, and folds nothing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    const csv = try tmpPath(&b1, &tmp, "e.csv");
+    try writeFile(csv, "a,b,c\n1,x,1.5\n2,y,2.5\n");
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    const csv_agg = @import("csv_agg.zig");
+    const e = try csv_agg.explain(ctx, a, .{ .inputs = &.{csv}, .aggregate = "sum(c) AS s", .group_by = "b", .filter = "a > 0" }, csv);
+    try testing.expect(e.grouped and e.filter and !e.having and !e.settled);
+    try testing.expectEqual(@as(usize, 1), e.calls);
+    try testing.expectEqual(@as(usize, 1), e.chunks);
+    try testing.expectEqual(@as(usize, 3), e.fields.len);
+    var out: std.Io.Writer.Allocating = .init(a);
+    try e.writeJson(&out.writer);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "\"strategy\":\"csv_fold\"") != null);
+    // `c` is not read when no call reads it.
+    const e2 = try csv_agg.explain(ctx, a, .{ .inputs = &.{csv}, .aggregate = "count(*) AS n", .group_by = "b" }, csv);
+    try testing.expectEqual(@as(usize, 1), e2.fields.len);
+    try testing.expectEqualStrings("b", e2.fields[0]);
+    try testing.expectError(error.CsvQueryNotSupported, csv_agg.explain(ctx, a, .{ .inputs = &.{csv}, .aggregate = "count(*) AS n", .group_by = "b", .result_order = .{ .limit = 1 } }, csv));
+}

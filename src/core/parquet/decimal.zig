@@ -453,12 +453,13 @@ pub fn decodeColumnExact(
     }
 }
 
-/// `col`, a DECIMAL column's unscaled integers as `decodeColumnAsI128` decodes an INT32/INT64-backed chunk, as the
-/// f64 column `decodeColumnAsF64` decodes from that chunk: the same conversion per value (an exact integer rounded
-/// to f64, then divided by 10^scale), so the same bits, without decoding the chunk a second time.
-pub fn scaledF64FromI128(
+/// `col`, a DECIMAL column's unscaled integers (`ColumnT(i128)` as `decodeColumnAsI128` decodes an INT32/INT64-backed
+/// chunk, or `ColumnT(i64)` as a CSV parse holds them), as the f64 column `decodeColumnAsF64` decodes from that chunk:
+/// the same conversion per value (an exact integer rounded to f64, then divided by 10^scale), so the same bits,
+/// without decoding the chunk a second time.
+pub fn scaledF64FromInt(
     arena: std.mem.Allocator,
-    col: filter_eval.ColumnT(i128),
+    col: anytype,
     scale: i32,
 ) Error!filter_eval.ColumnT(f64) {
     // The values came from i32/i64, so they convert through i64: an i128 conversion is a library call per value.
@@ -1430,7 +1431,7 @@ test "applyScaleI128: out-of-table scale uses the pow fallback without trapping"
     try testing.expect(v > 0 and v < 1e-30);
 }
 
-test "scaledF64FromI128 matches decodeColumnAsF64 bit for bit" {
+test "scaledF64FromInt matches decodeColumnAsF64 bit for bit" {
     var prng = std.Random.DefaultPrng.init(0xdec);
     const r = prng.random();
     inline for (.{ i32, i64 }) |T| {
@@ -1441,7 +1442,7 @@ test "scaledF64FromI128 matches decodeColumnAsF64 bit for bit" {
             applyScaleSimd(T, &raw, scale, &want);
             var wide: [1000]i128 = undefined;
             for (raw, &wide) |v, *w| w.* = v;
-            const got = try scaledF64FromI128(testing.allocator, .{ .values = &wide }, scale);
+            const got = try scaledF64FromInt(testing.allocator, filter_eval.ColumnT(i128){ .values = &wide }, scale);
             defer testing.allocator.free(got.values);
             for (want, got.values) |a, b| try testing.expectEqual(@as(u64, @bitCast(a)), @as(u64, @bitCast(b)));
         }

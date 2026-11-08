@@ -128,9 +128,12 @@ pub fn foldGroupedBatch(
     ids: []u32,
     pos: u64,
     ctx: expr_agg.FoldContext,
+    /// Whether a sparse selection may be gathered first; false folds under the mask (the caller judged the gather
+    /// would write more than the masked fold reads past it).
+    may_gather: bool,
 ) !void {
     const kept = sel.count();
-    if (table.sketch == null and kept != 0 and kept != sel.len and sel.len <= std.math.maxInt(u32)) {
+    if (may_gather and table.sketch == null and kept != 0 and kept != sel.len and sel.len <= std.math.maxInt(u32)) {
         if (try gatherUnder(arena, batch.cols, key_cols, sel, kept)) |g| {
             try resolver.resolveBatch(arena, table, g.key_cols, calls, pos, &g.sel, ids, g.ordinals);
             if (!table.countOnly()) for (calls, 0..) |_, i| {
@@ -452,7 +455,7 @@ fn foldGroupedWindows(
         @memset(ids, 0);
         var resolver = expr_agg.GroupKeyResolver.init(key_cols);
         defer resolver.deinit(wa);
-        try foldGroupedBatch(wa, gpa, &resolver, g.table, g.calls, key_cols, &win, lookup, &win_sel, ids, pos, ctx);
+        try foldGroupedBatch(wa, gpa, &resolver, g.table, g.calls, key_cols, &win, lookup, &win_sel, ids, pos, ctx, true);
         try part.pump(local, g.table, @intCast(win_sel.count()));
         off += n;
     }
@@ -2361,6 +2364,7 @@ fn scanRGSlicedExact(
                     ids,
                     g.pos_base + done,
                     ws.fold_context,
+                    true,
                 );
             },
         }

@@ -8,6 +8,7 @@
 //! states merge in, are the file's and not the host's: the answer is the same at every `-j`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const csv_write = @import("csv_write.zig");
 const aggregate = @import("aggregate.zig");
 const engine_types = @import("types.zig");
@@ -320,6 +321,11 @@ const Fold = struct {
     winners: *expr_agg.WinnerCharge,
     /// Per chunk, an error that stopped it other than a refusal of its text (`Source.failures` holds those).
     errs: []?anyerror,
+    /// The chunks' scratch arenas, on `scratch` (the ledger's): every one made, and those free for the next chunk.
+    scratch: std.mem.Allocator,
+    pool_lock: std.Io.Mutex = .init,
+    pool: std.ArrayList(*std.heap.ArenaAllocator) = .empty,
+    all_arenas: std.ArrayList(*std.heap.ArenaAllocator) = .empty,
     /// Worker time, summed: each chunk's whole (`produce`), and its filter and fold (with the merge) within it.
     chunk_ns: std.atomic.Value(u64) = .init(0),
     filter_ns: std.atomic.Value(u64) = .init(0),
@@ -383,7 +389,7 @@ const Fold = struct {
     /// Chunk `i`'s parsed fields (`Source.Fold`), on `a`, freed when it returns.
     fn foldErased(ctx: *anyopaque, p: *const Plan, parsed: *const consumer.OutputAggregator, a: std.mem.Allocator, i: usize) anyerror!void {
         const f: *Fold = @ptrCast(@alignCast(ctx));
-        const cb = try csv_write.ChunkBatch.of(p, parsed, f.lookup, f.evaluated, a);
+        const cb = try csv_write.ChunkBatch.of(p, parsed, f.lookup, f.evaluated, true, a);
         const t_filter = nowMonoNs();
         var batch: *const filter_eval.Batch = &cb.batch;
         const rows = parsed.num_rows;
@@ -410,7 +416,19 @@ const Fold = struct {
             defer resolver.deinit(a);
             const ids = try a.alloc(u32, rows);
             @memset(ids, 0);
-            try consumer.foldGroupedBatch(a, f.gpa, &resolver, &f.tables[i], f.calls, key_cols, batch, f.lookup, &sel, ids, expr_agg.firstPosition(i, 0), .{ .winner_charge = f.winners });
+            const table = &f.tables[i];
+            const pos = expr_agg.firstPosition(i, 0);
+            const fold_ctx: expr_agg.FoldContext = .{ .winner_charge = f.winners };
+            if (try denseIds(a, keys, cb.batch.cols, f.lookup, key_cols, &sel, &resolver, table, f.calls, pos, ids)) {
+                for (f.calls, 0..) |_, ci| try expr_agg.updateTableGroupedWithContext(a, f.gpa, table, ids, ci, f.calls, batch, f.lookup, &sel, fold_ctx);
+            } else {
+                // Gather the kept rows first only when that writes fewer bytes than folding under the mask reads past
+                // them: per chunk, from its kept count and its columns' widths.
+                const kept = sel.count();
+                const skipped_reads = (rows - kept) *| rowBytes(batch.cols);
+                const gather_writes = kept *| (rowBytes(batch.cols) +| rowBytes(key_cols));
+                try consumer.foldGroupedBatch(a, f.gpa, &resolver, table, f.calls, key_cols, batch, f.lookup, &sel, ids, pos, fold_ctx, gather_writes < skipped_reads);
+            }
         } else {
             const accs = try f.gpa.alloc(expr_agg.Accumulator, f.calls.len);
             for (accs, f.calls) |*acc, call| acc.* = initAcc(call, f.ledger);
@@ -425,7 +443,43 @@ const Fold = struct {
         _ = f.fold_ns.fetchAdd(@intCast(nowMonoNs() - t_fold), .monotonic);
     }
 
+    /// A worker's scratch arena for a chunk's parse: one returned by an earlier chunk, reset, or a new one.
+    fn take(ctx: *anyopaque) anyerror!*std.heap.ArenaAllocator {
+        const f: *Fold = @ptrCast(@alignCast(ctx));
+        {
+            f.pool_lock.lockUncancelable(blocking.io);
+            defer f.pool_lock.unlock(blocking.io);
+            if (f.pool.pop()) |ar| return ar;
+        }
+        const ar = try f.gpa.create(std.heap.ArenaAllocator);
+        ar.* = .init(f.scratch);
+        f.pool_lock.lockUncancelable(blocking.io);
+        defer f.pool_lock.unlock(blocking.io);
+        f.all_arenas.append(f.gpa, ar) catch |e| {
+            ar.deinit();
+            f.gpa.destroy(ar);
+            return e;
+        };
+        return ar;
+    }
+
+    /// Back to the pool, its pages kept (`retain_capacity`): the next chunk parses into them without faulting.
+    fn give(ctx: *anyopaque, ar: *std.heap.ArenaAllocator) void {
+        const f: *Fold = @ptrCast(@alignCast(ctx));
+        _ = ar.reset(.retain_capacity);
+        f.pool_lock.lockUncancelable(blocking.io);
+        defer f.pool_lock.unlock(blocking.io);
+        // `all_arenas` holds it either way; a full pool only means the next chunk makes another.
+        f.pool.append(f.gpa, ar) catch {};
+    }
+
     fn deinit(f: *Fold) void {
+        for (f.all_arenas.items) |ar| {
+            ar.deinit();
+            f.gpa.destroy(ar);
+        }
+        f.all_arenas.deinit(f.gpa);
+        f.pool.deinit(f.gpa);
         for (f.chunk_accs) |accs| {
             owned_merge.freeOwnedAccumulatorStrings(f.gpa, accs);
             f.gpa.free(accs);
@@ -433,6 +487,70 @@ const Fold = struct {
         for (f.tables) |*t| t.deinit();
     }
 };
+
+/// The bytes a row of `c` takes: its value, and a DECIMAL view's exact integer beside it.
+fn colBytes(c: filter_eval.Batch.Column) usize {
+    return switch (c) {
+        .f64 => |x| 8 + @as(usize, if (x.unscaled) |u| switch (u) {
+            .i32 => 4,
+            .i64 => 8,
+            .i128 => 16,
+        } else 0),
+        inline else => |x| @sizeOf(std.meta.Elem(@TypeOf(x.values))),
+    };
+}
+
+fn rowBytes(cols: []const filter_eval.Batch.Column) usize {
+    var n: usize = 0;
+    for (cols) |c| n +|= colBytes(c);
+    return n;
+}
+
+/// Group ids without a key serialized or hashed per row: when every key is a plain column the parse coded against
+/// its chunk's dictionary, and their code combinations (each dictionary and NULL) are no more than the chunk's rows,
+/// each combination is resolved once, at its first row, and every row takes its id from the combination's slot.
+/// False, nothing resolved, when the keys are not that.
+fn denseIds(
+    a: std.mem.Allocator,
+    keys: []const expr_ast.Expr,
+    parsed: []const filter_eval.Batch.Column,
+    lookup: []const ?usize,
+    key_cols: []const filter_eval.Batch.Column,
+    sel: *const filter_selection.SelectionVector,
+    resolver: *expr_agg.GroupKeyResolver,
+    table: *expr_agg.GroupTable,
+    calls: []const expr_agg.AggCall,
+    pos: u64,
+    ids: []u32,
+) !bool {
+    if (table.sketch != null or table.countOnly()) return false;
+    const codes = try a.alloc([]const u32, keys.len);
+    const radix = try a.alloc(usize, keys.len);
+    const stride = try a.alloc(usize, keys.len);
+    var total: usize = 1;
+    for (keys, codes, radix, stride) |k, *c, *r, *st| {
+        if (k != .col_ref) return false;
+        const at = lookup[k.col_ref.col_idx] orelse return false;
+        if (parsed[at] != .string) return false;
+        const s = parsed[at].string;
+        c.* = s.codes orelse return false;
+        r.* = s.dict.len + 1; // the last: NULL
+        st.* = total;
+        total = std.math.mul(usize, total, r.*) catch return false;
+        if (total > sel.len) return false;
+    }
+    const slot = try a.alloc(u32, total);
+    @memset(slot, std.math.maxInt(u32));
+    for (0..sel.len) |row| if (sel.isActive(row)) {
+        var combo: usize = 0;
+        for (codes, radix, stride, key_cols) |c, r, st, kc| {
+            combo += (if (expr_agg.isRowNull(kc, row)) r - 1 else c[row]) * st;
+        }
+        if (slot[combo] == std.math.maxInt(u32)) slot[combo] = try resolver.resolve(a, table, key_cols, row, calls, pos);
+        ids[row] = slot[combo];
+    };
+    return true;
+}
 
 /// A call's empty state. A count(DISTINCT)'s set spills against `ledger`, as a Parquet scan's does
 /// (`runMultiAggregate`): a set past `--max-memory` is refused, not grown.
@@ -547,9 +665,14 @@ fn foldOnce(
         .ledger = &ledger,
         .winners = &winners,
         .errs = errs,
+        .scratch = scratch_charge.allocator(),
     };
     defer fold.deinit();
-    source.fold = .{ .ctx = &fold, .scratch = scratch_charge.allocator(), .fold = Fold.foldErased };
+    source.fold = .{ .ctx = &fold, .take = Fold.take, .give = Fold.give, .fold = Fold.foldErased };
+    // A cold file is read ahead of the parse through the local reader, as a CSV write reads it (`startReader`); a
+    // resident one through its mapping, each chunk's pages dropped from it once parsed (`dropBehind`).
+    const reader = try csv_write.startReader(ctx, pass, args, &source, mapped, &ledger, report);
+    defer if (reader) |rd| rd.destroy();
 
     const t_scan = nowMonoNs();
     {
@@ -557,30 +680,22 @@ fn foldOnce(
         defer threaded.deinit();
         const io = threaded.io();
         const Task = struct {
-            fn stats(s: *Source, t_io: std.Io, i: usize) void {
-                s.stats[i] = csv_scan.chunkStats(s.plan.bytes[s.bound(i)..s.bound(i + 1)], s.plan.dialect.quote);
-                s.ready[i].set(t_io);
-            }
+            // Each chunk counts its own quotes as it starts (`Source.records`); chunks start in order, so a chunk
+            // waits only on those already counting.
             fn foldChunk(s: *Source, f: *Fold, t_io: std.Io, i: usize) void {
                 if (!f.awaitTurn(i)) return;
                 const t0 = nowMonoNs();
                 defer _ = f.chunk_ns.fetchAdd(@intCast(nowMonoNs() - t0), .monotonic);
+                defer if (s.gate) |g| g.done(g.ctx, i, 1) else dropBehind(s, i);
                 s.produce(t_io, null, i) catch |e| {
                     if (!s.failed[i]) f.errs[i] = e;
                     f.failFrom(i);
                 };
             }
         };
-        {
-            var group: std.Io.Group = .init;
-            for (0..source.count) |i| group.async(io, Task.stats, .{ &source, io, i });
-            group.await(io) catch {};
-        }
-        {
-            var group: std.Io.Group = .init;
-            for (0..source.count) |i| group.async(io, Task.foldChunk, .{ &source, &fold, io, i });
-            group.await(io) catch {};
-        }
+        var group: std.Io.Group = .init;
+        for (0..source.count) |i| group.async(io, Task.foldChunk, .{ &source, &fold, io, i });
+        group.await(io) catch {};
     }
     t.decode_wall_ns = @intCast(nowMonoNs() - t_scan);
     // Summed over the workers, as a Parquet scan's are (`--summary=json` worker_ms): parsing a chunk (framing, typing and
@@ -708,4 +823,16 @@ fn foldOnce(
     const check: Check = .{ .mapped = mapped, .path = path };
     ledger.limit -= core_memory.finalize_allowance;
     return aggregate.answerAggregate(ctx, pass, args, &r, &ledger, &t, .{}, .{ .ctx = &check, .check = Check.check }, null);
+}
+
+/// Chunk `i`'s own pages, dropped from the mapping once it is parsed: they stay in the page cache, so a later read (a
+/// neighbour's straddling record, a restart's pass) faults them back as they were. The pages it shares with its
+/// neighbours stay. One call a chunk; without it the process maps every page of the file until it exits.
+fn dropBehind(s: *const Source, i: usize) void {
+    if (builtin.os.tag != .linux) return;
+    const page = std.heap.pageSize();
+    const base = @intFromPtr(s.plan.bytes.ptr);
+    const lo = std.mem.alignForward(usize, base + s.bound(i), page);
+    const hi = std.mem.alignBackward(usize, base + s.bound(i + 1), page);
+    if (hi > lo) _ = std.os.linux.madvise(@ptrFromInt(lo), hi - lo, std.os.linux.MADV.DONTNEED);
 }

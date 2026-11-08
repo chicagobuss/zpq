@@ -1012,7 +1012,7 @@ pub const ProjectedRG = struct {
             const decoded: filter_eval.Batch.Column = if (int_backed) blk: {
                 const dcol = try decodeDecimalI128(ra, rg, meta, src, ci, decode_options);
                 unscaled[ci] = dcol;
-                var view = try decimal_mod.scaledF64FromI128(ra, dcol, kind.?.scale);
+                var view = try decimal_mod.scaledF64FromInt(ra, dcol, kind.?.scale);
                 view.unscaled = .{ .i128 = dcol.values };
                 break :blk .{ .f64 = view };
             } else if (agg.keep_codes)

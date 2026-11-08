@@ -379,6 +379,9 @@ pub const ChunkBatch = struct {
         parsed: *const consumer.OutputAggregator,
         lookup: []const ?usize,
         evaluated: []const bool,
+        /// An aggregate's batch: a DECIMAL of at most 18 digits keeps its parsed i64 integers as its exact lane, beside
+        /// its scaled view, as a Parquet INT64 DECIMAL decodes; no i128 copy, and no exact output column.
+        narrow: bool,
         scratch: std.mem.Allocator,
     ) !ChunkBatch {
         const rows = parsed.num_rows;
@@ -391,6 +394,13 @@ pub const ChunkBatch = struct {
             const t = p.types[k];
             if (t.kind != .decimal) {
                 cols[k] = raw;
+                continue;
+            }
+            if (narrow and raw == .i64) {
+                const x = raw.i64;
+                var view = try decimal_mod.scaledF64FromInt(scratch, x, t.scale);
+                view.unscaled = .{ .i64 = x.values };
+                cols[k] = .{ .f64 = view };
                 continue;
             }
             const unscaled: filter_eval.ColumnT(i128) = switch (raw) {
@@ -411,7 +421,7 @@ pub const ChunkBatch = struct {
                 continue;
             }
             var view = if (raw == .i64)
-                try decimal_mod.scaledF64FromI128(scratch, unscaled, t.scale)
+                try decimal_mod.scaledF64FromInt(scratch, unscaled, t.scale)
             else blk: {
                 const v = try scratch.alloc(f64, unscaled.values.len);
                 for (v, unscaled.values) |*d, u| d.* = decimal_mod.applyScaleI128(u, t.scale);
@@ -549,7 +559,7 @@ pub const Projection = struct {
         parsed: *const consumer.OutputAggregator,
         scratch: std.mem.Allocator,
     ) !void {
-        const cb = try ChunkBatch.of(p, parsed, pr.lookup, pr.evaluated, scratch);
+        const cb = try ChunkBatch.of(p, parsed, pr.lookup, pr.evaluated, false, scratch);
         const batch = cb.batch;
         const pass = cb.exact;
         const rows = parsed.num_rows;
@@ -595,13 +605,15 @@ pub const Source = struct {
     opts: Options = .{},
     /// A filter or computed SELECT: each chunk's fields are parsed into scratch and its kept rows projected.
     proj: ?*const Projection = null,
-    /// An aggregate: each chunk's fields are parsed into scratch on `scratch` and handed to `fold` (`csv_agg`).
+    /// An aggregate: each chunk's fields are parsed into a pooled scratch arena and handed to `fold` (`csv_agg`).
     fold: ?Fold = null,
 
     pub const Fold = struct {
         ctx: *anyopaque,
-        scratch: std.mem.Allocator,
-        /// Chunk `i`'s parsed columns, on `scratch_alloc`, freed when it returns.
+        /// A scratch arena for one chunk's parse, and its return, reset, once the chunk has folded.
+        take: *const fn (ctx: *anyopaque) anyerror!*std.heap.ArenaAllocator,
+        give: *const fn (ctx: *anyopaque, arena: *std.heap.ArenaAllocator) void,
+        /// Chunk `i`'s parsed columns, on `scratch_alloc` (the taken arena).
         fold: *const fn (ctx: *anyopaque, p: *const Plan, parsed: *const consumer.OutputAggregator, scratch_alloc: std.mem.Allocator, i: usize) anyerror!void,
     };
 
@@ -738,8 +750,11 @@ pub const Source = struct {
         if (piece) |pc| if (s.proj != null) {
             parse_state = .init(pc.arena.child_allocator);
         };
-        if (s.fold) |f| parse_state = .init(f.scratch);
-        const a: std.mem.Allocator = if (parse_state) |*ps| ps.allocator() else if (piece) |pc|
+        // An aggregate's chunk parses into a worker's scratch arena, reset (not freed) once the chunk has folded
+        // (`Fold.take`, `Fold.give`): the next chunk reuses its pages instead of faulting in fresh ones.
+        const fold_arena: ?*std.heap.ArenaAllocator = if (s.fold) |f| try f.take(f.ctx) else null;
+        defer if (fold_arena) |ar| s.fold.?.give(s.fold.?.ctx, ar);
+        const a: std.mem.Allocator = if (fold_arena) |ar| ar.allocator() else if (parse_state) |*ps| ps.allocator() else if (piece) |pc|
             pc.arena.allocator()
         else
             std.heap.page_allocator;
@@ -1344,7 +1359,7 @@ const overhang_bytes: usize = 256 << 10;
 /// out like it, chunk by chunk ahead of the producers, each chunk's pages drawn from the write's ledger and given back
 /// once its piece is freed. A resident file stays on the mapping. The mapping's descriptor is read, so the file is the
 /// one sniffed.
-fn startReader(
+pub fn startReader(
     ctx: Context,
     arena: std.mem.Allocator,
     args: QueryArgs,

@@ -480,7 +480,7 @@ test "csv query: a column projection writes the columns named, in order, and fra
     const expr = [_]@import("../core/expr/ast.zig").SelectColumn{.{ .expr = "a + 1" }};
     const renamed = [_]@import("../core/expr/ast.zig").SelectColumn{.{ .expr = "a", .alias = "z" }};
     // An expression needs a name, as over Parquet; a rename writes.
-    try testing.expectError(error.MissingOutputOrAggregate, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .select = "a + 1", .select_cols = &expr }));
+    try testing.expectError(error.SelectAliasRequired, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .select = "a + 1", .select_cols = &expr }));
     _ = try runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .select = "a AS z", .select_cols = &renamed });
     try testing.expectError(error.CsvQueryNotSupported, runQuery(ctx, .{ .inputs = &.{csv}, .output = out, .result_order = .{ .limit = 3 } }));
     // A column the file does not have is named; one asked for twice is refused.

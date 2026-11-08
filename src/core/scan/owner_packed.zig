@@ -422,7 +422,7 @@ fn selectedCountBits(
     const out_rows = try gpa.alloc([]const AggValue, groups.len);
     @memset(out_rows, &.{});
     output.group_rows = out_rows;
-    try buildGroupRows(gpa, &output.slab, row_source, out_rows, workers);
+    try buildGroupRows(gpa, &output.slab, row_source, out_rows, workers, null);
     // FailureProbe borrows Worker metadata through canonical diagnostics in prepareAggregate. Keep that query
     // arena credit beside output schema/rows; the temporary bindings, sources and finish views are gone.
     if (args.ledger != null) held = workers *| (@sizeOf(Worker) +| @sizeOf(expr_agg.GroupTable)) +|

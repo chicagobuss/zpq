@@ -733,7 +733,7 @@ pub fn mergeAndBuildRows(gpa: std.mem.Allocator, fixed: bool, n: usize, n_worker
         .folded = true,
         .in_place = if (in_place) &tables else &.{},
         .fixed_keys = fixed,
-    }, rows, n_workers);
+    }, rows, n_workers, null);
     return out;
 }
 

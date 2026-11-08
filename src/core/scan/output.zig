@@ -34,6 +34,8 @@ pub const AggOutput = struct {
     integer_stream: ?IntegerStream = null,
     byte_stream: ?ByteStream = null,
     string_arenas: []*expr_agg.KeyArena = &.{},
+    /// Blocks holding strings fetched for the rows (`rows.FetchStrings`), owned here, each among `borrowed_strings`.
+    fetched_blocks: [][]u8 = &.{},
     borrowed_strings: []BorrowedSpan = &.{},
     arena_ledger: ?*core_memory.SharedBudget = null,
     arena_credit: usize = 0,
@@ -70,6 +72,8 @@ pub const AggOutput = struct {
             gpa.destroy(strings);
         }
         gpa.free(self.string_arenas);
+        for (self.fetched_blocks) |b| gpa.free(b);
+        gpa.free(self.fetched_blocks);
         gpa.free(self.borrowed_strings);
         self.detachArenaLedger();
         self.* = .{};
@@ -127,7 +131,26 @@ pub const AggOutput = struct {
         self.group_rows = views;
     }
 
-    fn freeValue(self: *const AggOutput, gpa: std.mem.Allocator, v: AggValue) void {
+    /// Take over `blocks` (the strings rows were fetched into) and borrow every string in them.
+    pub fn adoptFetched(self: *AggOutput, gpa: std.mem.Allocator, blocks: []const []u8) !void {
+        if (blocks.len == 0) return;
+        const owned = try std.mem.concat(gpa, []u8, &.{ self.fetched_blocks, @constCast(blocks) });
+        errdefer gpa.free(owned);
+        const spans = try gpa.alloc(BorrowedSpan, self.borrowed_strings.len + blocks.len);
+        @memcpy(spans[0..self.borrowed_strings.len], self.borrowed_strings);
+        for (blocks, spans[self.borrowed_strings.len..]) |b, *sp| sp.* = .{ .lo = @intFromPtr(b.ptr), .hi = @intFromPtr(b.ptr) + b.len };
+        std.mem.sortUnstable(BorrowedSpan, spans, {}, struct {
+            fn less(_: void, a: BorrowedSpan, b: BorrowedSpan) bool {
+                return a.lo < b.lo;
+            }
+        }.less);
+        gpa.free(self.fetched_blocks);
+        gpa.free(self.borrowed_strings);
+        self.fetched_blocks = owned;
+        self.borrowed_strings = spans;
+    }
+
+    pub fn freeValue(self: *const AggOutput, gpa: std.mem.Allocator, v: AggValue) void {
         switch (v) {
             .s => |s| if (!BorrowedSpan.contains(self.borrowed_strings, s)) gpa.free(s),
             else => {},
@@ -383,4 +406,3 @@ test "applyResultOrder: a short cut that fails to allocate leaves the rows whole
         }
     }.run, .{});
 }
-

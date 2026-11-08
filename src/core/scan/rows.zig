@@ -99,7 +99,7 @@ pub const RowSource = struct {
         return s.slots.len *| per_row;
     }
 
-    fn outputKey(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, out: BoundOutputColumn) !AggValue {
+    fn outputKey(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, out: BoundOutputColumn, strings: ?*FetchStrings) !AggValue {
         if (s.dense != null or s.owner != null) {
             const identity = s.identity orelse return error.BadGroupKey;
             const key = if (s.owner) |owner|
@@ -111,18 +111,18 @@ pub const RowSource = struct {
                 .i => |v| .{ .i = v },
                 .s => |v| .{ .s = try gpa.dupe(u8, v) },
             };
-            if (out.derived) |e| if (e == .col_ref and e.col_ref.fetch != null) return fetched(gpa, e, value);
+            if (out.derived) |e| if (e == .col_ref and e.col_ref.fetch != null) return fetched(gpa, e, value, strings);
             return value;
         }
         var buf: [48]u8 = undefined;
         const bytes = if (s.fixed_keys) expr_agg.canonicalKey(slot.key, &buf) else slot.key;
-        return s.keyValue(gpa, bytes, out);
+        return s.keyValue(gpa, bytes, out, strings);
     }
 
-    fn keyValue(s: *const RowSource, gpa: std.mem.Allocator, bytes: []const u8, out: BoundOutputColumn) !AggValue {
+    fn keyValue(s: *const RowSource, gpa: std.mem.Allocator, bytes: []const u8, out: BoundOutputColumn, strings: ?*FetchStrings) !AggValue {
         const e = out.derived orelse return deserializeKeyColumnMode(gpa, bytes, out.source.key, s.key_types, s.borrowed_strings.len != 0);
         if (e == .col_ref and e.col_ref.fetch != null)
-            return fetched(gpa, e, try deserializeKeyColumnMode(gpa, bytes, out.source.key, s.key_types, true));
+            return fetched(gpa, e, try deserializeKeyColumnMode(gpa, bytes, out.source.key, s.key_types, true), strings);
         const Reader = struct {
             src: *const RowSource,
             gpa: std.mem.Allocator,
@@ -221,17 +221,17 @@ pub const RowSource = struct {
 
     /// Fill `vals`, the row's slab cells, all NULL, for `slot`. Each value is set only once built, so on an error the
     /// row holds what was built and NULLs, which `AggOutput.releaseRow` frees.
-    fn buildRow(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, vals: []AggValue) !void {
+    fn buildRow(s: *const RowSource, gpa: std.mem.Allocator, slot: MergedSlot, vals: []AggValue, strings: ?*FetchStrings) !void {
         if (s.owner) |owner| {
             for (s.outputs, vals) |out, *val| val.* = switch (out.source) {
-                .key => try s.outputKey(gpa, slot, out),
+                .key => try s.outputKey(gpa, slot, out, strings),
                 .agg => |ai| try owner.value(owner.ctx, gpa, slot.idx, ai),
             };
             return;
         }
         if (s.dense) |d| {
             for (s.outputs, vals) |out, *val| val.* = switch (out.source) {
-                .key => try s.outputKey(gpa, slot, out),
+                .key => try s.outputKey(gpa, slot, out, strings),
                 .agg => |ai| try materializeOne(gpa, s.calls[ai], d.accumulator(slot.idx, ai)),
             };
             return;
@@ -248,7 +248,7 @@ pub const RowSource = struct {
         else
             s.accs[at..][0..s.calls.len];
         for (s.outputs, vals) |out, *val| val.* = switch (out.source) {
-            .key => try s.outputKey(gpa, slot, out),
+            .key => try s.outputKey(gpa, slot, out, strings),
             .agg => |a_idx| blk: {
                 const acc = if (compact) table.?.readAcc(group, a_idx, s.calls.len) else accs[a_idx];
                 if (s.borrowed_strings.len != 0 and (acc == .min_arena or acc == .max_arena))
@@ -264,7 +264,7 @@ pub const RowSource = struct {
 
 /// A build column's value for its group (`expr_ast.Fetch`), from the value of the key that determines it, as the
 /// column would have read back as a key itself (`key_decode.keyTypeFromExpr`).
-fn fetched(gpa: std.mem.Allocator, e: expr_ast.Expr, base: AggValue) !AggValue {
+fn fetched(gpa: std.mem.Allocator, e: expr_ast.Expr, base: AggValue, strings: ?*FetchStrings) !AggValue {
     const f = e.col_ref.fetch.?;
     const key: i64 = switch (base) {
         .null_val => return .null_val,
@@ -277,9 +277,33 @@ fn fetched(gpa: std.mem.Allocator, e: expr_ast.Expr, base: AggValue) !AggValue {
         .u64 => .{ .i = @as(u64, @bitCast(v.int)) },
         .dec => |spec| .{ .dec = .{ .v = v.int, .spec = spec } },
         .f64 => .{ .f = v.float },
-        .string => .{ .s = try gpa.dupe(u8, v.bytes) },
+        .string => .{ .s = if (strings) |st| try st.dupe(v.bytes) else try gpa.dupe(u8, v.bytes) },
     };
 }
+
+/// Strings one row-build task fetched (`fetched`), in blocks the answer takes over (`AggOutput.adoptFetched`): a row,
+/// kept or cut, frees none on its own, and the answer frees the blocks at once.
+pub const FetchStrings = struct {
+    gpa: std.mem.Allocator,
+    blocks: std.ArrayList([]u8) = .empty,
+    used: usize = 0,
+
+    fn dupe(f: *FetchStrings, v: []const u8) ![]const u8 {
+        const last = if (f.blocks.items.len == 0) null else f.blocks.items[f.blocks.items.len - 1];
+        if (last == null or last.?.len - f.used < v.len) {
+            // Each block twice the last, so a task holds a few blocks, never one per string.
+            const size = @max(v.len, if (last) |l| l.len * 2 else 1 << 16);
+            try f.blocks.ensureUnusedCapacity(f.gpa, 1);
+            f.blocks.appendAssumeCapacity(try f.gpa.alloc(u8, size));
+            f.used = 0;
+        }
+        const block = f.blocks.items[f.blocks.items.len - 1];
+        const out = block[f.used..][0..v.len];
+        @memcpy(out, v);
+        f.used += v.len;
+        return out;
+    }
+};
 
 /// Drop groups before allocating their output cells. Key predicates and output forms whose finalization can
 /// fail stay with ResultProgram, so a discarded group cannot hide an output error.
@@ -380,21 +404,29 @@ pub fn buildGroupRows(
     src: RowSource,
     rows: [][]const AggValue,
     n_workers: usize,
+    /// When set, the rows' fetched strings (`expr_ast.Fetch`) go into blocks it takes over, failed or not.
+    adopt: ?*AggOutput,
 ) !void {
     std.debug.assert(rows.len == src.slots.len);
     if (rows.len == 0) return;
     const width = src.outputs.len;
     const cells = try gpa.alloc(AggValue, rows.len * width);
-    @memset(cells, .null_val);
     slab.* = cells;
-    for (rows, 0..) |*row, i| row.* = cells[i * width ..][0..width];
     const n_threads = @max(1, @min(n_workers, std.math.divCeil(usize, rows.len, row_block) catch unreachable));
     const tasks = try gpa.alloc(RowBuildTask, n_threads);
     defer gpa.free(tasks);
     var cursor: std.atomic.Value(usize) = .init(0);
-    for (tasks) |*t| t.* = .{ .gpa = gpa, .src = &src, .rows = rows, .cursor = &cursor };
+    for (tasks) |*t| t.* = .{ .gpa = gpa, .src = &src, .rows = rows, .cells = cells, .cursor = &cursor, .strings = if (adopt != null) .{ .gpa = gpa } else null };
     const config: std.Thread.SpawnConfig = .{ .stack_size = WORKER_STACK_SIZE };
     if (tasks.len == 1 or !spawn_util.runTree(RowBuildTask, tasks, config, RowBuildTask.run)) RowBuildTask.run(&tasks[0]);
+    // Adopted before any error returns: a row built so far may hold them, and its release must not free them.
+    if (adopt) |out| for (tasks) |*t| if (t.strings) |*st| {
+        defer st.blocks.deinit(gpa);
+        out.adoptFetched(gpa, st.blocks.items) catch |e| {
+            for (st.blocks.items) |b| gpa.free(b);
+            return e;
+        };
+    };
     // Every block below the lowest failing row was claimed and built whole, so that row's error is a serial build's.
     var failed: ?*const RowBuildTask = null;
     for (tasks) |*t| if (t.err != null and (failed == null or t.err_row < failed.?.err_row)) {
@@ -531,7 +563,7 @@ const ColumnBuildTask = struct {
                     continue;
                 }
                 @memset(t.vals, .null_val);
-                const built = t.src.buildRow(t.gpa, t.src.slots[i], t.vals);
+                const built = t.src.buildRow(t.gpa, t.src.slots[i], t.vals, null);
                 // Every value built passes to its column, whatever happens to the rest of the row.
                 for (t.answer.columns, t.types, t.vals, 0..) |*col, ty, v, ci| {
                     TypedAnswer.put(col, ty, i, v) catch |e| {
@@ -568,7 +600,7 @@ const ColumnBuildTask = struct {
         const row = s.integerRow(slot);
         for (s.outputs, t.types, t.answer.columns, 0..) |out, ty, *col, ci| switch (out.source) {
             .key => {
-                const v = try s.outputKey(t.gpa, slot, out);
+                const v = try s.outputKey(t.gpa, slot, out, null);
                 TypedAnswer.put(col, ty, i, v) catch |e| {
                     if (v == .s and !BorrowedSpan.contains(t.src.borrowed_strings, v.s)) t.gpa.free(v.s);
                     t.narrowing(e, ci, i);
@@ -585,7 +617,11 @@ const RowBuildTask = struct {
     gpa: std.mem.Allocator,
     src: *const RowSource,
     rows: [][]const AggValue,
+    /// The slab the rows are views into: each block's rows take their cells as they are built, on the task's thread.
+    cells: []AggValue,
     cursor: *std.atomic.Value(usize),
+    /// Where its fetched strings go, when the answer adopts them (`buildGroupRows`' `fetched`).
+    strings: ?FetchStrings = null,
     err: ?anyerror = null,
     err_row: usize = 0,
 
@@ -595,8 +631,13 @@ const RowBuildTask = struct {
         while (true) {
             const lo = t.cursor.fetchAdd(row_block, .monotonic);
             if (lo >= t.rows.len) return;
-            for (lo..@min(t.rows.len, lo + row_block)) |i| {
-                t.src.buildRow(t.gpa, t.src.slots[i], @constCast(t.rows[i])) catch |e| {
+            const width = t.src.outputs.len;
+            const hi = @min(t.rows.len, lo + row_block);
+            // A row not yet given its cells stays empty: a failed build releases nothing of it.
+            @memset(t.cells[lo * width .. hi * width], .null_val);
+            for (lo..hi) |i| t.rows[i] = t.cells[i * width ..][0..width];
+            for (lo..hi) |i| {
+                t.src.buildRow(t.gpa, t.src.slots[i], @constCast(t.rows[i]), if (t.strings) |*st| st else null) catch |e| {
                     t.err = e;
                     t.err_row = i;
                     return;
@@ -674,7 +715,7 @@ const RowFixture = struct {
         const rows = try gpa.alloc([]const AggValue, f.slots.len);
         @memset(rows, &.{});
         out.group_rows = rows;
-        try buildGroupRows(gpa, &out.slab, f.source(), rows, n_workers);
+        try buildGroupRows(gpa, &out.slab, f.source(), rows, n_workers, null);
     }
 
     fn expectRows(rows: []const []const AggValue) !void {
@@ -818,7 +859,7 @@ fn directIntegerColumnsTrial(gpa: std.mem.Allocator, compact: bool, in_place: bo
     try buildGroupColumns(gpa, &out, src, &types, j);
     for (slots, 0..) |slot, i| {
         var vals: [outputs.len]AggValue = @splat(.null_val);
-        try src.buildRow(gpa, slot, &vals);
+        try src.buildRow(gpa, slot, &vals, null);
         for (out.columns, vals) |col, v| {
             try testing.expectEqual(@as(u32, @intFromBool(v != .null_val)), col.i64.defs[i]);
             if (v != .null_val) try testing.expectEqual(v.i, col.i64.values[i]);
@@ -906,7 +947,7 @@ fn ownerColumnsTrial(a: std.mem.Allocator, j: usize) !void {
     };
     for (slots, expected, 0..) |slot, want, ri| {
         var row: [6]AggValue = @splat(.null_val);
-        try src.buildRow(a, slot, &row);
+        try src.buildRow(a, slot, &row, null);
         try testing.expectEqualDeep(want, row);
         for (answer.columns, row) |column, v| switch (column) {
             .i64 => |col| {
@@ -1123,7 +1164,7 @@ test "pruneHaving: state predicates agree with built rows, NULLs, hidden aggrega
             const rows = try gpa.alloc([]const AggValue, src.slots.len);
             @memset(rows, &.{});
             out.group_rows = rows;
-            try buildGroupRows(gpa, &out.slab, src, rows, 3);
+            try buildGroupRows(gpa, &out.slab, src, rows, 3, null);
             const cols = try gpa.alloc([]const u8, outputs.len);
             out.group_cols = cols;
             for (cols, outputs) |*c, o| c.* = try gpa.dupe(u8, o.name);

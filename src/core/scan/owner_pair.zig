@@ -324,7 +324,7 @@ fn bitmapAnswer(
         const out_rows = try gpa.alloc([]const AggValue, n);
         @memset(out_rows, &.{});
         output.group_rows = out_rows;
-        try buildGroupRows(gpa, &output.slab, row_source, out_rows, workers);
+        try buildGroupRows(gpa, &output.slab, row_source, out_rows, workers, null);
     }
     for (work) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
     if (args.ledger != null) {
@@ -751,7 +751,7 @@ fn finishPairOutput(
         const out_rows = try gpa.alloc([]const AggValue, n);
         @memset(out_rows, &.{});
         output.group_rows = out_rows;
-        try buildGroupRows(gpa, &output.slab, row_source, out_rows, workers);
+        try buildGroupRows(gpa, &output.slab, row_source, out_rows, workers, null);
     }
     for (work) |item| freeOwnedAccumulatorStrings(gpa, item.accumulators);
     if (args.ledger != null) {

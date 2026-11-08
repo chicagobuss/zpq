@@ -322,7 +322,7 @@ pub fn inlineSharedStrings(
         const out_rows = try gpa.alloc([]const AggValue, slots.items.len);
         @memset(out_rows, &.{});
         output.group_rows = out_rows;
-        try buildGroupRows(gpa, &output.slab, source, out_rows, workers);
+        try buildGroupRows(gpa, &output.slab, source, out_rows, workers, null);
     }
     if (args.ledger != null) {
         held = worker_credit + outputs.len * @sizeOf(GroupColType);

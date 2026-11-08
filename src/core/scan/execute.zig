@@ -2189,7 +2189,11 @@ fn prepareAggregateWithMetas(
             const rows = try gpa.alloc([]const AggValue, slots.items.len);
             @memset(rows, &.{});
             output.group_rows = rows;
-            try buildGroupRows(gpa, &output.slab, row_src, rows, n_workers);
+            // Strings fetched for a dropped key (`expr_ast.Fetch`) go into blocks the answer owns, freed with it at once.
+            const fetches = for (outputs) |out| {
+                if (out.derived) |d| if (d == .col_ref and d.col_ref.fetch != null) break true;
+            } else false;
+            try buildGroupRows(gpa, &output.slab, row_src, rows, n_workers, if (fetches) &output else null);
         }
 
         const cols = try gpa.alloc([]const u8, outputs.len);

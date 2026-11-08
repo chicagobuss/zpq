@@ -138,7 +138,29 @@ pub fn build(b: *std.Build) void {
             .dependOn(&b.addInstallArtifact(harness, .{ .dest_sub_path = "zpq-integration" }).step);
     }
 
+    addCrossMacos(b, cfg);
     addTiers(b, cfg);
+}
+
+/// The Macs a release ships for, at the minimum macOS tools/package_release.py builds them with.
+const macos_targets = [_][]const u8{ "x86_64-macos.11.0", "aarch64-macos.11.0" };
+
+/// `zig build cross-macos`: type-check, without running or linking, the CLI, the correctness runner and the core tests
+/// for each shipped Mac. A std call that exists on Linux alone (a raw `std.os.linux` syscall, say) is a compile error
+/// here, on the host that wrote it, rather than in the release build. The commit tier runs it as the `cross-macos`
+/// stage. Nothing here asks for an emitted binary, so Zig analyzes the code and skips code generation, which is most of
+/// a build's time; the CLI is a second executable over the CLI's module for that reason (`artifacts` emits its own,
+/// for the Lambda integration tests).
+fn addCrossMacos(b: *std.Build, cfg: Config) void {
+    const step = b.step("cross-macos", "Type-check the CLI, zpq-check and the core tests for the shipped Macs (no code generated)");
+    for (macos_targets) |triple| {
+        var mac = cfg;
+        mac.target = b.resolveTargetQuery(std.Target.Query.parse(.{ .arch_os_abi = triple }) catch @panic(triple));
+        const a = artifacts(b, mac, .ReleaseSafe);
+        step.dependOn(&b.addExecutable(.{ .name = "zpq", .root_module = a.cli.root_module }).step);
+        step.dependOn(&a.check.step);
+        step.dependOn(&a.unit_tests[0].exe.step);
+    }
 }
 
 /// Build settings every artifact graph shares; only the optimize mode differs between graphs.
@@ -379,6 +401,10 @@ fn addTiers(b: *std.Build, cfg: Config) void {
     // The scorecard's rules decide what a timing counts for (stalls, quarantine, the denominator): a gate too.
     if (tier != .edit) if (add(b, &stages, wanted, runner, dir, tier_name, "bench-self", "plain", 300)) |r| {
         r.addArgs(&.{ "--", python, "-m", "unittest", "discover", "-s", "bench/tests" });
+    };
+    // The shipped Macs still compile (nothing runs): the Linux gate is where a Linux-only std call must fail.
+    if (tier != .edit) if (add(b, &stages, wanted, runner, dir, tier_name, "cross-macos", "plain", 900)) |r| {
+        r.addArgs(&.{ "--", b.graph.zig_exe, "build", "cross-macos", "-j8" });
     };
     const Cases = struct { name: []const u8, files: []const []const u8, fresh: bool, timeout: u32, data: ?[]const u8 = null };
     const case_stages: []const Cases = switch (tier) {

@@ -6,7 +6,7 @@
     "cases": {"stages": ["integration", "check-self", "bench-self", "fanout-self", "cases-fresh"], "minutes": 9},
     "corpus": {"stages": ["corpus", "canonical"], "minutes": 2},
     "clickbench": {"stages": ["clickbench"], "minutes": 4, "needs": ["clickbench"]},
-    "os": {"stages": ["contracts", "path-parity"], "minutes": 4},
+    "os": {"stages": ["contracts", "path-parity", "cross-macos"], "minutes": 5},
     "cpu": {"stages": ["cpu-parity"], "minutes": 6},
     "libzpq": {"stages": ["libzpq"], "minutes": 8}
   }

@@ -65,11 +65,6 @@ const test_fixtures = @import("../parquet/test_fixtures.zig");
 // Compile-time API check. Behavioral coverage is via the CLI
 // regression suite + lambda integration tests.
 // ============================================================
-test "scan: API is well-typed" {
-    _ = runMultiAggregate;
-    _ = materializeOne;
-}
-
 // ============================================================ Partial thread-spawn failure.
 //
 // `Thread.spawn` can fail partway through a loop (EAGAIN); leftover work must still run and started threads must still

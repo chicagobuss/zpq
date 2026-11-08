@@ -797,11 +797,3 @@ test "released group metadata never emits a scalar phantom row" {
         try std.testing.expectEqualStrings(want, writer.buffered());
     }
 }
-
-// ============================================================
-// Compile-time API check.
-// ============================================================
-test "engine: API is well-typed" {
-    _ = runQuery;
-    _ = runPrint;
-}

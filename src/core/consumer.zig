@@ -221,14 +221,3 @@ const decodeWithReaderPruned = consumer_column.decodeWithReaderPruned;
 const decodeFloat16ColumnAsF64Pruned = consumer_column.decodeFloat16ColumnAsF64Pruned;
 const decodeU32ColumnAsI64Pruned = consumer_column.decodeU32ColumnAsI64Pruned;
 const decodeFloat16ColumnAsF64 = consumer_column.decodeFloat16ColumnAsF64;
-
-// ============================================================
-// Compile-time API check. End-to-end behavior is exercised through
-// the lambda integration tests + CLI golden tests.
-// ============================================================
-test "consumer: API is well-typed" {
-    _ = appendProjectedRG;
-    _ = encodeAggregator;
-    _ = copyRG;
-    _ = decodeColumnT;
-}

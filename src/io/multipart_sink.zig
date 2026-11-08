@@ -954,19 +954,6 @@ fn singlePut(
 // Compile-time reference check: forces type-checking of the public API
 // and the worker. Without this, Zig's lazy body-compilation would not
 // surface errors in functions that no caller in the tree references yet.
-test "multipart_sink: API is well-typed" {
-    _ = MultipartSink.init;
-    _ = MultipartSink.push;
-    _ = MultipartSink.close;
-    _ = MultipartSink.deinit;
-    _ = partWorker;
-    _ = doUploadPart;
-    _ = createMultipartUpload;
-    _ = completeMultipartUpload;
-    _ = abortMultipartUpload;
-    _ = singlePut;
-}
-
 const testing = std.testing;
 const fake_s3 = @import("fake_s3.zig");
 

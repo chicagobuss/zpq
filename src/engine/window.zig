@@ -19,6 +19,7 @@ const expr_ast = @import("../core/expr/ast.zig");
 const streaming = @import("../core/writer/streaming.zig");
 const local_fs = @import("../local_fs.zig");
 const write = @import("write.zig");
+const core_memory = @import("../core/memory.zig");
 
 const Column = filter_eval.Batch.Column;
 const OutputCol = expr_agg.OutputCol;
@@ -399,6 +400,17 @@ fn averageOf(total: i128, k: u32, width: u8, dec: ?expr_ast.Dec) f64 {
     return @floatCast(@as(f80, @floatFromInt(total)) / divisor);
 }
 
+/// Row `i` of an integer or DECIMAL column as a 256-bit integer, 0 for NULL.
+fn integerAt(c: Column, i: usize) i256 {
+    if (nullAt(c, i)) return 0;
+    return switch (c) {
+        .i32 => |x| x.values[i],
+        .i64 => |x| x.values[i],
+        .i128 => |x| x.values[i],
+        else => unreachable,
+    };
+}
+
 fn sumOrAvg(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Out {
     const n = t.rows;
     const ordered = spec.order.len > 0;
@@ -415,16 +427,24 @@ fn sumOrAvg(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Ou
         .i32, .i64, .i128 => {
             // Only the types DuckDB sums as integers and DECIMALs: a DATE, a time or an unsigned integer is another function's.
             const width = try integerWidth(t, ci);
-            const pre = try a.alloc(i128, n + 1);
-            pre[0] = 0;
-            for (0..n) |i| {
-                const v: i128 = if (nullAt(c, i)) 0 else switch (c) {
-                    .i32 => |x| x.values[i],
-                    .i64 => |x| x.values[i],
-                    .i128 => |x| x.values[i],
-                    else => unreachable,
-                };
-                pre[i + 1] = std.math.add(i128, pre[i], v) catch return error.WindowSumOverflow;
+            // The sum of each row's frame, exact: the frames of a partition move forward, so a sliding total adds each row
+            // once and takes it out once, in 256 bits, which no frame's sum or step of it can overflow.
+            const sums = try a.alloc(i128, n);
+            var at: usize = 0;
+            while (at < n) {
+                const ps: usize = r.pstart[at];
+                const pe: usize = r.pend[at];
+                var total: i256 = 0;
+                var lo_p: usize = ps;
+                var hi_p: usize = ps;
+                for (ps..pe) |row| {
+                    const span = frameOf(call.frame, ordered, r, row);
+                    std.debug.assert(span.lo >= lo_p);
+                    while (hi_p < span.hi) : (hi_p += 1) total += integerAt(c, hi_p);
+                    while (lo_p < span.lo) : (lo_p += 1) total -= integerAt(c, lo_p);
+                    sums[row] = std.math.cast(i128, total) orelse return error.WindowSumOverflow;
+                }
+                at = pe;
             }
             if (is_avg) {
                 const out = try a.alloc(f64, n);
@@ -437,7 +457,7 @@ fn sumOrAvg(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Ou
                         any_null = true;
                         continue;
                     }
-                    o.* = averageOf(pre[s.hi] - pre[s.lo], k, width, t.decs[ci]);
+                    o.* = averageOf(sums[i], k, width, t.decs[ci]);
                 }
                 return .{ .col = .{ .f64 = .{ .values = out, .def_levels = def, .max_def = 1, .has_nulls = any_null } }, .physical = .DOUBLE, .nullable = true };
             }
@@ -447,7 +467,7 @@ fn sumOrAvg(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Ou
                 for (out, def, 0..) |*o, *d, i| {
                     const s = frameOf(call.frame, ordered, r, i);
                     d.* = @intFromBool(cnt[s.hi] > cnt[s.lo]);
-                    o.* = pre[s.hi] - pre[s.lo];
+                    o.* = sums[i];
                     if (d.* == 0) any_null = true;
                     if (o.* >= limit or o.* <= -limit) return error.WindowSumOverflow;
                 }
@@ -455,12 +475,14 @@ fn sumOrAvg(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Ou
                 return .{ .col = .{ .i128 = .{ .values = out, .def_levels = def, .max_def = 1, .has_nulls = any_null } }, .physical = wide.physical(), .dec = wide, .nullable = true };
             }
             if (c == .i128) return error.WindowArgumentType;
+            // BIGINT, as zpq's own sum is (DuckDB's is a HUGEINT, which it writes to Parquet as a DOUBLE): a frame past
+            // 64 bits is an error, by frame.
             const out = try a.alloc(i64, n);
             for (out, def, 0..) |*o, *d, i| {
                 const s = frameOf(call.frame, ordered, r, i);
                 d.* = @intFromBool(cnt[s.hi] > cnt[s.lo]);
                 if (d.* == 0) any_null = true;
-                o.* = std.math.cast(i64, pre[s.hi] - pre[s.lo]) orelse return error.WindowSumOverflow;
+                o.* = std.math.cast(i64, sums[i]) orelse return error.WindowSumOverflow;
             }
             return .{ .col = .{ .i64 = .{ .values = out, .def_levels = def, .max_def = 1, .has_nulls = any_null } }, .physical = .INT64, .nullable = true };
         },
@@ -618,45 +640,187 @@ fn indexOf(names: []const []const u8, name: []const u8) !usize {
     return error.WindowColumnType;
 }
 
-/// Read `req.input` (already in window order), compute the calls and write the file's columns and theirs to
-/// `req.output`.
+/// An allocator over `inner` that draws every byte it hands out on a ledger and refuses past its limit. The pass's arena
+/// frees nothing before it ends, so nothing is given back: a count that can only be higher than what is held.
+const Ledgered = struct {
+    inner: std.mem.Allocator,
+    ledger: *core_memory.SharedBudget,
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn allocator(self: *Ledgered) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *Ledgered = @ptrCast(@alignCast(ctx));
+        _ = self.ledger.drawExact(len) orelse return null;
+        return self.inner.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *Ledgered = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) _ = self.ledger.drawExact(new_len - memory.len) orelse return false;
+        return self.inner.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *Ledgered = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) _ = self.ledger.drawExact(new_len - memory.len) orelse return null;
+        return self.inner.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *Ledgered = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+const SortIdx = struct { col: usize, descending: bool, nulls_first: bool };
+
+const SortOrder = struct {
+    cols: []const Column,
+    keys: []const SortIdx,
+
+    /// Row `x` before row `y` by the keys; equal rows keep their order (the sort is stable).
+    fn less(self: SortOrder, x: u32, y: u32) bool {
+        for (self.keys) |k| {
+            const c = self.cols[k.col];
+            const nx = nullAt(c, x);
+            const ny = nullAt(c, y);
+            if (nx or ny) {
+                if (nx and ny) continue;
+                return if (nx) k.nulls_first else !k.nulls_first;
+            }
+            const o = orderAt(c, x, y);
+            if (o == .eq) continue;
+            return (o == .lt) != k.descending;
+        }
+        return false;
+    }
+};
+
+/// The input rows' indices in the order of `keys`; the rows themselves are not moved.
+fn sortedRows(a: std.mem.Allocator, cols: []const Column, keys: []const SortIdx, rows: usize) ![]u32 {
+    const perm = try a.alloc(u32, rows);
+    for (perm, 0..) |*p, i| p.* = @intCast(i);
+    if (keys.len > 0) std.sort.block(u32, perm, SortOrder{ .cols = cols, .keys = keys }, SortOrder.less);
+    return perm;
+}
+
+/// What the pass will hold, counted before anything is decoded: every column in its lane, the strings' bytes, the levels of
+/// a column that can be NULL, the key and argument columns again in window order, the run arrays and each call's answer.
+fn estimate(meta: *const schema.FileMetaData, rows: u64, ncalls: usize, referenced: []const bool) u64 {
+    var held: u64 = 0;
+    for (meta.schema.items[1..], 0..) |elem, ci| {
+        var width: u64 = 8;
+        if (decimal_mod.kindFromSchema(&elem) != null) width = 16 else switch (elem.type orelse .INT64) {
+            .INT32, .FLOAT => width = 4,
+            .BOOLEAN => width = 1,
+            .BYTE_ARRAY => width = 16,
+            else => {},
+        }
+        var bytes: u64 = rows * width;
+        if ((elem.repetition_type orelse .REQUIRED) != .REQUIRED) bytes += rows * 4;
+        if (elem.type == .BYTE_ARRAY) for (meta.row_groups.items) |*rg| {
+            bytes += @intCast((rg.columns.items[ci].meta_data orelse continue).total_uncompressed_size);
+        };
+        held += bytes;
+        if (ci < referenced.len and referenced[ci]) held += bytes;
+    }
+    // Two index arrays and the five run arrays, and per call a value, its levels and a prefix of counts.
+    return held + rows * (8 + 8 + 20 + ncalls * 32);
+}
+
+/// Read `req.input`, sort a view of it by the pass's keys, compute the calls, and write the file's columns, in the order
+/// they were read, and the calls' to `req.output`. The rows keep the file's order: a later pass, or the final query, sees
+/// them as the query's input had them.
 pub fn run(gpa: std.mem.Allocator, req: Request) !void {
+    return runLedgered(gpa, req) catch |err| switch (err) {
+        error.OutOfMemory => error.ExceededMemoryBudget,
+        else => err,
+    };
+}
+
+fn runLedgered(gpa: std.mem.Allocator, req: Request) !void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const a = arena_state.allocator();
+    var ledger: core_memory.SharedBudget = .{ .limit = req.max_memory };
+    var counted: Ledgered = .{ .inner = arena_state.allocator(), .ledger = &ledger };
+    const a = counted.allocator();
 
     const mapped = try local_fs.mapFile(req.input);
     defer mapped.unmap();
     const meta = try metadata.open(a, mapped.bytes);
-    // What the file decodes to, twice (the columns and the answer's), with the runs; refused up front.
-    var held: u64 = 0;
-    var rows_total: u64 = 0;
-    for (meta.row_groups.items) |*rg| {
-        rows_total += @intCast(rg.num_rows);
-        for (rg.columns.items) |col| held += @intCast((col.meta_data orelse continue).total_uncompressed_size);
-    }
-    held = held * 2 + rows_total * (24 + 16 * req.pass.calls.len);
-    if (held > req.max_memory) return error.ExceededMemoryBudget;
+    const ncols = meta.schema.items.len -| 1;
 
-    const loaded = try loadTable(a, mapped.bytes, &meta);
-    const t = loaded.table;
+    // The columns the window reads: its keys and its calls' arguments.
+    const names = try a.alloc([]const u8, ncols);
+    for (meta.schema.items[1..], names) |elem, *n| n.* = elem.name;
+    const referenced = try a.alloc(bool, ncols);
+    @memset(referenced, false);
     const part = try a.alloc(usize, req.pass.partition.len);
-    for (req.pass.partition, part) |n, *p| p.* = try indexOf(loaded.names, n);
+    for (req.pass.partition, part) |n, *p| p.* = try indexOf(names, n);
     const order = try a.alloc(usize, req.pass.order.len);
-    for (req.pass.order, order) |n, *p| p.* = try indexOf(loaded.names, n);
+    for (req.pass.order, order) |n, *p| p.* = try indexOf(names, n);
+    const keys = try a.alloc(SortIdx, req.pass.sort.len);
+    for (req.pass.sort, keys) |k, *out| out.* = .{ .col = try indexOf(names, k.column), .descending = k.descending, .nulls_first = k.nulls_first orelse false };
     const calls = try a.alloc(Call, req.pass.calls.len);
     for (req.pass.calls, calls) |nc, *c| c.* = .{
         .func = nc.func,
-        .arg = if (nc.arg) |n| try indexOf(loaded.names, n) else null,
+        .arg = if (nc.arg) |n| try indexOf(names, n) else null,
         .offset = nc.offset,
         .default = nc.default,
         .frame = nc.frame,
     };
-    const outs = try columns(a, t, .{ .partition = part, .order = order, .calls = calls });
+    for (part) |c| referenced[c] = true;
+    for (order) |c| referenced[c] = true;
+    for (calls) |c| if (c.arg) |ci| {
+        referenced[ci] = true;
+    };
 
-    const all = try a.alloc(OutputCol, t.cols.len + outs.len);
+    var rows_total: u64 = 0;
+    for (meta.row_groups.items) |*rg| rows_total += @intCast(rg.num_rows);
+    if (estimate(&meta, rows_total, calls.len, referenced) > req.max_memory) return error.ExceededMemoryBudget;
+
+    const loaded = try loadTable(a, mapped.bytes, &meta);
+    const t = loaded.table;
+
+    // The pass computes over a view in window order: only the columns it reads, gathered by the sort. With no keys the file's
+    // order is the window's.
+    const perm = try sortedRows(a, t.cols, keys, t.rows);
+    const sorted: Table = if (keys.len == 0) t else blk: {
+        const pick = try a.alloc(i64, t.rows);
+        for (pick, perm) |*p, row| p.* = row;
+        const view = try a.alloc(Column, ncols);
+        for (view, t.cols, referenced) |*v, c, used| v.* = if (used) try gather(a, c, pick, .null) else .{ .i64 = .{ .values = &.{} } };
+        break :blk .{ .rows = t.rows, .cols = view, .elems = t.elems, .decs = t.decs };
+    };
+    const outs = try columns(a, sorted, .{ .partition = part, .order = order, .calls = calls });
+
+    // Back to the file's order: row `i` takes the answer of the window position that held it.
+    const results: []const Out = if (keys.len == 0) outs else blk: {
+        const back = try a.alloc(i64, t.rows);
+        for (perm, 0..) |row, position| back[row] = @intCast(position);
+        const moved = try a.alloc(Out, outs.len);
+        for (outs, moved) |o, *m| {
+            m.* = o;
+            m.col = try gather(a, o.col, back, .null);
+            // An answer that is never NULL is written as a column that cannot be.
+            if (!o.nullable) switch (m.col) {
+                inline else => |*col| {
+                    col.def_levels = null;
+                    col.max_def = 0;
+                    col.has_nulls = false;
+                },
+            };
+        }
+        break :blk moved;
+    };
+
+    const all = try a.alloc(OutputCol, t.cols.len + results.len);
     for (t.cols, 0..) |c, i| all[i] = passThrough(loaded.names[i], c, t.elems[i], t.decs[i]);
-    for (outs, req.pass.results, 0..) |o, name, i| {
+    for (results, req.pass.results, 0..) |o, name, i| {
         var col: OutputCol = if (o.from) |from| passThrough(name, o.col, t.elems[from], t.decs[from]) else .{
             .name = name,
             .col = o.col,
@@ -771,5 +935,65 @@ test "window: AVG finalizes as DuckDB does, short types in doubles and the rest 
     try T.expectEqual(@as(f64, 1.5), averageOf(3, 2, 16, null));
     try T.expectEqual(@as(f64, 12.3456), averageOf(123456, 1, 128, .{ .precision = 12, .scale = 4 }));
     try T.expectEqual(@as(f64, 3.5), averageOf(7, 2, 64, null));
+}
+
+test "window: the allocator refuses past its ledger and counts what it hands out" {
+    const T = std.testing;
+    var ledger: core_memory.SharedBudget = .{ .limit = 1000 };
+    var counted: Ledgered = .{ .inner = T.allocator, .ledger = &ledger };
+    const a = counted.allocator();
+    const first = try a.alloc(u8, 600);
+    defer a.free(first);
+    try T.expectError(error.OutOfMemory, a.alloc(u8, 600));
+    const second = try a.alloc(u8, 400);
+    defer a.free(second);
+    try T.expectEqual(@as(usize, 1000), ledger.used.load(.monotonic));
+}
+
+test "window: rows sort stably by key, descending, NULLs where asked" {
+    const T = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const k = [_]i64{ 2, 1, 2, 3, 1, 2 };
+    const defs = [_]u32{ 1, 1, 0, 1, 1, 1 };
+    const cols = [_]Column{.{ .i64 = .{ .values = &k, .def_levels = &defs, .max_def = 1, .has_nulls = true } }};
+    // Ascending, NULL last: 1 1 2 2 2 NULL (the equal keys keep their order).
+    const asc = try sortedRows(a, &cols, &.{.{ .col = 0, .descending = false, .nulls_first = false }}, 6);
+    try T.expectEqualSlices(u32, &.{ 1, 4, 0, 5, 3, 2 }, asc);
+    // Descending, NULL first.
+    const desc = try sortedRows(a, &cols, &.{.{ .col = 0, .descending = true, .nulls_first = true }}, 6);
+    try T.expectEqualSlices(u32, &.{ 2, 3, 0, 5, 1, 4 }, desc);
+    // No keys: the file's order.
+    const none = try sortedRows(a, &cols, &.{}, 6);
+    try T.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5 }, none);
+}
+
+test "window: sums slide per frame and do not overflow across partitions or steps" {
+    const T = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const big: i128 = std.math.pow(i128, 10, 38) - 1;
+    // Two partitions of two DECIMAL(38, 0) values at the limit; a frame of one row fits, a frame of two does not.
+    const v = [_]i128{ big, big, big, big };
+    const p = [_]i64{ 1, 1, 2, 2 };
+    const cols = [_]Column{ .{ .i64 = .{ .values = &p } }, .{ .i128 = .{ .values = &v } } };
+    const elems = [_]schema.SchemaElement{ intElem(), intElem() };
+    const t: Table = .{ .rows = 4, .cols = &cols, .elems = &elems, .decs = &.{ null, .{ .precision = 38, .scale = 0 } } };
+    const one_row: Call = .{ .func = .sum, .arg = 1, .frame = .{ .rows = true, .start = .current_row, .end = .current_row } };
+    const out = try columns(a, t, .{ .partition = &.{0}, .order = &.{}, .calls = &.{one_row} });
+    try T.expectEqualSlices(i128, &.{ big, big, big, big }, out[0].col.i128.values);
+    const two_rows: Call = .{ .func = .sum, .arg = 1 };
+    try T.expectError(error.WindowSumOverflow, columns(a, t, .{ .partition = &.{0}, .order = &.{}, .calls = &.{two_rows} }));
+    // BIGINT sums are exact per frame and refused past 64 bits only where a frame is.
+    const w = [_]i64{ std.math.maxInt(i64), 1, 5 };
+    const q = [_]i64{ 1, 1, 2 };
+    const wcols = [_]Column{ .{ .i64 = .{ .values = &q } }, .{ .i64 = .{ .values = &w } } };
+    const wt: Table = .{ .rows = 3, .cols = &wcols, .elems = &elems, .decs = &.{ null, null } };
+    const current: Call = .{ .func = .sum, .arg = 1, .frame = .{ .rows = true, .start = .current_row, .end = .current_row } };
+    const fits = try columns(a, wt, .{ .partition = &.{0}, .order = &.{}, .calls = &.{current} });
+    try T.expectEqualSlices(i64, &.{ std.math.maxInt(i64), 1, 5 }, fits[0].col.i64.values);
+    try T.expectError(error.WindowSumOverflow, columns(a, wt, .{ .partition = &.{0}, .order = &.{}, .calls = &.{.{ .func = .sum, .arg = 1 }} }));
 }
 

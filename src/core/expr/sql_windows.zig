@@ -1,5 +1,5 @@
 //! A query with window functions in its SELECT list, planned as stages (`window_plan.zig`): the query without its window
-//! calls, ordered by the first call's PARTITION BY / ORDER BY, into a file whose columns are named `c0`, `c1`, ...; a
+//! calls, into a file whose columns are named `c0`, `c1`, ...; a
 //! pass per distinct `(PARTITION BY, ORDER BY)` that adds the calls' `w0`, `w1`, ... columns; and the original SELECT list
 //! (each window call its column, each other expression its `c`) and ORDER BY / LIMIT / OFFSET over the last file.
 //!
@@ -266,7 +266,7 @@ const Builder = struct {
         // The pass of this PARTITION BY and ORDER BY.
         var pass_index: ?usize = null;
         for (self.passes.items, 0..) |p, pi| {
-            if (sameSort(p.sort, sort.items)) {
+            if (samePass(p, sort.items, partition.items.len)) {
                 pass_index = pi;
                 break;
             }
@@ -313,6 +313,12 @@ fn boundClass(b: wp.Bound) u8 {
         .following => 3,
         .unbounded_following => 4,
     };
+}
+
+/// A pass is one split of the rows into partitions and peers: the same sort keys and the same count of them that are PARTITION BY
+/// (`ORDER BY a, b`, `PARTITION BY a ORDER BY b` and `PARTITION BY a, b` sort alike and split differently).
+fn samePass(p: PassB, sort: []const wp.SortKey, partitions: usize) bool {
+    return p.partition.len == partitions and sameSort(p.sort, sort);
 }
 
 fn sameSort(a: []const wp.SortKey, b: []const wp.SortKey) bool {
@@ -378,26 +384,6 @@ fn quoteName(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
         try out.append(arena, ch);
     }
     try out.append(arena, '"');
-    return out.items;
-}
-
-/// `keys` as ORDER BY terms: by column name, or, for the input stage whose columns are `c0`, `c1`, ... in order, by position
-/// (a quoted name of a key is not found by every aggregate path, a position is).
-fn sortClause(arena: std.mem.Allocator, out: *std.ArrayList(u8), keys: []const wp.SortKey, positions: bool) !void {
-    for (keys, 0..) |k, i| {
-        if (i > 0) try out.appendSlice(arena, ", ");
-        if (positions) {
-            try out.print(arena, "{d}", .{(std.fmt.parseInt(usize, k.column[1..], 10) catch 0) + 1});
-        } else try out.print(arena, "\"{s}\"", .{k.column});
-        if (k.descending) try out.appendSlice(arena, " DESC");
-        if (k.nulls_first) |first| try out.appendSlice(arena, if (first) " NULLS FIRST" else " NULLS LAST");
-    }
-}
-
-/// The sort of a pass, as the text of an ORDER BY's terms.
-pub fn sortText(arena: std.mem.Allocator, keys: []const wp.SortKey) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try sortClause(arena, &out, keys, false);
     return out.items;
 }
 
@@ -501,11 +487,6 @@ pub fn build(arena: std.mem.Allocator, text: [:0]const u8, why: *Refusal) Error!
     }
     try input.append(arena, ' ');
     try input.appendSlice(arena, from_text);
-    const first = b.passes.items[0];
-    if (first.sort.len > 0) {
-        try input.appendSlice(arena, " ORDER BY ");
-        try sortClause(arena, &input, first.sort, true);
-    }
 
     const passes = try arena.alloc(wp.Pass, b.passes.items.len);
     for (b.passes.items, passes, 0..) |pb, *out, pi| {
@@ -520,3 +501,22 @@ pub fn build(arena: std.mem.Allocator, text: [:0]const u8, why: *Refusal) Error!
     }
     return .{ .input_sql = input.items, .passes = passes, .final_items = items.items, .final_tail = tail.items };
 }
+
+test "windows with the same sort and a different split are different passes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var why: Refusal = .{};
+    const text: [:0]const u8 = "SELECT sum(v) OVER (ORDER BY a, b) AS s1, sum(v) OVER (PARTITION BY a ORDER BY b) AS s2, " ++
+        "sum(v) OVER (PARTITION BY a, b) AS s3, rank() OVER (PARTITION BY a ORDER BY b) AS r FROM t";
+    const plan = try build(a, text, &why);
+    try std.testing.expectEqual(@as(usize, 3), plan.passes.len);
+    try std.testing.expectEqual(@as(usize, 0), plan.passes[0].partition.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.passes[1].partition.len);
+    try std.testing.expectEqual(@as(usize, 2), plan.passes[2].partition.len);
+    // The rank joins the pass of the same split.
+    try std.testing.expectEqual(@as(usize, 2), plan.passes[1].calls.len);
+    // The input query has no ORDER BY: the rows leave in the order they came.
+    try std.testing.expect(std.mem.indexOf(u8, plan.input_sql, "ORDER BY") == null);
+}
+

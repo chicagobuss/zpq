@@ -1,5 +1,5 @@
 //! A query with window functions, for the CLI: the stages `sql_windows.zig` planned. The input query runs into a scratch
-//! Parquet file (ordered by the first pass's PARTITION BY / ORDER BY), each pass reads the file before it and writes
+//! Parquet file, each pass reads the file before it, sorts a view of the rows for its own PARTITION BY / ORDER BY, and writes
 //! one with its columns added (`engine/window.zig`), and the user's own query, with their output and flags, reads the last.
 const std = @import("std");
 const zpq = @import("zpq");
@@ -35,14 +35,9 @@ pub fn run(
     var current = try std.fmt.allocPrint(arena, "{s}/input.parquet", .{dir});
     if (trace) stager.say(try std.fmt.allocPrint(arena, "window input: {s}\n", .{plan.input_sql}));
     try stager.stage(stager.ptr, plan.input_sql, current, true);
+    // Each pass sorts the rows for itself and writes them back in the order it read them, so the rows leave as the input
+    // query had them.
     for (plan.passes, 0..) |pass, i| {
-        if (i > 0 and pass.sort.len > 0) {
-            const sorted = try std.fmt.allocPrint(arena, "{s}/sort{d}.parquet", .{ dir, i });
-            const sql = try std.fmt.allocPrint(arena, "SELECT * FROM '{s}' ORDER BY {s}", .{ current, try sql_windows.sortText(arena, pass.sort) });
-            if (trace) stager.say(try std.fmt.allocPrint(arena, "window sort: {s}\n", .{sql}));
-            try stager.stage(stager.ptr, sql, sorted, false);
-            current = sorted;
-        }
         const out = try std.fmt.allocPrint(arena, "{s}/pass{d}.parquet", .{ dir, i });
         try window.run(gpa, .{ .input = current, .output = out, .pass = pass, .max_memory = max_memory });
         current = out;

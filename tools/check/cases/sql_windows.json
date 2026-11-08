@@ -3,6 +3,14 @@
   {
    "name": "wn",
    "path": "ci/fixtures/parquet/sql_windows.parquet"
+  },
+  {
+   "name": "ww",
+   "path": "ci/fixtures/parquet/sql_windows_wide.parquet"
+  },
+  {
+   "name": "wc",
+   "path": "ci/fixtures/parquet/sql_windows_const.parquet"
   }
  ],
  "cases": [
@@ -911,6 +919,250 @@
     "error": "SelectAliasRequired",
     "diag": "needs an alias",
     "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:same-sort-different-split",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY g, id) AS s1, sum(v) OVER (PARTITION BY g ORDER BY id) AS s2, sum(v) OVER (PARTITION BY g, id) AS s3, rank() OVER (ORDER BY g, v, id) AS r1, rank() OVER (PARTITION BY g ORDER BY v, id) AS r2, row_number() OVER (PARTITION BY g, v ORDER BY id) AS r3 FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (ORDER BY g, id) AS s1, sum(v) OVER (PARTITION BY g ORDER BY id) AS s2, sum(v) OVER (PARTITION BY g, id) AS s3, rank() OVER (ORDER BY g, v, id) AS r1, rank() OVER (PARTITION BY g ORDER BY v, id) AS r2, row_number() OVER (PARTITION BY g, v ORDER BY id) AS r3 FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:same-sort-different-split-reversed",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (PARTITION BY g, id) AS s3, sum(v) OVER (PARTITION BY g ORDER BY id) AS s2, sum(v) OVER (ORDER BY g, id) AS s1 FROM '{fixture:wn}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (PARTITION BY g, id) AS s3, sum(v) OVER (PARTITION BY g ORDER BY id) AS s2, sum(v) OVER (ORDER BY g, id) AS s1 FROM '{fixture:wn}'"
+   }
+  },
+  {
+   "id": "sql_windows:input-order-limit",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (ORDER BY v, id) AS r FROM '{fixture:wn}' LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, rank() OVER (ORDER BY v, id) AS r FROM read_parquet('{fixture:wn}', file_row_number=true) ORDER BY file_row_number LIMIT 5"
+   }
+  },
+  {
+   "id": "sql_windows:input-order-full",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s, row_number() OVER (PARTITION BY h ORDER BY v DESC, id) AS rn FROM '{fixture:wn}'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s, row_number() OVER (PARTITION BY h ORDER BY v DESC, id) AS rn FROM read_parquet('{fixture:wn}', file_row_number=true) ORDER BY file_row_number"
+   }
+  },
+  {
+   "id": "sql_windows:unordered-window-in-input-order",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY v, id) AS s, sum(v) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS r FROM '{fixture:wn}'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, sum(v) OVER (ORDER BY v, id) AS s, sum(v) OVER (ORDER BY file_row_number ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS r FROM read_parquet('{fixture:wn}', file_row_number=true) ORDER BY file_row_number"
+   }
+  },
+  {
+   "id": "sql_windows:row-number-over-nothing",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (ORDER BY v, id) AS a, row_number() OVER () AS n FROM '{fixture:wn}'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, rank() OVER (ORDER BY v, id) AS a, file_row_number + 1 AS n FROM read_parquet('{fixture:wn}', file_row_number=true) ORDER BY file_row_number"
+   }
+  },
+  {
+   "id": "sql_windows:outer-order-by-wins",
+   "fixture": "wn",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, rank() OVER (ORDER BY v, id) AS r FROM '{fixture:wn}' ORDER BY id DESC LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, rank() OVER (ORDER BY v, id) AS r FROM '{fixture:wn}' ORDER BY id DESC LIMIT 4"
+   }
+  },
+  {
+   "id": "sql_windows:sum-decimal38-one-row-partitions",
+   "fixture": "ww",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(d) OVER (PARTITION BY id) AS s, sum(d) OVER (PARTITION BY id ORDER BY id) AS t, avg(d) OVER (PARTITION BY id) AS a FROM '{fixture:ww}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(d) OVER (PARTITION BY id) AS s, sum(d) OVER (PARTITION BY id ORDER BY id) AS t, avg(d) OVER (PARTITION BY id) AS a FROM '{fixture:ww}'"
+   }
+  },
+  {
+   "id": "sql_windows:sum-bigint-frames-that-fit",
+   "fixture": "ww",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS s, sum(v) OVER (PARTITION BY id) AS t FROM '{fixture:ww}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS s, sum(v) OVER (PARTITION BY id) AS t FROM '{fixture:ww}'"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:sum-bigint-past-64-bits",
+   "fixture": "ww",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (PARTITION BY g) AS s FROM '{fixture:ww}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowSumOverflow",
+    "diag": "out of range for its result type",
+    "exit": 1
+   }
+  },
+  {
+   "id": "sql_windows:refuse:sum-decimal38-frame-past-38-digits",
+   "fixture": "ww",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(d) OVER (PARTITION BY g) AS s FROM '{fixture:ww}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowSumOverflow",
+    "diag": "out of range for its result type",
+    "exit": 1
+   }
+  },
+  {
+   "id": "sql_windows:refuse:memory-of-a-constant-column",
+   "fixture": "wc",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT x, row_number() OVER (ORDER BY x) AS r FROM '{fixture:wc}'",
+    "--max-memory",
+    "64M",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "ExceededMemoryBudget",
+    "diag": "needs more memory",
+    "exit": 1
    }
   }
  ]

@@ -106,7 +106,8 @@
   `OVER (PARTITION BY .. ORDER BY .. [ROWS BETWEEN ..])` (the default frame and `ROWS` frames), over rows or over a GROUP BY's
   output, in expressions, with ORDER BY / LIMIT, match DuckDB 2.0.0 (fuzzed on ~1,000 queries). The query runs as stages, as set
   operations do: the rows sorted by the window's keys into a scratch Parquet file, a pass that adds the window columns, and the query
-  over the result. The intermediate is held in memory (the bound of an ORDER BY with no LIMIT). `sum` / `avg` of a DOUBLE and the other
+  over the result. Each pass sorts a view of the rows itself and writes them back in input order, so a query with no ORDER BY returns
+  its rows as its input had them; the intermediate is held in memory, drawn on a ledger against `--max-memory`. `sum` / `avg` of a DOUBLE and the other
   window functions (`ntile`, `first_value`, ...), RANGE offsets, QUALIFY and `SELECT *` beside a window call are refused by name.
 - **Unaliased computed columns are named as DuckDB names them.** `SELECT id, id + 1, upper(s) FROM t ORDER BY id` was refused
   as `missing --output or --aggregate`; its columns are now `id`, `(id + 1)` and `upper(s)`. Names were checked against DuckDB on

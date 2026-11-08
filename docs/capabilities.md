@@ -122,15 +122,20 @@ with the query's own ORDER BY / LIMIT / OFFSET and a `UNION` of such queries. Th
 row's last peer; the whole partition without an ORDER BY), `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW | UNBOUNDED FOLLOWING`,
 or `ROWS BETWEEN` `UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW | n FOLLOWING` and `n PRECEDING | CURRENT ROW | n FOLLOWING |
 UNBOUNDED FOLLOWING` (an empty frame has a NULL sum and a zero count). Results are DuckDB's: ranks and counts BIGINT, `lag` / `lead` /
-`min` / `max` the argument's type, integer sums BIGINT (an overflow is `WindowSumOverflow`), DECIMAL sums DECIMAL(38, s), averages
+`min` / `max` the argument's type, integer sums BIGINT, added exactly frame by frame (DuckDB's is a HUGEINT, which its own Parquet writer
+turns into a DOUBLE; a frame past 64 bits is `WindowSumOverflow`, as zpq's plain `sum` is `AggIntTooWide`), DECIMAL sums DECIMAL(38, s)
+(`WindowSumOverflow` past 38 digits; DuckDB errors on some frames that fit), averages
 of integers and DECIMALs DOUBLE, finalized as DuckDB does. Compared with DuckDB 2.0.0 on fuzzed data (ties, NULL keys and values,
 DESC / NULLS FIRST, frames past the partition's ends, one-row partitions) and in `sql_windows.json`.
-How it runs: the query without its window calls is an ordinary query whose rows are sorted by the first call's PARTITION BY and ORDER BY
-into a scratch Parquet file, each distinct `(PARTITION BY, ORDER BY)` is one pass over a sorted file (`engine/window.zig`) that adds
-its columns, and the SELECT list and ORDER BY / LIMIT read the last file, so every output format works. The sort and the pass hold the
-intermediate (the columns the query reads, after WHERE and GROUP BY) in memory, as an ORDER BY with no LIMIT does: past `--max-memory`
-it is "the query needs more memory than --max-memory allows". Ties in an ORDER BY are in input order; DuckDB's row_number and ROWS
-frames over ties are unspecified, so a query that depends on them should break its ties.
+How it runs: the query without its window calls is an ordinary query into a scratch Parquet file; each distinct split into partitions and
+peers (`PARTITION BY a ORDER BY b` and `ORDER BY a, b` sort alike and are two) is one pass (`engine/window.zig`) that sorts a view of the
+rows by its keys, computes its calls, and writes the rows back in the order it read them with its columns added; the SELECT list and ORDER
+BY / LIMIT read the last file, so every output format works. Without an outer ORDER BY the rows leave in the input query's order, and a
+window with no ORDER BY sees them in it (DuckDB leaves the order unspecified: it returns the rows in the order of its last sort). The pass
+holds the intermediate (every column the query reads, after WHERE and GROUP BY, in its decoded lane, and a sorted view of the columns the
+windows read) in memory, drawn on a ledger: past `--max-memory` it is "the query needs more memory than --max-memory allows". Ties in
+an ORDER BY are in input order; DuckDB's row_number and ROWS frames over ties are unspecified, so a query that depends on them should
+break its ties.
 Refused by name: `ntile`, `first_value` / `last_value` / `nth_value`, `percent_rank`, `cume_dist` and the rest (`WindowNotSupported`);
 RANGE frames with an offset and GROUPS frames; `EXCLUDE`; a frame DuckDB's parser refuses; DISTINCT or FILTER on a window call;
 `IGNORE NULLS`; a named `WINDOW` clause; a window call in WHERE, GROUP BY or HAVING (QUALIFY is not supported); `SELECT DISTINCT` or

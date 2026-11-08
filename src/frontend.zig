@@ -233,7 +233,13 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         error.WindowDefaultType => diagnosticPrint("zpq query: the default of lag / lead does not fit the type of its column\n", .{}),
         error.WindowSumOverflow => diagnosticPrint("zpq query: a window SUM is out of range for its result type\n", .{}),
         error.WindowRangeOverflow => diagnosticPrint(
-            "zpq query: an ORDER BY key plus its RANGE offset leaves the key's type\n",
+            "zpq query: an ORDER BY key plus its RANGE offset leaves the key's type\n" ++
+                "  (38 digits for a DECIMAL, the range of the days a DATE holds)\n",
+            .{},
+        ),
+        error.WindowRangeCast => diagnosticPrint(
+            "zpq query: an ORDER BY key or its RANGE offset needs more than 38 digits once\n" ++
+                "  both are at one scale (DuckDB's Conversion Error)\n",
             .{},
         ),
         error.WindowRangeOffset => diagnosticPrint(

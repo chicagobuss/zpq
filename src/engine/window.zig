@@ -66,8 +66,11 @@ pub const Error = error{
     WindowRangeKey,
     /// A RANGE offset that reaches the wrong way: DuckDB's "Invalid RANGE PRECEDING value".
     WindowRangeOffset,
-    /// A key and its RANGE offset that add up past the key's type.
+    /// A key and its RANGE offset that add up past the key's type (a DECIMAL's 38 digits, a DATE's range).
     WindowRangeOverflow,
+    /// A key or a RANGE offset that does not fit the type DuckDB brings both to before the sum: 38 digits, once a
+    /// DECIMAL key and a fractional offset are at one scale, which DuckDB reports as a Conversion Error.
+    WindowRangeCast,
     ExceededMemoryBudget,
 };
 
@@ -234,6 +237,13 @@ const Reached = union(enum) { exact: i256, float: f64 };
 
 const us_per_day: i256 = 86_400_000_000;
 
+/// The widest a DECIMAL holds either way: 38 digits, unscaled.
+const decimal_limit: i256 = expr_ast.pow10(38) - 1;
+
+/// The most days from the epoch a DATE holds either way (5881580-07-10 and -5877641-06-25, `calendar.max_date_days`);
+/// one more is DuckDB's infinity, and its error to reach.
+const max_date_days: i256 = std.math.maxInt(i32) - 1;
+
 /// The ORDER BY key of a RANGE frame with offsets.
 const RangeKey = struct {
     col: Column,
@@ -262,6 +272,9 @@ const RangeKey = struct {
         interval: ?plan_types.Interval = null,
         /// The range of the type the sum is computed in, when it can leave it.
         limit: ?struct { lo: i256, hi: i256 } = null,
+        /// The most a key may be, in the key's own units, when the offset's scale is the wider one and so casts the
+        /// key column up: DuckDB casts it before the pass, so one key past this is an error for the query.
+        key_max: ?i256 = null,
     };
 
     fn of(t: Table, ci: usize, descending: bool) !RangeKey {
@@ -323,21 +336,36 @@ const RangeKey = struct {
         switch (reach) {
             .number => |n| switch (self.kind) {
                 .double => return .{ .off_f = expr_ast.decimalToDouble(n.mant, n.scale) },
-                .decimal => |ks| return numberOffset(ks, n),
+                // DuckDB adds a DECIMAL key and its offset at the wider of the two scales in 38 digits: the side that
+                // does not fit the cast there is a Conversion Error, and a sum that leaves it an Out of Range one.
+                .decimal => |ks| {
+                    const s = @max(ks, n.scale);
+                    if (!fits38(n.mant, s - n.scale)) return error.WindowRangeCast;
+                    var o = try numberOffset(ks, n);
+                    o.limit = .{ .lo = -decimal_limit, .hi = decimal_limit };
+                    if (s > ks) o.key_max = expr_ast.pow10(38 - (s - ks));
+                    return o;
+                },
                 .integer => |k| {
                     var o = try numberOffset(0, n);
-                    // DuckDB adds in the key's type, or in the narrowest of INTEGER, BIGINT and HUGEINT that holds the key's
-                    // and the offset's both; what leaves it is an error.
                     if (n.scale == 0) {
+                        // DuckDB adds in the key's type, or in the narrowest of INTEGER, BIGINT and HUGEINT that holds
+                        // the key's and the offset's both; what leaves it is an error.
                         var range = k;
                         if (n.mant > k.hi) range = widest(k, n.mant);
                         o.limit = .{ .lo = range.lo, .hi = range.hi };
+                    } else {
+                        // A fractional offset casts the key to DECIMAL(38, its scale) and adds there: a key too big for
+                        // that cast is a Conversion Error, and the sum is a DECIMAL's of 38 digits.
+                        o.limit = .{ .lo = -decimal_limit, .hi = decimal_limit };
+                        o.key_max = expr_ast.pow10(38 - n.scale);
                     }
                     return o;
                 },
                 .date => {
-                    if (n.scale != 0) return error.WindowRangeKey;
-                    return .{ .off = n.mant };
+                    // DuckDB's -(DATE, INTEGER): whole days that fit an INTEGER, summed into the days a DATE holds.
+                    if (n.scale != 0 or n.bits > 32) return error.WindowRangeKey;
+                    return .{ .off = n.mant, .limit = .{ .lo = -max_date_days, .hi = max_date_days } };
                 },
                 .timestamp => return error.WindowRangeKey,
             },
@@ -355,6 +383,21 @@ const RangeKey = struct {
             .mult = expr_ast.pow10(scale - key_scale),
             .off = @as(i256, n.mant) * expr_ast.pow10(scale - n.scale),
         };
+    }
+
+    /// Whether `v` with `shift` more digits still has 38 of them, `|v| * 10^shift <= 10^38 - 1`, without the multiply.
+    fn fits38(v: i128, shift: u8) bool {
+        return @abs(@as(i256, v)) < expr_ast.pow10(38 - shift);
+    }
+
+    /// DuckDB casts the key column to the type it adds the offset in before the pass: a key that does not fit is an
+    /// error for the query, whatever row it is on or partition it is in.
+    fn admits(self: RangeKey, o: Offset, rows: usize) !void {
+        const max = o.key_max orelse return;
+        for (0..rows) |j| {
+            if (nullAt(self.col, j)) continue;
+            if (@abs(self.lane(j)) >= max) return error.WindowRangeCast;
+        }
     }
 
     fn widest(k: @FieldType(Kind, "integer"), mant: i128) @FieldType(Kind, "integer") {
@@ -442,6 +485,8 @@ fn rangeFrames(t: Table, r: Runs, spec: Spec, f: Frame, out: []Span) !void {
         .reach_preceding, .reach_following => |reach| try key.resolve(reach),
         else => null,
     };
+    if (start) |o| try key.admits(o, t.rows);
+    if (end) |o| try key.admits(o, t.rows);
     var at: usize = 0;
     while (at < t.rows) {
         const ps: usize = r.pstart[at];
@@ -1360,6 +1405,20 @@ test "window: a RANGE offset past the key's type or the wrong way is an error, a
     try T.expectError(error.WindowRangeKey, rangeSpans(a, &keys, &none, intElem(), false, reachFrame(.{ .reach_preceding = .{ .interval = .{ .months = 0, .days = 1, .micros = 0 } } }, .current_row)));
 }
 
+/// The frames of `f` over one partition whose ORDER BY key is `key`, in the lane, element and DECIMAL it is given.
+fn keySpans(a: std.mem.Allocator, key: Column, elem: schema.SchemaElement, dec: ?expr_ast.Dec, rows: usize, f: Frame) ![]const Span {
+    const p = try a.alloc(i64, rows);
+    @memset(p, 1);
+    const cols = try a.dupe(Column, &.{ .{ .i64 = .{ .values = p } }, key });
+    const elems = try a.dupe(schema.SchemaElement, &.{ intElem(), elem });
+    const t: Table = .{ .rows = rows, .cols = cols, .elems = elems, .decs = &.{ null, dec } };
+    const spec: Spec = .{ .partition = &.{0}, .order = &.{1}, .calls = &.{} };
+    const r = try runs(a, t, spec);
+    const out = try a.alloc(Span, rows);
+    try rangeFrames(t, r, spec, f, out);
+    return out;
+}
+
 test "window: an INTERVAL offset on a DATE moves by calendar months, the day clamped to the month" {
     const T = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(T.allocator);
@@ -1374,6 +1433,55 @@ test "window: an INTERVAL offset on a DATE moves by calendar months, the day cla
     try expectSpans(&.{ .{ 0, 1 }, .{ 0, 2 }, .{ 1, 3 } }, try rangeSpans(a, &days, &none, date, false, reachFrame(.{ .reach_preceding = month }, .current_row)));
     // A whole number on a DATE is days.
     try expectSpans(&.{ .{ 0, 1 }, .{ 1, 2 }, .{ 2, 3 } }, try rangeSpans(a, &days, &none, date, false, reachFrame(.{ .reach_preceding = offset(1) }, .current_row)));
+}
+
+test "window: a RANGE offset's bound is an error where DuckDB's 38 digits or DATE's range runs out" {
+    const T = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const big: i128 = std.math.pow(i128, 10, 38) - 1;
+    const zero = [_]i128{big};
+    const low = [_]i128{-big};
+    const dec38_0: ?expr_ast.Dec = .{ .precision = 38, .scale = 0 };
+    const dec38_37: ?expr_ast.Dec = .{ .precision = 38, .scale = 37 };
+    const dec10_2: ?expr_ast.Dec = .{ .precision = 10, .scale = 2 };
+    // DECIMAL(38, 0) at either limit: one more digit is an Out of Range error, DuckDB's too.
+    try T.expectError(error.WindowRangeOverflow, keySpans(a, .{ .i128 = .{ .values = &zero } }, intElem(), dec38_0, 1, reachFrame(.current_row, .{ .reach_following = offset(1) })));
+    try T.expectError(error.WindowRangeOverflow, keySpans(a, .{ .i128 = .{ .values = &low } }, intElem(), dec38_0, 1, reachFrame(.{ .reach_preceding = offset(1) }, .current_row)));
+    try expectSpans(&.{.{ 0, 1 }}, try keySpans(a, .{ .i128 = .{ .values = &zero } }, intElem(), dec38_0, 1, reachFrame(.{ .reach_preceding = offset(1) }, .current_row)));
+    // DECIMAL(38, 37) at its limit with the smallest offset: the same, one place to the right of the point.
+    const least: plan_types.Reach = .{ .number = .{ .mant = 1, .scale = 37, .bits = 32 } };
+    try T.expectError(error.WindowRangeOverflow, keySpans(a, .{ .i128 = .{ .values = &zero } }, intElem(), dec38_37, 1, reachFrame(.current_row, .{ .reach_following = least })));
+    // An offset with more decimals than the key casts the key column up: a key too big for it is a Conversion Error.
+    const milli: plan_types.Reach = .{ .number = .{ .mant = 1, .scale = 3, .bits = 32 } };
+    try T.expectError(error.WindowRangeCast, keySpans(a, .{ .i128 = .{ .values = &zero } }, intElem(), dec10_2, 1, reachFrame(.current_row, .{ .reach_following = milli })));
+    const small = [_]i128{500};
+    try expectSpans(&.{.{ 0, 1 }}, try keySpans(a, .{ .i128 = .{ .values = &small } }, intElem(), dec10_2, 1, reachFrame(.current_row, .{ .reach_following = milli })));
+    // And an offset with fewer decimals is the one cast up: 10^36 at scale 0 is 38 digits at the key's scale 2.
+    const huge: plan_types.Reach = .{ .number = .{ .mant = std.math.pow(i128, 10, 36), .scale = 0, .bits = 32 } };
+    try T.expectError(error.WindowRangeCast, keySpans(a, .{ .i128 = .{ .values = &small } }, intElem(), dec10_2, 1, reachFrame(.current_row, .{ .reach_following = huge })));
+    // A fractional offset on an integer key: the BIGINT cast to DECIMAL(38, 20) fails, to DECIMAL(38, 19) it does not.
+    const wide = [_]i64{1_000_000_000_000_000_000};
+    const scale20: plan_types.Reach = .{ .number = .{ .mant = 1, .scale = 20, .bits = 32 } };
+    const scale19: plan_types.Reach = .{ .number = .{ .mant = 1, .scale = 19, .bits = 32 } };
+    try T.expectError(error.WindowRangeCast, keySpans(a, .{ .i64 = .{ .values = &wide } }, intElem(), null, 1, reachFrame(.{ .reach_preceding = scale20 }, .current_row)));
+    try expectSpans(&.{.{ 0, 1 }}, try keySpans(a, .{ .i64 = .{ .values = &wide } }, intElem(), null, 1, reachFrame(.{ .reach_preceding = scale19 }, .current_row)));
+    // The sum a fractional offset makes is a DECIMAL's: 10 + (10^38 - 1) leaves it.
+    const one = [_]i64{1};
+    const largest: plan_types.Reach = .{ .number = .{ .mant = big, .scale = 1, .bits = 32 } };
+    try T.expectError(error.WindowRangeOverflow, keySpans(a, .{ .i64 = .{ .values = &one } }, intElem(), null, 1, reachFrame(.current_row, .{ .reach_following = largest })));
+    // A DATE takes whole days that fit an INTEGER, and a sum the days a DATE holds: 2147483647 days past the epoch is
+    // DuckDB's "Date out of range", while 3000000000 is a BIGINT and DuckDB binds no -(DATE, BIGINT).
+    var date = intElem();
+    date.logical_type = .{ .DATE = .{} };
+    const epoch = [_]i64{0};
+    const past: plan_types.Reach = .{ .number = .{ .mant = std.math.maxInt(i32), .scale = 0, .bits = 32 } };
+    const fits: plan_types.Reach = .{ .number = .{ .mant = std.math.maxInt(i32) - 1, .scale = 0, .bits = 32 } };
+    const wide_day: plan_types.Reach = .{ .number = .{ .mant = 3_000_000_000, .scale = 0, .bits = 64 } };
+    try T.expectError(error.WindowRangeOverflow, keySpans(a, .{ .i64 = .{ .values = &epoch } }, date, null, 1, reachFrame(.current_row, .{ .reach_following = past })));
+    try expectSpans(&.{.{ 0, 1 }}, try keySpans(a, .{ .i64 = .{ .values = &epoch } }, date, null, 1, reachFrame(.current_row, .{ .reach_following = fits })));
+    try T.expectError(error.WindowRangeKey, keySpans(a, .{ .i64 = .{ .values = &epoch } }, date, null, 1, reachFrame(.{ .reach_preceding = wide_day }, .current_row)));
 }
 
 test "window: AVG finalizes as DuckDB does, short types in doubles and the rest in long doubles" {

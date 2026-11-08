@@ -23,6 +23,10 @@
   {
    "name": "wr",
    "path": "ci/fixtures/parquet/sql_windows_range.parquet"
+  },
+  {
+   "name": "wx",
+   "path": "ci/fixtures/parquet/sql_windows_range_extreme.parquet"
   }
  ],
  "cases": [
@@ -2510,6 +2514,147 @@
     "exit": 1,
     "binder_sql": "SELECT id, sum(v) OVER (ORDER BY u RANGE BETWEEN 3000000000 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
     "duck_error": "Out of Range Error:"
+   }
+  },
+  {
+   "id": "sql_windows:range-offset-extreme",
+   "fixture": "wx",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY d0 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS d0_1, count(*) OVER (ORDER BY d37 RANGE BETWEEN 0.0000000000000000000000000000000000001 PRECEDING AND CURRENT ROW) AS d37_1, count(*) OVER (ORDER BY b RANGE BETWEEN 0.0000000000000000001 PRECEDING AND CURRENT ROW) AS b_19, count(*) OVER (ORDER BY i RANGE BETWEEN 0.000000001 PRECEDING AND CURRENT ROW) AS i_9, count(*) OVER (ORDER BY dt RANGE BETWEEN 1000 PRECEDING AND 1000 FOLLOWING) AS dt_1000 FROM '{fixture:wx}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, count(*) OVER (ORDER BY d0 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS d0_1, count(*) OVER (ORDER BY d37 RANGE BETWEEN 0.0000000000000000000000000000000000001 PRECEDING AND CURRENT ROW) AS d37_1, count(*) OVER (ORDER BY b RANGE BETWEEN 0.0000000000000000001 PRECEDING AND CURRENT ROW) AS b_19, count(*) OVER (ORDER BY i RANGE BETWEEN 0.000000001 PRECEDING AND CURRENT ROW) AS i_9, count(*) OVER (ORDER BY dt RANGE BETWEEN 1000 PRECEDING AND 1000 FOLLOWING) AS dt_1000 FROM '{fixture:wx}'"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-decimal-overflow",
+   "fixture": "wx",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY d0 RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) AS c FROM '{fixture:wx}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowRangeOverflow",
+    "diag": "leaves the key's type",
+    "exit": 1,
+    "binder_sql": "SELECT id, count(*) OVER (ORDER BY d0 RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) AS c FROM '{fixture:wx}'",
+    "duck_error": "Out of Range Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-decimal-overflow-scale",
+   "fixture": "wx",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY d37 RANGE BETWEEN CURRENT ROW AND 0.0000000000000000000000000000000000001 FOLLOWING) AS c FROM '{fixture:wx}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowRangeOverflow",
+    "diag": "leaves the key's type",
+    "exit": 1,
+    "binder_sql": "SELECT id, count(*) OVER (ORDER BY d37 RANGE BETWEEN CURRENT ROW AND 0.0000000000000000000000000000000000001 FOLLOWING) AS c FROM '{fixture:wx}'",
+    "duck_error": "Out of Range Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-decimal-key-cast",
+   "fixture": "wx",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY d0 RANGE BETWEEN 0.5 PRECEDING AND CURRENT ROW) AS c FROM '{fixture:wx}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowRangeCast",
+    "diag": "more than 38 digits",
+    "exit": 1,
+    "binder_sql": "SELECT id, count(*) OVER (ORDER BY d0 RANGE BETWEEN 0.5 PRECEDING AND CURRENT ROW) AS c FROM '{fixture:wx}'",
+    "duck_error": "Conversion Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-bigint-key-cast",
+   "fixture": "wx",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY b RANGE BETWEEN 0.00000000000000000001 PRECEDING AND CURRENT ROW) AS c FROM '{fixture:wx}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowRangeCast",
+    "diag": "more than 38 digits",
+    "exit": 1,
+    "binder_sql": "SELECT id, count(*) OVER (ORDER BY b RANGE BETWEEN 0.00000000000000000001 PRECEDING AND CURRENT ROW) AS c FROM '{fixture:wx}'",
+    "duck_error": "Conversion Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-int-key-cast",
+   "fixture": "wx",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY i RANGE BETWEEN 0.00000000000000000000000000001 PRECEDING AND CURRENT ROW) AS c FROM '{fixture:wx}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowRangeCast",
+    "diag": "more than 38 digits",
+    "exit": 1,
+    "binder_sql": "SELECT id, count(*) OVER (ORDER BY i RANGE BETWEEN 0.00000000000000000000000000001 PRECEDING AND CURRENT ROW) AS c FROM '{fixture:wx}'",
+    "duck_error": "Conversion Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-date-out-of-range",
+   "fixture": "wx",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY dt RANGE BETWEEN CURRENT ROW AND 2147483647 FOLLOWING) AS c FROM '{fixture:wx}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowRangeOverflow",
+    "diag": "leaves the key's type",
+    "exit": 1,
+    "binder_sql": "SELECT id, count(*) OVER (ORDER BY dt RANGE BETWEEN CURRENT ROW AND 2147483647 FOLLOWING) AS c FROM '{fixture:wx}'",
+    "duck_error": "Out of Range Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-date-bigint",
+   "fixture": "wx",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY dt RANGE BETWEEN 3000000000 PRECEDING AND CURRENT ROW) AS c FROM '{fixture:wx}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowRangeKey",
+    "diag": "needs one ORDER BY key whose type it reaches",
+    "exit": 1,
+    "binder_sql": "SELECT id, count(*) OVER (ORDER BY dt RANGE BETWEEN 3000000000 PRECEDING AND CURRENT ROW) AS c FROM '{fixture:wx}'"
    }
   }
  ]

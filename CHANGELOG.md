@@ -24,8 +24,11 @@
   formulas (the rows before the row's peers over the partition's other rows; the rows up to the last peer over all of them), and a
   `RANGE BETWEEN n PRECEDING / FOLLOWING` frame reaches by its ORDER BY key: a whole number or a decimal on an integer, DECIMAL,
   DOUBLE or DATE key, an `INTERVAL` on a DATE or TIMESTAMP key, added in the key's type as DuckDB adds it (a TINYINT key is a
-  `WindowRangeOverflow` at 127, `200 PRECEDING` on it adds in INTEGER), a NULL key framing its own peers. Checked against DuckDB
-  2.0.0 on 1,350 fuzzed queries, 0 differences, and in `tools/check/cases/sql_windows.json`.
+  `WindowRangeOverflow` at 127, `200 PRECEDING` on it adds in INTEGER), a NULL key framing its own peers. DuckDB's limits hold:
+  a DECIMAL key's bound and an integer key's fractional offset are checked against its 38 digits (`WindowRangeOverflow`,
+  `WindowRangeCast`), and a DATE's offset is an INTEGER whose day delta stays within the days a DATE holds (`WindowRangeKey`,
+  `WindowRangeOverflow`). Checked against DuckDB 2.0.0 on 2,150 fuzzed queries, 0 differences, and in
+  `tools/check/cases/sql_windows.json`.
 - **Review fixes for the SQL scalar functions.** Integer overflow checks (`+ - * % //` at the SQL type DuckDB resolves)
   now apply in a GROUP BY key and under a function or `coalesce` too, as they do in a bare expression. The remainder
   or quotient of DECIMALs that falls back to DOUBLE converts each DECIMAL to the nearest double, so equal values stay

@@ -128,13 +128,18 @@ type the offset reaches (an integer, DECIMAL, DOUBLE, DATE or TIMESTAMP; an INTE
 everything but a TIMESTAMP). The key and the offset add in the key's type, as DuckDB adds them: a TINYINT key with `1 FOLLOWING`
 at 127 is `WindowRangeOverflow`, `200 PRECEDING` on it adds in INTEGER, a decimal offset is exact, and a key that is NULL frames
 its own NULL peers (`WindowRangeKey` names an offset the key does not take, `WindowRangeOffset` a bound that reaches the wrong
-way). Results are DuckDB's: ranks and counts BIGINT, `percent_rank` / `cume_dist` DOUBLE, `lag` / `lead` /
+way, `WindowRangeCast` a key or an offset needing more than 38 digits once both are at one scale). DuckDB's limits hold: a
+DECIMAL key's bound is checked against 38 digits, an integer key with a fractional offset is cast to `DECIMAL(38, scale)`
+first, a DATE's day delta stays within the days a DATE holds, and a DATE takes only an INTEGER offset (`3000000000 PRECEDING`
+is a `WindowRangeKey`, as DuckDB binds no `-(DATE, BIGINT)`).
+Results are DuckDB's: ranks and counts BIGINT, `percent_rank` / `cume_dist` DOUBLE, `lag` / `lead` /
 `min` / `max` the argument's type, integer sums BIGINT, added exactly frame by frame (DuckDB's is a HUGEINT, which its own Parquet writer
 turns into a DOUBLE; a frame past 64 bits is `WindowSumOverflow`, as zpq's plain `sum` is `AggIntTooWide`), DECIMAL sums DECIMAL(38, s)
 (`WindowSumOverflow` past 38 digits; DuckDB errors on some frames that fit), averages
 of integers and DECIMALs DOUBLE, finalized as DuckDB does. Compared with DuckDB 2.0.0 on fuzzed data (ties, NULL keys and values,
 DESC / NULLS FIRST, frames past the partition's ends, one-row partitions, and RANGE offsets over TINYINT, INTEGER, BIGINT, UBIGINT,
-DECIMAL, DOUBLE, DATE and TIMESTAMP keys: 1,350 queries with no difference) and in `sql_windows.json`.
+DECIMAL, DOUBLE, DATE and TIMESTAMP keys, at the edges of a DECIMAL(38, s), a fractional offset on an integer key and a DATE's
+day range: 2,150 queries with no difference) and in `sql_windows.json`.
 How it runs: the query without its window calls is an ordinary query into a scratch Parquet file; each distinct split into partitions and
 peers (`PARTITION BY a ORDER BY b` and `ORDER BY a, b` sort alike and are two) is one pass (`engine/window.zig`) that sorts a view of the
 rows by its keys, computes its calls, and writes the rows back in the order it read them with its columns added; the SELECT list and ORDER

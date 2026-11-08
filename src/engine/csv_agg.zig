@@ -320,6 +320,10 @@ const Fold = struct {
     winners: *expr_agg.WinnerCharge,
     /// Per chunk, an error that stopped it other than a refusal of its text (`Source.failures` holds those).
     errs: []?anyerror,
+    /// Worker time, summed: each chunk's whole (`produce`), and its filter and fold (with the merge) within it.
+    chunk_ns: std.atomic.Value(u64) = .init(0),
+    filter_ns: std.atomic.Value(u64) = .init(0),
+    fold_ns: std.atomic.Value(u64) = .init(0),
 
     fn awaitTurn(f: *Fold, b: usize) bool {
         while (true) {
@@ -380,10 +384,13 @@ const Fold = struct {
     fn foldErased(ctx: *anyopaque, p: *const Plan, parsed: *const consumer.OutputAggregator, a: std.mem.Allocator, i: usize) anyerror!void {
         const f: *Fold = @ptrCast(@alignCast(ctx));
         const cb = try csv_write.ChunkBatch.of(p, parsed, f.lookup, f.evaluated, a);
+        const t_filter = nowMonoNs();
         var batch: *const filter_eval.Batch = &cb.batch;
         const rows = parsed.num_rows;
         var sel = try filter_selection.SelectionVector.init(a, rows);
         if (f.filter) |flt| try filter_eval.evaluate(flt, batch, &sel, f.lookup, a);
+        const t_fold = nowMonoNs();
+        _ = f.filter_ns.fetchAdd(@intCast(t_fold - t_filter), .monotonic);
         _ = f.matched.fetchAdd(sel.count(), .monotonic);
         if (f.keys) |keys| {
             // The grouped fold reads values: a string column parsed as dictionary codes alone is expanded first, as a
@@ -415,6 +422,7 @@ const Fold = struct {
             }
         }
         try f.finish(i);
+        _ = f.fold_ns.fetchAdd(@intCast(nowMonoNs() - t_fold), .monotonic);
     }
 
     fn deinit(f: *Fold) void {
@@ -555,6 +563,8 @@ fn foldOnce(
             }
             fn foldChunk(s: *Source, f: *Fold, t_io: std.Io, i: usize) void {
                 if (!f.awaitTurn(i)) return;
+                const t0 = nowMonoNs();
+                defer _ = f.chunk_ns.fetchAdd(@intCast(nowMonoNs() - t0), .monotonic);
                 s.produce(t_io, null, i) catch |e| {
                     if (!s.failed[i]) f.errs[i] = e;
                     f.failFrom(i);
@@ -573,6 +583,11 @@ fn foldOnce(
         }
     }
     t.decode_wall_ns = @intCast(nowMonoNs() - t_scan);
+    // Summed over the workers, as a Parquet scan's are (`--summary=json` worker_ms): parsing a chunk (framing, typing and
+    // its DECIMAL views) as decode, the WHERE as filter, and the fold with its ordered merge as fold.
+    t.core.eval_ns = fold.filter_ns.load(.monotonic);
+    t.core.encode_ns = fold.fold_ns.load(.monotonic);
+    t.core.decode_ns = fold.chunk_ns.load(.monotonic) -| (t.core.eval_ns +| t.core.encode_ns);
     // The earliest chunk to stop says why, a refusal of its text or another error.
     for (0..source.count) |i| {
         if (source.failed[i]) {

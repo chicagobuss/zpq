@@ -1,7 +1,20 @@
 //! What a query with window functions is made of, between the SQL layer that reads it (`sql_windows.zig`) and the
 //! pass that computes it (`engine/window.zig`): plain data, by column name.
 
-pub const Func = enum { row_number, rank, dense_rank, lag, lead, sum, count, count_star, avg, min, max, first_value, last_value, nth_value, ntile };
+pub const Func = enum { row_number, rank, dense_rank, percent_rank, cume_dist, lag, lead, sum, count, count_star, avg, min, max, first_value, last_value, nth_value, ntile };
+
+/// A whole number or a decimal written in the query, `mant / 10^scale`; `bits` is the width of the integer type DuckDB gives
+/// the literal (32, 64 or 128): arithmetic past the key's type is an error there.
+pub const Number = struct { mant: i128, scale: u8, bits: u8 };
+
+pub const Interval = struct { months: i32, days: i32, micros: i64 };
+
+/// How far a RANGE bound reaches from the row's ORDER BY key, as the query wrote it.
+pub const Reach = union(enum) {
+    number: Number,
+    /// `INTERVAL ..`, on a DATE or TIMESTAMP key.
+    interval: Interval,
+};
 
 pub const Bound = union(enum) {
     unbounded_preceding,
@@ -9,11 +22,14 @@ pub const Bound = union(enum) {
     current_row,
     following: u32,
     unbounded_following,
+    /// RANGE only: the rows whose key is within `Reach` before / after this row's, in the order of the sort.
+    reach_preceding: Reach,
+    reach_following: Reach,
 };
 
-/// `rows`: a ROWS frame between `start` and `end`. Otherwise the frame is a RANGE one: the default (the partition's
-/// start through the last peer of the row, or the whole partition when there is no ORDER BY), or, with `end` at
-/// `unbounded_following`, the whole partition.
+/// `rows`: a ROWS frame between `start` and `end`, counted in rows. Otherwise a RANGE frame: its bounds are the partition's
+/// edges, the row's peers (`current_row`) or a `Reach` from its key; the default frame is `unbounded_preceding` to
+/// `current_row`, or the whole partition when there is no ORDER BY.
 pub const Frame = struct {
     rows: bool = false,
     start: Bound = .unbounded_preceding,

@@ -20,6 +20,7 @@ const streaming = @import("../core/writer/streaming.zig");
 const local_fs = @import("../local_fs.zig");
 const write = @import("write.zig");
 const core_memory = @import("../core/memory.zig");
+const sql_literals = @import("../core/expr/sql_literals.zig");
 
 const Column = filter_eval.Batch.Column;
 const OutputCol = expr_agg.OutputCol;
@@ -42,6 +43,8 @@ pub const Call = struct {
 pub const Spec = struct {
     partition: []const usize,
     order: []const usize,
+    /// The ORDER BY key sorts descending (it is then the only one, where a call reaches by an offset).
+    descending: bool = false,
     calls: []const Call,
 };
 
@@ -58,6 +61,13 @@ pub const Error = error{
     WindowArgumentType,
     /// SUM or AVG of a DOUBLE or FLOAT over a window.
     WindowFloatAggregate,
+    /// A RANGE offset on a key that is no integer, DECIMAL, DOUBLE, DATE or TIMESTAMP (without a time zone), or of a kind the
+    /// key does not take (an INTERVAL on a number, a number on a TIMESTAMP).
+    WindowRangeKey,
+    /// A RANGE offset that reaches the wrong way: DuckDB's "Invalid RANGE PRECEDING value".
+    WindowRangeOffset,
+    /// A key and its RANGE offset that add up past the key's type.
+    WindowRangeOverflow,
     ExceededMemoryBudget,
 };
 
@@ -170,18 +180,27 @@ fn runs(a: std.mem.Allocator, t: Table, spec: Spec) !Runs {
 
 // ---- frames
 
-const Span = struct { lo: usize, hi: usize };
+const Span = struct { lo: u32, hi: u32 };
 
-/// The rows `[lo, hi)` the call's frame covers for row `i`; `lo >= hi` is an empty frame.
-fn frameOf(f: Frame, ordered: bool, r: Runs, i: usize) Span {
+/// The rows `[lo, hi)` the call's frame covers for row `i`; `lo >= hi` is an empty frame. A RANGE frame is read off the
+/// peers (with no ORDER BY every row of the partition is one), and has no offsets: those are `rangeFrames`'.
+fn frameOf(f: Frame, r: Runs, i: usize) Span {
     const ps: i64 = r.pstart[i];
     const pe: i64 = r.pend[i];
     const row: i64 = @intCast(i);
     var lo: i64 = undefined;
     var hi: i64 = undefined;
     if (!f.rows) {
-        lo = ps;
-        hi = if (f.end == .unbounded_following or !ordered) pe else r.gend[i];
+        lo = switch (f.start) {
+            .unbounded_preceding => ps,
+            .current_row => r.gstart[i],
+            else => unreachable,
+        };
+        hi = switch (f.end) {
+            .current_row => r.gend[i],
+            .unbounded_following => pe,
+            else => unreachable,
+        };
     } else {
         lo = switch (f.start) {
             .unbounded_preceding => ps,
@@ -189,6 +208,7 @@ fn frameOf(f: Frame, ordered: bool, r: Runs, i: usize) Span {
             .current_row => row,
             .following => |k| row + k,
             .unbounded_following => pe,
+            else => unreachable,
         };
         hi = switch (f.end) {
             .unbounded_preceding => ps,
@@ -196,12 +216,297 @@ fn frameOf(f: Frame, ordered: bool, r: Runs, i: usize) Span {
             .current_row => row + 1,
             .following => |k| row + k + 1,
             .unbounded_following => pe,
+            else => unreachable,
         };
     }
     // Both ends inside the partition, a frame that ends before it starts empty.
     lo = std.math.clamp(lo, ps, pe);
     hi = std.math.clamp(hi, lo, pe);
     return .{ .lo = @intCast(lo), .hi = @intCast(hi) };
+}
+
+fn reaches(b: Bound) bool {
+    return b == .reach_preceding or b == .reach_following;
+}
+
+/// A value a RANGE offset moves a key to: an exact integer in the units the key and its offset share, or a double.
+const Reached = union(enum) { exact: i256, float: f64 };
+
+const us_per_day: i256 = 86_400_000_000;
+
+/// The ORDER BY key of a RANGE frame with offsets.
+const RangeKey = struct {
+    col: Column,
+    unsigned: bool,
+    descending: bool,
+    kind: Kind,
+
+    const Kind = union(enum) {
+        /// An integer type, with the range it holds.
+        integer: struct { lo: i256, hi: i256 },
+        /// A DECIMAL of this scale.
+        decimal: u8,
+        double,
+        /// Days since the epoch.
+        date,
+        /// Microseconds since the epoch, without a time zone.
+        timestamp,
+    };
+
+    /// An offset against this key: the units both are brought to, and how the key moves by it.
+    const Offset = struct {
+        /// The key's value in the common units is `value * mult`.
+        mult: i256 = 1,
+        off: i256 = 0,
+        off_f: f64 = 0,
+        interval: ?plan_types.Interval = null,
+        /// The range of the type the sum is computed in, when it can leave it.
+        limit: ?struct { lo: i256, hi: i256 } = null,
+    };
+
+    fn of(t: Table, ci: usize, descending: bool) !RangeKey {
+        const e = t.elems[ci];
+        const unsigned = schema.isUnsignedInt(e);
+        const kind: Kind = blk: {
+            if (t.decs[ci]) |d| break :blk .{ .decimal = d.scale };
+            if (e.logical_type) |lt| switch (lt) {
+                .DATE => break :blk .date,
+                .TIMESTAMP => |ts| {
+                    if (ts.isAdjustedToUTC or ts.unit != .MICROS) return error.WindowRangeKey;
+                    break :blk .timestamp;
+                },
+                .INTEGER => |it| break :blk .{ .integer = integerLimits(@intCast(it.bitWidth), it.isSigned) },
+                else => return error.WindowRangeKey,
+            };
+            if (e.converted_type) |ct| switch (ct) {
+                .DATE => break :blk .date,
+                .INT_8 => break :blk .{ .integer = integerLimits(8, true) },
+                .INT_16 => break :blk .{ .integer = integerLimits(16, true) },
+                .INT_32 => break :blk .{ .integer = integerLimits(32, true) },
+                .INT_64 => break :blk .{ .integer = integerLimits(64, true) },
+                .UINT_8 => break :blk .{ .integer = integerLimits(8, false) },
+                .UINT_16 => break :blk .{ .integer = integerLimits(16, false) },
+                .UINT_32 => break :blk .{ .integer = integerLimits(32, false) },
+                .UINT_64 => break :blk .{ .integer = integerLimits(64, false) },
+                else => return error.WindowRangeKey,
+            };
+            break :blk switch (e.type orelse return error.WindowRangeKey) {
+                .INT32 => .{ .integer = integerLimits(32, true) },
+                .INT64 => .{ .integer = integerLimits(64, true) },
+                .DOUBLE => .double,
+                else => return error.WindowRangeKey,
+            };
+        };
+        return .{ .col = t.cols[ci], .unsigned = unsigned, .descending = descending, .kind = kind };
+    }
+
+    fn integerLimits(bits: u8, signed: bool) @FieldType(Kind, "integer") {
+        const one: i256 = 1;
+        return if (signed)
+            .{ .lo = -(one << (bits - 1)), .hi = (one << (bits - 1)) - 1 }
+        else
+            .{ .lo = 0, .hi = (one << bits) - 1 };
+    }
+
+    /// Row `j`'s key as an integer (not a DOUBLE's).
+    fn lane(self: RangeKey, j: usize) i256 {
+        return switch (self.col) {
+            .i32 => |x| if (self.unsigned) @as(u32, @bitCast(x.values[j])) else x.values[j],
+            .i64 => |x| if (self.unsigned) @as(u64, @bitCast(x.values[j])) else x.values[j],
+            .i128 => |x| x.values[j],
+            else => unreachable,
+        };
+    }
+
+    /// `reach` against this key, or the error for an offset of a kind the key does not take.
+    fn resolve(self: RangeKey, reach: plan_types.Reach) !Offset {
+        switch (reach) {
+            .number => |n| switch (self.kind) {
+                .double => return .{ .off_f = expr_ast.decimalToDouble(n.mant, n.scale) },
+                .decimal => |ks| return numberOffset(ks, n),
+                .integer => |k| {
+                    var o = try numberOffset(0, n);
+                    // DuckDB adds in the key's type, or in the narrowest of INTEGER, BIGINT and HUGEINT that holds the key's
+                    // and the offset's both; what leaves it is an error.
+                    if (n.scale == 0) {
+                        var range = k;
+                        if (n.mant > k.hi) range = widest(k, n.mant);
+                        o.limit = .{ .lo = range.lo, .hi = range.hi };
+                    }
+                    return o;
+                },
+                .date => {
+                    if (n.scale != 0) return error.WindowRangeKey;
+                    return .{ .off = n.mant };
+                },
+                .timestamp => return error.WindowRangeKey,
+            },
+            .interval => |iv| switch (self.kind) {
+                .date => return .{ .mult = us_per_day, .interval = iv },
+                .timestamp => return .{ .interval = iv },
+                else => return error.WindowRangeKey,
+            },
+        }
+    }
+
+    fn numberOffset(key_scale: u8, n: plan_types.Number) !Offset {
+        const scale = @max(key_scale, n.scale);
+        return .{
+            .mult = expr_ast.pow10(scale - key_scale),
+            .off = @as(i256, n.mant) * expr_ast.pow10(scale - n.scale),
+        };
+    }
+
+    fn widest(k: @FieldType(Kind, "integer"), mant: i128) @FieldType(Kind, "integer") {
+        for ([_]u8{ 32, 64, 128 }) |bits| {
+            const r = integerLimits(bits, true);
+            if (r.lo <= k.lo and r.hi >= k.hi and mant <= r.hi) return r;
+        }
+        return integerLimits(128, true);
+    }
+
+    /// Row `j`'s key moved by the offset, up (`plus`) or down.
+    fn moved(self: RangeKey, o: Offset, j: usize, plus: bool) !Reached {
+        if (self.kind == .double) {
+            const v = self.col.f64.values[j];
+            return .{ .float = if (plus) v + o.off_f else v - o.off_f };
+        }
+        if (o.interval) |iv| {
+            const v = self.lane(j);
+            const at: sql_literals.Moment = if (self.kind == .date)
+                .{ .days = @intCast(v), .micros = 0 }
+            else
+                .{ .days = @intCast(@divFloor(v, us_per_day)), .micros = @intCast(@mod(v, us_per_day)) };
+            const to = sql_literals.addInterval(at, .{ .months = iv.months, .days = iv.days, .micros = iv.micros }, if (plus) 1 else -1) orelse
+                return error.WindowRangeOverflow;
+            return .{ .exact = @as(i256, to.days) * us_per_day + to.micros };
+        }
+        const v = self.lane(j) * o.mult;
+        const b = if (plus) v + o.off else v - o.off;
+        if (o.limit) |l| if (b < l.lo or b > l.hi) return error.WindowRangeOverflow;
+        return .{ .exact = b };
+    }
+
+    /// Row `j`'s key against `b`, in the units of the offset that made `b`.
+    fn against(self: RangeKey, o: Offset, j: usize, b: Reached) std.math.Order {
+        return switch (b) {
+            .float => |f| floatOrder(self.col.f64.values[j], f),
+            .exact => |e| std.math.order(self.lane(j) * o.mult, e),
+        };
+    }
+
+    /// Whether row `j` comes before `b` in the order of the sort.
+    fn before(self: RangeKey, o: Offset, j: usize, b: Reached) bool {
+        const ord = self.against(o, j, b);
+        return if (self.descending) ord == .gt else ord == .lt;
+    }
+
+    fn after(self: RangeKey, o: Offset, j: usize, b: Reached) bool {
+        const ord = self.against(o, j, b);
+        return if (self.descending) ord == .lt else ord == .gt;
+    }
+
+    /// The first row of `[lo, hi)` that does not come before `b`.
+    fn lowerBound(self: RangeKey, o: Offset, lo: usize, hi: usize, b: Reached) usize {
+        var l = lo;
+        var h = hi;
+        while (l < h) {
+            const mid = l + (h - l) / 2;
+            if (self.before(o, mid, b)) l = mid + 1 else h = mid;
+        }
+        return l;
+    }
+
+    /// The first row of `[lo, hi)` that comes after `b`.
+    fn upperBound(self: RangeKey, o: Offset, lo: usize, hi: usize, b: Reached) usize {
+        var l = lo;
+        var h = hi;
+        while (l < h) {
+            const mid = l + (h - l) / 2;
+            if (self.after(o, mid, b)) h = mid else l = mid + 1;
+        }
+        return l;
+    }
+};
+
+/// The frames of a RANGE frame with an offset, as DuckDB finds them: the key is the only ORDER BY expression, a row whose key
+/// is NULL has its peers for the frame of an offset, and any other row's is searched among the rows with a key. An offset
+/// that puts the bound past the row's own key the wrong way is an error.
+fn rangeFrames(t: Table, r: Runs, spec: Spec, f: Frame, out: []Span) !void {
+    const key = try RangeKey.of(t, spec.order[0], spec.descending);
+    const start: ?RangeKey.Offset = switch (f.start) {
+        .reach_preceding, .reach_following => |reach| try key.resolve(reach),
+        else => null,
+    };
+    const end: ?RangeKey.Offset = switch (f.end) {
+        .reach_preceding, .reach_following => |reach| try key.resolve(reach),
+        else => null,
+    };
+    var at: usize = 0;
+    while (at < t.rows) {
+        const ps: usize = r.pstart[at];
+        const pe: usize = r.pend[at];
+        // The NULLs of a partition are the rows at one end of it.
+        var valid_lo = ps;
+        while (valid_lo < pe and nullAt(key.col, valid_lo)) valid_lo += 1;
+        var valid_hi = pe;
+        while (valid_hi > valid_lo and nullAt(key.col, valid_hi - 1)) valid_hi -= 1;
+        for (ps..pe) |row| {
+            const peer_lo: usize = r.gstart[row];
+            const peer_hi: usize = r.gend[row];
+            const keyless = nullAt(key.col, row);
+            var lo: usize = switch (f.start) {
+                .unbounded_preceding => ps,
+                .current_row => peer_lo,
+                .reach_preceding => if (keyless) peer_lo else blk: {
+                    const o = start.?;
+                    const b = try key.moved(o, row, key.descending);
+                    if (key.before(o, row, b)) return error.WindowRangeOffset;
+                    break :blk key.lowerBound(o, valid_lo, row + 1, b);
+                },
+                .reach_following => if (keyless) peer_lo else blk: {
+                    const o = start.?;
+                    const b = try key.moved(o, row, !key.descending);
+                    if (key.after(o, row, b)) return error.WindowRangeOffset;
+                    break :blk key.lowerBound(o, peer_lo, valid_hi, b);
+                },
+                else => unreachable,
+            };
+            var hi: usize = switch (f.end) {
+                .current_row => peer_hi,
+                .unbounded_following => pe,
+                .reach_preceding => if (keyless) peer_hi else blk: {
+                    const o = end.?;
+                    const b = try key.moved(o, row, key.descending);
+                    if (key.before(o, row, b)) return error.WindowRangeOffset;
+                    break :blk key.upperBound(o, valid_lo, peer_hi, b);
+                },
+                .reach_following => if (keyless) peer_hi else blk: {
+                    const o = end.?;
+                    const b = try key.moved(o, row, !key.descending);
+                    if (key.after(o, row, b)) return error.WindowRangeOffset;
+                    break :blk key.upperBound(o, row, valid_hi, b);
+                },
+                else => unreachable,
+            };
+            // A frame that ends before it starts is empty.
+            lo = @min(lo, pe);
+            hi = std.math.clamp(hi, lo, pe);
+            out[row] = .{ .lo = @intCast(lo), .hi = @intCast(hi) };
+        }
+        at = pe;
+    }
+}
+
+/// Every row's frame for `call`, in window order.
+fn frames(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) ![]const Span {
+    const out = try a.alloc(Span, t.rows);
+    if (!call.frame.rows and (reaches(call.frame.start) or reaches(call.frame.end))) {
+        try rangeFrames(t, r, spec, call.frame, out);
+    } else for (out, 0..) |*s, i| {
+        s.* = frameOf(call.frame, r, i);
+    }
+    return out;
 }
 
 // ---- results
@@ -283,14 +588,8 @@ fn argOf(call: Call) !usize {
     return call.arg orelse error.WindowArgumentType;
 }
 
-/// Whether the frame the call asks for grows from the partition's start, so a running total is its answer.
-fn fromStart(f: Frame) bool {
-    return !f.rows or f.start == .unbounded_preceding;
-}
-
 fn compute(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Out {
     const n = t.rows;
-    const ordered = spec.order.len > 0;
     switch (call.func) {
         .row_number, .rank, .dense_rank => {
             const out = try a.alloc(i64, n);
@@ -300,6 +599,18 @@ fn compute(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Out
                 else => r.dense[i],
             };
             return i64Out(out, null, false);
+        },
+        .percent_rank, .cume_dist => {
+            // DuckDB's: the rows before the row's peers over the partition's other rows; the rows up to its peers' last over all.
+            const out = try a.alloc(f64, n);
+            for (out, 0..) |*o, i| {
+                const size: f64 = @floatFromInt(r.pend[i] - r.pstart[i]);
+                o.* = if (call.func == .percent_rank)
+                    (if (size > 1) @as(f64, @floatFromInt(r.gstart[i] - r.pstart[i])) / (size - 1) else 0)
+                else
+                    @as(f64, @floatFromInt(r.gend[i] - r.pstart[i])) / size;
+            }
+            return .{ .col = .{ .f64 = .{ .values = out } }, .physical = .DOUBLE, .nullable = false };
         },
         .lag, .lead => {
             const ci = try argOf(call);
@@ -317,6 +628,7 @@ fn compute(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Out
             const unsigned = ci < t.elems.len and schema.isUnsignedInt(t.elems[ci]);
             const pick = try a.alloc(i64, n);
             const queue = try a.alloc(u32, n);
+            const spans = try frames(a, t, r, spec, call);
             const want: std.math.Order = if (call.func == .min) .lt else .gt;
             var i: usize = 0;
             while (i < n) {
@@ -326,7 +638,7 @@ fn compute(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Out
                 var tail: usize = 0;
                 var added: usize = ps;
                 for (ps..pe) |row| {
-                    const span = frameOf(call.frame, ordered, r, row);
+                    const span = spans[row];
                     while (added < span.hi) : (added += 1) {
                         if (nullAt(c, added)) continue;
                         // A later value at least as good as the ones queued behind it replaces them.
@@ -348,8 +660,9 @@ fn compute(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Out
         .first_value, .last_value, .nth_value => {
             const ci = try argOf(call);
             const pick = try a.alloc(i64, n);
+            const spans = try frames(a, t, r, spec, call);
             for (pick, 0..) |*p, i| {
-                const s = frameOf(call.frame, ordered, r, i);
+                const s = spans[i];
                 if (s.lo >= s.hi) {
                     p.* = -1;
                     continue;
@@ -379,21 +692,16 @@ fn compute(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Out
         },
         .count_star, .count => {
             const out = try a.alloc(i64, n);
+            const spans = try frames(a, t, r, spec, call);
             if (call.func == .count_star) {
-                for (out, 0..) |*o, i| {
-                    const s = frameOf(call.frame, ordered, r, i);
-                    o.* = @intCast(s.hi - s.lo);
-                }
+                for (out, spans) |*o, s| o.* = s.hi - s.lo;
                 return i64Out(out, null, false);
             }
             const c = t.cols[try argOf(call)];
             const pre = try a.alloc(u32, n + 1);
             pre[0] = 0;
             for (0..n) |i| pre[i + 1] = pre[i] + @intFromBool(!nullAt(c, i));
-            for (out, 0..) |*o, i| {
-                const s = frameOf(call.frame, ordered, r, i);
-                o.* = pre[s.hi] - pre[s.lo];
-            }
+            for (out, spans) |*o, s| o.* = pre[s.hi] - pre[s.lo];
             return i64Out(out, null, false);
         },
         .sum, .avg => return sumOrAvg(a, t, r, spec, call),
@@ -452,7 +760,7 @@ fn integerAt(c: Column, i: usize) i256 {
 
 fn sumOrAvg(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Out {
     const n = t.rows;
-    const ordered = spec.order.len > 0;
+    const spans = try frames(a, t, r, spec, call);
     const ci = try argOf(call);
     const c = t.cols[ci];
     const is_avg = call.func == .avg;
@@ -477,7 +785,7 @@ fn sumOrAvg(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Ou
                 var lo_p: usize = ps;
                 var hi_p: usize = ps;
                 for (ps..pe) |row| {
-                    const span = frameOf(call.frame, ordered, r, row);
+                    const span = spans[row];
                     std.debug.assert(span.lo >= lo_p);
                     while (hi_p < span.hi) : (hi_p += 1) total += integerAt(c, hi_p);
                     while (lo_p < span.lo) : (lo_p += 1) total -= integerAt(c, lo_p);
@@ -487,8 +795,7 @@ fn sumOrAvg(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Ou
             }
             if (is_avg) {
                 const out = try a.alloc(f64, n);
-                for (out, def, 0..) |*o, *d, i| {
-                    const s = frameOf(call.frame, ordered, r, i);
+                for (out, def, spans, 0..) |*o, *d, s, i| {
                     const k = cnt[s.hi] - cnt[s.lo];
                     d.* = @intFromBool(k > 0);
                     if (k == 0) {
@@ -503,8 +810,7 @@ fn sumOrAvg(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Ou
             if (t.decs[ci]) |dd| {
                 const out = try a.alloc(i128, n);
                 const limit = expr_ast.pow10(38);
-                for (out, def, 0..) |*o, *d, i| {
-                    const s = frameOf(call.frame, ordered, r, i);
+                for (out, def, spans, 0..) |*o, *d, s, i| {
                     d.* = @intFromBool(cnt[s.hi] > cnt[s.lo]);
                     o.* = sums[i];
                     if (d.* == 0) any_null = true;
@@ -517,8 +823,7 @@ fn sumOrAvg(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Ou
             // BIGINT, as zpq's own sum is (DuckDB's is a HUGEINT, which it writes to Parquet as a DOUBLE): a frame past
             // 64 bits is an error, by frame.
             const out = try a.alloc(i64, n);
-            for (out, def, 0..) |*o, *d, i| {
-                const s = frameOf(call.frame, ordered, r, i);
+            for (out, def, spans, 0..) |*o, *d, s, i| {
                 d.* = @intFromBool(cnt[s.hi] > cnt[s.lo]);
                 if (d.* == 0) any_null = true;
                 o.* = std.math.cast(i64, sums[i]) orelse return error.WindowSumOverflow;
@@ -767,8 +1072,8 @@ fn estimate(meta: *const schema.FileMetaData, rows: u64, ncalls: usize, referenc
         held += bytes;
         if (ci < referenced.len and referenced[ci]) held += bytes;
     }
-    // Two index arrays and the five run arrays, and per call a value, its levels and a prefix of counts.
-    return held + rows * (8 + 8 + 20 + ncalls * 32);
+    // Two index arrays and the five run arrays, and per call a value, its levels, a prefix of counts and the frames.
+    return held + rows * (8 + 8 + 20 + ncalls * 40);
 }
 
 /// Read `req.input`, sort a view of it by the pass's keys, compute the calls, and write the file's columns, in the order
@@ -838,7 +1143,8 @@ fn runLedgered(gpa: std.mem.Allocator, req: Request) !void {
         for (view, t.cols, referenced) |*v, c, used| v.* = if (used) try gather(a, c, pick, .null) else .{ .i64 = .{ .values = &.{} } };
         break :blk .{ .rows = t.rows, .cols = view, .elems = t.elems, .decs = t.decs };
     };
-    const outs = try columns(a, sorted, .{ .partition = part, .order = order, .calls = calls });
+    const order_desc = order.len > 0 and keys[keys.len - 1].descending;
+    const outs = try columns(a, sorted, .{ .partition = part, .order = order, .descending = order_desc, .calls = calls });
 
     // Back to the file's order: row `i` takes the answer of the window position that held it.
     const results: []const Out = if (keys.len == 0) outs else blk: {
@@ -931,6 +1237,8 @@ test "window: ranking, offsets and frames over partitions of a sorted table" {
         .{ .func = .sum, .arg = 2, .frame = .{ .rows = true, .start = .{ .preceding = 1 }, .end = .current_row } },
         .{ .func = .max, .arg = 2, .frame = .{ .rows = true, .start = .current_row, .end = .unbounded_following } },
         .{ .func = .count_star, .frame = .{ .rows = true, .start = .{ .following = 5 }, .end = .{ .following = 9 } } },
+        .{ .func = .percent_rank },
+        .{ .func = .cume_dist },
     };
     const out = try columns(a, t, .{ .partition = &.{0}, .order = &.{1}, .calls = &calls });
     try T.expectEqualSlices(i64, &.{ 1, 2, 3, 1, 2, 3 }, out[0].col.i64.values);
@@ -943,6 +1251,10 @@ test "window: ranking, offsets and frames over partitions of a sorted table" {
     try T.expectEqualSlices(i64, &.{ 30, 30, 30, 60, 60, 60 }, out[6].col.i64.values);
     // A frame wholly past the partition's end is empty.
     try T.expectEqualSlices(i64, &.{ 0, 0, 0, 0, 0, 0 }, out[7].col.i64.values);
+    // Rows before the row's peers over the other rows of the partition (0 for a partition of one); the rows up to its last peer over all.
+    try T.expectEqualSlices(f64, &.{ 0, 0, 1, 0, 0.5, 0.5 }, out[8].col.f64.values);
+    const third: f64 = 1.0 / 3.0;
+    try T.expectEqualSlices(f64, &.{ 2.0 / 3.0, 2.0 / 3.0, 1, third, 1, 1 }, out[9].col.f64.values);
 }
 
 fn intElem() schema.SchemaElement {
@@ -957,17 +1269,111 @@ test "window: frames are clamped into the partition" {
     var gend = [_]u32{ 3, 4, 5 };
     var dense = [_]u32{ 1, 2, 3 };
     const r: Runs = .{ .pstart = &pstart, .pend = &pend, .gstart = &gstart, .gend = &gend, .dense = &dense };
-    const far = frameOf(.{ .rows = true, .start = .{ .following = 40 }, .end = .{ .following = 50 } }, true, r, 1);
-    try T.expectEqual(@as(usize, 5), far.lo);
-    try T.expectEqual(@as(usize, 5), far.hi);
-    const behind = frameOf(.{ .rows = true, .start = .{ .preceding = 50 }, .end = .{ .preceding = 40 } }, true, r, 1);
-    try T.expectEqual(@as(usize, 2), behind.lo);
-    try T.expectEqual(@as(usize, 2), behind.hi);
-    const default = frameOf(.{}, true, r, 1);
-    try T.expectEqual(@as(usize, 2), default.lo);
-    try T.expectEqual(@as(usize, 4), default.hi);
-    const whole = frameOf(.{}, false, r, 1);
-    try T.expectEqual(@as(usize, 5), whole.hi);
+    const far = frameOf(.{ .rows = true, .start = .{ .following = 40 }, .end = .{ .following = 50 } }, r, 1);
+    try T.expectEqual(@as(u32, 5), far.lo);
+    try T.expectEqual(@as(u32, 5), far.hi);
+    const behind = frameOf(.{ .rows = true, .start = .{ .preceding = 50 }, .end = .{ .preceding = 40 } }, r, 1);
+    try T.expectEqual(@as(u32, 2), behind.lo);
+    try T.expectEqual(@as(u32, 2), behind.hi);
+    const default = frameOf(.{}, r, 1);
+    try T.expectEqual(@as(u32, 2), default.lo);
+    try T.expectEqual(@as(u32, 4), default.hi);
+    const whole = frameOf(.{ .end = .unbounded_following }, r, 1);
+    try T.expectEqual(@as(u32, 5), whole.hi);
+    // Peers on both sides.
+    const peers = frameOf(.{ .start = .current_row }, r, 1);
+    try T.expectEqual(@as(u32, 3), peers.lo);
+    try T.expectEqual(@as(u32, 4), peers.hi);
+}
+
+fn offset(m: i128) plan_types.Reach {
+    return .{ .number = .{ .mant = m, .scale = 0, .bits = 32 } };
+}
+
+fn reachFrame(start: Bound, end: Bound) Frame {
+    return .{ .start = start, .end = end };
+}
+
+/// The frames of `f` over one partition whose ORDER BY key is `keys`, NULL where `nulls` says.
+fn rangeSpans(a: std.mem.Allocator, keys: []const i64, nulls: []const bool, elem: schema.SchemaElement, descending: bool, f: Frame) ![]const Span {
+    const p = try a.alloc(i64, keys.len);
+    @memset(p, 1);
+    const def = try a.alloc(u32, keys.len);
+    for (def, nulls) |*d, is_null| d.* = @intFromBool(!is_null);
+    const cols = try a.dupe(Column, &.{
+        .{ .i64 = .{ .values = p } },
+        .{ .i64 = .{ .values = keys, .def_levels = def, .max_def = 1, .has_nulls = true } },
+    });
+    const elems = try a.dupe(schema.SchemaElement, &.{ intElem(), elem });
+    const t: Table = .{ .rows = keys.len, .cols = cols, .elems = elems, .decs = &.{ null, null } };
+    const spec: Spec = .{ .partition = &.{0}, .order = &.{1}, .descending = descending, .calls = &.{} };
+    const r = try runs(a, t, spec);
+    const out = try a.alloc(Span, keys.len);
+    try rangeFrames(t, r, spec, f, out);
+    return out;
+}
+
+fn expectSpans(want: []const [2]u32, got: []const Span) !void {
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |w, g| {
+        try std.testing.expectEqual(w[0], g.lo);
+        try std.testing.expectEqual(w[1], g.hi);
+    }
+}
+
+test "window: a RANGE offset frames the rows whose key is within reach, a NULL key its peers" {
+    const T = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Ascending, NULLs last: keys 1, 2, 2, 4, 7 and two NULLs.
+    const keys = [_]i64{ 1, 2, 2, 4, 7, 0, 0 };
+    const nulls = [_]bool{ false, false, false, false, false, true, true };
+    try expectSpans(&.{ .{ 0, 3 }, .{ 0, 3 }, .{ 0, 3 }, .{ 3, 4 }, .{ 4, 5 }, .{ 5, 7 }, .{ 5, 7 } }, try rangeSpans(a, &keys, &nulls, intElem(), false, reachFrame(.{ .reach_preceding = offset(1) }, .{ .reach_following = offset(1) })));
+    // The end 1 PRECEDING can leave a frame empty; a NULL key's frame runs to the end of its peers.
+    try expectSpans(&.{ .{ 0, 0 }, .{ 0, 1 }, .{ 0, 1 }, .{ 0, 3 }, .{ 0, 4 }, .{ 0, 7 }, .{ 0, 7 } }, try rangeSpans(a, &keys, &nulls, intElem(), false, reachFrame(.unbounded_preceding, .{ .reach_preceding = offset(1) })));
+    // 1 FOLLOWING to the end takes in the NULLs, which sort after every key.
+    try expectSpans(&.{ .{ 1, 7 }, .{ 3, 7 }, .{ 3, 7 }, .{ 4, 7 }, .{ 5, 7 }, .{ 5, 7 }, .{ 5, 7 } }, try rangeSpans(a, &keys, &nulls, intElem(), false, reachFrame(.{ .reach_following = offset(1) }, .unbounded_following)));
+    // Descending, NULLs first: 7, 4, 2, 2, 1 after two NULLs; before and after follow the order of the sort.
+    const down = [_]i64{ 0, 0, 7, 4, 2, 2, 1 };
+    const down_nulls = [_]bool{ true, true, false, false, false, false, false };
+    try expectSpans(&.{ .{ 0, 2 }, .{ 0, 2 }, .{ 2, 3 }, .{ 3, 4 }, .{ 4, 6 }, .{ 4, 6 }, .{ 4, 7 } }, try rangeSpans(a, &down, &down_nulls, intElem(), true, reachFrame(.{ .reach_preceding = offset(1) }, .current_row)));
+    // From the row's first peer to the last row with its key.
+    try expectSpans(&.{ .{ 0, 1 }, .{ 1, 3 }, .{ 1, 3 }, .{ 3, 4 }, .{ 4, 5 }, .{ 5, 7 }, .{ 5, 7 } }, try rangeSpans(a, &keys, &nulls, intElem(), false, reachFrame(.current_row, .{ .reach_following = offset(0) })));
+}
+
+test "window: a RANGE offset past the key's type or the wrong way is an error, and the key's type decides" {
+    const T = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const keys = [_]i64{ 100, 126, 127 };
+    const none = [_]bool{ false, false, false };
+    var tiny = intElem();
+    tiny.converted_type = .INT_8;
+    // 127 + 1 leaves a TINYINT; 200 is an INTEGER offset, and the sum is computed in that.
+    try T.expectError(error.WindowRangeOverflow, rangeSpans(a, &keys, &none, tiny, false, reachFrame(.current_row, .{ .reach_following = offset(1) })));
+    try expectSpans(&.{ .{ 0, 3 }, .{ 0, 3 }, .{ 0, 3 } }, try rangeSpans(a, &keys, &none, tiny, false, reachFrame(.{ .reach_preceding = offset(200) }, .unbounded_following)));
+    try T.expectError(error.WindowRangeOffset, rangeSpans(a, &keys, &none, intElem(), false, reachFrame(.{ .reach_preceding = offset(-1) }, .current_row)));
+    try T.expectError(error.WindowRangeOffset, rangeSpans(a, &keys, &none, intElem(), true, reachFrame(.current_row, .{ .reach_following = offset(-1) })));
+    // An INTERVAL needs a DATE or TIMESTAMP key.
+    try T.expectError(error.WindowRangeKey, rangeSpans(a, &keys, &none, intElem(), false, reachFrame(.{ .reach_preceding = .{ .interval = .{ .months = 0, .days = 1, .micros = 0 } } }, .current_row)));
+}
+
+test "window: an INTERVAL offset on a DATE moves by calendar months, the day clamped to the month" {
+    const T = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(T.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // 2000-01-31, 2000-02-29, 2000-03-31.
+    const days = [_]i64{ 10987, 11016, 11047 };
+    const none = [_]bool{ false, false, false };
+    var date = intElem();
+    date.logical_type = .{ .DATE = .{} };
+    const month: plan_types.Reach = .{ .interval = .{ .months = 1, .days = 0, .micros = 0 } };
+    try expectSpans(&.{ .{ 0, 1 }, .{ 0, 2 }, .{ 1, 3 } }, try rangeSpans(a, &days, &none, date, false, reachFrame(.{ .reach_preceding = month }, .current_row)));
+    // A whole number on a DATE is days.
+    try expectSpans(&.{ .{ 0, 1 }, .{ 1, 2 }, .{ 2, 3 } }, try rangeSpans(a, &days, &none, date, false, reachFrame(.{ .reach_preceding = offset(1) }, .current_row)));
 }
 
 test "window: AVG finalizes as DuckDB does, short types in doubles and the rest in long doubles" {

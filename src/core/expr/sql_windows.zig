@@ -10,6 +10,9 @@ const c = @import("liteparser_c");
 const wp = @import("window_plan.zig");
 const sql_setops = @import("sql_setops.zig");
 const sql_names = @import("sql_names.zig");
+const sql_literals = @import("sql_literals.zig");
+
+const interval_marker = sql_literals.frame_interval;
 
 pub const Error = error{ OutOfMemory, SqlParseError, WindowNotSupported, SelectAliasRequired };
 
@@ -252,15 +255,52 @@ const Builder = struct {
         return std.fmt.parseInt(u32, std.mem.span(n.u.literal.value), 10) catch return self.why.set("{s} is out of range", .{what});
     }
 
-    fn bound(self: *Builder, node: ?*c.LpNode) Error!wp.Bound {
+    /// How far a RANGE bound reaches: a whole number or a decimal written in the query, or an INTERVAL (which `frameIntervals`
+    /// has made a string literal). A negative one is an error in DuckDB, whenever a row has a key.
+    fn reach(self: *Builder, node: ?*c.LpNode) Error!wp.Reach {
+        const n = node orelse return self.why.set("a RANGE offset needs a number", .{});
+        switch (n.kind) {
+            c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT => {
+                const text = std.mem.span(n.u.literal.value);
+                const dot = std.mem.indexOfScalar(u8, text, '.');
+                const whole = if (dot) |d| text[0..d] else text;
+                const frac = if (dot) |d| text[d + 1 ..] else "";
+                if (std.mem.indexOfAny(u8, text, "eE") != null)
+                    return self.why.set("a RANGE offset written as a floating-point number is not supported", .{});
+                if (whole.len + frac.len > 38 or whole.len + frac.len == 0 or frac.len > 38)
+                    return self.why.set("this RANGE offset is out of range", .{});
+                var digits: [40]u8 = undefined;
+                @memcpy(digits[0..whole.len], whole);
+                @memcpy(digits[whole.len..][0..frac.len], frac);
+                const mant = std.fmt.parseInt(i128, digits[0 .. whole.len + frac.len], 10) catch return self.why.set("this RANGE offset is out of range", .{});
+                const bits: u8 = if (mant <= std.math.maxInt(i32)) 32 else if (mant <= std.math.maxInt(i64)) 64 else 128;
+                return .{ .number = .{ .mant = mant, .scale = @intCast(frac.len), .bits = bits } };
+            },
+            c.LP_EXPR_LITERAL_STRING => {
+                const text = std.mem.span(n.u.literal.value);
+                if (std.mem.startsWith(u8, text, interval_marker)) {
+                    var it = std.mem.splitScalar(u8, text[interval_marker.len..], ':');
+                    const months = std.fmt.parseInt(i32, it.next() orelse return error.SqlParseError, 10) catch return error.SqlParseError;
+                    const days = std.fmt.parseInt(i32, it.next() orelse return error.SqlParseError, 10) catch return error.SqlParseError;
+                    const micros = std.fmt.parseInt(i64, it.next() orelse return error.SqlParseError, 10) catch return error.SqlParseError;
+                    return .{ .interval = .{ .months = months, .days = days, .micros = micros } };
+                }
+            },
+            c.LP_EXPR_UNARY_OP => return self.why.set("a negative RANGE offset is an error in DuckDB, and is not supported", .{}),
+            else => {},
+        }
+        return self.why.set("a RANGE offset must be a number or an INTERVAL written in the query", .{});
+    }
+
+    fn bound(self: *Builder, node: ?*c.LpNode, rows: bool) Error!wp.Bound {
         const n = node orelse return .current_row;
         const b = n.u.frame_bound;
         return switch (b.type) {
             c.LP_BOUND_CURRENT_ROW => .current_row,
             c.LP_BOUND_UNBOUNDED_PRECEDING => .unbounded_preceding,
             c.LP_BOUND_UNBOUNDED_FOLLOWING => .unbounded_following,
-            c.LP_BOUND_PRECEDING => .{ .preceding = try self.literalInt(b.expr, "a frame offset") },
-            c.LP_BOUND_FOLLOWING => .{ .following = try self.literalInt(b.expr, "a frame offset") },
+            c.LP_BOUND_PRECEDING => if (rows) .{ .preceding = try self.literalInt(b.expr, "a frame offset") } else .{ .reach_preceding = try self.reach(b.expr) },
+            c.LP_BOUND_FOLLOWING => if (rows) .{ .following = try self.literalInt(b.expr, "a frame offset") } else .{ .reach_following = try self.reach(b.expr) },
             else => return self.why.set("this frame bound is not supported", .{}),
         };
     }
@@ -270,21 +310,15 @@ const Builder = struct {
         const f = n.u.window_frame;
         if (f.exclude != c.LP_EXCLUDE_NONE and f.exclude != c.LP_EXCLUDE_NO_OTHERS)
             return self.why.set("EXCLUDE in a window frame is not supported", .{});
-        const start = try self.bound(f.start);
-        const end = try self.bound(f.end);
+        if (f.type != c.LP_FRAME_ROWS and f.type != c.LP_FRAME_RANGE) return self.why.set("GROUPS frames are not supported", .{});
+        const rows = f.type == c.LP_FRAME_ROWS;
+        const start = try self.bound(f.start, rows);
+        const end = try self.bound(f.end, rows);
         if (start == .unbounded_following or end == .unbounded_preceding)
             return self.why.set("a window frame cannot start at UNBOUNDED FOLLOWING or end at UNBOUNDED PRECEDING", .{});
         // DuckDB's parser refuses a frame that starts after it ends in kind (`1 FOLLOWING AND 1 PRECEDING`).
         if (boundClass(start) > boundClass(end)) return self.why.set("this window frame starts after it ends", .{});
-        switch (f.type) {
-            c.LP_FRAME_ROWS => return .{ .rows = true, .start = start, .end = end },
-            c.LP_FRAME_RANGE => {
-                if (start != .unbounded_preceding or (end != .current_row and end != .unbounded_following))
-                    return self.why.set("RANGE frames are supported only as UNBOUNDED PRECEDING to CURRENT ROW or to UNBOUNDED FOLLOWING", .{});
-                return .{ .rows = false, .start = start, .end = end };
-            },
-            else => return self.why.set("GROUPS frames are not supported", .{}),
-        }
+        return .{ .rows = rows, .start = start, .end = end };
     }
 
     /// Register the window call `node`; its result column's name.
@@ -305,7 +339,7 @@ const Builder = struct {
         var call: wp.Call = .{ .func = undefined };
         const Kind = enum { ranking, offset, aggregate, value, tile };
         const kind: Kind = blk: {
-            if (std.mem.eql(u8, name, "row_number")) call.func = .row_number else if (std.mem.eql(u8, name, "rank")) call.func = .rank else if (std.mem.eql(u8, name, "dense_rank")) call.func = .dense_rank else if (std.mem.eql(u8, name, "lag")) {
+            if (std.mem.eql(u8, name, "row_number")) call.func = .row_number else if (std.mem.eql(u8, name, "rank")) call.func = .rank else if (std.mem.eql(u8, name, "dense_rank")) call.func = .dense_rank else if (std.mem.eql(u8, name, "percent_rank")) call.func = .percent_rank else if (std.mem.eql(u8, name, "cume_dist")) call.func = .cume_dist else if (std.mem.eql(u8, name, "lag")) {
                 call.func = .lag;
                 break :blk .offset;
             } else if (std.mem.eql(u8, name, "lead")) {
@@ -338,7 +372,7 @@ const Builder = struct {
             } else if (std.mem.eql(u8, name, "ntile")) {
                 call.func = .ntile;
                 break :blk .tile;
-            } else return self.why.set("the window function {s} is not supported (row_number, rank, dense_rank, ntile, lag, lead, first_value, last_value, nth_value, sum, count, avg, min and max are)", .{raw});
+            } else return self.why.set("the window function {s} is not supported (row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value, sum, count, avg, min and max are)", .{raw});
             break :blk .ranking;
         };
         switch (kind) {
@@ -401,6 +435,8 @@ const Builder = struct {
         if (try self.frame(wd.frame)) |fr| {
             // The grammar hands every window a frame; the default one is no frame at all.
             const is_default = !fr.rows and fr.start == .unbounded_preceding and fr.end == .current_row;
+            const reaches = (fr.start == .reach_preceding or fr.start == .reach_following or fr.end == .reach_preceding or fr.end == .reach_following);
+            if (reaches and order.items.len != 1) return self.why.set("a RANGE frame with an offset needs exactly one ORDER BY key", .{});
             if (kind != .aggregate and kind != .value and !is_default) return self.why.set("a frame on {s} is not supported", .{raw});
             call.frame = fr;
         }
@@ -450,9 +486,9 @@ const Builder = struct {
 fn boundClass(b: wp.Bound) u8 {
     return switch (b) {
         .unbounded_preceding => 0,
-        .preceding => 1,
+        .preceding, .reach_preceding => 1,
         .current_row => 2,
-        .following => 3,
+        .following, .reach_following => 3,
         .unbounded_following => 4,
     };
 }
@@ -749,4 +785,62 @@ test "QUALIFY comes before ORDER BY and LIMIT, and a window function must be som
     try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT id, rank() OVER (ORDER BY id) AS r FROM t LIMIT 3 QUALIFY r > 2", &why, columns));
     try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT id, v + 1 AS x FROM t QUALIFY x > 20", &why, columns));
     _ = try build(a, "SELECT id, rank() OVER (ORDER BY id) AS r FROM t QUALIFY id > 2", &why, columns);
+}
+
+test "windows: a RANGE frame's offset is a reach from the ORDER BY key, in the width DuckDB gives the literal" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var why: Refusal = .{};
+    const text: [:0]const u8 = "SELECT sum(v) OVER (ORDER BY i RANGE BETWEEN 3 PRECEDING AND 2 FOLLOWING) AS a, " ++
+        "count(*) OVER (ORDER BY i RANGE BETWEEN 1000000000000 PRECEDING AND 1.5 FOLLOWING) AS b, " ++
+        "sum(v) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c, " ++
+        "sum(v) OVER (ORDER BY i DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS d FROM t";
+    const plan = try build(a, text, &why, null);
+    // Three ORDER BY i calls share one pass; the DESC one sorts its own way.
+    try std.testing.expectEqual(@as(usize, 2), plan.passes.len);
+    const calls = plan.passes[0].calls;
+    try std.testing.expectEqual(@as(usize, 3), calls.len);
+    try std.testing.expectEqual(wp.Bound{ .reach_preceding = .{ .number = .{ .mant = 3, .scale = 0, .bits = 32 } } }, calls[0].frame.start);
+    try std.testing.expectEqual(wp.Bound{ .reach_following = .{ .number = .{ .mant = 2, .scale = 0, .bits = 32 } } }, calls[0].frame.end);
+    // A literal past INT32 is added in BIGINT; a decimal keeps its scale.
+    try std.testing.expectEqual(wp.Bound{ .reach_preceding = .{ .number = .{ .mant = 1000000000000, .scale = 0, .bits = 64 } } }, calls[1].frame.start);
+    try std.testing.expectEqual(wp.Bound{ .reach_following = .{ .number = .{ .mant = 15, .scale = 1, .bits = 32 } } }, calls[1].frame.end);
+    // ROWS keeps counting rows.
+    try std.testing.expect(calls[2].frame.rows);
+    try std.testing.expectEqual(wp.Bound{ .preceding = 1 }, calls[2].frame.start);
+    try std.testing.expectEqual(wp.Bound{ .following = 1 }, calls[2].frame.end);
+    // Under DESC a reach is still the ORDER BY key's own reach: the pass says which way it sorts.
+    try std.testing.expect(plan.passes[1].sort[0].descending);
+    try std.testing.expectEqual(wp.Bound{ .reach_preceding = .{ .number = .{ .mant = 1, .scale = 0, .bits = 32 } } }, plan.passes[1].calls[0].frame.start);
+}
+
+test "windows: an INTERVAL offset reaches through the frame marker string the parser leaves" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var why: Refusal = .{};
+    var report: sql_literals.Report = .{};
+    const sql = "SELECT count(*) OVER (ORDER BY ts RANGE BETWEEN INTERVAL '2 days 3 hours' PRECEDING AND INTERVAL 1 MONTH FOLLOWING) AS n FROM t";
+    const framed = try sql_literals.frameIntervals(a, sql, &report);
+    const plan = try build(a, try std.fmt.allocPrintSentinel(a, "{s}", .{framed}, 0), &why, null);
+    const call = plan.passes[0].calls[0];
+    try std.testing.expectEqual(wp.Bound{ .reach_preceding = .{ .interval = .{ .months = 0, .days = 2, .micros = 10_800_000_000 } } }, call.frame.start);
+    try std.testing.expectEqual(wp.Bound{ .reach_following = .{ .interval = .{ .months = 1, .days = 0, .micros = 0 } } }, call.frame.end);
+}
+
+test "windows: a RANGE offset is refused where no key or offset of the query reaches" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var why: Refusal = .{};
+    // DuckDB binds these as errors too: an offset needs exactly one ORDER BY key, and a value a key can be moved by.
+    try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT sum(v) OVER (ORDER BY i, v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM t", &why, null));
+    try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT sum(v) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM t", &why, null));
+    try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT sum(v) OVER (ORDER BY i RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) AS s FROM t", &why, null));
+    try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT sum(v) OVER (ORDER BY i RANGE BETWEEN 1e5 PRECEDING AND CURRENT ROW) AS s FROM t", &why, null));
+    try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT sum(v) OVER (ORDER BY i RANGE BETWEEN v PRECEDING AND CURRENT ROW) AS s FROM t", &why, null));
+    try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT sum(v) OVER (ORDER BY i RANGE BETWEEN NULL PRECEDING AND CURRENT ROW) AS s FROM t", &why, null));
+    // An offset that reaches the other way from the key is what the engine refuses, not the planner.
+    _ = try build(a, "SELECT sum(v) OVER (ORDER BY i RANGE BETWEEN 0 PRECEDING AND 0 FOLLOWING) AS s FROM t", &why, null);
 }

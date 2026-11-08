@@ -232,6 +232,21 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         ),
         error.WindowDefaultType => diagnosticPrint("zpq query: the default of lag / lead does not fit the type of its column\n", .{}),
         error.WindowSumOverflow => diagnosticPrint("zpq query: a window SUM is out of range for its result type\n", .{}),
+        error.WindowRangeOverflow => diagnosticPrint(
+            "zpq query: an ORDER BY key plus its RANGE offset leaves the key's type\n",
+            .{},
+        ),
+        error.WindowRangeOffset => diagnosticPrint(
+            "zpq query: a RANGE offset reaches the wrong way from the ORDER BY key\n" ++
+                "  (DuckDB's Invalid RANGE PRECEDING value)\n",
+            .{},
+        ),
+        error.WindowRangeKey => diagnosticPrint(
+            "zpq query: a RANGE offset needs one ORDER BY key whose type it reaches\n" ++
+                "  (an integer, DECIMAL, DOUBLE, DATE or TIMESTAMP), and an offset that key\n" ++
+                "  takes: a number, or an INTERVAL on a DATE or TIMESTAMP\n",
+            .{},
+        ),
         error.WindowColumnType => diagnosticPrint("zpq query: a column of a window query has a type zpq does not carry through a window (nested, INT96, fixed-length bytes)\n", .{}),
         error.WindowTooManyRows => diagnosticPrint("zpq query: a window over more than 4294967294 rows is not supported\n", .{}),
         error.WindowArgumentType => diagnosticPrint("zpq query: this window function does not take that type (SUM and AVG take integers and DECIMALs)\n", .{}),

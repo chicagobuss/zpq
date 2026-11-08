@@ -19,6 +19,10 @@
   {
    "name": "wa",
    "path": "ci/fixtures/parquet/sql_windows_alias.parquet"
+  },
+  {
+   "name": "wr",
+   "path": "ci/fixtures/parquet/sql_windows_range.parquet"
   }
  ],
  "cases": [
@@ -664,21 +668,6 @@
    "oracle": {
     "compare": "written_sql",
     "sql": "SELECT id, row_number() OVER (ORDER BY v DESC NULLS LAST, id) AS a, row_number() OVER (ORDER BY v ASC NULLS FIRST, id) AS b, rank() OVER (ORDER BY s DESC, id) AS c, row_number() OVER (PARTITION BY g ORDER BY d NULLS FIRST, id) AS e FROM '{fixture:wn}'"
-   }
-  },
-  {
-   "id": "sql_windows:refuse:range-offset",
-   "fixture": "wn",
-   "cli": [
-    "query",
-    "--query",
-    "SELECT id, sum(v) OVER (ORDER BY id RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wn}'",
-    "--summary=json"
-   ],
-   "refuse": {
-    "error": "WindowNotSupported",
-    "diag": "RANGE frames are supported only",
-    "exit": 2
    }
   },
   {
@@ -2090,6 +2079,437 @@
     "exit": 2,
     "binder_sql": "SELECT id, rank() OVER (ORDER BY id) AS r FROM '{fixture:wa}' LIMIT 3 QUALIFY r > 2",
     "duck_error": "Parser Error:"
+   }
+  },
+  {
+   "id": "sql_windows:range-offset-int",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY i RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) AS c1, sum(v) OVER (ORDER BY i RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS s2, count(*) OVER (PARTITION BY g ORDER BY i RANGE BETWEEN 1 FOLLOWING AND 4 FOLLOWING) AS c3, sum(v) OVER (ORDER BY i RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS s4 FROM '{fixture:wr}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, count(*) OVER (ORDER BY i RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) AS c1, sum(v) OVER (ORDER BY i RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS s2, count(*) OVER (PARTITION BY g ORDER BY i RANGE BETWEEN 1 FOLLOWING AND 4 FOLLOWING) AS c3, sum(v) OVER (ORDER BY i RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS s4 FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:range-offset-key-types",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY tx RANGE BETWEEN 200 PRECEDING AND 0 FOLLOWING) AS tiny, count(*) OVER (ORDER BY b RANGE BETWEEN 1000000000000 PRECEDING AND CURRENT ROW) AS big, count(*) OVER (ORDER BY u RANGE BETWEEN CURRENT ROW AND 5 FOLLOWING) AS ubig, count(*) OVER (ORDER BY t RANGE BETWEEN 200 PRECEDING AND 200 FOLLOWING) AS t8 FROM '{fixture:wr}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, count(*) OVER (ORDER BY tx RANGE BETWEEN 200 PRECEDING AND 0 FOLLOWING) AS tiny, count(*) OVER (ORDER BY b RANGE BETWEEN 1000000000000 PRECEDING AND CURRENT ROW) AS big, count(*) OVER (ORDER BY u RANGE BETWEEN CURRENT ROW AND 5 FOLLOWING) AS ubig, count(*) OVER (ORDER BY t RANGE BETWEEN 200 PRECEDING AND 200 FOLLOWING) AS t8 FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:range-offset-decimals",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY d RANGE BETWEEN 1.5 PRECEDING AND 1.5 FOLLOWING) AS c1, sum(d) OVER (ORDER BY d RANGE BETWEEN 0.25 PRECEDING AND CURRENT ROW) AS s2, count(*) OVER (ORDER BY d RANGE BETWEEN 2 PRECEDING AND 0.5 PRECEDING) AS c3 FROM '{fixture:wr}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, count(*) OVER (ORDER BY d RANGE BETWEEN 1.5 PRECEDING AND 1.5 FOLLOWING) AS c1, sum(d) OVER (ORDER BY d RANGE BETWEEN 0.25 PRECEDING AND CURRENT ROW) AS s2, count(*) OVER (ORDER BY d RANGE BETWEEN 2 PRECEDING AND 0.5 PRECEDING) AS c3 FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:range-offset-double",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c1, count(*) OVER (ORDER BY x RANGE BETWEEN 0.5 PRECEDING AND CURRENT ROW) AS c2, min(v) OVER (ORDER BY x RANGE BETWEEN 2 FOLLOWING AND 4 FOLLOWING) AS m3 FROM '{fixture:wr}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, count(*) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c1, count(*) OVER (ORDER BY x RANGE BETWEEN 0.5 PRECEDING AND CURRENT ROW) AS c2, min(v) OVER (ORDER BY x RANGE BETWEEN 2 FOLLOWING AND 4 FOLLOWING) AS m3 FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:range-offset-dates",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY dt RANGE BETWEEN 30 PRECEDING AND CURRENT ROW) AS days, count(*) OVER (ORDER BY dt RANGE BETWEEN INTERVAL 1 MONTH PRECEDING AND CURRENT ROW) AS months, count(*) OVER (ORDER BY dt RANGE BETWEEN INTERVAL 2 DAY PRECEDING AND INTERVAL 2 DAY FOLLOWING) AS both FROM '{fixture:wr}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, count(*) OVER (ORDER BY dt RANGE BETWEEN 30 PRECEDING AND CURRENT ROW) AS days, count(*) OVER (ORDER BY dt RANGE BETWEEN INTERVAL 1 MONTH PRECEDING AND CURRENT ROW) AS months, count(*) OVER (ORDER BY dt RANGE BETWEEN INTERVAL 2 DAY PRECEDING AND INTERVAL 2 DAY FOLLOWING) AS both FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:range-offset-timestamps",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 6 HOUR PRECEDING AND CURRENT ROW) AS hours, count(*) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 1 DAY PRECEDING AND INTERVAL 1 DAY FOLLOWING) AS days, count(*) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 1 MONTH PRECEDING AND CURRENT ROW) AS months FROM '{fixture:wr}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, count(*) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 6 HOUR PRECEDING AND CURRENT ROW) AS hours, count(*) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 1 DAY PRECEDING AND INTERVAL 1 DAY FOLLOWING) AS days, count(*) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 1 MONTH PRECEDING AND CURRENT ROW) AS months FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:range-offset-null-keys",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY i RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS a, count(*) OVER (ORDER BY i NULLS FIRST RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS b, count(*) OVER (ORDER BY i DESC RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS c, count(*) OVER (ORDER BY i DESC NULLS LAST RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) AS d FROM '{fixture:wr}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, count(*) OVER (ORDER BY i RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS a, count(*) OVER (ORDER BY i NULLS FIRST RANGE BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS b, count(*) OVER (ORDER BY i DESC RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS c, count(*) OVER (ORDER BY i DESC NULLS LAST RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) AS d FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:range-offset-desc-partitioned",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (PARTITION BY g ORDER BY v DESC RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) AS a, sum(v) OVER (PARTITION BY g ORDER BY id RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS b FROM '{fixture:wr}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, count(*) OVER (PARTITION BY g ORDER BY v DESC RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) AS a, sum(v) OVER (PARTITION BY g ORDER BY id RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS b FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:range-offset-frame-kinds",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY i RANGE BETWEEN 5 PRECEDING AND 5 PRECEDING) AS same, count(*) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED PRECEDING AND 3 FOLLOWING) AS head, min(v) OVER (ORDER BY i RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS lo, max(v) OVER (ORDER BY i RANGE BETWEEN CURRENT ROW AND 2 FOLLOWING) AS hi, avg(v) OVER (ORDER BY i RANGE BETWEEN 4 PRECEDING AND 4 FOLLOWING) AS av, first_value(v) OVER (PARTITION BY g ORDER BY id RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS fv, last_value(v) OVER (PARTITION BY g ORDER BY id RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS lv FROM '{fixture:wr}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, count(*) OVER (ORDER BY i RANGE BETWEEN 5 PRECEDING AND 5 PRECEDING) AS same, count(*) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED PRECEDING AND 3 FOLLOWING) AS head, min(v) OVER (ORDER BY i RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS lo, max(v) OVER (ORDER BY i RANGE BETWEEN CURRENT ROW AND 2 FOLLOWING) AS hi, avg(v) OVER (ORDER BY i RANGE BETWEEN 4 PRECEDING AND 4 FOLLOWING) AS av, first_value(v) OVER (PARTITION BY g ORDER BY id RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS fv, last_value(v) OVER (PARTITION BY g ORDER BY id RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS lv FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:percent-rank-cume-dist",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, percent_rank() OVER (PARTITION BY g ORDER BY v) AS pr, cume_dist() OVER (PARTITION BY g ORDER BY v) AS cd, percent_rank() OVER (ORDER BY v DESC) AS pd, cume_dist() OVER (ORDER BY i) AS ci, percent_rank() OVER () AS pn, cume_dist() OVER (PARTITION BY g) AS cn, percent_rank() OVER (PARTITION BY id) AS p1, cume_dist() OVER (PARTITION BY id) AS c1 FROM '{fixture:wr}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, percent_rank() OVER (PARTITION BY g ORDER BY v) AS pr, cume_dist() OVER (PARTITION BY g ORDER BY v) AS cd, percent_rank() OVER (ORDER BY v DESC) AS pd, cume_dist() OVER (ORDER BY i) AS ci, percent_rank() OVER () AS pn, cume_dist() OVER (PARTITION BY g) AS cn, percent_rank() OVER (PARTITION BY id) AS p1, cume_dist() OVER (PARTITION BY id) AS c1 FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:qualify-range-offset",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY i RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS s FROM '{fixture:wr}' QUALIFY s > 100 ORDER BY id",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, sum(v) OVER (ORDER BY i RANGE BETWEEN 2 PRECEDING AND CURRENT ROW) AS s FROM '{fixture:wr}' QUALIFY s > 100 ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-two-keys",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY i, v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "needs exactly one ORDER BY key",
+    "exit": 2,
+    "binder_sql": "SELECT id, sum(v) OVER (ORDER BY i, v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-no-order",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "needs exactly one ORDER BY key",
+    "exit": 2,
+    "binder_sql": "SELECT id, sum(v) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-negative",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY i RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "negative RANGE offset",
+    "exit": 2,
+    "binder_sql": "SELECT id, sum(v) OVER (ORDER BY i RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "duck_error": "Out of Range Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-negative-interval",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY ts RANGE BETWEEN INTERVAL -1 DAY PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "BadInterval",
+    "diag": "cannot be negative",
+    "exit": 2,
+    "binder_sql": "SELECT id, sum(v) OVER (ORDER BY ts RANGE BETWEEN INTERVAL -1 DAY PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "duck_error": "Parser Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-null",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY i RANGE BETWEEN NULL PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "must be a number or an INTERVAL",
+    "exit": 2,
+    "binder_sql": "SELECT id, sum(v) OVER (ORDER BY i RANGE BETWEEN NULL PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-exponent",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY i RANGE BETWEEN 1e5 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "floating-point number",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-column",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY i RANGE BETWEEN u PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "must be a number or an INTERVAL",
+    "exit": 2
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-on-timestamp-int",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY ts RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowRangeKey",
+    "diag": "needs one ORDER BY key whose type it reaches",
+    "exit": 1,
+    "binder_sql": "SELECT id, sum(v) OVER (ORDER BY ts RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-interval-on-number",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY i RANGE BETWEEN INTERVAL 1 DAY PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowRangeKey",
+    "diag": "needs one ORDER BY key whose type it reaches",
+    "exit": 1,
+    "binder_sql": "SELECT id, sum(v) OVER (ORDER BY i RANGE BETWEEN INTERVAL 1 DAY PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-tinyint-overflow",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY tx RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) AS f FROM '{fixture:wr}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowRangeOverflow",
+    "diag": "leaves the key's type",
+    "exit": 1,
+    "binder_sql": "SELECT id, sum(v) OVER (ORDER BY tx RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING) AS f FROM '{fixture:wr}'",
+    "duck_error": "Out of Range Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:range-offset-ubigint-underflow",
+   "fixture": "wr",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(v) OVER (ORDER BY u RANGE BETWEEN 3000000000 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowRangeOverflow",
+    "diag": "leaves the key's type",
+    "exit": 1,
+    "binder_sql": "SELECT id, sum(v) OVER (ORDER BY u RANGE BETWEEN 3000000000 PRECEDING AND CURRENT ROW) AS f FROM '{fixture:wr}'",
+    "duck_error": "Out of Range Error:"
    }
   }
  ]

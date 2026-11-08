@@ -1541,7 +1541,15 @@ fn rewriteChain(allocator: std.mem.Allocator, folded_sql: []const u8) ![:0]u8 {
 /// markers a second parse would not recognise.
 pub fn parserText(allocator: std.mem.Allocator, sql: []const u8) !?[:0]u8 {
     var report: literals.Report = .{};
-    const folded = try fold(allocator, sql, &report);
+    const stripped = try stripComments(allocator, sql);
+    defer allocator.free(stripped);
+    // A RANGE frame's INTERVAL offset is no typed literal `fold` takes: it is read back from the string it becomes.
+    const framed = literals.frameIntervals(allocator, stripped, &report) catch |err| {
+        if (report.len > 0) diagnosticPrint("sql: {s}\n", .{report.text()});
+        return err;
+    };
+    defer allocator.free(framed);
+    const folded = try fold(allocator, framed, &report);
     defer allocator.free(folded);
     if (report.markers.rewrote) return null;
     return try rewriteChain(allocator, folded);

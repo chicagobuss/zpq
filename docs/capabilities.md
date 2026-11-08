@@ -115,19 +115,26 @@ two in one item, one in WHERE or HAVING, or a join or S3 table is `ColumnsNotSup
 a comment is no call. A set operation or a grouping-set query expands each of its
 queries on its own.
 
-Window functions in the SELECT list: `row_number()`, `rank()`, `dense_rank()`, `ntile(n)`, `lag` / `lead(x [, n [, default]])`,
+Window functions in the SELECT list: `row_number()`, `rank()`, `dense_rank()`, `percent_rank()`, `cume_dist()`, `ntile(n)`, `lag` / `lead(x [, n [, default]])`,
 `first_value` / `last_value(x)`, `nth_value(x, n)` (`n` and `ntile`'s count are constants of at least 1) and
 `sum` / `count` / `avg` / `min` / `max(x) OVER ([PARTITION BY ..] [ORDER BY ..] [frame])` (and `count(*)`), alone or inside
 arithmetic, a function call or a cast, over a row query or over the output of a GROUP BY (`rank() OVER (ORDER BY sum(x) DESC)`),
 with the query's own ORDER BY / LIMIT / OFFSET and a `UNION` of such queries. The frame is the default (the partition's start to the
 row's last peer; the whole partition without an ORDER BY), `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW | UNBOUNDED FOLLOWING`,
 or `ROWS BETWEEN` `UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW | n FOLLOWING` and `n PRECEDING | CURRENT ROW | n FOLLOWING |
-UNBOUNDED FOLLOWING` (an empty frame has a NULL sum and a zero count). Results are DuckDB's: ranks and counts BIGINT, `lag` / `lead` /
+UNBOUNDED FOLLOWING` (an empty frame has a NULL sum and a zero count). A `RANGE` frame may also have an offset — `n PRECEDING` / `n
+FOLLOWING` written as a whole number or a decimal, or `INTERVAL ..` on a DATE or TIMESTAMP key — over exactly one ORDER BY key whose
+type the offset reaches (an integer, DECIMAL, DOUBLE, DATE or TIMESTAMP; an INTERVAL needs a DATE or TIMESTAMP, and a number is
+everything but a TIMESTAMP). The key and the offset add in the key's type, as DuckDB adds them: a TINYINT key with `1 FOLLOWING`
+at 127 is `WindowRangeOverflow`, `200 PRECEDING` on it adds in INTEGER, a decimal offset is exact, and a key that is NULL frames
+its own NULL peers (`WindowRangeKey` names an offset the key does not take, `WindowRangeOffset` a bound that reaches the wrong
+way). Results are DuckDB's: ranks and counts BIGINT, `percent_rank` / `cume_dist` DOUBLE, `lag` / `lead` /
 `min` / `max` the argument's type, integer sums BIGINT, added exactly frame by frame (DuckDB's is a HUGEINT, which its own Parquet writer
 turns into a DOUBLE; a frame past 64 bits is `WindowSumOverflow`, as zpq's plain `sum` is `AggIntTooWide`), DECIMAL sums DECIMAL(38, s)
 (`WindowSumOverflow` past 38 digits; DuckDB errors on some frames that fit), averages
 of integers and DECIMALs DOUBLE, finalized as DuckDB does. Compared with DuckDB 2.0.0 on fuzzed data (ties, NULL keys and values,
-DESC / NULLS FIRST, frames past the partition's ends, one-row partitions) and in `sql_windows.json`.
+DESC / NULLS FIRST, frames past the partition's ends, one-row partitions, and RANGE offsets over TINYINT, INTEGER, BIGINT, UBIGINT,
+DECIMAL, DOUBLE, DATE and TIMESTAMP keys: 1,350 queries with no difference) and in `sql_windows.json`.
 How it runs: the query without its window calls is an ordinary query into a scratch Parquet file; each distinct split into partitions and
 peers (`PARTITION BY a ORDER BY b` and `ORDER BY a, b` sort alike and are two) is one pass (`engine/window.zig`) that sorts a view of the
 rows by its keys, computes its calls, and writes the rows back in the order it read them with its columns added; the SELECT list and ORDER
@@ -144,8 +151,9 @@ is written, inside a call or a window's argument), with or without WHERE, GROUP 
 them is DuckDB's syntax error, and refused), and the select list or the condition must hold a window call. `SELECT *` and
 `SELECT * EXCLUDE (..)` may stand beside window calls, from one local table (`t.*` is refused). `ntile`'s frame is ignored by DuckDB and
 refused here; `first_value` / `last_value` / `nth_value` follow the frame (the default frame's last row is the row's last peer).
-Refused by name: `percent_rank`, `cume_dist` and the rest (`WindowNotSupported`);
-RANGE frames with an offset and GROUPS frames; `EXCLUDE`; a frame DuckDB's parser refuses; DISTINCT or FILTER on a window call;
+Refused by name: the window functions zpq does not have (`WindowNotSupported`), a RANGE offset the key does not take
+(`WindowRangeKey`), and an offset not written as a literal or written negatively (a column, `1e5`, `-1 PRECEDING`, each
+`WindowNotSupported`); GROUPS frames; `EXCLUDE`; a frame DuckDB's parser refuses; DISTINCT or FILTER on a window call;
 `IGNORE NULLS`; a named `WINDOW` clause; a window call in WHERE, GROUP BY or HAVING (use QUALIFY); a subquery in QUALIFY; QUALIFY
 with ROLLUP, CUBE or GROUPING SETS; `SELECT DISTINCT` or `t.*` beside a window call; a window item with no alias; `lag` / `lead` defaults that do not fit the column; a window with
 typed literals, ILIKE or GROUP BY ALL in the query; and **`sum` / `avg` of a DOUBLE or FLOAT** (`WindowFloatAggregate`): DuckDB adds a

@@ -20,6 +20,12 @@
   `count(*)` or an integer `sum` now runs on one worker per L2 cache when more workers would push it off the dense plan,
   and the merge of the workers' tables runs in parallel. On a Ryzen 9 9950X, `SELECT a, b, count(*), sum(v) ... GROUP BY
   a, b` over a Zipf-distributed file is 47% faster (319 ms to 170 ms). `--threads N` keeps the plan it had.
+- **`percent_rank`, `cume_dist` and RANGE frames with an offset.** `percent_rank()` and `cume_dist()` answer with DuckDB's
+  formulas (the rows before the row's peers over the partition's other rows; the rows up to the last peer over all of them), and a
+  `RANGE BETWEEN n PRECEDING / FOLLOWING` frame reaches by its ORDER BY key: a whole number or a decimal on an integer, DECIMAL,
+  DOUBLE or DATE key, an `INTERVAL` on a DATE or TIMESTAMP key, added in the key's type as DuckDB adds it (a TINYINT key is a
+  `WindowRangeOverflow` at 127, `200 PRECEDING` on it adds in INTEGER), a NULL key framing its own peers. Checked against DuckDB
+  2.0.0 on 1,350 fuzzed queries, 0 differences, and in `tools/check/cases/sql_windows.json`.
 - **Review fixes for the SQL scalar functions.** Integer overflow checks (`+ - * % //` at the SQL type DuckDB resolves)
   now apply in a GROUP BY key and under a function or `coalesce` too, as they do in a bare expression. The remainder
   or quotient of DECIMALs that falls back to DOUBLE converts each DECIMAL to the nearest double, so equal values stay
@@ -125,8 +131,8 @@
   output, in expressions, with ORDER BY / LIMIT, match DuckDB 2.0.0 (fuzzed on ~1,000 queries). The query runs as stages, as set
   operations do: the rows sorted by the window's keys into a scratch Parquet file, a pass that adds the window columns, and the query
   over the result. Each pass sorts a view of the rows itself and writes them back in input order, so a query with no ORDER BY returns
-  its rows as its input had them; the intermediate is held in memory, drawn on a ledger against `--max-memory`. `sum` / `avg` of a DOUBLE and the other
-  window functions (`percent_rank`, `cume_dist`, ...) and RANGE offsets are refused by name.
+  its rows as its input had them; the intermediate is held in memory, drawn on a ledger against `--max-memory`. `sum` / `avg` of a DOUBLE and the other frame
+  shapes (`GROUPS`, `EXCLUDE`) are refused by name.
 - **Unaliased computed columns are named as DuckDB names them.** `SELECT id, id + 1, upper(s) FROM t ORDER BY id` was refused
   as `missing --output or --aggregate`; its columns are now `id`, `(id + 1)` and `upper(s)`. Names were checked against DuckDB on
   over 500 generated expressions. What zpq rewrites before it reads, or prints differently from DuckDB (`CASE`, `//`, `EXTRACT`,

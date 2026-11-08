@@ -596,6 +596,57 @@ fn groupByAllAt(s: []const u8, at: usize) ?usize {
     return wordEnd(s, all);
 }
 
+/// What a RANGE frame's `INTERVAL ..` offset becomes for `frameIntervals`: the string literal `'<this>months:days:micros'`.
+pub const frame_interval = "zpq:frame-interval:";
+
+/// `sql` with each `INTERVAL ..` that is followed by PRECEDING or FOLLOWING (a RANGE frame's offset, which `rewrite` takes no
+/// other way) as the string literal above; everything else passes through. A negative offset is DuckDB's syntax error.
+pub fn frameIntervals(allocator: std.mem.Allocator, sql: []const u8, report: *Report) Error![]u8 {
+    if (std.ascii.findIgnoreCase(sql, frame_interval) != null) {
+        report.set("the query spells a name zpq's window rewrite uses", .{});
+        return error.BadValue;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < sql.len) {
+        const ch = sql[i];
+        if (ch == '\'' or ch == '"') {
+            const e = quotedEnd(sql, i) orelse sql.len;
+            try out.appendSlice(allocator, sql[i..e]);
+            i = e;
+        } else if (ch == '-' and i + 1 < sql.len and sql[i + 1] == '-') {
+            const e = std.mem.indexOfScalarPos(u8, sql, i, '\n') orelse sql.len;
+            try out.appendSlice(allocator, sql[i..e]);
+            i = e;
+        } else if (ch == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
+            const e = if (std.mem.indexOfPos(u8, sql, i + 2, "*/")) |x| x + 2 else sql.len;
+            try out.appendSlice(allocator, sql[i..e]);
+            i = e;
+        } else if (isWord(ch)) {
+            const end = wordEnd(sql, i);
+            if (wordIs(sql, i, "interval")) if (try intervalAt(sql, i, report)) |p| {
+                const after = skipSpace(sql, p.end);
+                if (wordIs(sql, after, "preceding") or wordIs(sql, after, "following")) {
+                    if (p.iv.months < 0 or p.iv.days < 0 or p.iv.micros < 0) {
+                        report.set("a RANGE frame's INTERVAL offset cannot be negative", .{});
+                        return error.BadInterval;
+                    }
+                    try out.print(allocator, "'{s}{d}:{d}:{d}'", .{ frame_interval, p.iv.months, p.iv.days, p.iv.micros });
+                    i = p.end;
+                    continue;
+                }
+            };
+            try out.appendSlice(allocator, sql[i..end]);
+            i = end;
+        } else {
+            try out.append(allocator, ch);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// `sql` with the spellings above folded. Quoted text and comments pass through. A `DATE '..'` or `INTERVAL` the fold
 /// cannot take is a named error, never a syntax error from the parser that follows.
 pub fn rewrite(allocator: std.mem.Allocator, sql: []const u8, report: *Report) Error![]u8 {
@@ -902,4 +953,31 @@ test "sql_literals: civil dates round-trip through days" {
         const c = civilFromDays(days);
         try std.testing.expectEqual(days, filters.daysFromCivil(c.y, c.m, c.d));
     }
+}
+
+test "sql_literals: a window RANGE frame's INTERVAL offset becomes the marker string the planner reads back" {
+    const a = std.testing.allocator;
+    const check = struct {
+        fn go(alloc: std.mem.Allocator, sql: []const u8, want: []const u8) !void {
+            var report: Report = .{};
+            const got = try frameIntervals(alloc, sql, &report);
+            defer alloc.free(got);
+            try std.testing.expectEqualStrings(want, got);
+        }
+    }.go;
+    // Months, days and micros, in DuckDB's own order of addition.
+    try check(a, "RANGE BETWEEN INTERVAL 1 MONTH PRECEDING AND CURRENT ROW", "RANGE BETWEEN 'zpq:frame-interval:1:0:0' PRECEDING AND CURRENT ROW");
+    try check(a, "INTERVAL '2 days 3 hours' FOLLOWING", "'zpq:frame-interval:0:2:10800000000' FOLLOWING");
+    try check(a, "RANGE BETWEEN INTERVAL '1' YEAR PRECEDING AND INTERVAL 3 HOUR FOLLOWING", "RANGE BETWEEN 'zpq:frame-interval:12:0:0' PRECEDING AND 'zpq:frame-interval:0:0:10800000000' FOLLOWING");
+    // Only an interval that the frame bound follows is an offset: every other interval stays what it was, and so do quoted
+    // text and comments that spell one.
+    try check(a, "INTERVAL '2 days 3 hours' ROWS PRECEDING", "INTERVAL '2 days 3 hours' ROWS PRECEDING");
+    try check(a, "t + INTERVAL 1 DAY", "t + INTERVAL 1 DAY");
+    try check(a, "INTERVAL '1 day' -- INTERVAL 1 DAY PRECEDING\n", "INTERVAL '1 day' -- INTERVAL 1 DAY PRECEDING\n");
+    // A negative offset is DuckDB's syntax error, and a query that spells the marker's name is refused rather than misread.
+    var report: Report = .{};
+    try std.testing.expectError(error.BadInterval, frameIntervals(a, "INTERVAL -1 DAY PRECEDING", &report));
+    try std.testing.expectError(error.BadInterval, frameIntervals(a, "INTERVAL '-1' DAY PRECEDING", &report));
+    report = .{};
+    try std.testing.expectError(error.BadValue, frameIntervals(a, "SELECT \"zpq:frame-interval:x\" FROM t", &report));
 }

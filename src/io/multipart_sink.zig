@@ -47,7 +47,6 @@ fn uriEncodeQueryValue(arena: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(arena);
 }
 
-pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 /// Smaller parts with high concurrency. The narrow per-part wall
 /// time (8 MB / ~100 MB-per-second effective ≈ 80 ms) lets many
 /// parts overlap, and total upload wall is bounded by the slowest

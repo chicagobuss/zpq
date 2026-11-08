@@ -31,7 +31,6 @@ const AtomicWorkCursor = work_cursor.AtomicWorkCursor;
 const http = @import("http.zig");
 const sigv4 = @import("sigv4.zig");
 const pool_mod = @import("pool.zig");
-const multipart_sink = @import("multipart_sink.zig");
 const retry = @import("retry.zig");
 const clock = @import("../clock.zig");
 const profile = @import("../profile.zig");
@@ -44,8 +43,6 @@ pub const AnyPool = pool_mod.AnyPool;
 /// or split sub-range fetches). Larger pools increase memory and TLS
 /// pressure before they improve throughput for the target workloads.
 pub const MAX_PARTS: usize = 8;
-/// S3's hard minimum for a non-final multipart part.
-pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 /// Above this size, fetchManyRanges splits a single range into
 /// sub-ranges so we can fan out across the pool. Below it the
 /// per-request TLS handshake amortizes badly across tiny fetches.
@@ -541,7 +538,7 @@ pub fn get(
 }
 
 /// Single-shot S3 PUT. Body must fit in one HTTP request — S3's per-PUT
-/// limit is 5 GB. Use uploadMultipart for larger or parallelism.
+/// limit is 5 GB. Larger bodies go through `multipart_sink.MultipartSink`.
 ///
 /// Fresh TLS handshake per call. For warm Lambda invocations where a
 /// pool already exists for the same host, prefer `putViaPool` —
@@ -1105,43 +1102,6 @@ fn doFetch(ctx: *FetchCtx, arena: std.mem.Allocator, conn: *tls.Connection) !htt
 fn noteDataHeader(ctx: *anyopaque) void {
     const f: *FetchCtx = @ptrCast(@alignCast(ctx));
     if (f.wave) |w| w.noteHeader(f.io);
-}
-
-/// Parallel multipart upload of `body` to `url`. Thin wrapper around
-/// `multipart_sink.MultipartSink`: build a sink, push the entire body,
-/// close. The sink internally chunks at multipart_sink.TARGET_PART_SIZE,
-/// dispatches `UploadPart` workers on a long-lived `Io.Group`, and
-/// either calls `CompleteMultipartUpload` or falls back to a single
-/// `PutObject` if the body never exceeded one part.
-pub fn uploadMultipart(
-    io: Io,
-    p: anytype, // *Pool(N) shared with the caller when buckets match
-    arena: std.mem.Allocator,
-    gpa: std.mem.Allocator,
-    creds: Credentials,
-    url: Url,
-    body: []const u8,
-) !void {
-    if (body.len < MIN_PART_SIZE) return error.BodyTooSmallForMultipart;
-
-    const criteria = try poolCriteria(arena, creds, url.bucket);
-    var sink = multipart_sink.MultipartSink.init(
-        io,
-        gpa,
-        arena,
-        creds,
-        url,
-        p,
-        criteria,
-        .{},
-    );
-    defer {
-        if (!sink.isClosed()) sink.abort();
-        sink.deinit();
-    }
-
-    try sink.push(body);
-    try sink.close();
 }
 
 pub fn extractXml(arena: std.mem.Allocator, xml: []const u8, tag: []const u8) ![]const u8 {

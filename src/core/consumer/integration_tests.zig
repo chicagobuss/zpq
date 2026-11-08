@@ -246,7 +246,6 @@ test "a page claiming more values than its chunk is rejected before sizing buffe
     try testing.expectError(error.DictionaryLargerThanPage, decodeColumnT([]const u8, a, dict_page, .UNCOMPRESSED, required, 1));
 }
 
-
 // Regression: copyRG(no_projection) used to write whatever `src.bytes`
 // the caller passed, even when those bytes covered more than just this
 // RG. The engine passes the *whole file*, so a file with N row groups

@@ -237,7 +237,6 @@ test "regression: sumBlocksGatheredF64 sums gathered values in their rows' block
     }
 }
 
-
 const contracts = @import("contracts.zig");
 pub const minTotal = contracts.minTotal;
 pub const maxTotal = contracts.maxTotal;
@@ -628,7 +627,6 @@ fn foldStatBytes(
     }
 }
 
-
 test "canStatShortCircuit eligibility rules" {
     // count/min/max with no FILTER and no outer filter → eligible
     const a_count: AggCall = .{ .func = .count, .arg = null, .where = null, .alias = "n", .result = .i64 };
@@ -678,7 +676,6 @@ test "canStatShortCircuit eligibility rules" {
     };
     try testing.expect(!canStatShortCircuit(a_sum_where, false, true));
 }
-
 
 pub fn finalize(
     arena: std.mem.Allocator,
@@ -868,7 +865,6 @@ test "boundary: an unsigned 64-bit value's INT64 lane is its low bits, as one-ro
     }
 }
 
-
 /// Update one accumulator using one RG's decoded batch: fold the rows
 /// the call selects (`PreparedAggInput`) into it in bulk.
 ///
@@ -1056,7 +1052,6 @@ fn foldDistinct(
         if (sel.isActive(r)) try state.distinct.insertColRow(persist, col, r);
     }
 }
-
 
 /// Bytewise/unsigned min (`is_min`) or max over a decoded string column,
 /// honoring the selection vector and the null mask. The per-batch winner is
@@ -1409,7 +1404,6 @@ fn minMaxU64(
     };
     return if (acc) |u| @as(i128, u) else null;
 }
-
 
 /// Generic SIMD min/max reducer. Uses sentinel-init (max-int / min-int
 /// for i64, +inf / -inf for f64) so the vector fold doesn't need a
@@ -2787,13 +2781,11 @@ test "sum/avg/min/max over no values are NULL; count is 0" {
     try testing.expectEqual(@as(?i128, 6), empty.sum_i);
 }
 
-
 /// Both NaN, or the same bits (so -0 and +0 differ).
 fn sameF(want: f64, got: f64) bool {
     if (std.math.isNan(want)) return std.math.isNan(got);
     return @as(u64, @bitCast(want)) == @as(u64, @bitCast(got));
 }
-
 
 test "string min/max by 16-byte prefix agree with a byte-by-byte fold: shared prefixes, zero bytes, nulls" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);

@@ -217,4 +217,3 @@ test "sortSlotsByFirst: an allocation failure leaves the slots as they were" {
     try testing.expect(fail_index > 0);
     for (slots, 0..) |s, i| try testing.expectEqual(slots.len - 1 - i, s.idx);
 }
-

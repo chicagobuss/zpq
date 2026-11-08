@@ -76,7 +76,6 @@ test "scan: API is well-typed" {
 // be joined. Driven through the seam in spawn.zig, since real spawn failure is not reproducible.
 // ============================================================
 
-
 test "runMultiAggregate: injected spawn failures don't change the answer" {
     // The scan workers, unlike the footer parsers, are the loop whose old `try spawn` returned while earlier threads
     // still read the arena the caller frees. Sizing is by decode volume, so a small fixture would test nothing.
@@ -379,8 +378,6 @@ test "runMultiAggregate: --max-memory means the same thing at every -j" {
         }
     }
 }
-
-
 
 test "runMultiAggregate: a COUNT-descending cut merges only groups that can make it, and answers the same" {
     const path = "ci/fixtures/parquet/topk_skew.parquet";
@@ -831,8 +828,6 @@ test "runMultiAggregate: behind heavy keys a census cut certifies on a short pre
     try testing.expect(seen.contains(.census));
 }
 
-
-
 test "runMultiAggregate: a sketched COUNT cut frees everything on any allocation failure" {
     // One row group, string keys that own memory, one past the 16 bytes an unframed key needs.
     const path = "ci/fixtures/parquet/json_escape.parquet";
@@ -897,8 +892,6 @@ test "runMultiAggregate: a LIMIT with no ORDER BY answers as the full scan throu
     }
 }
 
-
-
 test "runMultiAggregate: a first-keys cut frees everything on any allocation failure" {
     const path = "ci/fixtures/parquet/census_topk.parquet";
     const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
@@ -915,10 +908,6 @@ test "runMultiAggregate: a first-keys cut frees everything on any allocation fai
         try testing.checkAllAllocationFailures(fixed.allocator(), runFirstCutAndFree, .{ &inputs, &meta, limit });
     }
 }
-
-
-
-
 
 test "runMultiAggregate: a count(DISTINCT) census cut frees everything on any allocation failure" {
     const path = "ci/fixtures/parquet/census_topk.parquet";
@@ -1053,12 +1042,6 @@ test "runMultiAggregate: a GROUP BY that fits its budget still fits when spawns 
 // `leafLabel`). The fixture puts a MAP ahead of ordinary scalars to reproduce that shape.
 // ============================================================
 
-
-
-
-
-
-
 test "group key: a scalar column after a MAP is framed by its own type" {
     // `ts` is INT64 but leaf-indexed lookup resolved a BYTE_ARRAY element, so deserialization read the timestamp bytes
     // as a string length: "index out of bounds: index 2690342917, len 9".
@@ -1125,16 +1108,6 @@ test "group key: a BOOLEAN first column does not truncate the rest" {
 // Fixture layout (tools/zpq-gen full_match): 8 row groups x 200 rows, `ts` = 0..1599 sorted, so `ts >= 500`
 // skips row groups 0-1, leaves 2 partial and proves 3-7.
 // ============================================================
-
-
-
-
-
-
-
-
-
-
 
 test "min-fill: a column the filter also reads under an OR decodes the pages its conjunct is proven on" {
     // ci/fixtures/parquet/min_fill_or.parquet (tools/zpq-gen min_fill): c alternates 1, 2 with no nulls, in
@@ -1372,8 +1345,6 @@ test "full match: several files keep their own decisions" {
     try testing.expectEqual(@as(i128, 3 * 1100), res.output.aggs[0].value.i);
 }
 
-
-
 test "full match: filter-only chunks of proven row groups are never read" {
     const clean = (try loadFullMatchFixture()) orelse return error.SkipZigTest;
     defer testing.allocator.free(clean);
@@ -1438,12 +1409,6 @@ test "full match: filter-only chunks of proven row groups are never read" {
 // Fixtures from tools/zpq-gen stats_order; expected answers are hand-computed from the generator's formulas.
 // ------------------------------------------------------------
 
-
-
-
-
-
-
 test "unsigned columns filter and prune in unsigned order" {
     try expectCountSum(unsigned_order_fixture, &.{
         .{ .filter = "u32 >= 2147483648", .n = 640, .sum_i = 450240 },
@@ -1493,8 +1458,6 @@ test "unsigned columns: row-group decisions read bounds unsigned" {
         }
     }
 }
-
-
 
 test "deprecated min/max prune only where their signed order is the column's order" {
     try expectCountSum(deprecated_stats_fixture, &.{
@@ -1562,8 +1525,6 @@ test "deprecated min/max never answer a DECIMAL aggregate under --trust-stats" {
     try testing.expectEqual(@as(i128, 103), res.output.aggs[2].value.i);
 }
 
-
-
 test "bounds in a declared column order zpq does not implement never prune" {
     // `s` declares an unknown order whose bounds, read bytewise, exclude 'B' and 'Y' from their row groups and pages.
     try expectCountSum(column_order_fixture, &.{
@@ -1600,8 +1561,6 @@ test "bounds in a declared column order zpq does not implement never prune" {
         }
     }
 }
-
-
 
 test "!= on a float chunk whose bounds are the literal skips only when nan_count proves no NaN" {
     // Every row group records [-0, 0]; row groups 0 and 2 hold a NaN, which `!= 0` keeps.
@@ -2022,16 +1981,6 @@ test "runMultiAggregate: an input that is not Parquet is named with the reason" 
 // as written, lie and all.
 // ============================================================
 
-
-
-
-
-
-
-
-
-
-
 test "poisoned stats: chunk bounds with min above max are refused, by default and under --trust-stats" {
     const edit = struct {
         fn f(meta: *schema.FileMetaData) void {
@@ -2076,4 +2025,3 @@ test "poisoned stats: a zero null count with no bounds decodes by default and is
         .{ .filter = "n IS NOT NULL", .n = 1280, .trusted = 1480 },
     });
 }
-

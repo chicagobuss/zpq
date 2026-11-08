@@ -606,8 +606,6 @@ test "hot COUNT certificate matches canonical clustered keys, NULLs, ties, offse
     try testing.expect(residual);
 }
 
-
-
 test "hot COUNT certificate releases every trial allocation and its ledger charge on failure" {
     const path = "ci/fixtures/parquet/count_certificate_plain.parquet";
     const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
@@ -620,8 +618,6 @@ test "hot COUNT certificate releases every trial allocation and its ledger charg
     var fixed: NoInPlaceResize = .{ .child = testing.allocator };
     try testing.checkAllAllocationFailures(fixed.allocator(), runHotCertificateAndFree, .{ &inputs, &meta });
 }
-
-
 
 test "COUNT-certified payloads preserve signed SUM, exact integer AVG, NULLs, extrema and complete counts" {
     var used_certificate = false;
@@ -749,8 +745,6 @@ test "COUNT input-wide sample survives every partial worker start" {
         while (it.next()) |entry| try testing.expectEqual(entry.value_ptr.*, got.counts.get(entry.key_ptr.*).?);
     }
 }
-
-
 
 test "COUNT residual budget refusal releases trial groups and restores counts before the fitting plain scan" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -897,10 +891,6 @@ test "integer owner decoded runs and false sorted hints match the canonical mult
         }
     }
 }
-
-
-
-
 
 test "ordered decline replays releasing gates for NULL descent and cross-row-group overlap" {
     var held = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1177,8 +1167,6 @@ test "dense composite SUM arms globally and preserves selected first through win
     try denseProductScan(true);
 }
 
-
-
 test "distinct bitmaps retain identities after releasing windows and late wide fallback" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1387,8 +1375,6 @@ test "distinct coded sets share automatic pairs across releasing windows and ref
         }
     }
 }
-
-
 
 test "scalar owner cardinality survives releasing windows and late width refusal through mapped rewind" {
     const gpa = testing.allocator;
@@ -2044,10 +2030,6 @@ test "duplicate integer counts keep levels-only rows through releasing readers" 
     }
 }
 
-
-
-
-
 test "packed composite count survives releasing windows and late dictionary refusal" {
     const gpa = testing.allocator;
     var held = std.heap.ArenaAllocator.init(gpa);
@@ -2241,4 +2223,3 @@ test "packed composite count survives releasing windows and late dictionary refu
         }
     };
 }
-

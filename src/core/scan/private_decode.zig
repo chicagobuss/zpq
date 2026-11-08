@@ -160,4 +160,3 @@ test "private decoder floors decline a dictionary that leaves no sliced sample r
     defer ample.release();
     try testing.expectEqual(@as(usize, parent.limit / 4), ample.held);
 }
-

@@ -441,7 +441,6 @@ test "initOutputAggregator maps precision > 38 BYTE_ARRAY decimal to f64" {
     try testing.expectEqual(schema.Type.DOUBLE, agg.schema_elems[0].type.?);
 }
 
-
 /// Rows `lo..hi` of an output buffer as the column the encoder takes: its values, or its codes into the dictionary
 /// they index, and its levels; an exact DECIMAL as its unscaled integers (the encoder narrows them to the schema's
 /// width).
@@ -534,7 +533,6 @@ pub fn joinRows(arena: std.mem.Allocator, ranges: []const BufRange) !filter_eval
         },
     }
 }
-
 
 /// Append the rows `sel` keeps of a flat column straight into the aggregator's buffer: one copy, no intermediate
 /// filtered column. String bytes are copied into one block of `arena`, since the decoded pages they point into die
@@ -753,7 +751,6 @@ test "appendSelected keeps one level per row when a column's batches come with a
     try std.testing.expectEqual(@as(usize, 0), plain.i64.def_levels.items.len);
 }
 
-
 /// A named passthrough's leaf as the flat column it is written as: present (`def == max_def`) or NULL, at one level.
 /// A nested leaf counts its parents' levels too, which a flat leaf has none of. Others pass through as they are.
 pub fn namedLevels(scratch: std.mem.Allocator, pt: OutputCol.Passthrough, col: filter_eval.Batch.Column) !filter_eval.Batch.Column {
@@ -847,7 +844,6 @@ test "regression: a renamed passthrough is its leaf renamed and flat, NULL where
     const flat: filter_eval.Batch.Column = .{ .i32 = .{ .values = &vals, .def_levels = &flat_defs, .max_def = 1, .has_nulls = true } };
     try testing.expectEqual(flat.i32.def_levels.?.ptr, (try namedLevels(a, .{ .ci = 0, .name = "k" }, flat)).i32.def_levels.?.ptr);
 }
-
 
 /// Decode + filter + eval one input RG; project survivors into the
 /// aggregator. Uses a per-RG scratch arena that's freed at function
@@ -1245,7 +1241,6 @@ pub fn appendSliceRows(
     return surviving;
 }
 
-
 test "Survivors: computed outputs evaluate over the kept rows only, with their levels, codes and exact values" {
     const testing = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1340,4 +1335,3 @@ test "appendSliceRows: a computed column over the kept rows is the one computed 
         if (d == 1) try testing.expectEqual(w, g);
     }
 }
-

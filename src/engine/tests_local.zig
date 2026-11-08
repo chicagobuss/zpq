@@ -1782,4 +1782,3 @@ test "a NULL that survives the filter comes back NULL from the replay, whatever 
         try std.testing.expectEqualStrings("0,\"hay-1001-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",527,;", got);
     }
 }
-

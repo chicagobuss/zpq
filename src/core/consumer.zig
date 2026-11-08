@@ -161,7 +161,6 @@ const pool_module = @import("consumer/pool.zig");
 pub const poolOn = pool_module.poolOn;
 pub const releaseSlicePool = pool_module.releaseSlicePool;
 
-
 const scan_plan = @import("consumer/plan.zig");
 const payloadColumns = scan_plan.payloadColumns;
 const plainValueEncodings = scan_plan.plainValueEncodings;
@@ -233,4 +232,3 @@ test "consumer: API is well-typed" {
     _ = copyRG;
     _ = decodeColumnT;
 }
-

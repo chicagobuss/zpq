@@ -93,7 +93,6 @@ pub fn refusedDraw(ws: AggWorkspace, err: anyerror) bool {
     return false;
 }
 
-
 /// A mapped scan reading ahead: advice for a claimed item's gated column (`scan/read_ahead.zig`
 /// `ReadAhead.adviseClaimed`), capped, ledger-checked and counted as the read-ahead's own; `held` is the worker's count
 /// of it, given back at its next claim.
@@ -195,4 +194,3 @@ pub fn cacheDictionary(in: AggRowGroup, ci: usize) ?CacheDictionary {
     }
     return if (data) dict else null;
 }
-

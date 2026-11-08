@@ -111,6 +111,106 @@ const answerBytesParallel = scan_rows.answerBytesParallel;
 const buildGroupColumns = scan_rows.buildGroupColumns;
 const slot_sort = @import("slot_sort.zig");
 const sortSlotsByFirst = slot_sort.sortSlotsByFirst;
+
+/// The merge counted each exclusive ID range, so workers can build the same ID-ordered slots without a serial scan.
+fn denseSlots(
+    gpa: std.mem.Allocator,
+    lanes: *const agg_dense.Lanes,
+    ranges: []const agg_dense.MergeRange,
+    slots: *std.ArrayList(MergedSlot),
+) !void {
+    const Task = struct {
+        lanes: *const agg_dense.Lanes,
+        range: agg_dense.MergeRange,
+        slots: []MergedSlot,
+        ran: bool = false,
+
+        fn run(t: *@This()) void {
+            t.ran = true;
+            var at = t.range.offset;
+            for (t.range.lo..t.range.hi) |id| if (t.lanes.seen(id)) {
+                t.slots[at] = .{ .key = &.{}, .first = t.lanes.position(id), .idx = id };
+                at += 1;
+            };
+            std.debug.assert(at == t.range.offset + t.range.count);
+        }
+    };
+    std.debug.assert(ranges.len != 0);
+    const last = ranges[ranges.len - 1];
+    const tasks = try gpa.alloc(Task, ranges.len);
+    defer gpa.free(tasks);
+    try slots.ensureTotalCapacityPrecise(gpa, last.offset + last.count);
+    slots.items.len = last.offset + last.count;
+    for (tasks, ranges) |*task, range| task.* = .{ .lanes = lanes, .range = range, .slots = slots.items };
+    if (tasks.len > 1) _ = spawn_util.runTree(Task, tasks, .{ .stack_size = 1 << 20 }, Task.run);
+    // A partially started pool leaves some exclusive ranges unrun.
+    for (tasks) |*task| if (!task.ran) task.run();
+}
+test "dense direct slots retain ID and first-position order across workers and failed starts" {
+    var values: [256]u64 = @splat(0);
+    var axes = [_]agg_dense.Axis{.{ .values = .{ .int64 = &values }, .trans = &.{}, .file_base = &.{}, .bytes = 0 }};
+    const domain: agg_dense.Domain = .{ .axes = &axes, .bytes = 0 };
+    const Run = struct { workers: usize, fail: bool = false };
+    for (0..3) |shape| for ([_]Run{ .{ .workers = 1 }, .{ .workers = 4 }, .{ .workers = 16 }, .{ .workers = 16, .fail = true } }) |run| {
+        var cells: [257]agg_dense.CompactSum = @splat(.{});
+        for (&cells, 0..) |*cell, id| {
+            if (shape == 0 or (shape == 1 and id % 7 != 0)) continue;
+            cell.add(null, @intCast(256 - id));
+        }
+        var lanes = [_]agg_dense.Lanes{.{
+            .domain = &domain,
+            .calls = &.{},
+            .compact_sums = &cells,
+            .global_ordinals = true,
+        }};
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const merged = (try agg_dense.mergeRanges(testing.allocator, arena.allocator(), &lanes, run.workers, true)).?;
+        var slots: std.ArrayList(MergedSlot) = .empty;
+        defer slots.deinit(testing.allocator);
+        if (run.fail) spawn_util.injectFailureAfter(0);
+        defer spawn_util.resetFailure();
+        try denseSlots(testing.allocator, merged.lanes, merged.ranges, &slots);
+        if (run.fail) try testing.expect(spawn_util.failuresInjected() > 0);
+        var at: usize = 0;
+        for (cells, 0..) |cell, id| {
+            if (cell.count() == 0) continue;
+            try testing.expectEqual(id, slots.items[at].idx);
+            try testing.expectEqual(@as(u64, 256 - id), slots.items[at].first);
+            at += 1;
+        }
+        try testing.expectEqual(at, slots.items.len);
+    };
+}
+
+fn denseSlotsAllocation(a: std.mem.Allocator) !void {
+    var values: [3]u64 = @splat(0);
+    var axes = [_]agg_dense.Axis{.{ .values = .{ .int64 = &values }, .trans = &.{}, .file_base = &.{}, .bytes = 0 }};
+    const domain: agg_dense.Domain = .{ .axes = &axes, .bytes = 0 };
+    var cells: [4]agg_dense.CompactSum = @splat(.{});
+    cells[0].add(null, 3);
+    cells[3].add(7, 1);
+    const lanes: agg_dense.Lanes = .{
+        .domain = &domain,
+        .calls = &.{},
+        .compact_sums = &cells,
+        .global_ordinals = true,
+    };
+    const ranges = [_]agg_dense.MergeRange{
+        .{ .lo = 0, .hi = 2, .offset = 0, .count = 1 },
+        .{ .lo = 2, .hi = 4, .offset = 1, .count = 1 },
+    };
+    var slots: std.ArrayList(MergedSlot) = .empty;
+    defer slots.deinit(a);
+    try denseSlots(a, &lanes, &ranges, &slots);
+    try testing.expectEqual(@as(usize, 2), slots.items.len);
+    try testing.expectEqual(@as(usize, 3), slots.items[1].idx);
+}
+
+test "dense direct slots release their memory on allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, denseSlotsAllocation, .{});
+}
+
 const pair_fold = @import("pair_fold.zig");
 const drainDistinctPairs = pair_fold.drainDistinctPairs;
 const foldDistinctPairs = pair_fold.foldDistinctPairs;
@@ -1795,6 +1895,7 @@ fn prepareAggregateWithMetas(
     var dense_merged = false;
     var dense_verified = false;
     var dense_direct: ?*agg_dense.Lanes = null;
+    var dense_ranges: []const agg_dense.MergeRange = &.{};
     // Left to the exit with the tables, but freed if a later refusal runs the scan again (`runMultiAggregate`).
     var left_lanes: []agg_dense.Lanes = &.{};
     var left_domain: ?agg_dense.Domain = null;
@@ -1825,7 +1926,10 @@ fn prepareAggregateWithMetas(
             break :only_lanes true;
         };
         if (direct) {
-            dense_direct = try agg_dense.merge(gpa, arena, dense_lanes, n_workers);
+            if (try agg_dense.mergeRanges(gpa, arena, dense_lanes, n_workers, cut == null)) |merged| {
+                dense_direct = merged.lanes;
+                dense_ranges = merged.ranges;
+            }
         } else try agg_dense.intoTable(gpa, arena, dense_lanes, dense_keys, dense_table, dense_lookup, n_workers, cut);
         if (prof != null) profile.record(
             prof,
@@ -1952,7 +2056,10 @@ fn prepareAggregateWithMetas(
             null;
         defer if (first_parallel) if (candidates) |kept| lists.free(kept);
         // One table already holds complete ranks; its top-H heap avoids materializing every losing group.
-        const cut: ?[]const u32 = if (dense_direct) |d|
+        const dense_full = dense_direct != null and dense_cut == null;
+        const cut: ?[]const u32 = if (dense_full)
+            null
+        else if (dense_direct) |d|
             try agg_dense.reached(arena, d, dense_cut)
         else if (n_workers == 1 and candidates == null and out_tables.len == 1)
             try resultLimitGroups(
@@ -1967,7 +2074,9 @@ fn prepareAggregateWithMetas(
         else
             null;
         var total_group_refs: usize = 0;
-        if (cut) |ids| {
+        if (dense_full) {
+            // Complete dense slots are filled directly from the already counted merge ranges.
+        } else if (cut) |ids| {
             total_group_refs = ids.len;
         } else if (candidates) |keys_kept| {
             total_group_refs = keys_kept.len * out_tables.len;
@@ -1977,7 +2086,9 @@ fn prepareAggregateWithMetas(
         const group_refs_buf = try lists.alloc(MergeGroupRef, total_group_refs);
         defer lists.free(group_refs_buf);
         var ref_i: usize = 0;
-        if (cut == null and candidates == null) {
+        if (dense_full) {
+            // There are no table references in a direct dense answer.
+        } else if (cut == null and candidates == null) {
             finishGroupRanges(out_tables, group_refs_buf, null, n_workers, false);
             ref_i = total_group_refs;
         } else for (out_tables, 0..) |gt, ti| {
@@ -2052,12 +2163,16 @@ fn prepareAggregateWithMetas(
         // Partition tables already hold each key once. Their accumulators move into `merged_accs`; the keys stay
         // borrowed until the rows are built.
         if (dense_direct) |d| {
-            try slots.ensureTotalCapacity(lists, group_refs.len);
-            for (group_refs) |ref| slots.appendAssumeCapacity(.{
-                .key = &.{},
-                .first = d.position(ref.group),
-                .idx = ref.group,
-            });
+            if (dense_full) {
+                try denseSlots(lists, d, dense_ranges, &slots);
+            } else {
+                try slots.ensureTotalCapacity(lists, group_refs.len);
+                for (group_refs) |ref| slots.appendAssumeCapacity(.{
+                    .key = &.{},
+                    .first = d.position(ref.group),
+                    .idx = ref.group,
+                });
+            }
             folded = false;
         } else if (spilled) {
             const ps = &part_state.?;

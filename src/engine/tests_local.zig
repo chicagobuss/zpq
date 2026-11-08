@@ -2129,3 +2129,53 @@ test "a row group with a join in its filter is not fused, and answers as the sam
     defer gpa.free(plain);
     try std.testing.expectEqualStrings(plain, joined);
 }
+
+test "an ILIKE prefilters with its fold: the rows a case-folded match keeps are not blanked" {
+    const fixture = "ci/fixtures/parquet/fusion_ilike.parquet";
+    std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const slice_reader = @import("../core/consumer/slice_reader.zig");
+    const sql_parser = @import("../core/expr/sql_parser.zig");
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // pyarrow 26, PLAIN optional strings, 3000 rows in three row groups, v = k % 7; s is 'Alpha', 'alpha' or 'ALPHA' on
+    // the first three rows of every 27 and otherwise 'Beta', 'é', 'K', 'foo' or 'Delta' padded to 40 bytes, NULL or ''. ILIKE 'a%' keeps the
+    // three spellings (DuckDB 2.0: 333 rows, few enough to stay under the keep cap). The prefilter matched the lowered
+    // pattern against the unfolded value and blanked all but 'alpha', so min(s) came back 'alpha'. The answers are
+    // DuckDB's.
+    const Case = struct { sql: []const u8, rows: []const u8, replays: bool };
+    for ([_]Case{
+        .{
+            .sql = "SELECT v, count(*) AS n FROM '{s}' WHERE v > -100000 AND s ILIKE 'a%' GROUP BY v",
+            .rows = "0,48,;1,48,;2,48,;3,48,;4,48,;5,48,;6,48,;",
+            .replays = false,
+        },
+        .{
+            .sql = "SELECT v, min(s) AS lo, count(*) AS n FROM '{s}' WHERE v > -100000 AND s ILIKE 'a%' GROUP BY v",
+            .rows = "0,\"ALPHA\",48,;1,\"ALPHA\",48,;2,\"ALPHA\",48,;3,\"ALPHA\",48,;" ++
+                "4,\"ALPHA\",48,;5,\"ALPHA\",48,;6,\"ALPHA\",48,;",
+            .replays = true,
+        },
+    }) |case| {
+        const text = try std.mem.replaceOwned(u8, gpa, case.sql, "{s}", fixture);
+        defer gpa.free(text);
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const pq = try sql_parser.parseSqlPlan(arena_state.allocator(), text);
+        const replays_before = slice_reader.test_replays.load(.monotonic);
+        const got = try sortedGroupText(gpa, ctx, .{
+            .inputs = &.{fixture},
+            .plan_source = if (pq.syntax) |sx| @import("syntax_plan.zig").source(sx) else null,
+            .aggregate = pq.aggregate_str,
+            .filter = pq.filter_str,
+            .group_by = pq.group_by_str,
+            .select = pq.select_str,
+            .select_cols = pq.select_cols,
+            .result_order = pq.result_order,
+            .parallelism = 1,
+        });
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(case.rows, got);
+        try std.testing.expectEqual(case.replays, slice_reader.test_replays.load(.monotonic) != replays_before);
+    }
+}
+

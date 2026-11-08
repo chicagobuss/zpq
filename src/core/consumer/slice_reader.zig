@@ -95,7 +95,8 @@ pub const SliceReader = struct {
     /// Rows of this reader's sequence delivered so far.
     taken: usize = 0,
 
-    pub const Prefilter = struct { kind: filter_ast.LikeKind, operand: []const u8 };
+    /// The LIKE leaf itself (ILIKE's fold included), matched as the filter matches it.
+    pub const Prefilter = filter_ast.LikeMatch;
 
     pub const Fused = struct {
         /// A LIKE that every row the filter keeps satisfies: a page's values are checked while the page is in cache,
@@ -822,7 +823,7 @@ pub const SliceReader = struct {
             const present = if (def) |d| d[i] >= max_def else true;
             const alive = if (f.active) |s| row0 + i < s.len and s.isActive(row0 + i) else true;
             if (track_nulls and !present and alive) null_rows += 1;
-            const wanted = present and alive and (if (f.prefilter) |pf| filter_ast.likeMatches(pf.kind, pf.operand, v.*) else true);
+            const wanted = present and alive and (if (f.prefilter) |pf| filter_ast.leafMatches(pf, v.*) else true);
             if (wanted) {
                 total += v.len;
                 entries += @intFromBool(v.len != 0);

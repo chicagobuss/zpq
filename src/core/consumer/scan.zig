@@ -1363,7 +1363,7 @@ fn filterNames(f: filter_ast.Filter, ci: usize) bool {
 /// The LIKE a byte-array reader of `ci` checks as its pages decode (`plan.fusion`).
 fn prefilterOf(in: AggRowGroup, target: AggTarget, ci: usize) ?SliceReader.Prefilter {
     const like = (fusion(in, target, ci) orelse return null).like orelse return null;
-    return .{ .kind = like.kind, .operand = like.operand };
+    return like;
 }
 
 /// The rows of a row group its filter keeps, reading only the columns before the payload a slice at a time.

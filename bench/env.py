@@ -72,15 +72,14 @@ def evict(paths, attempts=3):
 
 
 def warm(paths):
-    """Read each file that is not fully resident; verified when every page is."""
+    """Read each file whole, then verify every page is resident. Reading only the missing pages left the resident
+    ones untouched and so first to be reclaimed, and ClickBench's 14.78 GB hits.parquet never stayed whole."""
     state, buf = {}, bytearray(4 << 20)
     for p in paths:
+        with open(p, "rb", buffering=0) as f:
+            while f.readinto(buf):
+                pass
         resident, pages = residency(p)
-        if resident < pages:
-            with open(p, "rb", buffering=0) as f:
-                while f.readinto(buf):
-                    pass
-            resident, pages = residency(p)
         state[p] = {"resident": resident, "pages": pages, "ok": resident == pages}
     return all(s["ok"] for s in state.values()), state
 

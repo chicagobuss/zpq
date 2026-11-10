@@ -136,7 +136,8 @@ class Lane:
         available = int(next(l.split()[1] for l in Path("/proc/meminfo").read_text().splitlines()
                              if l.startswith("MemAvailable:"))) * 1024
         reasons = [r for r, bad in (("inputs-unverified", not verified), ("busy-before", not quiet["quiet"]),
-                                    ("memory-before", available < MIN_MEMORY)) if bad and not self.smoke]
+                                    ("memory-before", available < MIN_MEMORY))
+                   if bad and not (self.smoke and r == "busy-before")]
         resident = max((s["resident"] / max(1, s["pages"]) for s in state.values()), default=0)
         return reasons, {"resident_fraction": round(resident, 6), "busy_cores": round(quiet["busy_cores"], 3),
                          "mem_available": available}

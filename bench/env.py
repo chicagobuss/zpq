@@ -79,6 +79,7 @@ def warm(paths):
         with open(p, "rb", buffering=0) as f:
             while f.readinto(buf):
                 pass
+    for p in paths:
         resident, pages = residency(p)
         state[p] = {"resident": resident, "pages": pages, "ok": resident == pages}
     return all(s["ok"] for s in state.values()), state
@@ -120,6 +121,14 @@ def psi_available():
 @contextmanager
 def timing_lock(wait_s=0):
     """The host's one timing lock (fleet.sh skips a host that holds it); waits up to `wait_s` for it."""
+    inherited = os.environ.get("ZPQ_BENCH_LOCK_FD")
+    if inherited is not None:
+        fd = int(inherited)
+        if os.fstat(fd).st_ino != LOCK.stat().st_ino or os.fstat(fd).st_dev != LOCK.stat().st_dev:
+            raise ValueError("inherited timing lock does not match the bench lock")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield fd
+        return
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + wait_s
     with LOCK.open("w") as lock:
@@ -131,4 +140,4 @@ def timing_lock(wait_s=0):
                 if time.monotonic() >= deadline:
                     raise SystemExit(f"bench: {LOCK} is held: this host is timing") from None
                 time.sleep(1)
-        yield
+        yield lock.fileno()

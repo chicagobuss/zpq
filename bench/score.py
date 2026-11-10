@@ -83,6 +83,21 @@ def control(table, zpq="zpq", prev="zpq_prev"):
     return {"engine": prev, "cases": len(xs), "geomean": geomean(xs)} if xs else None
 
 
+def confirmations(scored):
+    """Cases over the rival threshold or with a disjoint loss against the control."""
+    flagged = []
+    for case, row in scored["cells"].items():
+        candidate, prev = row.get("zpq", {}), row.get("zpq_prev", {})
+        if "median_ns" not in candidate:
+            continue
+        rivals = [row[r]["median_ns"] for r in RIVALS if "median_ns" in row.get(r, {})]
+        if ((rivals and candidate["median_ns"] > 1.2 * min(rivals)) or
+                ("median_ns" in prev and candidate["median_ns"] > 1.05 * prev["median_ns"] and
+                 candidate["min_ns"] > prev["max_ns"])):
+            flagged.append(case)
+    return sorted(flagged)
+
+
 def score(header, records, planned, max_round=2):
     table, quarantined, pending = cells(records, header["reps"], max_round)
     missing = sorted(c for c in planned if c not in table)

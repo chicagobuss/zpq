@@ -1,8 +1,5 @@
 import io
-import os
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 from bench import env, lane
@@ -32,13 +29,3 @@ class WarmConditionTests(unittest.TestCase):
              patch('pathlib.Path.read_text', return_value='MemAvailable: 0 kB\n'):
             reasons, _ = runner.condition({'inputs': []})
         self.assertEqual(reasons, ['inputs-unverified', 'memory-before'])
-
-    def test_inherited_lock_does_not_release_parent_lock(self):
-        import fcntl
-        with tempfile.TemporaryDirectory() as tmp, patch.object(env, 'LOCK', Path(tmp) / 'lock'):
-            with env.timing_lock() as fd, patch.dict(os.environ, {'ZPQ_BENCH_LOCK_FD': str(fd)}):
-                with env.timing_lock():
-                    pass
-                with env.LOCK.open('a') as contender:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)

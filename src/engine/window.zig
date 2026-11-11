@@ -254,8 +254,8 @@ const RangeKey = struct {
     const Kind = union(enum) {
         /// An integer type, with the range it holds.
         integer: struct { lo: i256, hi: i256 },
-        /// A DECIMAL of this scale.
-        decimal: u8,
+        /// A DECIMAL's precision and scale, as the file declares them.
+        decimal: struct { precision: u8, scale: u8 },
         double,
         /// Days since the epoch.
         date,
@@ -275,13 +275,16 @@ const RangeKey = struct {
         /// The most a key may be, in the key's own units, when the offset's scale is the wider one and so casts the
         /// key column up: DuckDB casts it before the pass, so one key past this is an error for the query.
         key_max: ?i256 = null,
+        /// Digits to drop from the bound, when DuckDB's common type for the key and key + offset keeps the key's
+        /// digits left of the point and so rounds the sum.
+        round: ?u8 = null,
     };
 
     fn of(t: Table, ci: usize, descending: bool) !RangeKey {
         const e = t.elems[ci];
         const unsigned = schema.isUnsignedInt(e);
         const kind: Kind = blk: {
-            if (t.decs[ci]) |d| break :blk .{ .decimal = d.scale };
+            if (t.decs[ci]) |d| break :blk .{ .decimal = .{ .precision = d.precision, .scale = d.scale } };
             if (e.logical_type) |lt| switch (lt) {
                 .DATE => break :blk .date,
                 .TIMESTAMP => |ts| {
@@ -338,12 +341,16 @@ const RangeKey = struct {
                 .double => return .{ .off_f = expr_ast.decimalToDouble(n.mant, n.scale) },
                 // DuckDB adds a DECIMAL key and its offset at the wider of the two scales in 38 digits: the side that
                 // does not fit the cast there is a Conversion Error, and a sum that leaves it an Out of Range one.
-                .decimal => |ks| {
-                    const s = @max(ks, n.scale);
+                .decimal => |k| {
+                    const s = @max(k.scale, n.scale);
                     if (!fits38(n.mant, s - n.scale)) return error.WindowRangeCast;
-                    var o = try numberOffset(ks, n);
+                    var o = try numberOffset(k.scale, n);
                     o.limit = .{ .lo = -decimal_limit, .hi = decimal_limit };
-                    if (s > ks) o.key_max = expr_ast.pow10(38 - (s - ks));
+                    if (s > k.scale) o.key_max = expr_ast.pow10(38 - (s - k.scale));
+                    // DuckDB's common type keeps the key's digits left of the point: an offset with more decimals
+                    // than 38 - (precision - scale) is rounded to that scale, as its bound is cast to the key's.
+                    const max_scale = 38 - (k.precision - k.scale);
+                    if (s > max_scale) o.round = s - max_scale;
                     return o;
                 },
                 .integer => |k| {
@@ -425,8 +432,15 @@ const RangeKey = struct {
             return .{ .exact = @as(i256, to.days) * us_per_day + to.micros };
         }
         const v = self.lane(j) * o.mult;
-        const b = if (plus) v + o.off else v - o.off;
+        var b = if (plus) v + o.off else v - o.off;
         if (o.limit) |l| if (b < l.lo or b > l.hi) return error.WindowRangeOverflow;
+        // DuckDB casts the sum to the common type, rounding half away from zero when it drops digits.
+        if (o.round) |drop| {
+            const d = expr_ast.pow10(drop);
+            const q = @divTrunc(b, d);
+            const r = b - q * d;
+            b = q * d + if (@abs(r) * 2 >= d) (if (b < 0) -d else d) else 0;
+        }
         return .{ .exact = b };
     }
 
@@ -1482,6 +1496,21 @@ test "window: a RANGE offset's bound is an error where DuckDB's 38 digits or DAT
     try T.expectError(error.WindowRangeOverflow, keySpans(a, .{ .i64 = .{ .values = &epoch } }, date, null, 1, reachFrame(.current_row, .{ .reach_following = past })));
     try expectSpans(&.{.{ 0, 1 }}, try keySpans(a, .{ .i64 = .{ .values = &epoch } }, date, null, 1, reachFrame(.current_row, .{ .reach_following = fits })));
     try T.expectError(error.WindowRangeKey, keySpans(a, .{ .i64 = .{ .values = &epoch } }, date, null, 1, reachFrame(.{ .reach_preceding = wide_day }, .current_row)));
+    // DuckDB's common type keeps the key's 38 - (precision - scale) digits left of the point, so an offset with
+    // more decimals is rounded to that scale: DECIMAL(38, 1) 1.0 + 0.55 is 1.6, and its frame takes 1.6 in.
+    const dec38_1: ?expr_ast.Dec = .{ .precision = 38, .scale = 1 };
+    const dec37_1: ?expr_ast.Dec = .{ .precision = 37, .scale = 1 };
+    const d38 = [_]i128{ 10, 16 };
+    const fiftyfive: plan_types.Reach = .{ .number = .{ .mant = 55, .scale = 2, .bits = 32 } };
+    try expectSpans(&.{ .{ 0, 2 }, .{ 1, 2 } }, try keySpans(a, .{ .i128 = .{ .values = &d38 } }, intElem(), dec38_1, 2, reachFrame(.current_row, .{ .reach_following = fiftyfive })));
+    // A DECIMAL(37, 1) key keeps two decimals: 10.0 + 0.095 rounds to 10.10, and takes 10.1 in.
+    const d37 = [_]i128{ 100, 101 };
+    const ninetyfive: plan_types.Reach = .{ .number = .{ .mant = 95, .scale = 3, .bits = 32 } };
+    try expectSpans(&.{ .{ 0, 2 }, .{ 1, 2 } }, try keySpans(a, .{ .i128 = .{ .values = &d37 } }, intElem(), dec37_1, 2, reachFrame(.current_row, .{ .reach_following = ninetyfive })));
+    // A DECIMAL(38, 0) key has no decimals to give: 1 + 0.5 rounds half away from zero to 2.
+    const d38_0 = [_]i128{ 1, 2 };
+    const half: plan_types.Reach = .{ .number = .{ .mant = 5, .scale = 1, .bits = 32 } };
+    try expectSpans(&.{ .{ 0, 2 }, .{ 1, 2 } }, try keySpans(a, .{ .i128 = .{ .values = &d38_0 } }, intElem(), dec38_0, 2, reachFrame(.current_row, .{ .reach_following = half })));
 }
 
 test "window: AVG finalizes as DuckDB does, short types in doubles and the rest in long doubles" {

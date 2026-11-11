@@ -126,8 +126,8 @@ UNBOUNDED FOLLOWING` (an empty frame has a NULL sum and a zero count). A `RANGE`
 FOLLOWING` written as a whole number or a decimal, or `INTERVAL ..` on a DATE or TIMESTAMP key — over exactly one ORDER BY key whose
 type the offset reaches (an integer, DECIMAL, DOUBLE, DATE or TIMESTAMP; an INTERVAL needs a DATE or TIMESTAMP, and a number is
 everything but a TIMESTAMP). The key and the offset add in the key's type, as DuckDB adds them: a TINYINT key with `1 FOLLOWING`
-at 127 is `WindowRangeOverflow`, `200 PRECEDING` on it adds in INTEGER, a decimal offset is exact, and a key that is NULL frames
-its own NULL peers (`WindowRangeKey` names an offset the key does not take, `WindowRangeOffset` a bound that reaches the wrong
+at 127 is `WindowRangeOverflow`, `200 PRECEDING` on it adds in INTEGER, a decimal offset is rounded half away from zero to the
+scale the key's 38 digits leave, and a key that is NULL frames its own NULL peers (`WindowRangeKey` names an offset the key does not take, `WindowRangeOffset` a bound that reaches the wrong
 way, `WindowRangeCast` a key or an offset needing more than 38 digits once both are at one scale). DuckDB's limits hold: a
 DECIMAL key's bound is checked against 38 digits, an integer key with a fractional offset is cast to `DECIMAL(38, scale)`
 first, a DATE's day delta stays within the days a DATE holds, and a DATE takes only an INTEGER offset (`3000000000 PRECEDING`

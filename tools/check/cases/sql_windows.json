@@ -27,6 +27,10 @@
   {
    "name": "wx",
    "path": "ci/fixtures/parquet/sql_windows_range_extreme.parquet"
+  },
+  {
+   "name": "ws",
+   "path": "ci/fixtures/parquet/sql_windows_range_scale.parquet"
   }
  ],
  "cases": [
@@ -2537,6 +2541,29 @@
    "oracle": {
     "compare": "written_sql",
     "sql": "SELECT id, count(*) OVER (ORDER BY d0 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS d0_1, count(*) OVER (ORDER BY d37 RANGE BETWEEN 0.0000000000000000000000000000000000001 PRECEDING AND CURRENT ROW) AS d37_1, count(*) OVER (ORDER BY b RANGE BETWEEN 0.0000000000000000001 PRECEDING AND CURRENT ROW) AS b_19, count(*) OVER (ORDER BY i RANGE BETWEEN 0.000000001 PRECEDING AND CURRENT ROW) AS i_9, count(*) OVER (ORDER BY dt RANGE BETWEEN 1000 PRECEDING AND 1000 FOLLOWING) AS dt_1000 FROM '{fixture:wx}'"
+   }
+  },
+  {
+   "id": "sql_windows:range-offset-decimal-scale",
+   "fixture": "ws",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, count(*) OVER (ORDER BY d1 RANGE BETWEEN CURRENT ROW AND 0.55 FOLLOWING) AS f1, count(*) OVER (ORDER BY d1 RANGE BETWEEN 0.55 PRECEDING AND CURRENT ROW) AS p1, count(*) OVER (ORDER BY d1 DESC RANGE BETWEEN CURRENT ROW AND 0.55 FOLLOWING) AS d1d, count(*) OVER (ORDER BY d37 RANGE BETWEEN CURRENT ROW AND 0.095 FOLLOWING) AS f37, count(*) OVER (ORDER BY d20 RANGE BETWEEN CURRENT ROW AND 0.000000000000000000055 FOLLOWING) AS f20, count(*) OVER (ORDER BY d0 RANGE BETWEEN CURRENT ROW AND 0.5 FOLLOWING) AS f0, count(*) OVER (ORDER BY d10 RANGE BETWEEN CURRENT ROW AND 0.55 FOLLOWING) AS f10 FROM '{fixture:ws}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, count(*) OVER (ORDER BY d1 RANGE BETWEEN CURRENT ROW AND 0.55 FOLLOWING) AS f1, count(*) OVER (ORDER BY d1 RANGE BETWEEN 0.55 PRECEDING AND CURRENT ROW) AS p1, count(*) OVER (ORDER BY d1 DESC RANGE BETWEEN CURRENT ROW AND 0.55 FOLLOWING) AS d1d, count(*) OVER (ORDER BY d37 RANGE BETWEEN CURRENT ROW AND 0.095 FOLLOWING) AS f37, count(*) OVER (ORDER BY d20 RANGE BETWEEN CURRENT ROW AND 0.000000000000000000055 FOLLOWING) AS f20, count(*) OVER (ORDER BY d0 RANGE BETWEEN CURRENT ROW AND 0.5 FOLLOWING) AS f0, count(*) OVER (ORDER BY d10 RANGE BETWEEN CURRENT ROW AND 0.55 FOLLOWING) AS f10 FROM '{fixture:ws}'"
    }
   },
   {

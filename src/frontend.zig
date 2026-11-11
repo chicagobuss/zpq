@@ -43,6 +43,14 @@ pub fn failureMessage(err: anyerror) []const u8 {
         error.NoCredentials => "S3 credentials are missing; set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY,\n" ++
             "  or S3_NO_SIGN_REQUEST=1 for a public bucket",
         error.NoRegion => "the S3 region is missing; set AWS_REGION (or S3_REGION)",
+        error.NoSuchKey => "the object does not exist; check the bucket and key",
+        error.NoSuchBucket => "the bucket does not exist; check its name and region",
+        error.InvalidAccessKeyId => "S3 did not accept the access key; check AWS_ACCESS_KEY_ID (or S3_ACCESS_KEY_ID)",
+        error.SignatureDoesNotMatch => "S3 did not accept the secret key; check AWS_SECRET_ACCESS_KEY (or S3_SECRET_ACCESS_KEY)",
+        error.WrongRegion => "the S3 endpoint is in the wrong region; check AWS_REGION (or S3_REGION)",
+        error.SlowDown => "S3 is throttling the request; try again",
+        error.S3ServerError => "S3 failed; try again",
+        error.S3RequestFailed => "S3 refused the request; check the bucket, key and credentials",
         error.BadRangeResponse => "S3 did not return the requested byte range; check the endpoint and access",
         error.OutOfMemory => "not enough memory; reduce workers with -j 1 or use a host with more memory",
         error.NoSpaceLeft => "output storage is full; free space or choose another output path",
@@ -83,6 +91,34 @@ test "frontend: first-five-minutes failures explain recovery without bare error 
     try std.testing.expect(std.mem.indexOf(u8, full, "NoSpaceLeft") == null);
 }
 
+test "frontend: an S3 refusal prints the request, status, code and message once" {
+    const Capture = struct {
+        var bytes: [2048]u8 = undefined;
+        var len: usize = 0;
+        fn write(message: []const u8) void {
+            const n = @min(message.len, bytes.len - len);
+            @memcpy(bytes[len..][0..n], message[0..n]);
+            len += n;
+        }
+    };
+    const saved = diagnostic_fn;
+    diagnostic_fn = Capture.write;
+    defer diagnostic_fn = saved;
+    Capture.len = 0;
+    var failure: Diag = .{};
+    failure.detail = .{ .s3_request = .{
+        .op = .GetObject,
+        .phase = .response,
+        .status = 404,
+    } };
+    failure.detail.s3_request.bucket.set("bkt");
+    failure.detail.s3_request.key.set("key");
+    failure.detail.s3_request.code.set("NoSuchKey");
+    failure.detail.s3_request.message.set("The specified key does not exist.");
+    queryError(error.NoSuchKey, &failure);
+    try std.testing.expectEqualStrings("zpq query: GET s3://bkt/key: 404 NoSuchKey: The specified key does not exist.\n", Capture.bytes[0..Capture.len]);
+}
+
 fn diagnosticPrint(comptime fmt: []const u8, args: anytype) void {
     const report = diagnostic_fn orelse return std.debug.print(fmt, args);
     var buf: [16 * 1024]u8 = undefined;
@@ -96,6 +132,10 @@ pub fn noSqlMatches(table_name: []const u8) void {
 pub fn queryError(err: anyerror, diag: *const Diag) void {
     if (diag.detail == .decode and zpq.core.consumer.isDecodeError(err)) return decodeError(err, diag);
     if (csvError(err, diag)) return;
+    if (diag.detail == .s3_request) {
+        diagnosticPrint("zpq query: {f}\n", .{diag.detail.s3_request});
+        return;
+    }
     printDetail(diag);
     if (querySetupError(err, diag)) return;
     switch (err) {
@@ -702,11 +742,11 @@ fn causeName(diag: *const Diag) []const u8 {
 /// Plain paths (no glob char) pass through as a single-element slice.
 /// Only `*` is supported as a wildcard, in the basename only — covers
 /// the duckdb-style `prefix/*.parquet` shape we want for the demo.
-pub fn expandGlob(arena: std.mem.Allocator, io: std.Io, pattern: []const u8, env: std.process.Environ) ![][]const u8 {
+pub fn expandGlob(arena: std.mem.Allocator, io: std.Io, pattern: []const u8, env: std.process.Environ, diag: ?*Diag) ![][]const u8 {
     // s3:// patterns: handled separately. Plain s3 URLs (no glob char)
     // pass through; globbed s3 URLs go through ListObjectsV2.
     if (std.mem.startsWith(u8, pattern, "s3://")) {
-        return expandS3Glob(arena, pattern, env);
+        return expandS3Glob(arena, pattern, env, diag);
     }
 
     if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
@@ -754,6 +794,7 @@ fn expandS3Glob(
     arena: std.mem.Allocator,
     pattern: []const u8,
     env: std.process.Environ,
+    diag: ?*Diag,
 ) ![][]const u8 {
     if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
         const single = try arena.alloc([]const u8, 1);
@@ -794,7 +835,7 @@ fn expandS3Glob(
     var client = try s3.Client.init(arena, creds, url.bucket);
     defer client.deinit();
 
-    const entries = try s3.listAll(arena, &client, list_prefix);
+    const entries = try s3.listAll(arena, &client, list_prefix, diag);
     if (entries.len == 0) {
         diagnosticPrint("zpq query: s3 glob matched no objects under prefix {s}\n", .{list_prefix});
     }

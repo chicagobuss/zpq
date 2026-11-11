@@ -114,20 +114,47 @@ pub const Detail = union(enum) {
     },
 };
 
-/// A failed S3 request, as reported to the user: the operation, the phase it failed in, and the error or the status
-/// and S3 error code it was answered with.
+/// A failed S3 request, as reported to the user: the operation, the bucket and key, the phase it failed in, and the
+/// error or the status and S3 error code and message it was answered with.
 pub const S3Failure = struct {
     op: Op,
     phase: Phase,
+    bucket: Text = .{},
+    key: Text = .{},
     /// The error, for the `connect` and `request` phases.
     err: ?anyerror = null,
-    /// The HTTP status and S3 error code (`<Code>`), for the `response` phase.
+    /// The HTTP status, S3 error code (`<Code>`) and message, for the `response` phase.
     status: u16 = 0,
     code: Text = .{},
+    message: Text = .{},
+    /// The bucket's region S3 named, when it answered from the wrong one.
+    region: Text = .{},
     /// Connections tried; only a connect failure is tried again.
     attempts: u8 = 1,
 
-    pub const Op = enum { CreateMultipartUpload, CompleteMultipartUpload, AbortMultipartUpload, PutObject };
+    pub const Op = enum {
+        GetObject,
+        HeadObject,
+        ListObjectsV2,
+        PutObject,
+        UploadPart,
+        CreateMultipartUpload,
+        CompleteMultipartUpload,
+        AbortMultipartUpload,
+        ListMultipartUploads,
+
+        /// The request as a user names it: `GET`, `PUT part`, or the operation's tag.
+        pub fn name(self: Op) []const u8 {
+            return switch (self) {
+                .GetObject => "GET",
+                .HeadObject => "HEAD",
+                .ListObjectsV2 => "LIST",
+                .PutObject => "PUT",
+                .UploadPart => "PUT part",
+                else => @tagName(self),
+            };
+        }
+    };
 
     pub const Phase = enum {
         /// Resolving the host, connecting, or the TLS handshake: nothing was sent.
@@ -138,18 +165,41 @@ pub const S3Failure = struct {
         response,
     };
 
-    /// One line: `CreateMultipartUpload failed while connecting (3 attempts): ConnectTimeout`.
+    /// One line: `GET s3://bucket/key: 404 NoSuchKey: The specified key does not exist.`; for a failure before the
+    /// answer, `GET s3://bucket/key: failed while connecting (3 attempts): ConnectTimeout`.
     pub fn format(self: S3Failure, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("{s} ", .{@tagName(self.op)});
+        try w.writeAll(self.op.name());
+        if (self.bucket.len > 0) {
+            try w.print(" s3://{s}", .{self.bucket.get()});
+            if (self.key.len > 0) try w.print("/{s}", .{self.key.get()});
+        }
+        try w.writeAll(": ");
         switch (self.phase) {
             .connect => try w.writeAll("failed while connecting"),
             .request => try w.writeAll("failed after the request was sent"),
             .response => {
                 const code = if (self.code.len > 0) self.code.get() else "(no S3 error code)";
-                try w.print("was answered {d} {s}", .{ self.status, code });
+                try w.print("{d} {s}", .{ self.status, code });
+                if (self.message.len > 0) try w.print(": {s}", .{self.message.get()});
             },
         }
         if (self.attempts > 1) try w.print(" ({d} attempts)", .{self.attempts});
         if (self.err) |e| try w.print(": {s}", .{@errorName(e)});
+        const code = self.code.get();
+        if (std.mem.eql(u8, code, "InvalidAccessKeyId") or
+            std.mem.eql(u8, code, "SignatureDoesNotMatch") or
+            std.mem.eql(u8, code, "InvalidToken") or
+            std.mem.eql(u8, code, "ExpiredToken"))
+        {
+            try w.writeAll("; check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)");
+        } else if (self.region.len > 0) {
+            try w.print("; the bucket is in region {s}", .{self.region.get()});
+        }
     }
 };
+
+/// Record `failure` unless the query already has a more specific detail.
+pub fn setS3Failure(diag: ?*Diag, failure: S3Failure) void {
+    const d = diag orelse return;
+    if (d.detail == .none) d.detail = .{ .s3_request = failure };
+}

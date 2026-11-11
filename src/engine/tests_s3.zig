@@ -1020,7 +1020,7 @@ test "a windowed S3 fetch that fails mid-scan fails the query rather than hangin
     fake.gets_allowed = 5;
     const keys = [_][]const u8{ "t/a.parquet", "t/b.parquet" };
     const q: QueryArgs = .{ .inputs = &.{}, .aggregate = "count(*) AS n, sum(i) AS s", .parallelism = 2 };
-    try std.testing.expectError(error.RangeFetchFailed, fakeS3AggregateJsonEnv(gpa, &fake, &keys, q, 1, &.{"ZPQ_S3_FOOTER_PROBE=16384"}));
+    try std.testing.expectError(error.AccessDenied, fakeS3AggregateJsonEnv(gpa, &fake, &keys, q, 1, &.{"ZPQ_S3_FOOTER_PROBE=16384"}));
 }
 
 test "a windowed row print waits for a row group left to its writer, and fails with its fetch, at every parallelism" {
@@ -1113,7 +1113,7 @@ test "a windowed row print waits for a row group left to its writer, and fails w
             }
         }
         if (refuse) {
-            try std.testing.expectEqual(@as(?anyerror, error.RangeFetchFailed), first_err);
+            try std.testing.expectEqual(@as(?anyerror, error.AccessDenied), first_err);
         } else {
             try std.testing.expectEqual(@as(?anyerror, null), first_err);
             try std.testing.expectEqual(@as(usize, 1624), std.mem.count(u8, first.?, "\n"));

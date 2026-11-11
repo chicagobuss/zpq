@@ -1361,7 +1361,7 @@ fn valuesOf(
 }
 
 fn expandInputs(arena: std.mem.Allocator, ctx: engine.Context, pattern: []const u8) ![]const []const u8 {
-    return zpq.frontend.expandGlob(arena, ctx.io, pattern, ctx.env);
+    return zpq.frontend.expandGlob(arena, ctx.io, pattern, ctx.env, null);
 }
 
 /// `{data}` is the external data root; without `--data` a case that needs it fails rather than skips.

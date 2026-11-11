@@ -580,6 +580,7 @@ const RemoteInputs = struct {
                     .batch = @max(1, self.fetch_window.limit / 4),
                     // Only a reader that may stop early (`always`: a print with a limit) fetches its first rows first.
                     .slow_start = self.fetch_window.always,
+                    .diag = self.args.diag,
                 },
                 .pool = pool,
                 .creds = creds,
@@ -617,6 +618,7 @@ const RemoteInputs = struct {
                 s3.inFlight(self.ctx.env),
                 self.args.profiler,
                 &data_wave,
+                self.ctx.diag,
             );
             fetch_span.end(.fetch, profile.args(.{ fetch_jobs.items.len, fetched }));
             for (fetch_jobs.items) |j| try ensureHeadMagic(j.range.start, j.target);

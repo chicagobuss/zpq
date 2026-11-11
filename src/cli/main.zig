@@ -589,10 +589,11 @@ const ColumnNames = struct {
     schemas: *engine.join.LocalSchemas,
     io: std.Io,
     env: std.process.Environ,
+    diag: ?*Diag,
 
     fn of(ctx: *anyopaque, arena: std.mem.Allocator, table: []const u8) anyerror![]const []const u8 {
         const self: *ColumnNames = @ptrCast(@alignCast(ctx));
-        const matches = try expandGlob(arena, self.io, table, self.env);
+        const matches = try expandGlob(arena, self.io, table, self.env, self.diag);
         if (matches.len == 0) return error.NoMatches;
         // A footer is read from a local file only.
         const meta = engine.join.LocalSchemas.footer(self.schemas, matches[0]) catch |err| return if (err == error.JoinNotLocal) error.ColumnsNotSupported else err;
@@ -631,7 +632,7 @@ fn runParsed(
     var column_schemas: engine.join.LocalSchemas = .{ .arena = arena };
     defer column_schemas.deinit();
     const query: ?[]const u8 = if (comptime build_options.enable_sql) if (options.query) |q| blk: {
-        var names: ColumnNames = .{ .schemas = &column_schemas, .io = io, .env = env };
+        var names: ColumnNames = .{ .schemas = &column_schemas, .io = io, .env = env, .diag = diag };
         // Comments are gone first: a COLUMNS( in one is no call.
         const clean = try zpq.core.expr.sql_parser.stripComments(arena, q);
         break :blk zpq.core.expr.sql_columns.expand(arena, clean, .{ .ctx = &names, .names = ColumnNames.of }) catch |err| {
@@ -728,7 +729,7 @@ fn runParsed(
                 return error.BadArgs;
             }
             // A star beside a window call is the columns it stands for: the stages are planned around them.
-            var star_names: ColumnNames = .{ .schemas = &column_schemas, .io = io, .env = env };
+            var star_names: ColumnNames = .{ .schemas = &column_schemas, .io = io, .env = env, .diag = diag };
             const starred = zpq.core.expr.sql_columns.expandStars(arena, stripped, .{ .ctx = &star_names, .names = ColumnNames.of }) catch |err| {
                 switch (err) {
                     error.ColumnsNotSupported => diagnosticPrint("sql: SELECT * with a window function needs one local table\n", .{}),
@@ -817,7 +818,7 @@ fn runParsed(
                 limit = @intCast(n);
             };
 
-            const matches = try expandGlob(arena, io, pq.table_name, env);
+            const matches = try expandGlob(arena, io, pq.table_name, env, diag);
             if (matches.len == 0) {
                 zpq.frontend.noSqlMatches(pq.table_name);
                 return error.NoMatches;
@@ -831,7 +832,7 @@ fn runParsed(
         }
     } else {
         for (inputs_raw.items) |pat| {
-            const matches = try expandGlob(arena, io, pat, env);
+            const matches = try expandGlob(arena, io, pat, env, diag);
             if (matches.len == 0) {
                 diagnosticPrint("zpq query: no files matched: {s}\n", .{pat});
                 return error.NoMatches;
@@ -1711,7 +1712,7 @@ fn runInspect(init: std.process.Init, iter: *std.process.Args.Iterator) !void {
             diagnosticPrint("zpq inspect: unrecognized option: {s}; see `zpq --help`\n", .{arg});
             return error.BadArgs;
         } else {
-            const expanded = try expandGlob(arena, init.io, arg, init.minimal.environ);
+            const expanded = try expandGlob(arena, init.io, arg, init.minimal.environ, null);
             if (expanded.len == 0) {
                 diagnosticPrint("zpq inspect: no matches for {s}; check the basename wildcard\n", .{arg});
                 return error.BadArgs;

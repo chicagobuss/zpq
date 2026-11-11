@@ -34,6 +34,7 @@ const pool_mod = @import("pool.zig");
 const retry = @import("retry.zig");
 const clock = @import("../clock.zig");
 const profile = @import("../profile.zig");
+const diag_mod = @import("../core/diag.zig");
 
 pub const Pool = pool_mod.Pool;
 pub const PoolCriteria = pool_mod.Criteria;
@@ -107,6 +108,17 @@ pub const Error = error{
     Ipv6EndpointUnsupported,
     BadResponse,
     SignFailed,
+    /// S3 answered with an error code this client names. The status, code and message are on the query's
+    /// `Diag.detail.s3_request`.
+    NoSuchKey,
+    NoSuchBucket,
+    AccessDenied,
+    InvalidAccessKeyId,
+    SignatureDoesNotMatch,
+    WrongRegion,
+    SlowDown,
+    S3ServerError,
+    S3RequestFailed,
 } || tls.Error || http.Error || std.mem.Allocator.Error;
 
 pub const Range = struct {
@@ -476,6 +488,7 @@ pub const Client = struct {
         prefix: []const u8,
         max_keys: u32,
         continuation_token: ?[]const u8,
+        diag: ?*diag_mod.Diag,
     ) Error!ListPage {
         if (self.conn == null) {
             self.conn = try connect(self.client_arena, self.creds, self.addrs, self.host);
@@ -489,6 +502,7 @@ pub const Client = struct {
             prefix,
             max_keys,
             continuation_token,
+            diag,
         );
     }
 };
@@ -511,11 +525,12 @@ pub fn listAll(
     req_arena: std.mem.Allocator,
     client: *Client,
     prefix: []const u8,
+    diag: ?*diag_mod.Diag,
 ) Error![]const ListEntry {
     var all: std.ArrayList(ListEntry) = .empty;
     var token: ?[]const u8 = null;
     while (true) {
-        const page = try client.list(req_arena, prefix, 1000, token);
+        const page = try client.list(req_arena, prefix, 1000, token, diag);
         for (page.entries) |e| try all.append(req_arena, e);
         token = page.next_token;
         if (token == null) break;
@@ -892,6 +907,8 @@ pub fn fetchJobs(
     profiler: ?*profile.Profiler,
     /// The query's data wave, or null for a fetch that is not a data range (Bloom, tests, `fetchManyRanges`).
     wave: ?*DataWave,
+    /// Receives the first failed request's named error and S3 answer.
+    diag: ?*diag_mod.Diag,
 ) !u64 {
     // 1. Pre-process: split big ranges into sub-jobs.
     var split: std.ArrayList(FetchJob) = .empty;
@@ -983,10 +1000,18 @@ pub fn fetchJobs(
 
     // 5. Tally + check for failures.
     var fetched: u64 = 0;
+    var failed: ?anyerror = null;
     for (ctxs) |ctx| {
-        if (!ctx.ok) return error.RangeFetchFailed;
-        fetched += ctx.target.len;
+        if (ctx.ok) {
+            fetched += ctx.target.len;
+            continue;
+        }
+        if (failed == null) {
+            failed = ctx.err orelse error.RangeFetchFailed;
+            if (ctx.failure) |f| diag_mod.setS3Failure(diag, f);
+        }
     }
+    if (failed) |err| return err;
     return fetched;
 }
 
@@ -1015,7 +1040,7 @@ pub fn fetchManyRanges(
             .target = into[@intCast(r.start)..@intCast(r.end)],
         });
     }
-    return fetchJobs(io, p, gpa, arena, creds, jobs.items, @TypeOf(p.*).capacity, null, null);
+    return fetchJobs(io, p, gpa, arena, creds, jobs.items, @TypeOf(p.*).capacity, null, null, null);
 }
 
 const FetchCtx = struct {
@@ -1032,6 +1057,9 @@ const FetchCtx = struct {
     /// Pre-sized target buffer; `target.len == range.end - range.start`.
     target: []u8,
     ok: bool,
+    /// The named error and S3 answer when this request failed; read after the workers join.
+    err: ?anyerror = null,
+    failure: ?diag_mod.S3Failure = null,
     profiler: ?*profile.Profiler = null,
     landed: ?Landed = null,
     /// Set for a query's data-range fetches. Null for Bloom and other callers.
@@ -1062,10 +1090,19 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
     const arena = arena_state.allocator();
     const resp = requestViaPool(io, ctx.pool, arena, criteria, opts, ctx, doFetch) catch |err| switch (err) {
         error.Canceled => return error.Canceled,
-        else => return,
+        else => {
+            ctx.err = err;
+            return;
+        },
     };
     // Any status but a full 200/206 (including a throttle that outlasted the budget) fails this fetch.
-    ctx.ok = (resp.status == 206 or resp.status == 200) and resp.body.len == ctx.target.len;
+    if (resp.status == 206 or resp.status == 200) {
+        ctx.ok = resp.body.len == ctx.target.len;
+    } else {
+        const r = refusal(.GetObject, ctx.bucket, ctx.key, resp);
+        ctx.failure = r.failure;
+        ctx.err = r.err;
+    }
     if (ctx.ok) if (ctx.landed) |l| l.f(l.ctx, ctx.target.len);
 }
 
@@ -1112,6 +1149,88 @@ pub fn extractXml(arena: std.mem.Allocator, xml: []const u8, tag: []const u8) ![
     const after_open = start + open.len;
     const end = std.mem.indexOfPos(u8, xml, after_open, close) orelse return error.XmlTagMissing;
     return try arena.dupe(u8, xml[after_open..end]);
+}
+
+pub const S3Failure = diag_mod.S3Failure;
+
+/// One failed S3 response and the named error it maps to.
+pub const Refusal = struct {
+    failure: S3Failure,
+    err: Error,
+
+    pub fn record(self: Refusal, diag: ?*diag_mod.Diag) void {
+        diag_mod.setS3Failure(diag, self.failure);
+    }
+};
+
+/// Parse S3's error answer once: status, `<Code>` and `<Message>`, plus `x-amz-bucket-region`, then map the code to a
+/// named error. A HEAD body is empty, so its status and headers are all there is. A redirect or a region complaint is
+/// `WrongRegion`; a 5xx is `SlowDown` when S3 says so and `S3ServerError` otherwise.
+pub fn refusal(op: diag_mod.S3Failure.Op, bucket: []const u8, key: []const u8, resp: http.Response) Refusal {
+    var failure: S3Failure = .{
+        .op = op,
+        .phase = .response,
+        .status = resp.status,
+        .bucket = .of(bucket),
+        .key = .of(key),
+    };
+    if (extractTag(resp.body, "<Code>", "</Code>")) |code| {
+        failure.code.set(std.mem.trim(u8, code, " \t\r\n"));
+    }
+    if (extractTag(resp.body, "<Message>", "</Message>")) |message| {
+        failure.message.set(std.mem.trim(u8, message, " \t\r\n"));
+    }
+    if (resp.header("x-amz-bucket-region")) |region| failure.region.set(std.mem.trim(u8, region, " \t\r\n"));
+
+    const code = failure.code.get();
+    const redirect = resp.status == 301 or resp.status == 307 or resp.status == 308;
+    const err: Error = if (redirect or std.mem.eql(u8, code, "AuthorizationHeaderMalformed") or
+        std.mem.eql(u8, code, "PermanentRedirect") or std.mem.eql(u8, code, "TemporaryRedirect"))
+        error.WrongRegion
+    else if (std.mem.eql(u8, code, "NoSuchKey"))
+        error.NoSuchKey
+    else if (std.mem.eql(u8, code, "NoSuchBucket"))
+        error.NoSuchBucket
+    else if (std.mem.eql(u8, code, "AccessDenied"))
+        error.AccessDenied
+    else if (std.mem.eql(u8, code, "InvalidAccessKeyId"))
+        error.InvalidAccessKeyId
+    else if (std.mem.eql(u8, code, "SignatureDoesNotMatch"))
+        error.SignatureDoesNotMatch
+    else if (std.mem.eql(u8, code, "InvalidToken") or std.mem.eql(u8, code, "ExpiredToken"))
+        error.InvalidAccessKeyId
+    else if (std.mem.eql(u8, code, "InvalidRequest") and std.mem.indexOf(u8, failure.message.get(), "region") != null)
+        error.WrongRegion
+    else if (std.mem.eql(u8, code, "SlowDown") or resp.status == 429)
+        error.SlowDown
+    else if (resp.status == 404)
+        if (op == .GetObject or op == .HeadObject) error.NoSuchKey else error.NoSuchBucket
+    else if (resp.status == 403)
+        error.AccessDenied
+    else if (resp.status >= 500)
+        error.S3ServerError
+    else
+        error.S3RequestFailed;
+
+    if (failure.message.len == 0) failure.message.set(if (err == error.NoSuchKey)
+        "the object does not exist"
+    else if (err == error.NoSuchBucket)
+        "the bucket does not exist"
+    else if (err == error.AccessDenied)
+        "access denied"
+    else if (err == error.InvalidAccessKeyId)
+        "the access key is not valid"
+    else if (err == error.SignatureDoesNotMatch)
+        "the request signature does not match the secret key"
+    else if (err == error.WrongRegion)
+        "the endpoint is in the wrong region"
+    else if (err == error.SlowDown)
+        "S3 is throttling the request; try again"
+    else if (err == error.S3ServerError)
+        "S3 failed; try again"
+    else
+        "S3 refused the request");
+    return .{ .failure = failure, .err = err };
 }
 
 fn buildAndSend(
@@ -1188,6 +1307,7 @@ fn sendListV2(
     prefix: []const u8,
     max_keys: u32,
     continuation_token: ?[]const u8,
+    diag: ?*diag_mod.Diag,
 ) Error!ListPage {
     // Path: virtual-hosted is "/"; path-style (R2 / endpoint override /
     // dotted bucket) is "/<bucket>". Same logic as `pathFor` for an empty key.
@@ -1235,7 +1355,11 @@ fn sendListV2(
         .path = path_with_query,
         .headers = req_headers.items,
     });
-    if (resp.status != 200) return error.BadResponse;
+    if (resp.status != 200) {
+        const r = refusal(.ListObjectsV2, bucket, prefix, resp);
+        r.record(diag);
+        return r.err;
+    }
 
     return parseListV2Body(req_arena, resp.body);
 }
@@ -1424,6 +1548,122 @@ test "a dotted AWS bucket is addressed path-style, so its host stays inside AWS'
     };
     try testing.expectEqualStrings("acct.r2.example:8443", try hostFor(a, r2, "logs"));
     try testing.expectEqualStrings("/logs/k.parquet", try pathFor(a, r2, "logs", "k.parquet"));
+}
+
+test "S3 refusals name the request, status, code and message, and map the code to a named error" {
+    const wrong_region = [_]http.Header{.{ .name = "x-amz-bucket-region", .value = "eu-west-1" }};
+    const Case = struct {
+        status: u16,
+        body: []const u8 = "",
+        headers: []const http.Header = &.{},
+        op: diag_mod.S3Failure.Op,
+        key: []const u8 = "key",
+        want: anyerror,
+        text: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .status = 404,
+            .body = "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>",
+            .op = .GetObject,
+            .want = error.NoSuchKey,
+            .text = "GET s3://bkt/key: 404 NoSuchKey: The specified key does not exist.",
+        },
+        .{
+            .status = 404,
+            .body = "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>",
+            .op = .GetObject,
+            .want = error.NoSuchBucket,
+            .text = "GET s3://bkt/key: 404 NoSuchBucket: The specified bucket does not exist",
+        },
+        .{
+            .status = 403,
+            .body = "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
+            .op = .GetObject,
+            .want = error.AccessDenied,
+            .text = "GET s3://bkt/key: 403 AccessDenied: Access Denied",
+        },
+        .{
+            .status = 403,
+            .body = "<Error><Code>InvalidAccessKeyId</Code><Message>The AWS Access Key Id you provided does not exist.</Message></Error>",
+            .op = .GetObject,
+            .want = error.InvalidAccessKeyId,
+            .text = "GET s3://bkt/key: 403 InvalidAccessKeyId: The AWS Access Key Id you provided does not exist.; " ++
+                "check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)",
+        },
+        .{
+            .status = 403,
+            .body = "<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match.</Message></Error>",
+            .op = .PutObject,
+            .want = error.SignatureDoesNotMatch,
+            .text = "PUT s3://bkt/key: 403 SignatureDoesNotMatch: The request signature we calculated does not match.; " ++
+                "check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)",
+        },
+        .{
+            .status = 301,
+            .headers = &wrong_region,
+            .op = .GetObject,
+            .want = error.WrongRegion,
+            .text = "GET s3://bkt/key: 301 (no S3 error code): the endpoint is in the wrong region; " ++
+                "the bucket is in region eu-west-1",
+        },
+        .{
+            .status = 400,
+            .body = "<Error><Code>AuthorizationHeaderMalformed</Code><Message>The authorization header is malformed; expecting 'eu-west-1'.</Message></Error>",
+            .headers = &wrong_region,
+            .op = .GetObject,
+            .want = error.WrongRegion,
+            .text = "GET s3://bkt/key: 400 AuthorizationHeaderMalformed: The authorization header is malformed; " ++
+                "expecting 'eu-west-1'.; the bucket is in region eu-west-1",
+        },
+        .{
+            .status = 400,
+            .body = "<Error><Code>InvalidRequest</Code><Message>invalid credential region</Message></Error>",
+            .op = .GetObject,
+            .want = error.WrongRegion,
+            .text = "GET s3://bkt/key: 400 InvalidRequest: invalid credential region",
+        },
+        .{
+            .status = 503,
+            .body = "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
+            .op = .GetObject,
+            .want = error.SlowDown,
+            .text = "GET s3://bkt/key: 503 SlowDown: Please reduce your request rate.",
+        },
+        .{
+            .status = 500,
+            .body = "<Error><Code>InternalError</Code></Error>",
+            .op = .GetObject,
+            .want = error.S3ServerError,
+            .text = "GET s3://bkt/key: 500 InternalError: S3 failed; try again",
+        },
+        .{
+            .status = 404,
+            .op = .HeadObject,
+            .want = error.NoSuchKey,
+            .text = "HEAD s3://bkt/key: 404 (no S3 error code): the object does not exist",
+        },
+        .{
+            .status = 404,
+            .op = .ListObjectsV2,
+            .key = "prefix",
+            .want = error.NoSuchBucket,
+            .text = "LIST s3://bkt/prefix: 404 (no S3 error code): the bucket does not exist",
+        },
+        .{
+            .status = 403,
+            .body = "<Error><Code>AccessDenied</Code></Error>",
+            .op = .UploadPart,
+            .want = error.AccessDenied,
+            .text = "PUT part s3://bkt/key: 403 AccessDenied: access denied",
+        },
+    };
+    for (cases) |case| {
+        const r = refusal(case.op, "bkt", case.key, .{ .status = case.status, .headers = case.headers, .body = case.body });
+        try testing.expectEqual(case.want, r.err);
+        var buf: [512]u8 = undefined;
+        try testing.expectEqualStrings(case.text, try std.fmt.bufPrint(&buf, "{f}", .{r.failure}));
+    }
 }
 
 fn testEnviron(comptime entries: []const [*:0]const u8) std.process.Environ {
@@ -1969,7 +2209,7 @@ test "the first data wave keeps at most 8 data-range requests in flight until th
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            _ = fetchJobs(self.io, self.pool, testing.allocator, self.arena, self.creds, self.jobs, 16, null, self.wave) catch |e| {
+            _ = fetchJobs(self.io, self.pool, testing.allocator, self.arena, self.creds, self.jobs, 16, null, self.wave, null) catch |e| {
                 self.err = e;
             };
         }

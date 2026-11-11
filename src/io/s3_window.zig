@@ -15,6 +15,7 @@ const coalescer = @import("coalescer.zig");
 const profile = @import("../profile.zig");
 const scan = @import("../core/scan.zig");
 const metadata = @import("../core/parquet/metadata.zig");
+const Diag = @import("../core/diag.zig").Diag;
 
 pub const Gate = scan.RowGroupGate;
 
@@ -229,6 +230,7 @@ pub fn Fetcher(comptime Pool: type) type {
                     self.workers,
                     self.profiler,
                     &self.wave,
+                    w.diag,
                 );
                 for (planned.held) |h| {
                     @memcpy(h.dst, h.src);
@@ -297,6 +299,8 @@ pub const Window = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     /// Set before any row group is marked failed, read only after.
     err: ?anyerror = null,
+    /// Receives the first failed request's named error and S3 answer.
+    diag: ?*Diag = null,
     stats: Stats = .{},
     stalls: std.atomic.Value(u64) = .init(0),
     stall_ns: std.atomic.Value(u64) = .init(0),

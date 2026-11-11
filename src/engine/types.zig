@@ -280,12 +280,15 @@ pub const Context = struct {
     /// kernel tears it down at exit regardless. The CLI drops the input mappings' pages in parallel once the answer is
     /// out (`local_fs.releaseLeft`). Never for a process that runs another query (the Lambda).
     exit_after: bool = false,
+    /// The query's diagnostic, for a named S3 refusal and the request behind it.
+    diag: ?*Diag = null,
 
     /// The context one query runs in, for every entry point and query kind alike: only a `--max-memory` the caller
     /// set pays for promptly released buffer mappings (`memory.queryAllocator`).
     pub fn forQuery(self: Context, args: *const QueryArgs) Context {
         var ctx = self;
         ctx.gpa = core_memory.queryAllocator(self.gpa, args.max_memory_explicit != null);
+        ctx.diag = args.diag;
         return ctx;
     }
 };

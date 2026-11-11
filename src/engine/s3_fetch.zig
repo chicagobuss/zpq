@@ -3,6 +3,7 @@ const AtomicWorkCursor = @import("../io/work_cursor.zig").AtomicWorkCursor;
 const std = @import("std");
 const s3_window = @import("../io/s3_window.zig");
 const system = @import("../core/system.zig");
+const diag_mod = @import("../core/diag.zig");
 
 // Large Lambda scans should overlap fetching and decoding instead of retaining a serial decode tail.
 pub const lambda_window_cap: u64 = 128 << 20;
@@ -392,6 +393,8 @@ pub const FetchSpec = struct {
     /// the first byte is not latency.
     rtt_ns: u64 = 0,
     err: ?anyerror = null,
+    /// The S3 answer behind `err`, when the request reached the server; set on the fetching thread.
+    failure: ?s3.S3Failure = null,
 
     /// Free the fetched tail, unless it is `footer_region` itself (the warm meta-cache path), which is owned apart.
     pub fn releaseTail(self: *FetchSpec, gpa: std.mem.Allocator) void {
@@ -576,6 +579,7 @@ pub const S3Membership = struct {
                 self.in_flight,
                 self.profiler,
                 null,
+                self.ctx.diag,
             );
             self.observe(jobs.items.len, got, @intCast(nowMonoNs() - t0));
         }
@@ -629,6 +633,7 @@ pub const S3Membership = struct {
                 self.in_flight,
                 self.profiler,
                 null,
+                self.ctx.diag,
             );
             self.observe(jobs.items.len, got, @intCast(nowMonoNs() - t0));
         }
@@ -822,7 +827,10 @@ pub fn fetchMetaBatch(
         try work_cursor.startWorkers(TaskCtx, &group, ctx.io, &shared, @min(READ_CONCURRENCY, task_ctxs.len), {}, Item.run);
         try group.await(ctx.io);
     }
-    for (specs) |sp| if (sp.err) |err| return err;
+    for (specs) |sp| if (sp.err) |err| {
+        if (sp.failure) |f| diag_mod.setS3Failure(ctx.diag, f);
+        return err;
+    };
     const prof = profile.threadOf(profiler, .main);
     for (specs) |*sp| {
         if (sp.footer_region.len < 8) return error.BadResponse;
@@ -831,6 +839,14 @@ pub fn fetchMetaBatch(
         defer span.end(.footer_parse, profile.args(.{ sp.file_index, footer_len }));
         sp.meta = try metadata.openFooter(arena, sp.footer_region[0..footer_len]);
     }
+}
+
+/// Fail a GET on `resp`: the one parser maps S3's answer to a named error, and the fetch keeps the details for the
+/// query's diagnostic after the workers join.
+fn refuseGet(sp: *FetchSpec, resp: http.Response) anyerror {
+    const r = s3.refusal(.GetObject, sp.url.bucket, sp.url.key, resp);
+    sp.failure = r.failure;
+    return r.err;
 }
 
 fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
@@ -878,7 +894,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
                 try maybeCacheMeta(t.ctx, sp, cond.header("ETag"));
                 return;
             }
-            return error.BadResponse;
+            return refuseGet(sp, cond);
         }
     };
 
@@ -890,7 +906,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
         .range = s3.Range.suffix(t.probe),
         .prof = t.prof,
     });
-    if (tail_resp.status != 206 and tail_resp.status != 200) return error.BadResponse;
+    if (tail_resp.status != 206 and tail_resp.status != 200) return refuseGet(sp, tail_resp);
     noteFooterRtt(sp, tail_resp);
     sp.noteEtag(tail_resp.header("ETag"));
     try populateFromTailResponse(t, scratch, tail_resp);
@@ -942,7 +958,7 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
             .range = s3.Range.span(footer_actual_start, sp.tail_start - 1),
             .prof = t.prof,
         });
-        if (need.status != 206) return error.BadResponse;
+        if (need.status != 206) return refuseGet(sp, need);
         const missing_len: usize = @intCast(sp.tail_start - footer_actual_start);
         if (need.body.len != missing_len) return error.BadResponse;
         // The prefix itself starts at offset 0. Check it here: nothing later re-reads these bytes.

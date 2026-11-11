@@ -379,11 +379,11 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
             var arena_state = std.heap.ArenaAllocator.init(allocator);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
+            var diag: Diag = .{};
             var inputs: std.ArrayList([]const u8) = .empty;
-            for (qa.inputs) |pattern| try inputs.appendSlice(arena, try zpq.frontend.expandGlob(arena, io, pattern, env));
+            for (qa.inputs) |pattern| try inputs.appendSlice(arena, try zpq.frontend.expandGlob(arena, io, pattern, env, &diag));
             qa.inputs = inputs.items;
             var registry = persistentPoolAdapter(pool);
-            var diag: Diag = .{};
             qa.diag = &diag;
             return engine.fanout_plan.prepare(.{
                 .gpa = allocator,
@@ -617,7 +617,7 @@ fn executeSql(
     const parser = zpq.core.expr.sql_parser;
     const pq = (try parser.parseSqlJoinPlan(arena, sql, .{ .ctx = &schemas, .footer = engine.join.LocalSchemas.footer })) orelse
         try parser.parseSqlPlan(arena, sql);
-    const inputs = try zpq.frontend.expandGlob(arena, io, pq.table_name, env);
+    const inputs = try zpq.frontend.expandGlob(arena, io, pq.table_name, env, diag);
     if (inputs.len == 0) {
         zpq.frontend.noSqlMatches(pq.table_name);
         return error.NoMatches;
@@ -878,15 +878,32 @@ fn engineError(allocator: std.mem.Allocator, err: anyerror, diag: *const Diag) !
     return aw.toOwnedSlice();
 }
 
-/// `,"s3":{...}`: the failed S3 request behind an engine error, its phase, and its error or its status and S3 code.
+/// `,"s3":{...}`: the failed S3 request behind an engine error, its phase, and its error or its status, S3 code and
+/// message. Credentials never appear, only the request's bucket and key.
 fn writeS3Failure(w: *std.Io.Writer, f: zpq.core.diag.S3Failure) !void {
     try w.print(",\"s3\":{{\"op\":\"{s}\",\"phase\":\"{s}\",\"attempts\":{d}", .{
         @tagName(f.op), @tagName(f.phase), f.attempts,
     });
+    if (f.bucket.len > 0) {
+        try w.writeAll(",\"bucket\":");
+        try engine.writeJsonQuoted(w, f.bucket.get());
+    }
+    if (f.key.len > 0) {
+        try w.writeAll(",\"key\":");
+        try engine.writeJsonQuoted(w, f.key.get());
+    }
     if (f.err) |e| try w.print(",\"error\":\"{s}\"", .{@errorName(e)});
     if (f.phase == .response) {
         try w.print(",\"status\":{d},\"code\":", .{f.status});
         try engine.writeJsonQuoted(w, f.code.get());
+        if (f.message.len > 0) {
+            try w.writeAll(",\"message\":");
+            try engine.writeJsonQuoted(w, f.message.get());
+        }
+        if (f.region.len > 0) {
+            try w.writeAll(",\"region\":");
+            try engine.writeJsonQuoted(w, f.region.get());
+        }
     }
     try w.writeByte('}');
 }
@@ -1422,6 +1439,25 @@ test "an engine error names the failed S3 request, its phase, and its error or s
     try std.testing.expectEqualStrings("{\"error\":\"engine\",\"reason\":\"CreateMultipartFailed\"," ++
         "\"s3\":{\"op\":\"CreateMultipartUpload\",\"phase\":\"response\",\"attempts\":1,\"status\":503," ++
         "\"code\":\"SlowDown\"}}", slow);
+}
+
+test "an S3 refusal's JSON names the request's bucket, key, status, code and message" {
+    var failure: zpq.core.diag.S3Failure = .{
+        .op = .GetObject,
+        .phase = .response,
+        .status = 404,
+    };
+    failure.bucket.set("bkt");
+    failure.key.set("key");
+    failure.code.set("NoSuchKey");
+    failure.message.set("The specified key does not exist.");
+    var diag: Diag = .{};
+    diag.detail = .{ .s3_request = failure };
+    const body = try engineError(std.testing.allocator, error.NoSuchKey, &diag);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("{\"error\":\"engine\",\"reason\":\"NoSuchKey\",\"s3\":{" ++
+        "\"op\":\"GetObject\",\"phase\":\"response\",\"attempts\":1,\"bucket\":\"bkt\",\"key\":\"key\"," ++
+        "\"status\":404,\"code\":\"NoSuchKey\",\"message\":\"The specified key does not exist.\"}}", body);
 }
 
 test "sink error details retain the service WriteFailed reason" {

@@ -185,7 +185,7 @@ pub const PerFileScan = struct {
 
         const capacity = @TypeOf(self.pool.*).capacity;
         var data_wave: s3.DataWave = .{};
-        _ = try s3.fetchJobs(io, self.pool, self.gpa, arena, self.creds, jobs.items, capacity, null, &data_wave);
+        _ = try s3.fetchJobs(io, self.pool, self.gpa, arena, self.creds, jobs.items, capacity, null, &data_wave, null);
 
         return .{
             .file_idx = self.file_idx,

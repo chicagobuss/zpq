@@ -798,12 +798,12 @@ const WriteRows = struct {
                 };
                 // Set once, before any producer: the pieces' arenas hold these addresses until they are freed.
                 w.cpu_budget = sizing.budget;
+                w.piece_pages = w.outAlloc();
                 w.piece_pool = .{ .gpa = self.ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = ledger };
                 defer w.piece_pool.deinit();
                 defer consumer.releaseSlicePool(&w.slice_pool);
-                w.piece_pages.child = w.outAlloc();
-                w.slicing_pages.child = slicing.allocator();
-                w.lean_pages.child = lean.allocator();
+                w.slicing_pages = slicing.allocator();
+                w.lean_pages = lean.allocator();
                 var encode_scratch: EncodeScratch = .{
                     .io = self.ctx.io,
                     .ledger = ledger,
@@ -811,7 +811,7 @@ const WriteRows = struct {
                 };
                 defer encode_scratch.deinit();
                 w.encode_scratch = &encode_scratch;
-                w.encode_pages.child = encode_scratch.allocator();
+                w.encode_pages = encode_scratch.allocator();
                 const re_span = profile.Span.begin(self.prof);
                 defer re_span.end(.reencode, profile.args(.{ jobs.items.len, effective_async_budget, window }));
                 try runWindowedReencode(&w, effective_async_budget, self.ctx.env);

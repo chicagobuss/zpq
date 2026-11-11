@@ -1,4 +1,4 @@
-//! Transparent-huge-page advice for large, long-lived scratch blocks.
+//! Huge-page-aligned worker regions, and gated transparent-huge-page advice for the dense lanes.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -8,54 +8,8 @@ const blocking = @import("blocking.zig");
 
 pub const huge_page_size: usize = 2 << 20;
 
-/// Forwards to `child`, and asks the kernel to back the 2 MiB-aligned interior of every block of at least 2 MiB
-/// with transparent huge pages (MADV_HUGEPAGE). Meant for a scan worker's decode arena and scratch: they are
-/// filled sequentially and fully, so one fault per 2 MiB replaces 512, and the TLB covers them with a handful of
-/// entries.
-///
-/// Advice only. A no-op off Linux or where THP is "never"; under "madvise" it is what opts the block in. Pages are
-/// still faulted lazily, so resident memory follows what is touched, rounded up to 2 MiB inside advised ranges.
-pub const HugePageAdvisor = struct {
-    child: std.mem.Allocator,
-
-    pub fn allocator(self: *HugePageAdvisor) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &.{
-            .alloc = alloc,
-            .resize = resize,
-            .remap = remap,
-            .free = free,
-        } };
-    }
-
-    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *HugePageAdvisor = @ptrCast(@alignCast(ctx));
-        const p = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
-        advise(p[0..len]);
-        return p;
-    }
-
-    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *HugePageAdvisor = @ptrCast(@alignCast(ctx));
-        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
-        if (new_len > memory.len) advise(memory.ptr[0..new_len]);
-        return true;
-    }
-
-    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *HugePageAdvisor = @ptrCast(@alignCast(ctx));
-        const p = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
-        if (new_len > memory.len) advise(p[0..new_len]);
-        return p;
-    }
-
-    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self: *HugePageAdvisor = @ptrCast(@alignCast(ctx));
-        self.child.rawFree(memory, alignment, ret_addr);
-    }
-};
-
 /// A worker's private bump region: one reserved, 2 MiB-aligned span of address space that blocks are carved from
-/// front to back, advised for transparent huge pages, and released with a single `munmap`. Meant as the child of a
+/// front to back, and released with a single `munmap`. Meant as the child of a
 /// scan worker's decode arena and scratch, which allocate a row group's buffers and grow them in place:
 ///   - a fresh process faults a worker's few MiB in 2 MiB pages instead of 4 KiB ones (hundreds of faults become a
 ///     handful, and the TLB covers them with a few entries);
@@ -94,9 +48,7 @@ pub const Region = struct {
     refused: bool = false,
 
     pub fn init(child: std.mem.Allocator, reserve: usize) Region {
-        const r = map(child, reserve);
-        advise(r.buf);
-        return r;
+        return map(child, reserve);
     }
 
     pub const Pair = struct { scratch: Region, arena: Region };
@@ -117,7 +69,6 @@ pub const Region = struct {
         var scratch: Region = .{ .child = std.heap.page_allocator, .allowance = huge_page_size };
         arena.allowance = huge_page_size;
         if (arena.buf.len == 0) return .{ .scratch = scratch, .arena = arena };
-        advise(arena.buf);
         scratch.buf = arena.buf[0..pair_scratch_span];
         arena.buf = arena.buf[pair_scratch_span..];
         arena.phase = pair_scratch_span;
@@ -424,7 +375,7 @@ fn currentPid() std.posix.pid_t {
     return if (builtin.target.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
 }
 
-/// Drop `span`'s pages now. Linux keeps the mapping and its huge-page advice; Darwin's MADV_DONTNEED may keep the
+/// Drop `span`'s pages now. Linux keeps the mapping; Darwin's MADV_DONTNEED may keep the
 /// pages resident, so the span is mapped afresh in place (a failed remap leaves them until `deinit`).
 fn release(span: []align(std.heap.page_size_min) u8) void {
     if (builtin.target.os.tag == .linux) {
@@ -436,24 +387,6 @@ fn release(span: []align(std.heap.page_size_min) u8) void {
     }
 }
 
-// Advice is process-wide and sampled once: synchronous THP compaction can cost hundreds of milliseconds on a
-// fragmented long-lived host. Require twice a conservative 4 GiB active working set in free huge-capable blocks.
-// Virtual Region reserves are not committed bytes. ZPQ_HUGEPAGE=on/off overrides this decision for experiments.
-var advice_state: std.atomic.Value(u8) = .init(0); // 0 uninitialized, 1 reading, 2 off, 3 on
-
-fn adviceEnabled() bool {
-    while (true) switch (advice_state.load(.acquire)) {
-        2 => return false,
-        3 => return true,
-        1 => std.atomic.spinLoopHint(),
-        else => if (advice_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
-            const enabled = discoverAdvice(8 << 30);
-            advice_state.store(if (enabled) 3 else 2, .release);
-            return enabled;
-        },
-    };
-}
-
 fn policyFile(path: [:0]const u8, buf: []u8) ?[]const u8 {
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch
         return null;
@@ -462,7 +395,11 @@ fn policyFile(path: [:0]const u8, buf: []u8) ?[]const u8 {
     return if (n == buf.len) null else buf[0..n];
 }
 
-fn discoverAdvice(needed: u64) bool {
+/// Whether to advise blocks totalling `bytes` for huge pages: the host's THP policy, and free huge blocks that cover
+/// them, sampled now. A host without them compacts synchronously on the first touches (374 stalls and 1.85 s of
+/// system time in one measured run). ZPQ_HUGEPAGE=on/off overrides the decision for experiments.
+pub fn worthAdvising(bytes: u64) bool {
+    if (builtin.target.os.tag != .linux) return false;
     if (std.c.getenv("ZPQ_HUGEPAGE")) |raw| {
         const value = std.mem.span(raw);
         if (std.mem.eql(u8, value, "on")) return true;
@@ -474,14 +411,7 @@ fn discoverAdvice(needed: u64) bool {
     const end = std.mem.indexOfScalarPos(u8, modes, start, ']') orelse return false;
     var buddy_buf: [16 << 10]u8 = undefined;
     const buddy = policyFile("/proc/buddyinfo", &buddy_buf) orelse return false;
-    return adviceFor(modes[start..end], buddy, needed);
-}
-
-/// Whether to advise blocks totalling `bytes`: the process gate's policy, and free huge blocks that cover them, not
-/// the fixed 8 GiB, sampled now. A host without them compacts synchronously on the first touches (374 stalls and
-/// 1.85 s of system time in one measured run).
-pub fn worthAdvising(bytes: u64) bool {
-    return builtin.target.os.tag == .linux and discoverAdvice(bytes);
+    return adviceFor(modes[start..end], buddy, bytes);
 }
 
 /// `needed` bytes of free huge-capable blocks are enough to back the advised blocks without compacting.
@@ -505,11 +435,7 @@ fn adviceFor(mode: []const u8, buddy: []const u8, needed: u64) bool {
     return free >= needed;
 }
 
-fn advise(block: []u8) void {
-    if (builtin.target.os.tag == .linux and adviceEnabled()) adviseBlock(block);
-}
-
-/// Ask for huge pages over the 2 MiB-aligned interior of `block`, whatever the process gate says.
+/// Ask for huge pages over the 2 MiB-aligned interior of `block`.
 pub fn adviseBlock(block: []u8) void {
     if (builtin.target.os.tag != .linux) return;
     const lo = std.mem.alignForward(usize, @intFromPtr(block.ptr), huge_page_size);
@@ -517,20 +443,6 @@ pub fn adviseBlock(block: []u8) void {
     if (hi <= lo) return;
     // Failure (EINVAL without CONFIG_TRANSPARENT_HUGEPAGE, ENOMEM on odd ranges) just leaves 4 KiB pages.
     _ = std.os.linux.madvise(@ptrFromInt(lo), hi - lo, std.os.linux.MADV.HUGEPAGE);
-}
-
-test "HugePageAdvisor round-trips allocations of every size class through its child" {
-    var advisor: HugePageAdvisor = .{ .child = std.testing.allocator };
-    const a = advisor.allocator();
-    for ([_]usize{ 1, 4096, huge_page_size - 1, huge_page_size, 3 * huge_page_size + 17 }) |n| {
-        const buf = try a.alloc(u8, n);
-        @memset(buf, 0x5a);
-        try std.testing.expectEqual(@as(u8, 0x5a), buf[n - 1]);
-        a.free(buf);
-    }
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    _ = try arena.allocator().alloc(u64, huge_page_size);
 }
 
 test "Region carves blocks in order, grows the newest in place, and spills past its reserve to the child" {

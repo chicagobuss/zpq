@@ -1,6 +1,5 @@
 //! Fixed payload storage funded by the caller before decoding. Reader scratch never owns these bytes.
 const std = @import("std");
-const huge_pages = @import("huge_pages.zig");
 
 pub const Chunk = struct {
     buffer: []u8,
@@ -37,9 +36,8 @@ pub const Store = struct {
         errdefer s.deinit(a);
         var total: usize = 0;
         for (capacities) |cap| total = std.math.add(usize, total, cap) catch return error.OutOfMemory;
-        // The complete capacity is prepaid. Huge-page advice changes fault/teardown cost, never admission.
-        var advisor: huge_pages.HugePageAdvisor = .{ .child = a };
-        s.bytes = try advisor.allocator().alloc(u8, total);
+        // The complete capacity is prepaid.
+        s.bytes = try a.alloc(u8, total);
         s.chunks = try a.alloc(Chunk, capacities.len);
         var at: usize = 0;
         for (s.chunks, capacities) |*c, cap| {

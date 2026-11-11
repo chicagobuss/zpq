@@ -1547,9 +1547,9 @@ fn writeOnce(
     };
     w.cpu_budget = sizing.budget;
     // Idle pieces kept for reuse are on the ledger too: a sixteenth of a small budget, not a fixed 32 MiB of it.
+    w.piece_pages = w.outAlloc();
     w.piece_pool = .{ .gpa = ctx.gpa, .rows_alloc = w.pieceAlloc(), .ledger = &ledger, .limit = args.max_memory / 16 };
     defer w.piece_pool.deinit();
-    w.piece_pages.child = w.outAlloc();
     const t_scan = nowMonoNs();
     // A draw the ledger refused is the budget's refusal, not the host's: named so, as a Parquet write names it.
     window_mod.runWindowedReencode(&w, sizing.workers, ctx.env) catch |e| return slicing.refusal(memory.refusal(e));

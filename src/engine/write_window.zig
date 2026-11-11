@@ -773,7 +773,7 @@ const EncodeJob = struct {
             job.arena = .init(r.rows.allocator());
             return .{ .keep = job.arena.?.allocator(), .work = &r.work };
         }
-        job.arena = .init(w.encode_pages.allocator());
+        job.arena = .init(w.encode_pages);
         return .{ .keep = job.arena.?.allocator(), .work = null };
     }
 
@@ -1026,7 +1026,7 @@ const EncodeState = struct {
         state.* = .{
             .job = job,
             .keep = ja,
-            .work_alloc = if (memory.work) |r| r.allocator() else w.encode_pages.allocator(),
+            .work_alloc = if (memory.work) |r| r.allocator() else w.encode_pages,
             .work_region = memory.work,
             .charges = &.{},
             .inputs = &.{},
@@ -1057,7 +1057,7 @@ const EncodeState = struct {
         job.encs = try ja.alloc(encoder.EncodedColumn, n_cols);
         state.parts = try ja.alloc(consumer.BufRange, job.ranges.len);
         state.tasks = try ja.alloc(EncodeTask, w.executor.?.workers);
-        for (state.tasks) |*task| task.* = .{ .shared = &state.shared, .arena = .init(w.encode_pages.allocator()) };
+        for (state.tasks) |*task| task.* = .{ .shared = &state.shared, .arena = .init(w.encode_pages) };
         try state.nextWave();
     }
 
@@ -1230,12 +1230,12 @@ pub const WinCtx = struct {
     slicing_now: ?*core_memory.Charged = null,
     /// Page buffers for sliced row groups, kept for the write and released with it.
     slice_pool: ?*consumer.SliceScratch = null,
-    /// Pieces and encodings are fresh memory, waiting or worked on whole: in huge pages, a fault per 2 MiB rather
-    /// than per 4 KiB. One advisor per child, at a fixed address, as the arenas over them hold it until they are freed.
-    piece_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
-    slicing_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
-    lean_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
-    encode_pages: huge_pages.HugePageAdvisor = .{ .child = std.heap.page_allocator },
+    /// Where pieces and encodings come from: fresh memory, waiting or worked on whole. Set before any producer runs,
+    /// as the arenas over them copy the allocator and hold it until they are freed.
+    piece_pages: std.mem.Allocator = std.heap.page_allocator,
+    slicing_pages: std.mem.Allocator = std.heap.page_allocator,
+    lean_pages: std.mem.Allocator = std.heap.page_allocator,
+    encode_pages: std.mem.Allocator = std.heap.page_allocator,
     encode_scratch: ?*EncodeScratch = null,
 
     /// What a deferred row group's slices draw from (`slicing`, `lean`): the writer alone has the write's ledger and
@@ -1253,9 +1253,9 @@ pub const WinCtx = struct {
         return if (w.memory) |m| m.allocator() else w.gpa;
     }
 
-    /// What a piece's rows are allocated through: `outAlloc` in huge pages.
+    /// What a piece's rows are allocated through: `outAlloc`.
     pub fn pieceAlloc(w: *WinCtx) std.mem.Allocator {
-        return w.piece_pages.allocator();
+        return w.piece_pages;
     }
 
     /// An empty piece for a source to fill, its memory reused from freed pieces where there is some.
@@ -1277,10 +1277,10 @@ pub const WinCtx = struct {
         }
     }
 
-    /// What a sliced row group's pieces are allocated through: the ledger it slices on, in huge pages.
+    /// What a sliced row group's pieces are allocated through: the ledger it slices on.
     fn slicePieceAlloc(w: *WinCtx) std.mem.Allocator {
         const m = w.slicing_now orelse return w.pieceAlloc();
-        return if (m == w.lean) w.lean_pages.allocator() else w.slicing_pages.allocator();
+        return if (m == w.lean) w.lean_pages else w.slicing_pages;
     }
 
     /// `err` was a refused draw from the query's ledger, by `regions` or the output: the row group may still be
@@ -2419,7 +2419,7 @@ test "shared encode turns clean up allocation failures with serial and parallel 
             w.cpu_budget = if (limited or parallel) 4 else 1;
             w.rg_target = .{};
             w.regions = &.{};
-            w.encode_pages = .{ .child = if (w.encode_scratch != null) scratch.allocator() else gpa };
+            w.encode_pages = if (w.encode_scratch != null) scratch.allocator() else gpa;
             w.out_elems = &elems;
             w.out_paths = &paths;
             w.codec = .UNCOMPRESSED;
@@ -2523,7 +2523,7 @@ test "wide carried rows release their original piece without changing values und
             w.gpa = gpa;
             w.memory = null;
             w.rg_target = .{};
-            w.piece_pages = .{ .child = gpa };
+            w.piece_pages = gpa;
             w.out_elems = &elems;
             w.out_paths = &paths;
             var a = Assembler.init(&w);
@@ -2699,7 +2699,7 @@ test "encode reservations cover placement and retained regions become charged pa
     w.gpa = gpa;
     w.regions = &regions;
     w.memory = &charged;
-    w.encode_pages = .{ .child = charged.allocator() };
+    w.encode_pages = charged.allocator();
     const job = try EncodeJob.create(&w, 1);
     job.charge = 8 << 20;
     job.permit = .encoder;

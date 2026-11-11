@@ -2,7 +2,6 @@
 const std = @import("std");
 const memory = @import("memory.zig");
 const retained = @import("retained_pages.zig");
-const huge_pages = @import("huge_pages.zig");
 const eval = @import("filter/eval.zig");
 const Selection = @import("filter/selection.zig").SelectionVector;
 const spawn = @import("spawn.zig");
@@ -483,8 +482,7 @@ pub const State = struct {
         errdefer s.deinit();
         s.pages = try retained.Store.init(a, capacities);
         const cap = blockCapacity(rows, workers);
-        var advisor: huge_pages.HugePageAdvisor = .{ .child = a };
-        s.blocks = try advisor.allocator().alloc(Block, cap);
+        s.blocks = try a.alloc(Block, cap);
         s.ids = try a.alloc(u32, cap);
         s.locals = try a.alloc(Local, workers);
         for (s.locals) |*l| {

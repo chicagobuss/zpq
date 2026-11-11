@@ -12,7 +12,6 @@ const Selection = @import("filter/selection.zig").SelectionVector;
 const memory = @import("memory.zig");
 const spawn = @import("spawn.zig");
 const hw = @import("hw.zig");
-const HugePageAdvisor = @import("huge_pages.zig").HugePageAdvisor;
 const now = @import("../clock.zig").monoNs;
 pub const Lane = @import("owner_lanes.zig").Lane;
 pub const PackedLayout = @import("owner_lanes.zig").Layout;
@@ -881,8 +880,6 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     for (s.locals, 0..) |*l, i|
                         l.count_cache.entries = s.count_caches[i * cache_entries ..][0..cache_entries];
                 }
-                // The full answer's blocks are claimed densely front to back: advise them for huge pages.
-                var dense: HugePageAdvisor = .{ .child = a };
                 const full_entries = fullCacheEntries();
                 if (full_entries != 0) {
                     s.cache_trial_rows = @intCast(@import("owner_cache.zig").trialRows(
@@ -894,7 +891,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                     for (s.locals, 0..) |*l, i|
                         l.full_cache.entries = s.full_caches[i * full_entries ..][0..full_entries];
                 }
-                s.blocks = try (if (kind == .full) dense.allocator() else a).alloc(Block, blockCount(rows, workers, parts));
+                s.blocks = try a.alloc(Block, blockCount(rows, workers, parts));
                 for (s.locals) |*l| {
                     l.records = try Records.Frontier.init(a, parts);
                 }
@@ -1345,12 +1342,11 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         }
                     }.larger);
                     s.groups = try s.gpa.alloc(Group, s.rows);
-                    // The order pass reads every winner slot: advise the map for huge pages. It is mapped afresh
-                    // (page_allocator's anonymous mmap or committed Windows pages read as zero), so no serial clear.
+                    // The map is fresh (page_allocator's anonymous mmap or committed Windows pages read as zero), so no
+                    // serial clear.
                     // rawAlloc, unlike alloc, does not fill safe builds' new memory with `undefined`.
                     if (s.rows != 0) {
-                        var dense: HugePageAdvisor = .{ .child = std.heap.page_allocator };
-                        const raw = dense.allocator().rawAlloc(s.rows * @sizeOf(u32), .of(u32), @returnAddress()) orelse
+                        const raw = std.heap.page_allocator.rawAlloc(s.rows * @sizeOf(u32), .of(u32), @returnAddress()) orelse
                             return error.OutOfMemory;
                         s.winners = @as([*]u32, @ptrCast(@alignCast(raw)))[0..s.rows];
                         s.winners_fresh = true;

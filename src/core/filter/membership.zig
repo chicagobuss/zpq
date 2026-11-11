@@ -791,7 +791,8 @@ pub const Stats = struct {
     /// Bytes the query scratch was asked for, and how many of those a body plan added. Planning belongs to the wave.
     scratch_peak: u64 = 0,
     plan_scratch: u64 = 0,
-    /// One entry per filter actually probed, in probe order. The count alone cannot see a probe moved onto another target.
+    /// One entry per filter actually probed, in probe order. The count alone cannot see a probe moved onto another
+    /// target.
     probes: []const ProbeId = &.{},
     /// A request's fixed cost, in bytes, that the last plan assumed (remote sources only).
     request_bytes: u64 = 0,

@@ -284,11 +284,6 @@ pub const Writer = struct {
         try self.buffer.appendSlice(self.allocator, s);
     }
 
-    pub fn writeDouble(self: *Writer, value: f64) !void {
-        const bits: u64 = @bitCast(value);
-        try self.buffer.appendSlice(self.allocator, &std.mem.toBytes(bits));
-    }
-
     pub fn writeStructBegin(self: *Writer) void {
         if (self.saved_stack_pos < self.saved_stack.len) {
             self.saved_stack[self.saved_stack_pos] = self.last_field_id;

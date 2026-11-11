@@ -185,7 +185,6 @@ pub fn rebaseColumnOffsets(col: *schema.ColumnChunk, base: i64) void {
     }
 }
 
-
 /// One row group as `scanRGForAgg` reads it. Everything is borrowed.
 pub const RowSubgroup = struct { group: *const row_subgroups.Group, rows: row_subgroups.Range };
 
@@ -256,7 +255,6 @@ test "a selected window keeps original indexes and rejects a gather past the win
     const slice = try selectedWindow(&batch, null, 40, null, 2);
     try std.testing.expectEqual(@as(u64, 40), try slice.ordinal(0));
 }
-
 
 /// The output leaf for a computed column. Shared by the row buffers (whose printing reads it) and the footer.
 pub fn computedSchemaElem(c: OutputCol.Computed) schema.SchemaElement {
@@ -371,7 +369,6 @@ test "computedSchemaElem keeps the unsigned annotation of an aliased UINT64 refe
     try std.testing.expect(!schema.isUnsignedInt(computedSchemaElem(.{ .expr = signed, .alias = "b" })));
 }
 
-
 /// `elem`, a kept leaf's schema element, as the flat leaf `name` that a renamed passthrough writes: the same type and
 /// annotation, OPTIONAL exactly when the leaf can be NULL at its depth (`max_def`), whatever its own repetition says.
 pub fn renameLeaf(elem: *schema.SchemaElement, name: []const u8, max_def: i32) void {
@@ -379,7 +376,6 @@ pub fn renameLeaf(elem: *schema.SchemaElement, name: []const u8, max_def: i32) v
     elem.num_children = 0;
     elem.repetition_type = if (max_def > 0) .OPTIONAL else .REQUIRED;
 }
-
 
 /// `column_chunk` span arguments for chunk `ci` of a row group.
 pub fn chunkArgs(file: usize, rg: usize, ci: usize, cm: schema.ColumnMetaData) profile.Args {
@@ -402,4 +398,3 @@ pub fn sourceBytes(src: RGSrc, range: fastpath.ByteRange) ![]const u8 {
     if (off > src.bytes.len or range.len > src.bytes.len - off) return error.MissingChunkBytes;
     return src.bytes[off..][0..range.len];
 }
-

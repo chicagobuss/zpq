@@ -2712,7 +2712,7 @@ test "shared string top-k cut refusals replay at every budget the old path answe
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    // The reviewer's shape: small row groups keep the scan inside a few MiB, so a cut past it can still refuse.
+    // Small row groups keep the scan inside a few MiB, so a cut past it can still refuse.
     const file = try rankedStringFile(a, 180000, 2048, 60, 13007);
     const Shape = struct { aggregate: []const u8, order: expr_ast.ResultOrder };
     const shapes = [_]Shape{

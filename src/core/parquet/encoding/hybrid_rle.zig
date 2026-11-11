@@ -849,10 +849,8 @@ fn putRleRun(out: []u8, o: usize, value: u32, count: usize, value_bytes: usize) 
     return p;
 }
 
-/// `values` bit-packed LSB-first as `groups` groups of 8, zero-padded past its end (at most the last group), through
-/// a 128-bit accumulator drained 8 bytes at a time. The buffer's slack covers the 8-byte stores past the last whole
-/// byte.
-/// `putBitPackedRun` as runs of at most `max_groups` groups. Only the last group may be padded, so it ends the last run.
+/// `putBitPackedRun` as runs of at most `max_groups` groups. Only the last group may be padded, so it ends the last
+/// run.
 fn putBitPackedRuns(out: []u8, o: usize, values: []const u32, groups: usize, bit_width: u8, max_groups: usize) usize {
     var p = o;
     var rest = values;
@@ -864,6 +862,9 @@ fn putBitPackedRuns(out: []u8, o: usize, values: []const u32, groups: usize, bit
     return putBitPackedRun(out, p, rest, left, bit_width);
 }
 
+/// `values` bit-packed LSB-first as `groups` groups of 8, zero-padded past its end (at most the last group), through
+/// a 128-bit accumulator drained 8 bytes at a time. The buffer's slack covers the 8-byte stores past the last whole
+/// byte.
 fn putBitPackedRun(out: []u8, o: usize, values: []const u32, groups: usize, bit_width: u8) usize {
     std.debug.assert(values.len <= groups * 8 and values.len + 8 > groups * 8);
     const p0 = putUleb128(out, o, (@as(u64, groups) << 1) | 1);
@@ -1351,7 +1352,7 @@ test "regression: encode splits bit-packed runs at the format's run-length limit
     for (1..6) |max_groups| for (0..400) |iter| {
         _ = arena_state.reset(.retain_capacity);
         const bw: u8 = @intCast(1 + r.uintLessThan(u8, 32));
-        // Lengths at the limit and around it (the review's 2^31-1 alternating levels, scaled down), then random.
+        // Lengths at the limit and around it (`max_groups` stands in for `max_run_groups`, scaled down), then random.
         const n = if (iter < 20) max_groups * 8 - 1 + iter else r.uintLessThan(usize, 300);
         const vals = try a.alloc(u32, n);
         const maxv: u32 = @intCast((@as(u64, 1) << @intCast(bw)) - 1);

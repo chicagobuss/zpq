@@ -423,8 +423,8 @@ fn printRowGroupSliced(
     return true;
 }
 
-/// Print `rg` whole, or a slice of rows at a time when it would not fit (`printRowGroupSliced`): the serial loop's step,
-/// and the parallel writer's for a row group no producer took (`print_window`).
+/// Print `rg` whole, or a slice of rows at a time when it would not fit (`printRowGroupSliced`): the serial loop's
+/// step, and the parallel writer's for a row group no producer took (`print_window`).
 pub fn printRowGroup(
     gpa: std.mem.Allocator,
     agg: *consumer.OutputAggregator,

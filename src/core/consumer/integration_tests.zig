@@ -62,7 +62,6 @@ const output = @import("output.zig");
 const OutputAggregator = output.OutputAggregator;
 const initOutputAggregator = output.initOutputAggregator;
 const resetAggregator = output.resetAggregator;
-const appendProjectedRG = output.appendProjectedRG;
 const appendProjectedRGWithOptions = output.appendProjectedRGWithOptions;
 const ProjectedRG = output.ProjectedRG;
 const Survivors = output.Survivors;
@@ -245,7 +244,6 @@ test "a page claiming more values than its chunk is rejected before sizing buffe
     const required: schema.Levels = .{ .max_def = 0, .max_rep = 0 };
     try testing.expectError(error.DictionaryLargerThanPage, decodeColumnT([]const u8, a, dict_page, .UNCOMPRESSED, required, 1));
 }
-
 
 // Regression: copyRG(no_projection) used to write whatever `src.bytes`
 // the caller passed, even when those bytes covered more than just this

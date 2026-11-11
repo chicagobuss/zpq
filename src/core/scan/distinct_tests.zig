@@ -334,8 +334,6 @@ test "count-only: no filter-only column materialized" {
     try testing.expect(rows.len > 0);
 }
 
-
-
 test "result cut SUM: complete signed ranks, NULLs, ties, offsets and owned payload failures" {
     spawn_util.injectFailureAfter(0);
     defer spawn_util.resetFailure();
@@ -1126,8 +1124,6 @@ test "regression: counts pairs folded merge in place or under a count cut, as th
     };
 }
 
-
-
 test "regression: count(DISTINCT) pairs pay by the values the sets took, a filter's dropped rows left out" {
     const path = "ci/fixtures/parquet/census_dictionary_review.parquet";
     const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
@@ -1156,8 +1152,6 @@ test "regression: count(DISTINCT) pairs pay by the values the sets took, a filte
     try testing.expectEqual(sets.len, results[1].output.group_rows.?.len);
     for (sets, results[1].output.group_rows.?) |r, p_row| for (r, p_row) |x, y| try expectSameAggValue(x, y);
 }
-
-
 
 test "a scalar query's string winner copy is drawn before it is made, so a refusal holds no copy past the ledger" {
     const path = "ci/fixtures/parquet/scalar_strings.parquet";
@@ -1912,8 +1906,6 @@ test "retained MSD composite count matches ordered rows across workers, encoding
     }
 }
 
-
-
 test "inline integer decode errors follow projection ties across windows, decline and mapped replay" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -2130,4 +2122,3 @@ test "canonical full projection prefix includes count arguments and skipped admi
     const next = canonicalFailurePrefix(testing.allocator, FailureProbe.contextOf(&w));
     try testing.expectEqual(&groups[1], next.site.rg);
 }
-

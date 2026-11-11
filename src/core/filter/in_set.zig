@@ -198,8 +198,8 @@ pub fn NumSet(comptime T: type) type {
                 .few => |lanes| return @reduce(.Or, lanes == @as(V, @splat(v))),
                 .bitmap => |b| {
                     if (comptime !is_int) unreachable;
-                    // Both bounds, not one unsigned compare of `v - min`: that wraps back into range for a value near the
-                    // other end of T. Out of range reads word 0, so the load needs no branch either.
+                    // Both bounds, not one unsigned compare of `v - min`: that wraps back into range for a value near
+                    // the other end of T. Out of range reads word 0, so the load needs no branch either.
                     const in_range = @intFromBool(v >= b.min) & @intFromBool(v <= b.max) == 1;
                     const off: u64 = if (in_range) @as(Bits, @bitCast(v -% b.min)) else 0;
                     return in_range and (b.bits[off / 64] >> @intCast(off % 64)) & 1 == 1;

@@ -675,7 +675,6 @@ pub fn inlineByteAnswer(
     };
 }
 
-
 fn byteTopRowsTrial(a: std.mem.Allocator) !void {
     var output: AggOutput = .{};
     defer output.deinit(a);
@@ -728,4 +727,3 @@ test "retained MSD top rows own keys across partial allocation failures" {
     try msdOutputAllocTrial(testing.allocator);
     try testing.checkAllAllocationFailures(testing.allocator, msdOutputAllocTrial, .{});
 }
-

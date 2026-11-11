@@ -47,7 +47,6 @@ fn uriEncodeQueryValue(arena: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(arena);
 }
 
-pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 /// Smaller parts with high concurrency. The narrow per-part wall
 /// time (8 MB / ~100 MB-per-second effective ≈ 80 ms) lets many
 /// parts overlap, and total upload wall is bounded by the slowest
@@ -955,19 +954,6 @@ fn singlePut(
 // Compile-time reference check: forces type-checking of the public API
 // and the worker. Without this, Zig's lazy body-compilation would not
 // surface errors in functions that no caller in the tree references yet.
-test "multipart_sink: API is well-typed" {
-    _ = MultipartSink.init;
-    _ = MultipartSink.push;
-    _ = MultipartSink.close;
-    _ = MultipartSink.deinit;
-    _ = partWorker;
-    _ = doUploadPart;
-    _ = createMultipartUpload;
-    _ = completeMultipartUpload;
-    _ = abortMultipartUpload;
-    _ = singlePut;
-}
-
 const testing = std.testing;
 const fake_s3 = @import("fake_s3.zig");
 

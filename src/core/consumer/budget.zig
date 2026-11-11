@@ -90,7 +90,6 @@ pub fn decodeEstimate(in: AggRowGroup, cols: []const bool, calls: []const expr_a
     return total +| if (grouped) rows *| 4 else 0;
 }
 
-
 test "a decode budget's waiting worker sleeps until a release makes room, then holds its bytes" {
     var budget: DecodeBudget = .{ .limit = 100 };
     try budget.acquire(80);
@@ -113,4 +112,3 @@ test "a decode budget's waiting worker sleeps until a release makes room, then h
     try std.testing.expectError(error.RowGroupTooLarge, budget.acquire(101));
     budget.release(50);
 }
-

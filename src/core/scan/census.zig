@@ -1147,8 +1147,6 @@ test "DISTINCT shares score bounds and widens only to new identities with alloca
     try testing.checkAllAllocationFailures(testing.allocator, distinctBoundPlanTrial, .{});
 }
 
-
-
 /// The k-th largest total of the COUNT at `a_idx` over every key of `tables`, 0 with fewer than `k` keys.
 fn kthTotal(arena: std.mem.Allocator, tables: []const expr_agg.GroupTable, stride: usize, a_idx: usize, k: usize) !u64 {
     var totals: std.StringArrayHashMapUnmanaged(u64) = .empty;
@@ -1161,4 +1159,3 @@ fn kthTotal(arena: std.mem.Allocator, tables: []const expr_agg.GroupTable, strid
     std.mem.sortUnstable(u64, vals, {}, std.sort.desc(u64));
     return vals[k - 1];
 }
-

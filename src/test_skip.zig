@@ -4,10 +4,10 @@
 //!
 //!     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "epoll");
 //!
-//! The condition is known at compile time, as `builtin.os.tag != .linux` was, so a target that lacks the need never
-//! analyzes the rest of the test (Linux-only calls would not compile there). `skipNeeding` refuses to compile where the
-//! target meets the need, so a reason is never named for a skip that cannot happen. Zig's test runner prints the test's number and name, then whatever the test prints, then `SKIP`, so the
-//! log line reads
+//! The condition is known at compile time, like a bare `builtin.os.tag != .linux` check, so a target that lacks the
+//! need never analyzes the rest of the test (Linux-only calls would not compile there). `skipNeeding` refuses to
+//! compile where the target meets the need, so a reason is never named for a skip that cannot happen. Zig's test
+//! runner prints the test's number and name, then whatever the test prints, then `SKIP`, so the log line reads
 //!
 //!     12/40 io.epoll.test.timer fires within deadline...[skip needs linux: epoll] SKIP
 //!

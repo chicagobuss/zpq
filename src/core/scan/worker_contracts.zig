@@ -275,4 +275,3 @@ test "stream probe funding is independent of peer ledger pressure and unwinds ev
     try testing.expectError(error.ExceededMemoryBudget, probe.reserveStream(&small, 128 << 10));
     try testing.expectEqual(@as(usize, 0), small.used.load(.monotonic));
 }
-

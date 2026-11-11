@@ -291,7 +291,8 @@ pub fn stageMain(arena: Allocator, io: std.Io, gpa: Allocator, args: []const []c
     const ns: i64 = @intCast(started.untilNow(io, .awake).toNanoseconds());
     const seconds = @as(f64, @floatFromInt(ns)) / 1e9;
     const log = try std.mem.concat(arena, u8, &.{ out.stdout, out.stderr });
-    // The stage was killed at its deadline (oracle.captureTimed reports that as exit 124, as coreutils `timeout` did).
+    // The stage was killed at its deadline (`oracle.captureTimed` reports that as exit 124, the code coreutils
+    // `timeout` uses).
     const timed_out = !out.signaled and out.code == oracle_mod.timed_out_code;
     const log_path = try std.fmt.allocPrint(arena, "{s}/{s}.log", .{ out_dir, stage_name });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = log_path, .data = log });
@@ -389,7 +390,7 @@ fn header(arena: Allocator, io: std.Io, gpa: Allocator, duckdb: []const u8, arti
         .cases_sha256 = run(arena, io, &.{ "git", "rev-parse", "HEAD:tools/check" }) orelse "unknown",
         .fixtures = try std.fmt.allocPrint(arena, "parquet-testing {s}; {s}", .{
             run(arena, io, &.{ "git", "-C", "data/parquet-testing", "rev-parse", "HEAD" }) orelse "absent",
-            // `name=bytes ` per file, as GNU `ls --time-style=+` gave; BSD ls has no such flag, so the list came out empty.
+            // `name=bytes ` per file through `wc -c`: the GNU-only `ls` option this replaced printed nothing on macOS.
             run(arena, io, &.{ "sh", "-c", "cd data && for f in *.parquet; do [ -e \"$f\" ] || continue; " ++
                 "printf '%s=%s ' \"$f\" \"$(wc -c < \"$f\" | tr -d ' ')\"; done 2>/dev/null" }) orelse "",
         }),

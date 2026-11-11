@@ -12,9 +12,9 @@
 //!   first and last bytes share with its neighbours (advice is page-granular, and a fault there reads the same page).
 //!   A column the decode reads behind the filter's gate (`gated`: a payload column, or a filter column read only at
 //!   the survivors of the conjuncts before it) follows what those conjuncts keep: its own reader advises just the
-//!   pages its gate keeps, once that gate is decided (`consumer/plan.zig` `adviseGated`), and here it is advised whole only
-//!   while the latest such reader found its gate keeping every page (`kept`). A gated column whose pages are skipped
-//!   is never advised ahead of the survivors that skip them;
+//!   pages its gate keeps, once that gate is decided (`consumer/plan.zig` `adviseGated`), and here it is advised whole
+//!   only while the latest such reader found its gate keeping every page (`kept`). A gated column whose pages are
+//!   skipped is never advised ahead of the survivors that skip them;
 //! - how far: a few items per worker ahead of the latest claim, paced by the claims (each moves the cursor by about
 //!   one item), and a hard cap on the bytes advised and not yet claimed: the caller's window (`Config`: within what
 //!   one of the device's hardware queues holds), or what the query's ledger has free when it is less, whichever is
@@ -31,9 +31,9 @@
 //!   delay is the whole cost.
 //!
 //! Residency and advice go through each file's descriptor (`Config.fds`): `cachestat` and `fadvise`, where the
-//! mapping's `mincore` and `madvise` also take the address space's lock, which the workers' region maps write. On
-//! granite that was 4-6% of a 3 GB cold scan (ClickBench Q21) and even elsewhere; per call, the two cost about the
-//! same. A mapping kept without a descriptor uses the mapping's calls.
+//! mapping's `mincore` and `madvise` also take the address space's lock, which the workers' region maps write. That
+//! lock cost 4-6% of a 3 GB cold scan on a many-core host; per call, the two cost about the same. A mapping kept
+//! without a descriptor uses the mapping's calls.
 //!
 //! What a claim releases: the bytes advised for every item up to it, which a worker is decoding or has decoded.
 //! Advice changes when pages arrive, never what is decoded: answers and refusals are those of the mapping.
@@ -103,8 +103,8 @@ pub const ReadAhead = struct {
     kept: []std.atomic.Value(bool) = &.{},
     /// Items before `released` are claimed, and their advice no longer counts.
     released: usize = 0,
-    /// Page-rounded bytes advised and not yet decoded, never past the cap: the cursor's for items not yet claimed, and a
-    /// gated column's for a claimed item its worker is decoding (`adviseClaimed`), until that worker's next claim.
+    /// Page-rounded bytes advised and not yet decoded, never past the cap: the cursor's for items not yet claimed, and
+    /// a gated column's for a claimed item its worker is decoding (`adviseClaimed`), until that worker's next claim.
     ahead: std.atomic.Value(u64) = .init(0),
     /// The row group advised last and the item that advised it, so the items a row group was split into advise it
     /// once (and an item the cap stopped before its first block is not taken for one of them on return).
@@ -606,8 +606,8 @@ test "a gated column's kept pages are advised within the window and the ledger, 
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const page = std.heap.pageSize();
-    // The reviewer's chunk: two PLAIN INT32 data pages of 256 OS pages (1 MiB) each, the gate keeping every row of
-    // the first and none of the second.
+    // Two PLAIN INT32 data pages of 256 OS pages (1 MiB) each, the gate keeping every row of the first and none of
+    // the second: the advice must follow the pages the gate keeps, not the chunk.
     const payload_len = 256 * page;
     const rows = payload_len / @sizeOf(i32);
     var header = thrift.Writer.init(a);

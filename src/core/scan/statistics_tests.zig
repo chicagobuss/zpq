@@ -106,8 +106,8 @@ test "poisoned stats: a null count outside the chunk's values is refused, by def
 
 test "cut bounds prune but never answer: equality and ranges at the cut, min and max decoded" {
     // full_match.parquet's s holds 'k%06d-' then 24 'p's, row ids 200..399 in row group 1. Its bounds there become what
-    // a writer cutting to 9 bytes writes: the min a prefix, the max a prefix grown by one, both marked inexact. ts's max
-    // there becomes an inexact 10^6 (no row holds it).
+    // a writer cutting to 9 bytes writes: the min a prefix, the max a prefix grown by one, both marked inexact. ts's
+    // max there becomes an inexact 10^6 (no row holds it).
     const edit = struct {
         fn f(meta: *schema.FileMetaData) void {
             const st = rg1Stats(meta, 2);
@@ -205,8 +205,6 @@ test "poisoned stats: page locations out of page order drop the page index, by d
 // The fixture's ColumnIndex flags whole pages of `v` and `s.b` all-null (see tools/zpq-gen null_pages). A
 // null check proves such a page always-match; its rows must still read as null wherever the filter is evaluated.
 // ============================================================
-
-
 
 test "all-null pages: null checks and their combinations answer like --scan-all" {
     const bytes = metadata.readFileSlice(null_pages_fixture, testing.allocator) catch |err| {
@@ -337,12 +335,6 @@ test "GROUP BY labels a nested leaf whose dotted path a top-level column takes b
     try testing.expectEqualStrings("\"a\".\"b\"", diag.column.get());
 }
 
-
-
-
-
-
-
 test "runMultiAggregate: the result destructors free a partly built answer" {
     // Strings are what own memory: string min/max winners, string group keys, output names. Every allocation is
     // failed in turn, so each partial state the answer passes through must be one `deinit` frees.
@@ -456,8 +448,6 @@ test "regression: float sums and avgs keep their bits at every -j, budget, decod
     }
 }
 
-
-
 test "regression: count(col) answers, or fails, the same at every budget and -j" {
     const path = "ci/fixtures/parquet/plain_values_corrupt.parquet";
     const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
@@ -533,8 +523,6 @@ test "GROUP BY hash merge: same groups, counts and string mins at every -j" {
     }
 }
 
-
-
 test "hash merge of worker tables: owned-string setup preserves arena state on refusal" {
     var arena: expr_agg.KeyArena = .{};
     // A nonempty payload makes the old tag/payload mismatch visible without relying on allocator fill or layout.
@@ -552,12 +540,6 @@ test "hash merge of worker tables: owned-string setup preserves arena state on r
     defer freeOwnedAccumulatorStrings(testing.allocator, (&acc)[0..1]);
     try testing.expectEqualStrings("winner", acc.min_bytes.?);
 }
-
-
-
-
-
-
 
 test "parallel hash merge matches one thread, including a failed spawn" {
     const calls = [_]expr_agg.AggCall{
@@ -663,12 +645,6 @@ test "hash merge of worker tables: overlapping keys, first appearance, allocatio
     try testing.checkAllAllocationFailures(fixed.allocator(), mergeOverlapAndFree, .{});
 }
 
-
-
-
-
-
-
 test "hash merge of fixed-width tables: the byte map's groups, firsts, order and state, cut or not, at every -j" {
     for ([_]u8{ 9, 18, 27 }) |stride| for ([_]usize{ 1, 3, 8 }) |j| {
         try mergeFixedAsBytes(testing.allocator, 6000, stride, j);
@@ -677,14 +653,6 @@ test "hash merge of fixed-width tables: the byte map's groups, firsts, order and
     defer spawn_util.resetFailure();
     try mergeFixedAsBytes(testing.allocator, 6000, 9, 8);
 }
-
-
-
-
-
-
-
-
 
 test "in-place merge: the copying merge's rows, bit for bit, at every -j and when spawns fail" {
     const gpa = testing.allocator;
@@ -1121,8 +1089,6 @@ test "inline record decode refusals retry serially without disabling the layout"
     try testing.expect(!wide.integer_records and !wide.byte_records);
 }
 
-
-
 test "inline byte stream matches full rows across workers, windows, allocation and spawn failures" {
     const path = "ci/fixtures/parquet/topk_skew.parquet";
     const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
@@ -1321,12 +1287,6 @@ test "statistics never invent a zero of the other sign: --trust-stats answers ze
 //
 // The fixture (tools/zpq-gen decimal_exact) stores decimals as INT32, INT64 and FLBA(16), dictionary-encoded,
 // in three row groups. Every expected value is DuckDB's answer for the same query, as unscaled integer and type.
-
-
-
-
-
-
 
 test "DECIMAL aggregates and arithmetic are exact, on every decode path and worker count" {
     const bytes = (try loadFixture(decimal_exact_fixture)) orelse return error.SkipZigTest;
@@ -1702,8 +1662,6 @@ test "firstCandidates: every table's earliest groups hold the groups that appear
     }
 }
 
-
-
 test "runMultiAggregate: returned count(DISTINCT) sets no longer point at the scan's budget" {
     const path = "ci/fixtures/parquet/topk_skew.parquet";
     const bytes = metadata.readFileSlice(path, testing.allocator) catch |err| {
@@ -1953,12 +1911,6 @@ test "runMultiAggregate: a budget the plain fold fits in holds every worker's pa
     }
 }
 
-
-
-
-
-
-
 test "regression: string-key spill answers every budget the plain fold answers, gated inputs included" {
     const path = "ci/fixtures/parquet/census_topk.parquet";
     const bytes = (try loadFixture(path)) orelse return error.SkipZigTest;
@@ -2075,8 +2027,6 @@ test "grouped DISTINCT bitmap forced layouts match exact fallback with NULLs fil
     try testing.expect(null_key and null_values);
 }
 
-
-
 test "grouped DISTINCT bitmap domain violation discards partial state and replays exact fallback" {
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -2111,4 +2061,3 @@ test "grouped DISTINCT bitmap domain violation discards partial state and replay
         try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
     }
 }
-

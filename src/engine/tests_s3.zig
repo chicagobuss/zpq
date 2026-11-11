@@ -263,7 +263,8 @@ test "a footer prefix that starts at offset 0 is checked for the leading magic" 
     const gpa = std.testing.allocator;
     const bytes = metadata.readFileSlice("ci/fixtures/parquet/group_order.parquet", gpa) catch return error.SkipZigTest;
     defer gpa.free(bytes);
-    // The serialized footer and its trailer, and nothing in front of them. Not a Parquet file: no leading PAR1, no pages.
+    // The serialized footer and its trailer, and nothing in front of them. Not a Parquet file: no leading PAR1, no
+    // pages.
     const footer_len: usize = std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
     const footer_only = bytes[bytes.len - 8 - footer_len ..];
     try std.testing.expect(!metadata.hasLeadingMagic(footer_only));
@@ -283,7 +284,8 @@ test "many files keep a count under the memory budget" {
     defer gpa.free(bytes);
     const footer_len: usize = std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little);
     const split = bytes.len - 8 - footer_len;
-    // Padding between the pages and the footer makes the default 1 MiB suffix real. The pages, and the row count, stay put.
+    // Padding between the pages and the footer makes the default 1 MiB suffix real. The pages, and the row count, stay
+    // put.
     const pad: usize = 1 << 20;
     const padded = try gpa.alloc(u8, bytes.len + pad);
     defer gpa.free(padded);
@@ -328,7 +330,8 @@ test "many files keep a count under the memory budget" {
     const wave = @as(u64, READ_CONCURRENCY) * FOOTER_PROBE_DEFAULT;
     try std.testing.expect(accounted <= @as(u64, budget) + wave);
     // RSS is not asserted here. VmHWM is the whole test process's lifetime high-water, so earlier tests fail it
-    // even when this query stays inside the allowance. The loose bound runs in its own process; see the integration test.
+    // even when this query stays inside the allowance. The loose bound runs in its own process; see the integration
+    // test.
 }
 
 // ── Windowed S3 fetch ──
@@ -975,7 +978,8 @@ test "a recompressing S3 copy whose ranged read stalls writes the same bytes as 
         try lines.append(a, try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0));
         try lines.appendSlice(a, &.{ "AWS_REGION=us-east-1", "AWS_ACCESS_KEY_ID=ak", "AWS_SECRET_ACCESS_KEY=sk" });
         try lines.append(a, "ZPQ_S3_WINDOW_KIB=1");
-        // Smaller than the fixture, so the copy still range-fetches column chunks instead of taking them from the suffix.
+        // Smaller than the fixture, so the copy still range-fetches column chunks instead of taking them from the
+        // suffix.
         try lines.append(a, "ZPQ_S3_FOOTER_PROBE=16384");
         for (stall_env) |e| try lines.append(a, e);
         const block = try a.allocSentinel(?[*:0]const u8, lines.items.len, null);

@@ -74,7 +74,6 @@ pub const OutputAggregator = output.OutputAggregator;
 pub const initOutputAggregator = output.initOutputAggregator;
 pub const resetAggregator = output.resetAggregator;
 
-pub const appendProjectedRG = output.appendProjectedRG;
 pub const appendProjectedRGWithOptions = output.appendProjectedRGWithOptions;
 pub const ProjectedRG = output.ProjectedRG;
 pub const Survivors = output.Survivors;
@@ -164,7 +163,6 @@ const pool_module = @import("consumer/pool.zig");
 pub const poolOn = pool_module.poolOn;
 pub const releaseSlicePool = pool_module.releaseSlicePool;
 
-
 const scan_plan = @import("consumer/plan.zig");
 const payloadColumns = scan_plan.payloadColumns;
 const plainValueEncodings = scan_plan.plainValueEncodings;
@@ -225,15 +223,3 @@ const decodeWithReaderPruned = consumer_column.decodeWithReaderPruned;
 const decodeFloat16ColumnAsF64Pruned = consumer_column.decodeFloat16ColumnAsF64Pruned;
 const decodeU32ColumnAsI64Pruned = consumer_column.decodeU32ColumnAsI64Pruned;
 const decodeFloat16ColumnAsF64 = consumer_column.decodeFloat16ColumnAsF64;
-
-// ============================================================
-// Compile-time API check. End-to-end behavior is exercised through
-// the lambda integration tests + CLI golden tests.
-// ============================================================
-test "consumer: API is well-typed" {
-    _ = appendProjectedRG;
-    _ = encodeAggregator;
-    _ = copyRG;
-    _ = decodeColumnT;
-}
-

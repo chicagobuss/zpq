@@ -343,12 +343,13 @@ pub fn captureEnv(
     return captureTimed(gpa, io, argv, env, null);
 }
 
-/// Exit code of a child stopped at its deadline, the same code coreutils `timeout` uses, so callers read it the same way.
+/// Exit code of a child stopped at its deadline, the same code coreutils `timeout` uses, so callers read it the same
+/// way.
 pub const timed_out_code: u8 = 124;
 
-/// `captureEnv` with a deadline: a child still running after `timeout_s` seconds is killed with its process group (SIGKILL,
-/// so every pipe writer is gone and the reads drain normally) and reported as exit `timed_out_code`. No external `timeout`
-/// command (macOS has none).
+/// `captureEnv` with a deadline: a child still running after `timeout_s` seconds is killed with its process group
+/// (SIGKILL, so every pipe writer is gone and the reads drain normally) and reported as exit `timed_out_code`. No
+/// external `timeout` command (macOS has none).
 pub fn captureTimed(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -362,7 +363,8 @@ pub fn captureTimed(
         .stdout = .pipe,
         .stderr = .pipe,
         .environ_map = env,
-        // A timed child leads its own process group, so the deadline kills it with everything it started (as `timeout` does).
+        // A timed child leads its own process group, so the deadline kills it with everything it started (as `timeout`
+        // does).
         .pgid = if (timeout_s != null) 0 else null,
     }) catch |err| {
         if (err == error.FileNotFound) std.debug.print("cannot start {s}: FileNotFound\n", .{argv[0]});

@@ -340,7 +340,8 @@ pub fn appendSplitFetch(
     }
 }
 
-/// Stable partition: jobs that overlap a filter column's bytes come first, so those GETs start while output columns wait.
+/// Stable partition: jobs that overlap a filter column's bytes come first, so those GETs start while output columns
+/// wait.
 pub fn orderFilterFirst(arena: std.mem.Allocator, jobs: []s3.FetchJob, filters: []const coalescer.Range) !void {
     if (filters.len == 0 or jobs.len < 2) return;
     var front: std.ArrayList(s3.FetchJob) = .empty;

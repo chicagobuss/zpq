@@ -46,7 +46,8 @@ pub const AggWorkspace = struct {
     /// decode reads it behind the filter's gate (a payload column, or a filter column `GatedFilter` defers). The
     /// read-ahead leaves those to the decode, which advises only the pages the gate keeps (`adviseGated`).
     gated: ?[]std.atomic.Value(bool) = null,
-    /// Beside `gated`: per leaf column, whether the gate kept every page of the latest gated chunk of it (`adviseGated`).
+    /// Beside `gated`: per leaf column, whether the gate kept every page of the latest gated chunk of it
+    /// (`adviseGated`).
     kept: ?[]std.atomic.Value(bool) = null,
     /// Beside `gated`: how the pages a gate keeps are advised, within the read-ahead's own bounds.
     gate_advice: ?GateAdvice = null,
@@ -92,7 +93,6 @@ pub fn refusedDraw(ws: AggWorkspace, err: anyerror) bool {
     };
     return false;
 }
-
 
 /// A mapped scan reading ahead: advice for a claimed item's gated column (`scan/read_ahead.zig`
 /// `ReadAhead.adviseClaimed`), capped, ledger-checked and counted as the read-ahead's own; `held` is the worker's count
@@ -195,4 +195,3 @@ pub fn cacheDictionary(in: AggRowGroup, ci: usize) ?CacheDictionary {
     }
     return if (data) dict else null;
 }
-

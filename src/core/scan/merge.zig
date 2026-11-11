@@ -1314,7 +1314,6 @@ test "DistinctMergeTask: partitioned distinct sets merge and handle allocation f
     }.run, .{});
 }
 
-
 test "DistinctMergeTask: a tight budget funds live source and destination without overlap" {
     // "Without overlap" is the destination's page mapping growing in place, which only Linux's mremap does.
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "mremap page growth");

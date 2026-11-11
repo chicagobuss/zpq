@@ -101,15 +101,3 @@ pub const output_values = @import("scan/output_values.zig");
 pub const AggValue = output_values.AggValue;
 pub const DecValue = output_values.DecValue;
 pub const AggOutputItem = output_values.AggOutputItem;
-
-
-test {
-    _ = @import("scan/upstream_tests.zig");
-    _ = @import("scan/execution_tests.zig");
-    _ = @import("scan/statistics_tests.zig");
-    _ = @import("scan/distinct_tests.zig");
-    _ = @import("scan/decode_tests.zig");
-    _ = @import("scan/owner_tests.zig");
-    _ = @import("scan/distinct_owner_tests.zig");
-}
-

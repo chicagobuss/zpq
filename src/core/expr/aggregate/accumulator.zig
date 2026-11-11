@@ -400,6 +400,8 @@ comptime {
     std.debug.assert(@sizeOf(Accumulator.Blob) <= @sizeOf(AvgState));
 }
 
+/// `a + b` for counts a footer claims: each file's is bounded (`metadata.max_row_count`), their sum across files is
+/// not. Past i64, the type count() answers in, it is an error rather than a count that cannot be written.
 pub fn addRowCount(a: u64, b: u64) error{RowCountTooLarge}!u64 {
     const sum = std.math.add(u64, a, b) catch return error.RowCountTooLarge;
     if (sum > std.math.maxInt(i64)) return error.RowCountTooLarge;

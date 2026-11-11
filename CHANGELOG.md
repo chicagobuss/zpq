@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Joins fetch later.** A dependent column is fetched as the scan reads it, and a fetched GROUP BY value waits for the LIMIT cut, so fewer rows are copied.
 - **Two-key GROUP BY counts and sums are faster at the default thread count.** An exact `GROUP BY a, b` with
   `count(*)` or an integer `sum` now runs on one worker per L2 cache when more workers would push it off the dense plan,
   and the merge of the workers' tables runs in parallel. On a Ryzen 9 9950X, `SELECT a, b, count(*), sum(v) ... GROUP BY

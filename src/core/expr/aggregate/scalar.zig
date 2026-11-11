@@ -1050,11 +1050,13 @@ pub const PreparedAggInput = struct {
             .col_ref => |c| try in.bindColRef(arena, batch, column_lookup, c),
             else => {
                 // A float sum folds gathered values in their rows' blocks (`gathered_from`), which a NULL found after
-                // the gather would shift: such an argument is evaluated in place, its coded columns materialized.
-                in.values = if (rowless)
-                    try in.evalArg(arena, batch, column_lookup, arg, !(agg_coded.floatSum(call) and arg.mayBeNull()))
-                else
-                    try expr_eval.evalExpr(arena, &batch.restrictedTo(in.selection()), column_lookup, arg);
+                // the gather would shift: an argument that turns out to have one is evaluated again in place.
+                in.values = if (rowless) try in.evalArg(arena, batch, column_lookup, arg, true) else try expr_eval.evalExpr(arena, &batch.restrictedTo(in.selection()), column_lookup, arg);
+                if (rowless and in.gathered_from != null and agg_coded.floatSum(call) and columnHasNulls(in.values.?)) {
+                    in.own_sel = in.gathered_from;
+                    in.gathered_from = null;
+                    in.values = try in.evalArg(arena, batch, column_lookup, arg, false);
+                }
                 // A function only the generic fold runs reads values: a computed argument that passes a dictionary through
                 // (`coalesce(s, s)` over a coded column) is expanded first.
                 if (call.func.extended()) switch (in.values.?) {

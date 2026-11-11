@@ -1337,8 +1337,7 @@ fn foldGroupedValue(
     // bare column's do, so it is evaluated before any fold reads the selection: counted, a NULL was a row.
     var computed: ?Column = prepared;
     if (call.arg) |arg| if (arg != .col_ref and (prepared != null or arg.mayBeNull())) {
-        const restricted = batch.restrictedTo(if (own) |*s| s else outer);
-        const v = prepared orelse try expr_eval.evalExpr(ra, &restricted, lookup, arg);
+        const v = prepared orelse try evalSelected(ra, batch, lookup, if (own) |*s| s else outer, arg);
         if (switch (v) {
             inline else => |c| c.has_nulls,
         }) {
@@ -1456,7 +1455,7 @@ fn foldGroupedValue(
                 },
             };
         },
-        else => |e| vals_col = computed orelse try expr_eval.evalExpr(ra, &batch.restrictedTo(sel), lookup, e),
+        else => |e| vals_col = computed orelse try evalSelected(ra, batch, lookup, sel, e),
     }
     // Strings and anything unusual: the row fold, with group ids expanded from composites.
     const is_numeric_sum_like = call.func != .count_distinct and !call.func.extended() and (vals_col == .f64 or vals_col == .i64 or vals_col == .i128) and call.result != .bytes and
@@ -1984,6 +1983,41 @@ pub inline fn forEachActive(sel: *const Sel, n: usize, comptime f: anytype, ctx:
 
 /// The rows `sel` keeps of a flat column, `active` of them, as a column of their own: values (looked up in the
 /// dictionary for a coded column) and levels compacted. Nested columns are not gathered.
+/// `e` for the rows `sel` keeps, as a column of the batch's length that a fold reads at those rows. Under a sparse
+/// selection only they evaluate, as DuckDB evaluates over its selection vector: the columns `e` reads are gathered to
+/// them, and the results go back to their rows. A row `sel` drops holds no value then (NULL where `e` has NULLs).
+fn evalSelected(ra: std.mem.Allocator, batch: *const filter_eval.Batch, lookup: []const ?usize, sel: *const Sel, e: expr_ast.Expr) !Column {
+    const active = sel.count();
+    if (active * 4 > batch.num_rows or sel.len != batch.num_rows) return expr_eval.evalExpr(ra, &batch.restrictedTo(sel), lookup, e);
+    const refs = try ra.alloc(bool, lookup.len);
+    @memset(refs, false);
+    e.collectColumns(refs);
+    const cols = try ra.dupe(Column, batch.cols);
+    for (refs, lookup) |r, pos| if (r) if (pos) |p| {
+        cols[p] = try gatherSelected(ra, batch.cols[p], sel, active);
+    };
+    const gathered: filter_eval.Batch = .{ .cols = cols, .num_rows = active, .expr_batch_rows = batch.expr_batch_rows };
+    return switch (try expr_eval.evalExpr(ra, &gathered, lookup, e)) {
+        inline else => |c, tag| blk: {
+            if (c.max_rep > 0 or c.codes != null or c.unscaled != null) return error.UnsupportedAggType;
+            const T = @TypeOf(c.values[0]);
+            const values = try ra.alloc(T, batch.num_rows);
+            const def: ?[]u32 = if (c.def_levels != null) try ra.alloc(u32, batch.num_rows) else null;
+            if (def) |d| @memset(d, 0);
+            var it = sel.iterator();
+            var k: usize = 0;
+            while (it.next()) |r| : (k += 1) {
+                values[r] = c.values[k];
+                if (def) |d| d[r] = c.def_levels.?[k];
+            }
+            var out = c;
+            out.values = values;
+            out.def_levels = def;
+            break :blk @unionInit(Column, @tagName(tag), out);
+        },
+    };
+}
+
 pub fn gatherSelected(ra: std.mem.Allocator, col: Column, sel: *const Sel, active: usize) !Column {
     return switch (col) {
         inline else => |c, tag| blk: {

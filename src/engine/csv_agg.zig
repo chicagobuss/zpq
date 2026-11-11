@@ -647,7 +647,7 @@ fn foldOnce(
         const rows = try gpa.alloc([]const output_values.AggValue, kept);
         @memset(rows, &.{});
         output.group_rows = rows;
-        try scan_rows.buildGroupRows(gpa, &output.slab, row_src, rows, @max(1, workers));
+        try scan_rows.buildGroupRows(gpa, &output.slab, row_src, rows, @max(1, workers), null);
         const cols = try gpa.alloc([]const u8, outputs.len);
         @memset(cols, "");
         output.group_cols = cols;

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **zpq reads CSV.** A local `.csv`, `.tsv` or `.txt` file (or any file with `--input-format csv`) is parsed in parallel
+  chunks. It can be written to Parquet whole or with `--columns`, `--filter`, `--select` and SQL `SELECT ... WHERE`, or
+  aggregated with `GROUP BY`, `HAVING`, `FILTER (WHERE ...)` and `DISTINCT` as the file is parsed. The answer is the
+  same one the query gives over the Parquet it writes, at every `-j`.
+  - A column's type holds every value exactly, or the column is text: BIGINT, DECIMAL up to 38 digits, DOUBLE only
+    where its text round-trips, DATE, TIMESTAMP (with time zone), BOOLEAN. `02134` stays text and a decimal stays
+    DECIMAL. When a value past the sample doesn't fit its column's type, the column widens and the query starts again;
+    `--csv-strict` and `--csv-types` refuse instead.
+  - RFC 4180 quoting, LF or CRLF, a BOM, and a sniffed `,` tab `;` `|` delimiter and header (`--csv-delimiter`,
+    `--csv-header`, `--csv-null`). A malformed field, a record with the wrong number of fields, UTF-16 and backslash
+    escapes are refused with the line, byte and column.
+  - `ORDER BY`, `LIMIT`, `OFFSET`, joins, more than one input and S3 CSV input are refused by name; write the Parquet
+    first. Everything a CSV query holds is drawn from `--max-memory`.
 - **Joins fetch later.** A dependent column is fetched as the scan reads it, and a fetched GROUP BY value waits for the LIMIT cut, so fewer rows are copied.
 - **Two-key GROUP BY counts and sums are faster at the default thread count.** An exact `GROUP BY a, b` with
   `count(*)` or an integer `sum` now runs on one worker per L2 cache when more workers would push it off the dense plan,

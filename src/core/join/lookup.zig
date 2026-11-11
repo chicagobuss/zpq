@@ -533,7 +533,7 @@ const Ctx = struct {
     /// The payloads (indices into `spec.payload`) no filter reads: each decodes on its own, per row group
     /// (`LateLocal`), so a build of few row groups and many payloads still has a task per core.
     late: []const usize,
-    /// By payload: held plain (`Payload.plain`), a string column no row group's chunk dictionary-encodes.
+    /// By payload: held plain (`Payload.plain`), a column no row group's chunk dictionary-encodes (a filter's, numeric).
     plain: []const bool,
 
     fn arena(c: *const Ctx, rg_index: usize, slot: usize) std.mem.Allocator {
@@ -714,7 +714,8 @@ fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
         hi = @max(hi, key);
     }
     for (c.spec.payload, part.local, 0..) |p, *l, pi| if (c.filter_cols[p]) {
-        l.* = try c.keepLocal(rg_index, pi, try localOf(c, sa, rg, p, keep.items, cols.items[lookup[p].?]));
+        const col = cols.items[lookup[p].?];
+        l.* = if (c.plain[pi]) try plainLocal(c.arena(rg_index, 1 + pi), col, keep.items) else try c.keepLocal(rg_index, pi, try localOf(c, sa, rg, p, keep.items, col));
     };
     if (c.late.len != 0) part.kept = try c.gpa.dupe(u64, sel.mask);
     part.keys = if (keys.items.len != 0 and @as(i128, hi) - lo <= std.math.maxInt(u32)) blk: {
@@ -755,21 +756,27 @@ const LateLocal = struct {
         }
         // Plain: the survivors' values as decoded (strings into the payload's arena, which outlives the layout), unhashed.
         const a = c.arena(rg_index, 1 + pi);
-        part.local[pi] = switch (try decodeValues(a, c.bytes, c.meta, rg, c.spec.payload[pi])) {
-            inline .i32, .i64, .f64, .string => |col, tag| blk: {
-                const values = try a.alloc(@TypeOf(col.values[0]), keep.len);
-                var bytes: usize = 0;
-                for (keep, values) |r, *v| {
-                    if (col.def_levels) |dl| if (dl[r] < col.max_def) return error.JoinPayloadType;
-                    v.* = col.values[r];
-                    if (tag == .string) bytes += v.len;
-                }
-                break :blk .{ .codes = .{ .identity = keep.len }, .dict = @unionInit(Dict, @tagName(tag), values), .bytes = bytes };
-            },
-            else => return error.JoinPayloadType,
-        };
+        part.local[pi] = try plainLocal(a, try decodeValues(a, c.bytes, c.meta, rg, c.spec.payload[pi]), keep);
     }
 };
+
+/// A plain payload's local (`Payload.plain`): the `keep` rows' values of `col`, copied into `a`, unhashed; strings
+/// still point into `col`.
+fn plainLocal(a: std.mem.Allocator, col: filter_eval.Batch.Column, keep: []const u32) !Local {
+    return switch (col) {
+        inline .i32, .i64, .f64, .string => |cc, tag| blk: {
+            const values = try a.alloc(@TypeOf(cc.values[0]), keep.len);
+            var bytes: usize = 0;
+            for (keep, values) |r, *v| {
+                if (cc.def_levels) |dl| if (dl[r] < cc.max_def) return error.JoinPayloadType;
+                v.* = cc.values[r];
+                if (tag == .string) bytes += v.len;
+            }
+            break :blk .{ .codes = .{ .identity = keep.len }, .dict = @unionInit(Dict, @tagName(tag), values), .bytes = bytes };
+        },
+        else => error.JoinPayloadType,
+    };
+}
 
 /// The most workers `parallel` runs.
 const max_workers = 64;
@@ -1038,11 +1045,13 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     const plain = try gpa.alloc(bool, spec.payload.len);
     defer gpa.free(plain);
     @memset(plain, false);
-    for (late.items) |pi| plain[pi] = parts.len != 0 and for (meta.row_groups.items) |*rg| {
-        const cm = rg.columns.items[spec.payload[pi]].meta_data orelse break false;
+    for (spec.payload, plain) |leaf, *pl| pl.* = parts.len != 0 and for (meta.row_groups.items) |*rg| {
+        const cm = rg.columns.items[leaf].meta_data orelse break false;
         if (cm.dictionary_page_offset != null) break false;
         switch (cm.type) {
-            .INT32, .INT64, .DOUBLE, .BYTE_ARRAY => {},
+            .INT32, .INT64, .DOUBLE => {},
+            // A filter's strings decode into the row group's scratch; only a late payload's outlive it (`LateLocal`).
+            .BYTE_ARRAY => if (filter_cols[leaf]) break false,
             else => break false,
         }
     } else true;

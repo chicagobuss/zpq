@@ -682,19 +682,25 @@ fn foldOnce(
         const Task = struct {
             // Each chunk counts its own quotes as it starts (`Source.records`); chunks start in order, so a chunk
             // waits only on those already counting.
-            fn foldChunk(s: *Source, f: *Fold, t_io: std.Io, i: usize) void {
-                if (!f.awaitTurn(i)) return;
-                const t0 = nowMonoNs();
-                defer _ = f.chunk_ns.fetchAdd(@intCast(nowMonoNs() - t0), .monotonic);
-                defer if (s.gate) |g| g.done(g.ctx, i, 1) else dropBehind(s, i);
-                s.produce(t_io, null, i) catch |e| {
-                    if (!s.failed[i]) f.errs[i] = e;
-                    f.failFrom(i);
-                };
+            // One task per worker, each claiming the next chunk in order: no chunk waits on another's dispatch, and
+            // none runs on the dispatching thread while workers sit idle.
+            fn worker(s: *Source, f: *Fold, t_io: std.Io, cursor: *std.atomic.Value(usize)) void {
+                while (true) {
+                    const i = cursor.fetchAdd(1, .monotonic);
+                    if (i >= s.count or !f.awaitTurn(i)) return;
+                    const t0 = nowMonoNs();
+                    defer _ = f.chunk_ns.fetchAdd(@intCast(nowMonoNs() - t0), .monotonic);
+                    defer if (s.gate) |g| g.done(g.ctx, i, 1) else dropBehind(s, i);
+                    s.produce(t_io, null, i) catch |e| {
+                        if (!s.failed[i]) f.errs[i] = e;
+                        f.failFrom(i);
+                    };
+                }
             }
         };
+        var cursor: std.atomic.Value(usize) = .init(0);
         var group: std.Io.Group = .init;
-        for (0..source.count) |i| group.async(io, Task.foldChunk, .{ &source, &fold, io, i });
+        for (0..@min(@max(1, workers), source.count)) |_| group.async(io, Task.worker, .{ &source, &fold, io, &cursor });
         group.await(io) catch {};
     }
     t.decode_wall_ns = @intCast(nowMonoNs() - t_scan);

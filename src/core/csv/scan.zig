@@ -211,6 +211,25 @@ pub const Scanner = struct {
         return f;
     }
 
+    /// Up to `n` fields skipped off the structural bits without being returned: fields with no quote byte, within the
+    /// current block. The `n`-th must end the record when `ends`, and an earlier one must not; a field that breaks
+    /// either, a quote, or the block's end stops the skip before it, for `next` to return as usual. A field without a
+    /// quote cannot be malformed, so a field the parse does not read needs nothing more. Returns the count skipped.
+    pub inline fn skipPlain(s: *Scanner, n: usize, ends: bool) usize {
+        var k: usize = 0;
+        while (k < n and s.pending != 0) : (k += 1) {
+            const bit: u6 = @intCast(@ctz(s.pending));
+            const below = (@as(u64, 1) << bit) - 1;
+            if (s.span_quote or s.quote_bits & s.fromFieldStart() & below != 0) break;
+            const last = (s.newline_bits >> bit) & 1 == 1;
+            if (last != (ends and k + 1 == n)) break;
+            s.pending &= s.pending - 1;
+            s.field_start = s.block + bit + 1;
+            s.in_record = !last;
+        }
+        return k;
+    }
+
     fn atEnd(s: *Scanner) Error!?Field {
         s.done = true;
         if (!s.eof) {

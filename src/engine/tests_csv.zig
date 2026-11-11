@@ -989,3 +989,45 @@ test "csv aggregate: a GROUP BY whose fold fits the budget answers, its answer w
     // (`runMultiAggregate`): a budget that holds the fold answers.
     try testing.expect(try Probe.fits(ctx, plain, hi));
 }
+
+test "csv framing: unread fields are skipped off the structural bits, and every record still frames and refuses as when read" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var b1: [128]u8 = undefined;
+    const csv = try tmpPath(&b1, &tmp, "f.csv");
+    const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
+    // Unread fields with quotes, delimiters and newlines inside them, CRLF and LF, and a blank line: only `b` is read.
+    try writeFile(csv, "a,b,c,d\r\n" ++
+        "\"x,\ny\",1,\"q\"\"r\",z\r\n" ++
+        "p,2,,\n" ++
+        "\n" ++
+        "\"\",3,\"multi\r\nline\",\"d,d\"\n" ++
+        "k,4,plain,last");
+    // Chunks small enough to cut inside quotes, at CRLF, and inside the skipped runs.
+    for ([_]usize{ 1, 3, 7, 13, 64, 1 << 20 }) |chunk| {
+        var r = try runQuery(ctx, .{ .inputs = &.{csv}, .aggregate = "sum(b) AS s, count(*) AS n", .csv = .{ .chunk_bytes = chunk } });
+        defer r.deinit(testing.allocator);
+        try testing.expectEqual(@as(i128, 10), r.aggregate.output.aggs[0].value.i);
+        try testing.expectEqual(@as(i128, 4), r.aggregate.output.aggs[1].value.i);
+    }
+    // A short record, a long one, and a stray quote in an unread field: refused with the line, byte and column the
+    // reading of every field gives.
+    for ([_][]const u8{
+        "a,b,c,d\n1,2,3,4\n5,6,7\n",
+        "a,b,c,d\n1,2,3,4\n5,6,7,8,9\n",
+        "a,b,c,d\n1,2,3,4\n5,6,x\"y,8\n",
+        "a,b,c,d\n1,2,3,4\n5,6\n",
+    }) |text| {
+        try writeFile(csv, text);
+        var skipped: Diag = .{};
+        var read: Diag = .{};
+        const e1 = runQuery(ctx, .{ .inputs = &.{csv}, .aggregate = "sum(b) AS s", .diag = &skipped });
+        const e2 = runQuery(ctx, .{ .inputs = &.{csv}, .aggregate = "count(a) AS a, count(b) AS b, count(c) AS c, count(d) AS d", .diag = &read });
+        const want = if (std.mem.indexOfScalar(u8, text, '"') != null) error.CsvMalformed else error.CsvFieldCount;
+        try testing.expectError(want, e1);
+        try testing.expectError(want, e2);
+        try testing.expectEqualStrings(read.column.get(), skipped.column.get());
+        try testing.expectEqual(read.detail.csv.line, skipped.detail.csv.line);
+        try testing.expectEqual(read.detail.csv.byte, skipped.detail.csv.byte);
+    }
+}

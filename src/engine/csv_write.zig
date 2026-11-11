@@ -778,52 +778,75 @@ pub const Source = struct {
         defer scratch.deinit(scratch_alloc);
         var col: usize = 0;
         var record_start = span.lo;
-        while (true) {
-            const next = scanner.next() catch return s.fail(i, scanFailure(&scanner, col), span.lines, lo_b);
-            const f = next orelse break;
-            if (f.last and col == 0 and f.start == f.end and ncols > 1) {
-                // A blank line holds no record.
-                record_start = scanner.position();
-                if (record_start >= span.hi) break;
-                continue;
+        // Per column: the run of fields from it on that the parse neither writes nor classifies, which
+        // `Scanner.skipPlain` passes over without returning them when they hold no quote.
+        const unread = try a.alloc(u32, ncols);
+        {
+            var streak: u32 = 0;
+            var c = ncols;
+            while (c > 0) {
+                c -= 1;
+                streak = if (p.slot[c] == null) streak + 1 else 0;
+                unread[c] = streak;
             }
-            if (col >= ncols) return s.fail(i, .{
-                .kind = .field_count,
-                .offset = record_start,
-                // The first field past the header's.
-                .column = ncols,
-                .expected_fields = ncols,
-                // The extra field may end its record; only one that does not has more to count.
-                .got_fields = col + 1 + if (f.last) 0 else countRest(&scanner),
-            }, span.lines, lo_b);
-            const raw = bytes[f.start..f.end];
-            const text = csv_scan.fieldText(f, raw, p.dialect.quote, &scratch, scratch_alloc) catch |e| switch (e) {
-                error.MalformedCsv => return s.fail(i, .{
-                    .kind = .malformed,
-                    .malformed = csv_scan.fieldMalformation(raw, p.dialect.quote),
-                    .offset = f.start,
-                    .column = col,
-                }, span.lines, lo_b),
-                else => |oom| return oom,
-            };
-            // A field not written is framed and decoded (so a malformed one still refuses), and nothing more.
-            if (p.slot[col]) |out| if (s.classify) {
-                if (!isNull(text, p.nulls))
-                    seen[out] = seen[out].join(classifyText(text.bytes, ascii));
-            } else if (!(try builder.add(a, out, text, ascii, p.nulls, own_strings or unescaped(text, &scratch)))) {
-                const t = p.types[out];
-                var fl: Failure = .{
-                    .kind = if (p.pinned[out]) .pinned_type else .type_changed,
-                    .offset = f.start,
-                    .column = col,
-                    .type = t,
+        }
+        while (true) {
+            var ends_record = false;
+            const unread_run = if (col < ncols) unread[col] else 0;
+            if (unread_run > 0) {
+                const to_end = col + unread_run == ncols;
+                const skipped = scanner.skipPlain(unread_run, to_end);
+                col += skipped;
+                ends_record = to_end and skipped == unread_run;
+            }
+            if (!ends_record) {
+                const next = scanner.next() catch return s.fail(i, scanFailure(&scanner, col), span.lines, lo_b);
+                const f = next orelse break;
+                if (f.last and col == 0 and f.start == f.end and ncols > 1) {
+                    // A blank line holds no record.
+                    record_start = scanner.position();
+                    if (record_start >= span.hi) break;
+                    continue;
+                }
+                if (col >= ncols) return s.fail(i, .{
+                    .kind = .field_count,
+                    .offset = record_start,
+                    // The first field past the header's.
+                    .column = ncols,
+                    .expected_fields = ncols,
+                    // The extra field may end its record; only one that does not has more to count.
+                    .got_fields = col + 1 + if (f.last) 0 else countRest(&scanner),
+                }, span.lines, lo_b);
+                const raw = bytes[f.start..f.end];
+                const text = csv_scan.fieldText(f, raw, p.dialect.quote, &scratch, scratch_alloc) catch |e| switch (e) {
+                    error.MalformedCsv => return s.fail(i, .{
+                        .kind = .malformed,
+                        .malformed = csv_scan.fieldMalformation(raw, p.dialect.quote),
+                        .offset = f.start,
+                        .column = col,
+                    }, span.lines, lo_b),
+                    else => |oom| return oom,
                 };
-                fl.value_len = @min(fl.value.len, text.bytes.len);
-                @memcpy(fl.value[0..fl.value_len], text.bytes[0..fl.value_len]);
-                return s.fail(i, fl, span.lines, lo_b);
-            };
-            col += 1;
-            if (f.last) {
+                // A field not written is framed and decoded (so a malformed one still refuses), and nothing more.
+                if (p.slot[col]) |out| if (s.classify) {
+                    if (!isNull(text, p.nulls))
+                        seen[out] = seen[out].join(classifyText(text.bytes, ascii));
+                } else if (!(try builder.add(a, out, text, ascii, p.nulls, own_strings or unescaped(text, &scratch)))) {
+                    const t = p.types[out];
+                    var fl: Failure = .{
+                        .kind = if (p.pinned[out]) .pinned_type else .type_changed,
+                        .offset = f.start,
+                        .column = col,
+                        .type = t,
+                    };
+                    fl.value_len = @min(fl.value.len, text.bytes.len);
+                    @memcpy(fl.value[0..fl.value_len], text.bytes[0..fl.value_len]);
+                    return s.fail(i, fl, span.lines, lo_b);
+                };
+                col += 1;
+                ends_record = f.last;
+            }
+            if (ends_record) {
                 if (col != ncols) return s.fail(i, .{
                     .kind = .field_count,
                     .offset = record_start,

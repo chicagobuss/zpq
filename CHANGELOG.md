@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Faster CSV aggregates.** A CSV aggregate's chunks parse into pooled per-worker arenas, fold without copies and drop their pages behind them, and a one-byte string's dictionary code is its byte.
 - **Joins keep a plain key plain.** A numeric build-side column stored PLAIN is no longer run through a dictionary just because the build's filter reads it.
 - **zpq reads CSV.** A local `.csv`, `.tsv` or `.txt` file (or any file with `--input-format csv`) is parsed in parallel
   chunks. It can be written to Parquet whole or with `--columns`, `--filter`, `--select` and SQL `SELECT ... WHERE`, or

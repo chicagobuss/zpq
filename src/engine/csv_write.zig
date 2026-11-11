@@ -1335,26 +1335,21 @@ pub fn classifyFile(
     var threaded: std.Io.Threaded = .init(ctx.gpa, .{ .async_limit = .limited(@max(1, workers)) });
     defer threaded.deinit();
     const io = threaded.io();
+    // One task per worker, each claiming the next chunk in order (as `csv_agg` folds): each chunk counts its own
+    // quotes as it starts (`records`), and none waits on another's dispatch.
     const Task = struct {
-        fn stats(s: *Source, t_io: std.Io, i: usize) void {
-            const lo = s.bound(i);
-            s.stats[i] = csv_scan.chunkStats(s.plan.bytes[lo..s.bound(i + 1)], s.plan.dialect.quote);
-            s.ready[i].set(t_io);
-        }
-        fn classify(s: *Source, t_io: std.Io, i: usize) void {
-            s.produce(t_io, null, i) catch {};
+        fn worker(s: *Source, t_io: std.Io, cursor: *std.atomic.Value(usize)) void {
+            while (true) {
+                const i = cursor.fetchAdd(1, .monotonic);
+                if (i >= s.count) return;
+                s.produce(t_io, null, i) catch {};
+            }
         }
     };
-    {
-        var group: std.Io.Group = .init;
-        for (0..source.count) |i| group.async(io, Task.stats, .{ &source, io, i });
-        group.await(io) catch {};
-    }
-    {
-        var group: std.Io.Group = .init;
-        for (0..source.count) |i| group.async(io, Task.classify, .{ &source, io, i });
-        group.await(io) catch {};
-    }
+    var cursor: std.atomic.Value(usize) = .init(0);
+    var group: std.Io.Group = .init;
+    for (0..@min(@max(1, workers), source.count)) |_| group.async(io, Task.worker, .{ &source, io, &cursor });
+    group.await(io) catch {};
     if (source.firstFailure()) |f| {
         failure.* = f.*;
         return switch (f.kind) {

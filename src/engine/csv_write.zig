@@ -919,7 +919,10 @@ fn hasHighBit(bytes: []const u8) bool {
 /// (`encoder.dictPageMaxBytes`; a merge only adds entries, so that is final), or past either limit while its newest
 /// values still grow it faster than the limit grows (`judge`).
 const Coder = struct {
+    /// Values of two bytes or more; a one-byte value's code (plus one; 0: none yet) is in `one`.
     map: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Made on the column's first one-byte value, so a column without one costs a pointer.
+    one: ?*[256]u32 = null,
     dict: std.ArrayList([]const u8) = .empty,
     /// The dictionary's PLAIN bytes, and the present values' and their PLAIN bytes, as the encoder counts them.
     bytes: usize = 0,
@@ -928,6 +931,14 @@ const Coder = struct {
     /// Present values at the next judgment, and what was counted at the last one.
     next_judged: usize = encoder.dict_min_present,
     last: struct { present: usize = 0, plain: usize = 0, entries: usize = 0, bytes: usize = 0 } = .{},
+
+    /// A new entry's code; its bytes outlive the chunk as the entry does.
+    fn insert(c: *Coder, a: std.mem.Allocator, s: []const u8, copy: bool) !u32 {
+        const code: u32 = @intCast(c.dict.items.len);
+        try c.dict.append(a, if (copy) try a.dupe(u8, s) else s);
+        c.bytes += 4 + s.len;
+        return code;
+    }
 
     /// At doubling counts of present values: whether the column should go back to values. A dictionary grows
     /// concavely in the values it has seen (each new value is less likely to be new), so one within both limits
@@ -1065,16 +1076,26 @@ const Builder = struct {
                 if (t.kind == .null_only) return false;
                 if (x.coded) {
                     const c = &b.coders[col];
-                    const gop = try c.map.getOrPut(a, s);
-                    if (!gop.found_existing) {
-                        // The key must outlive the chunk as the entry does.
-                        const owned = if (copy) try a.dupe(u8, s) else s;
-                        gop.key_ptr.* = owned;
-                        gop.value_ptr.* = @intCast(c.dict.items.len);
-                        try c.dict.append(a, owned);
-                        c.bytes += 4 + s.len;
-                    }
-                    try x.codes.append(a, gop.value_ptr.*);
+                    // A one-byte value's code is its byte's slot, with no hash (flags and codes, as TPC-H's are).
+                    const code = if (s.len == 1) one: {
+                        const table = c.one orelse made: {
+                            const fresh = try a.create([256]u32);
+                            fresh.* = @splat(0);
+                            c.one = fresh;
+                            break :made fresh;
+                        };
+                        const slot = &table[s[0]];
+                        if (slot.* == 0) slot.* = 1 + try c.insert(a, s, copy);
+                        break :one slot.* - 1;
+                    } else map: {
+                        const gop = try c.map.getOrPut(a, s);
+                        if (!gop.found_existing) {
+                            gop.value_ptr.* = try c.insert(a, s, copy);
+                            gop.key_ptr.* = c.dict.items[gop.value_ptr.*];
+                        }
+                        break :map gop.value_ptr.*;
+                    };
+                    try x.codes.append(a, code);
                     if (x.max_def > 0) try x.def_levels.append(a, 1);
                     c.present += 1;
                     c.plain += 4 + s.len;

@@ -23,6 +23,7 @@ const core_memory = @import("../memory.zig");
 const partagg = @import("../partagg.zig");
 const ndv = @import("../ndv.zig");
 const agg_dense = @import("../expr/agg_dense.zig");
+const huge_pages = @import("../huge_pages.zig");
 const key_pack = @import("../expr/key_pack.zig");
 const owner_groups = @import("../owner_groups.zig");
 const NdvStat = ndv.Stat;
@@ -1658,12 +1659,14 @@ fn prepareAggregateWithMetas(
                 if (positions.?.rows() != ndv_stat.?.rows) break :dense;
             }
         }
+        const huge = huge_pages.worthAdvising(quote.lanes);
         dense_lanes = try arena.alloc(agg_dense.Lanes, n_workers);
         for (dense_lanes) |*l| l.* = .{
             .domain = d,
             .calls = agg_calls,
             .rows = ndv_stat.?.rows,
             .positions = positions,
+            .huge = huge,
         };
         if (args.taken) |taken| taken.insert(.dense);
     }

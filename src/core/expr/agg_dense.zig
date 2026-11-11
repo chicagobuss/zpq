@@ -405,7 +405,7 @@ pub fn charge(
     rows: u64,
     stride: usize,
     cut: ?usize,
-) struct { total: usize, table: usize } {
+) struct { total: usize, table: usize, lanes: usize } {
     const ids = d.ids();
     const table = domainTableBytes(d, ids, stride, calls.len);
     const heap = if (cut) |h| @min(h, ids) *| @sizeOf(u32) else 0;
@@ -424,10 +424,11 @@ pub fn charge(
         if (axis.values == .bytes) break false;
     } else true;
     const identity = if (product_sum or product_numeric) key_pack.planBytes(d.axes.len, true, raw_keys) else 0;
+    const worker_bytes = workers *| (lanes +| partials);
     return .{
-        .total = d.bytes +| identity +| workers *| (lanes +| partials) +| table +| heap +|
-            ids *| @sizeOf(u32) +| positions,
+        .total = d.bytes +| identity +| worker_bytes +| table +| heap +| ids *| @sizeOf(u32) +| positions,
         .table = table,
+        .lanes = worker_bytes,
     };
 }
 
@@ -721,6 +722,8 @@ pub const Lanes = struct {
     partials: []i64 = &.{},
     touched: []u32 = &.{},
     ordered_last: u64 = unseen,
+    /// Advise the big blocks for huge pages: set by the caller when the host has the free huge blocks for the quote.
+    huge: bool = false,
 
     fn allocated(l: *const Lanes) bool {
         return l.first.len != 0 or l.compact_sums.len != 0;
@@ -754,7 +757,7 @@ pub const Lanes = struct {
                 const positions = l.positions orelse return error.UnsupportedAggType;
                 if (positions.rows() != l.rows) return error.UnsupportedAggType;
             }
-            l.compact_sums = try gpa.alloc(CompactSum, n);
+            l.compact_sums = try l.big(CompactSum, gpa, n);
             @memset(l.compact_sums, .{});
             return;
         }
@@ -808,6 +811,12 @@ pub const Lanes = struct {
         l.ordered_last = unseen;
     }
 
+    fn big(l: *const Lanes, comptime T: type, gpa: std.mem.Allocator, n: usize) ![]T {
+        const block = try gpa.alloc(T, n);
+        if (l.huge) huge_pages.adviseBlock(std.mem.sliceAsBytes(block));
+        return block;
+    }
+
     /// The lane's allocated blocks, whichever of its layouts it holds.
     fn blocks(l: *const Lanes) [8][]const u8 {
         return .{
@@ -822,7 +831,7 @@ pub const Lanes = struct {
         if (l.partials.len != 0) return;
         const n = l.domain.ids();
         if (n > max_ids) return error.UnsupportedAggType;
-        const partials = try gpa.alloc(i64, n);
+        const partials = try l.big(i64, gpa, n);
         errdefer gpa.free(partials);
         l.touched = try gpa.alloc(u32, @min(n, partialRows(l.rows)));
         l.partials = partials;
@@ -2432,6 +2441,17 @@ test "dense lanes give large blocks' pages back from the pool and free everythin
     for (lanes[0 .. lanes.len - 1]) |l| try testing.expectEqual(@as(u8, 0), std.mem.sliceAsBytes(l.compact_sums)[2 << 20]);
     try testing.expectEqual(@as(u8, 0xaa), std.mem.sliceAsBytes(lanes[lanes.len - 1].compact_sums)[0]);
     deinitAll(testing.allocator, &lanes);
+}
+
+test "dense lanes advised for huge pages hold their data and free like any block" {
+    var values: [2]u64 = @splat(0);
+    var axes = [_]Axis{.{ .values = .{ .int64 = &values }, .trans = &.{}, .file_base = &.{}, .bytes = 0 }};
+    const domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    var l: Lanes = .{ .domain = &domain, .calls = &Fixture.calls, .huge = true };
+    l.compact_sums = try l.big(CompactSum, testing.allocator, (5 << 20) / @sizeOf(CompactSum));
+    defer l.deinit(testing.allocator);
+    @memset(std.mem.sliceAsBytes(l.compact_sums), 0x5a);
+    try testing.expectEqual(@as(u8, 0x5a), std.mem.sliceAsBytes(l.compact_sums)[(3 << 20) + 1]);
 }
 
 test "dense count lanes preserve selected first rows, NULLs and allocation failures" {

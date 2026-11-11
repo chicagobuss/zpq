@@ -447,7 +447,7 @@ fn adviceEnabled() bool {
         3 => return true,
         1 => std.atomic.spinLoopHint(),
         else => if (advice_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
-            const enabled = discoverAdvice();
+            const enabled = discoverAdvice(8 << 30);
             advice_state.store(if (enabled) 3 else 2, .release);
             return enabled;
         },
@@ -462,7 +462,7 @@ fn policyFile(path: [:0]const u8, buf: []u8) ?[]const u8 {
     return if (n == buf.len) null else buf[0..n];
 }
 
-fn discoverAdvice() bool {
+fn discoverAdvice(needed: u64) bool {
     if (std.c.getenv("ZPQ_HUGEPAGE")) |raw| {
         const value = std.mem.span(raw);
         if (std.mem.eql(u8, value, "on")) return true;
@@ -474,10 +474,18 @@ fn discoverAdvice() bool {
     const end = std.mem.indexOfScalarPos(u8, modes, start, ']') orelse return false;
     var buddy_buf: [16 << 10]u8 = undefined;
     const buddy = policyFile("/proc/buddyinfo", &buddy_buf) orelse return false;
-    return adviceFor(modes[start..end], buddy, 4 << 30);
+    return adviceFor(modes[start..end], buddy, needed);
 }
 
-fn adviceFor(mode: []const u8, buddy: []const u8, expected: u64) bool {
+/// Whether to advise blocks totalling `bytes`: the process gate's policy, and free huge blocks that cover them, not
+/// the fixed 8 GiB, sampled now. A host without them compacts synchronously on the first touches (374 stalls and
+/// 1.85 s of system time in one measured run).
+pub fn worthAdvising(bytes: u64) bool {
+    return builtin.target.os.tag == .linux and discoverAdvice(bytes);
+}
+
+/// `needed` bytes of free huge-capable blocks are enough to back the advised blocks without compacting.
+fn adviceFor(mode: []const u8, buddy: []const u8, needed: u64) bool {
     if (std.mem.eql(u8, mode, "defer") or std.mem.eql(u8, mode, "never")) return true;
     // defer+madvise still compacts synchronously for MADV_HUGEPAGE regions (Linux transhuge documentation).
     if (!std.mem.eql(u8, mode, "always") and !std.mem.eql(u8, mode, "madvise") and
@@ -494,11 +502,16 @@ fn adviceFor(mode: []const u8, buddy: []const u8, expected: u64) bool {
             bytes *|= 2;
         }
     }
-    return free >= expected *| 2;
+    return free >= needed;
 }
 
 fn advise(block: []u8) void {
-    if (builtin.target.os.tag != .linux or !adviceEnabled()) return;
+    if (builtin.target.os.tag == .linux and adviceEnabled()) adviseBlock(block);
+}
+
+/// Ask for huge pages over the 2 MiB-aligned interior of `block`, whatever the process gate says.
+pub fn adviseBlock(block: []u8) void {
+    if (builtin.target.os.tag != .linux) return;
     const lo = std.mem.alignForward(usize, @intFromPtr(block.ptr), huge_page_size);
     const hi = std.mem.alignBackward(usize, @intFromPtr(block.ptr) + block.len, huge_page_size);
     if (hi <= lo) return;
@@ -790,13 +803,13 @@ test "THP advice avoids synchronous compaction without enough free huge blocks" 
     var plenty_buf: [128]u8 = undefined;
     const plenty = try Buddy.line(&plenty_buf, orders);
     for ([_][]const u8{ "always", "madvise", "defer+madvise" }) |mode| {
-        try std.testing.expect(!adviceFor(mode, scarce, 4 << 30));
-        try std.testing.expect(adviceFor(mode, plenty, 4 << 30));
-        try std.testing.expect(!adviceFor(mode, plenty, 5 << 30));
-        try std.testing.expect(!adviceFor(mode, "bad input", 4 << 30));
+        try std.testing.expect(!adviceFor(mode, scarce, 8 << 30));
+        try std.testing.expect(adviceFor(mode, plenty, 8 << 30));
+        try std.testing.expect(!adviceFor(mode, plenty, 9 << 30));
+        try std.testing.expect(!adviceFor(mode, "bad input", 8 << 30));
     }
-    for ([_][]const u8{ "defer", "never" }) |mode| try std.testing.expect(adviceFor(mode, scarce, 4 << 30));
-    try std.testing.expect(!adviceFor("unknown", plenty, 4 << 30));
+    for ([_][]const u8{ "defer", "never" }) |mode| try std.testing.expect(adviceFor(mode, scarce, 8 << 30));
+    try std.testing.expect(!adviceFor("unknown", plenty, 8 << 30));
 }
 
 test "retired pairs return every charge and serve the next take on the same mapping" {

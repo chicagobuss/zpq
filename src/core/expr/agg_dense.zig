@@ -379,11 +379,6 @@ fn partialRows(rows: u64) usize {
     return @intCast(@min(rows, @max(1, hw.l2BytesPerWorkerOr(256 << 10) / (@sizeOf(i64) + @sizeOf(u32)))));
 }
 
-pub fn partialBytes(ids: usize, rows: u64) usize {
-    if (rows >= compact_present) return 0;
-    return ids *| @sizeOf(i64) +| @min(ids, partialRows(rows)) *| @sizeOf(u32);
-}
-
 /// Bytes at most the table `intoTable` fills holds for `ids` groups: what `GroupTable.reserveFixed` charges.
 pub fn tableBytes(ids: usize, stride: usize, n_calls: usize) usize {
     const slots = std.math.ceilPowerOfTwo(usize, @max(16, ids *| 4 / 3 + 1)) catch std.math.maxInt(usize);
@@ -416,10 +411,7 @@ pub fn charge(
     else
         0;
     const lanes = laneBytes(ids, calls, rows, product_sum);
-    const partials = if (product_sum) partialBytes(ids, rows) else if (product_numeric)
-        numericScratchBytes(ids, calls)
-    else
-        0;
+    const partials = if (product_numeric) numericScratchBytes(ids, calls) else 0;
     const raw_keys = for (d.axes) |axis| {
         if (axis.values == .bytes) break false;
     } else true;
@@ -520,35 +512,6 @@ fn sumValue(values: anytype, row: usize) !?i64 {
     const vs = if (values.codes != null) values.dict else values.values;
     if (at >= vs.len) return error.BadColumn;
     return vs[at];
-}
-
-fn maxAbs(values: []const i64) u64 {
-    const width = std.simd.suggestVectorLength(i64) orelse 1;
-    const V = @Vector(width, i64);
-    var maximum: @Vector(width, u64) = @splat(0);
-    var at: usize = 0;
-    while (values.len - at >= width) : (at += width) {
-        const v: V = values[at..][0..width].*;
-        maximum = @max(maximum, @abs(v));
-    }
-    var out = @reduce(.Max, maximum);
-    for (values[at..]) |v| out = @max(out, @abs(v));
-    return out;
-}
-
-/// Actual decoded values are a proof; unverified footer extrema and uninitialized NULL slots are not.
-fn magnitude(values: anytype, rows: usize) ?u64 {
-    if (@TypeOf(values.values[0]) == i32) return @as(u64, 1) << 31;
-    if (values.codes != null) return maxAbs(values.dict);
-    if (values.values.len < rows) return null;
-    if (values.def_levels) |defs| {
-        var out: u64 = 0;
-        for (defs[0..rows], 0..) |dl, row| {
-            if (dl >= values.max_def) out = @max(out, @abs(values.values[row]));
-        }
-        return out;
-    }
-    return maxAbs(values.values[0..rows]);
 }
 
 fn activeRange(sel: ?*const Sel, lo: usize, hi: usize, comptime row: anytype, ctx: anytype) void {
@@ -719,8 +682,6 @@ pub const Lanes = struct {
     compact_sums: []CompactSum = &.{},
     positions: ?Ordinals = null,
     global_ordinals: bool = false,
-    partials: []i64 = &.{},
-    touched: []u32 = &.{},
     ordered_last: u64 = unseen,
     /// Advise the big blocks for huge pages: set by the caller when the host has the free huge blocks for the quote.
     huge: bool = false,
@@ -798,16 +759,12 @@ pub const Lanes = struct {
         gpa.free(l.counts64);
         gpa.free(l.sums);
         gpa.free(l.compact_sums);
-        gpa.free(l.partials);
-        gpa.free(l.touched);
         l.accs = &.{};
         l.first = &.{};
         l.counts32 = &.{};
         l.counts64 = &.{};
         l.sums = &.{};
         l.compact_sums = &.{};
-        l.partials = &.{};
-        l.touched = &.{};
         l.ordered_last = unseen;
     }
 
@@ -818,23 +775,12 @@ pub const Lanes = struct {
     }
 
     /// The lane's allocated blocks, whichever of its layouts it holds.
-    fn blocks(l: *const Lanes) [8][]const u8 {
+    fn blocks(l: *const Lanes) [6][]const u8 {
         return .{
             std.mem.sliceAsBytes(l.accs),     std.mem.sliceAsBytes(l.first),
             std.mem.sliceAsBytes(l.counts32), std.mem.sliceAsBytes(l.counts64),
             std.mem.sliceAsBytes(l.sums),     std.mem.sliceAsBytes(l.compact_sums),
-            std.mem.sliceAsBytes(l.partials), std.mem.sliceAsBytes(l.touched),
         };
-    }
-
-    fn ensurePartials(l: *Lanes, gpa: std.mem.Allocator) !void {
-        if (l.partials.len != 0) return;
-        const n = l.domain.ids();
-        if (n > max_ids) return error.UnsupportedAggType;
-        const partials = try l.big(i64, gpa, n);
-        errdefer gpa.free(partials);
-        l.touched = try gpa.alloc(u32, @min(n, partialRows(l.rows)));
-        l.partials = partials;
     }
 
     fn count(l: *const Lanes, id: usize) u64 {
@@ -893,8 +839,8 @@ pub const Lanes = struct {
                     if (bindings.len == 2 and bindings[0].ni.def_levels == null and
                         bindings[1].ni.def_levels == null)
                     {
-                        try l.foldSum(gpa, bindings[0..2].*, false, c, pos_base, batch.num_rows, sel);
-                    } else try l.foldSum(gpa, bindings, true, c, pos_base, batch.num_rows, sel);
+                        try l.foldSum(bindings[0..2].*, false, c, pos_base, batch.num_rows, sel);
+                    } else try l.foldSum(bindings, true, c, pos_base, batch.num_rows, sel);
                 },
                 else => unreachable,
             }
@@ -962,8 +908,8 @@ pub const Lanes = struct {
                     if (values.def_levels) |dl| if (dl.len < rows) return error.BadColumn;
                     try l.ensure(gpa);
                     if (l.compact_sums.len != 0) {
-                        try l.foldSumOrdinals(gpa, bindings, true, values, ordinals, rows, source.selected, true);
-                    } else try l.foldSumOrdinals(gpa, bindings, true, values, ordinals, rows, source.selected, false);
+                        try l.foldSumRows(bindings, true, values, ordinals, rows, source.selected, true);
+                    } else try l.foldSumRows(bindings, true, values, ordinals, rows, source.selected, false);
                 },
                 else => unreachable,
             }
@@ -1032,7 +978,6 @@ pub const Lanes = struct {
 
     fn foldSum(
         l: *Lanes,
-        gpa: std.mem.Allocator,
         axes: anytype,
         comptime nullable: bool,
         values: anytype,
@@ -1043,96 +988,12 @@ pub const Lanes = struct {
         if (l.compact_sums.len != 0) {
             const base_ordinal = try l.positions.?.pack(base);
             if (try l.positions.?.pack(base + rows - 1) != base_ordinal + rows - 1) return error.BadColumn;
-            return l.foldSumOrdinals(gpa, axes, nullable, values, .{
+            return l.foldSumRows(axes, nullable, values, .{
                 .base = base_ordinal,
                 .limit = l.rows,
             }, rows, sel, true);
         }
-        return l.foldSumOrdinals(gpa, axes, nullable, values, .{ .base = base }, rows, sel, false);
-    }
-
-    fn foldSumOrdinals(
-        l: *Lanes,
-        gpa: std.mem.Allocator,
-        axes: anytype,
-        comptime nullable: bool,
-        values: anytype,
-        ordinals: RowOrdinals,
-        rows: usize,
-        sel: ?*const Sel,
-        comptime compact: bool,
-    ) !void {
-        if (compact) if (magnitude(values, rows)) |max_abs| {
-            const bound = if (max_abs == 0) rows else (present - 1) / max_abs;
-            const mini: usize = @intCast(@min(rows, @min(partialRows(l.rows), bound)));
-            if (mini > 1) {
-                try l.ensurePartials(gpa);
-                return l.foldSumPartials(axes, nullable, values, ordinals, rows, sel, mini);
-            }
-        };
-        return l.foldSumRows(axes, nullable, values, ordinals, rows, sel, compact);
-    }
-
-    fn foldSumPartials(
-        l: *Lanes,
-        axes: anytype,
-        comptime nullable: bool,
-        values: anytype,
-        ordinals: RowOrdinals,
-        rows: usize,
-        sel: ?*const Sel,
-        mini: usize,
-    ) !void {
-        var lo: usize = 0;
-        while (lo < rows) {
-            const hi = lo + @min(rows - lo, mini);
-            var n_touched: usize = 0;
-            var bad = false;
-            activeRange(sel, lo, hi, struct {
-                fn row(c: anytype, r: usize) void {
-                    const id = productId(c.axes, r, nullable) catch {
-                        c.bad.* = true;
-                        return;
-                    };
-                    const value = sumValue(c.values, r) catch {
-                        c.bad.* = true;
-                        return;
-                    };
-                    const ordinal = c.ordinals.at(r) catch {
-                        c.bad.* = true;
-                        return;
-                    };
-                    const s = &c.states[id];
-                    // Original ordinals are <2^31. Their spare bit marks only this worker's pending mini-batch.
-                    if (s.count() == 0 or s.first & compact_present == 0) {
-                        c.touched[c.n_touched.*] = @intCast(id);
-                        c.n_touched.* += 1;
-                        c.partials[id] = 0;
-                    }
-                    s.first = compact_present | @min(s.first & ~compact_present, @as(u32, @intCast(ordinal)));
-                    s.count_present += 1;
-                    if (value) |v| {
-                        c.partials[id] += v;
-                        s.count_present |= compact_present;
-                    }
-                }
-            }.row, .{
-                .axes = axes,
-                .values = values,
-                .ordinals = ordinals,
-                .states = l.compact_sums,
-                .partials = l.partials,
-                .touched = l.touched,
-                .n_touched = &n_touched,
-                .bad = &bad,
-            });
-            for (l.touched[0..n_touched]) |id| {
-                l.compact_sums[id].value += l.partials[id];
-                l.compact_sums[id].first &= ~compact_present;
-            }
-            if (bad) return error.BadColumn;
-            lo = hi;
-        }
+        return l.foldSumRows(axes, nullable, values, .{ .base = base }, rows, sel, false);
     }
 
     fn foldSumRows(
@@ -1652,7 +1513,7 @@ test "dense SUM quote matches compact and widened storage and refuses a missing 
     const scratch = domain.ids() * @sizeOf(u32) + (axes[0].trans.len + 1) * @sizeOf(u32);
     try testing.expectEqual(
         key_pack.planBytes(2, true, true) +
-            3 * (compact_bytes + partialBytes(domain.ids(), 258)) + quote.table + 2 * @sizeOf(u32) + scratch,
+            3 * compact_bytes + quote.table + 2 * @sizeOf(u32) + scratch,
         quote.total,
     );
     var ledger: agg.SharedBudget = .{ .limit = quote.total - 1 };
@@ -1704,22 +1565,11 @@ test "dense selected SUM mini-batches equal exact i128 folding across cache size
             }, 8, source.selected, true);
         }
         try testing.expectEqualDeep(want.compact_sums, got.compact_sums);
-        try testing.expectEqual(cache_bytes > 12, got.partials.len != 0);
-        const owned = got.partials.len * @sizeOf(i64) + got.touched.len * @sizeOf(u32);
-        if (owned != 0) try testing.expectEqual(partialBytes(domain.ids(), 1000), owned);
         for (0..domain.ids()) |id| if (got.seen(id)) {
             try testing.expectEqual(want.firstOrdinal(id), got.position(id));
             try testing.expect(got.firstOrdinal(id) < 1000);
         };
     }
-}
-
-test "dense mini-batch magnitude proofs include negative extremes and reject unsafe single-value bounds" {
-    try testing.expectEqual(@as(u64, 1) << 63, maxAbs(&.{ 0, -7, std.math.minInt(i64), std.math.maxInt(i64) }));
-    try testing.expectEqual(@as(u64, 0), maxAbs(&.{}));
-    const col = Column{ .i64 = .{ .values = &.{ -9, undefined, 7 }, .def_levels = &.{ 1, 0, 1 }, .max_def = 1 } };
-    try testing.expectEqual(@as(?u64, 9), magnitude(col.i64, 3));
-    try testing.expectEqual(@as(?u64, @as(u64, 1) << 31), magnitude((Column{ .i32 = .{ .values = &.{} } }).i32, 8));
 }
 
 test "dense selected SUM refuses magnitude 2^63 at the fold and admits zero without changing exact sums" {
@@ -1748,7 +1598,6 @@ test "dense selected SUM refuses magnitude 2^63 at the fold and admits zero with
         const sum = @as(i128, values[0]) + values[1];
         try testing.expectEqual(@as(?i128, sum), lanes.integer(id, 1));
         if (i == 0) try testing.expectEqual(-(@as(i128, 1) << 64), sum);
-        try testing.expectEqual(i == 2, lanes.partials.len != 0);
     }
 }
 
@@ -2172,11 +2021,8 @@ test "dense ordered merge includes fresh identity and retains block order for si
     }
 }
 
-test "dense selected adapters validate ordinal metadata before allocation and free failed partial scratch" {
+test "dense selected adapters validate ordinal metadata before allocation and free a failed lane" {
     const a = testing.allocator;
-    const old_cpu = hw.test_cpu;
-    defer hw.test_cpu = old_cpu;
-    hw.test_cpu = .{ .l2 = .{ .bytes = 96 } };
     const fixture = Fixture.domain();
     var axes = [_]Axis{ fixture.axes[0], fixture.axes[0] };
     const domain: Domain = .{ .axes = &axes, .bytes = 0 };
@@ -2197,8 +2043,8 @@ test "dense selected adapters validate ordinal metadata before allocation and fr
         &.{ 0, 1 },
     ));
     try testing.expectEqual(@as(usize, 0), no_alloc.alloc_index);
-    for (0..3) |failure| {
-        var failing = testing.FailingAllocator.init(a, .{ .fail_index = failure });
+    {
+        var failing = testing.FailingAllocator.init(a, .{ .fail_index = 0 });
         var lanes: Lanes = .{ .domain = &domain, .calls = Fixture.calls[0..2], .rows = 1000, .global_ordinals = true };
         defer lanes.deinit(failing.allocator());
         try testing.expectError(error.OutOfMemory, lanes.foldSelected(
@@ -2210,7 +2056,6 @@ test "dense selected adapters validate ordinal metadata before allocation and fr
             .{ .batch = &batch, .input_base = 100 },
             &.{ 0, 1 },
         ));
-        try testing.expectEqual(@as(usize, 0), lanes.partials.len);
     }
 }
 

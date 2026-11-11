@@ -1190,8 +1190,7 @@ fn prepareAggregateWithMetas(
         if (d.axes.len > 1 and (product_sum or agg_dense.countOnly(agg_calls))) {
             const hw = @import("../hw.zig");
             const rows = ndv_stat.?.rows;
-            const lane = agg_dense.laneBytes(d.ids(), agg_calls, rows, product_sum) +|
-                if (product_sum) agg_dense.partialBytes(d.ids(), rows) else 0;
+            const lane = agg_dense.laneBytes(d.ids(), agg_calls, rows, product_sum);
             const capped = denseCacheWorkers(n_workers, hw.independentOwnerWorkers(n_workers), hw.l2BytesPerWorker(), lane);
             if (capped < n_workers and d.globalFits(capped)) {
                 var candidate = plan_inputs;

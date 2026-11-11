@@ -240,7 +240,7 @@ pub fn verdictMain(arena: Allocator, io: std.Io, args: []const []const u8) !u8 {
     return if (failed == 0 and n != 0) 0 else 1;
 }
 
-/// `zpq-check stage --name N --dir D --kind K [--tier T] [--timeout S] [--sha S]
+/// `zpq-check stage --name N --dir D --kind K [--tier T] [--timeout S] [--sha S] [--zig PATH]
 /// [--artifact NAME=PATH]... -- ARGV...`: runs
 /// ARGV in its own process group under `timeout`, writes D/N.log and D/N.json, and exits 0 whatever the stage did
 /// (the verdict judges it), so one failing stage never hides the rest of the tier.
@@ -251,6 +251,7 @@ pub fn stageMain(arena: Allocator, io: std.Io, gpa: Allocator, args: []const []c
     var tier: []const u8 = "";
     var timeout_s: u32 = 3600;
     var duckdb: []const u8 = "";
+    var zig: []const u8 = "zig";
     var vouched: ?[]const u8 = null;
     var artifacts: std.ArrayList(Artifact) = .empty;
     var i: usize = 0;
@@ -270,6 +271,8 @@ pub fn stageMain(arena: Allocator, io: std.Io, gpa: Allocator, args: []const []c
             timeout_s = try std.fmt.parseInt(u32, v, 10);
         } else if (std.mem.eql(u8, a, "--duckdb")) {
             duckdb = v;
+        } else if (std.mem.eql(u8, a, "--zig")) {
+            zig = v;
         } else if (std.mem.eql(u8, a, "--sha")) {
             vouched = v;
         } else if (std.mem.eql(u8, a, "--artifact")) {
@@ -299,7 +302,7 @@ pub fn stageMain(arena: Allocator, io: std.Io, gpa: Allocator, args: []const []c
 
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(log, &digest, .{});
-    var head = try header(arena, io, gpa, duckdb, artifacts.items);
+    var head = try header(arena, io, gpa, duckdb, artifacts.items, zig);
     // A fleet host runs a bundle built and shipped from a clean tree at this SHA (tools/check/fleet.sh); it has no git.
     if (vouched) |v| {
         head.sha = v;
@@ -374,7 +377,7 @@ fn gitHead(arena: Allocator, io: std.Io) !?[]const u8 {
 
 /// Who ran what: the revision and whether the tree matched it, the host, the compiler, the oracle, every artifact
 /// named on the command line, the case files and goldens, and the fixtures (corpus pin, generated files).
-fn header(arena: Allocator, io: std.Io, gpa: Allocator, duckdb: []const u8, artifacts: []const Artifact) !Header {
+fn header(arena: Allocator, io: std.Io, gpa: Allocator, duckdb: []const u8, artifacts: []const Artifact, zig: []const u8) !Header {
     const uts = std.posix.uname();
     const dirty = run(arena, io, &.{ "git", "status", "--porcelain", "--untracked-files=no" });
     const duck = if (duckdb.len != 0) oracle_mod.fileSha(gpa, io, duckdb) catch null else null;
@@ -384,7 +387,7 @@ fn header(arena: Allocator, io: std.Io, gpa: Allocator, duckdb: []const u8, arti
         .host = try arena.dupe(u8, std.mem.sliceTo(&uts.nodename, 0)),
         .kernel = try arena.dupe(u8, std.mem.sliceTo(&uts.release, 0)),
         .os = try arena.dupe(u8, std.mem.sliceTo(&uts.sysname, 0)),
-        .zig = run(arena, io, &.{ "zig", "version" }) orelse "none",
+        .zig = run(arena, io, &.{ zig, "version" }) orelse "none",
         .duckdb_sha256 = if (duck) |d| try arena.dupe(u8, &d) else "none",
         .artifacts = artifacts,
         .cases_sha256 = run(arena, io, &.{ "git", "rev-parse", "HEAD:tools/check" }) orelse "unknown",
@@ -411,6 +414,14 @@ fn cpuHas(cpu: std.Target.Cpu, f: CpuFeature) bool {
             .avx512f, .avx512bw, .avx512vl, .avx512vbmi, .avx512vbmi2,
         }),
     };
+}
+
+test "a receipt stamps the compiler it is given, not the one PATH names" {
+    var state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer state.deinit();
+    // `/bin/echo version` stands in for a compiler whose version differs from PATH's `zig`.
+    const h = try header(state.allocator(), testing.io, testing.allocator, "", &.{}, "/bin/echo");
+    try testing.expectEqualStrings("version", h.zig);
 }
 
 // ---- fail-open: missing, stale, wrong-SHA, dirty, altered, empty or skipping evidence never passes

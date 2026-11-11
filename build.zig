@@ -358,6 +358,7 @@ fn addTiers(b: *std.Build, cfg: Config) void {
             }
             const r = bb.addRunArtifact(exe);
             r.addArgs(&.{ "stage", "--name", name, "--dir", d, "--kind", kind, "--tier", t, "--timeout", bb.fmt("{d}", .{timeout}) });
+            r.addArgs(&.{ "--zig", bb.graph.zig_exe });
             r.has_side_effects = true;
             if (list.items.len != 0) r.step.dependOn(&list.items[list.items.len - 1].run.step);
             list.append(bb.allocator, .{ .name = name, .run = r }) catch @panic("OOM");

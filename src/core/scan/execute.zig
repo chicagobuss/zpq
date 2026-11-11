@@ -1626,7 +1626,7 @@ fn prepareAggregateWithMetas(
     var dense_lanes: []agg_dense.Lanes = &.{};
     var dense_charge: usize = 0;
     defer group_budget.release(dense_charge);
-    defer for (dense_lanes) |*l| l.deinit(gpa);
+    defer agg_dense.deinitAll(gpa, dense_lanes);
     // The table the lanes merge into is reserved with them, and handed to it as it is built.
     var dense_table_charge: usize = 0;
     if (dense_wanted) dense: {
@@ -1922,7 +1922,7 @@ fn prepareAggregateWithMetas(
     var left_lanes: []agg_dense.Lanes = &.{};
     var left_domain: ?agg_dense.Domain = null;
     errdefer {
-        for (left_lanes) |*l| l.deinit(gpa);
+        agg_dense.deinitAll(gpa, left_lanes);
         if (left_domain) |*d| d.deinit(gpa);
     }
     if (dense_lanes.len > 0) {
@@ -1966,7 +1966,7 @@ fn prepareAggregateWithMetas(
                 left_lanes = dense_lanes;
                 left_domain = domain;
             } else {
-                for (dense_lanes) |*l| l.deinit(gpa);
+                agg_dense.deinitAll(gpa, dense_lanes);
                 domain.?.deinit(gpa);
             }
             dense_lanes = &.{};
@@ -2295,7 +2295,7 @@ fn prepareAggregateWithMetas(
             // Its encoding draws up to three times its bytes (`consumer.aggEncodeCharge`) from the ledger.
             if (leave_tables and args.ledger != null and group_budget.available() < answer_charge *| 3) {
                 leave_tables = false;
-                for (left_lanes) |*l| l.deinit(gpa);
+                agg_dense.deinitAll(gpa, left_lanes);
                 if (left_domain) |*d| d.deinit(gpa);
                 left_lanes = &.{};
                 left_domain = null;

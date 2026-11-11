@@ -8,6 +8,7 @@
 //! and each reached ID retains its least selected ordinal. String values are owned independently of reader windows.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const agg = @import("agg.zig");
 const agg_coded = @import("agg_coded.zig");
 const expr_ast = @import("ast.zig");
@@ -15,6 +16,7 @@ const filter_eval = @import("../filter/eval.zig");
 const filter_selection = @import("../filter/selection.zig");
 const spawn = @import("../spawn.zig");
 const hw = @import("../hw.zig");
+const huge_pages = @import("../huge_pages.zig");
 const SelectedBatch = @import("../selected_batch.zig").SelectedBatch;
 const key_pack = @import("key_pack.zig");
 const expr_eval = @import("eval.zig");
@@ -806,6 +808,16 @@ pub const Lanes = struct {
         l.ordered_last = unseen;
     }
 
+    /// The lane's allocated blocks, whichever of its layouts it holds.
+    fn blocks(l: *const Lanes) [8][]const u8 {
+        return .{
+            std.mem.sliceAsBytes(l.accs),     std.mem.sliceAsBytes(l.first),
+            std.mem.sliceAsBytes(l.counts32), std.mem.sliceAsBytes(l.counts64),
+            std.mem.sliceAsBytes(l.sums),     std.mem.sliceAsBytes(l.compact_sums),
+            std.mem.sliceAsBytes(l.partials), std.mem.sliceAsBytes(l.touched),
+        };
+    }
+
     fn ensurePartials(l: *Lanes, gpa: std.mem.Allocator) !void {
         if (l.partials.len != 0) return;
         const n = l.domain.ids();
@@ -1394,6 +1406,40 @@ pub fn intoTable(
 /// A completed contiguous ID range, with the prefix and number of reached IDs for direct output.
 pub const MergeRange = struct { lo: usize, hi: usize, offset: usize, count: usize };
 pub const MergeResult = struct { lanes: *Lanes, ranges: []MergeRange };
+
+/// Frees every lane. `munmap` zaps a block's pages under the address space's write lock, so lanes unmapped one after
+/// another on this thread cost 40 ms for 16 x 32 MB. MADV_DONTNEED over disjoint ranges takes the read lock and runs on
+/// all the pool's threads, leaving the unmaps below empty blocks (`local_fs.releaseLeft` does the same for mappings).
+/// Linux only: Darwin's MADV_DONTNEED may keep the pages. A lane under a huge page is not worth a dispatch.
+pub fn deinitAll(gpa: std.mem.Allocator, lanes: []Lanes) void {
+    giveBack(lanes);
+    for (lanes) |*l| l.deinit(gpa);
+}
+
+fn giveBack(lanes: []Lanes) void {
+    if (comptime builtin.os.tag != .linux) return;
+    const Task = struct {
+        lane: *Lanes,
+
+        fn run(t: *@This()) void {
+            for (t.lane.blocks()) |b| {
+                const lo = std.mem.alignForward(usize, @intFromPtr(b.ptr), std.heap.pageSize());
+                const hi = std.mem.alignBackward(usize, @intFromPtr(b.ptr) + b.len, std.heap.pageSize());
+                if (hi > lo) _ = std.os.linux.madvise(@ptrFromInt(lo), hi - lo, std.os.linux.MADV.DONTNEED);
+            }
+        }
+    };
+    var tasks: [64]Task = undefined;
+    var n: usize = 0;
+    for (lanes) |*l| {
+        var bytes: usize = 0;
+        for (l.blocks()) |b| bytes += b.len;
+        if (bytes < huge_pages.huge_page_size or n == tasks.len) continue;
+        tasks[n] = .{ .lane = l };
+        n += 1;
+    }
+    if (n > 1) _ = spawn.runTree(Task, tasks[0..n], .{ .stack_size = 1 << 20 }, Task.run);
+}
 
 /// Completed lanes stay owned by their worker; callers can consume them without serializing or hashing keys.
 pub fn merge(gpa: std.mem.Allocator, arena: std.mem.Allocator, lanes: []Lanes, n_threads: usize) !?*Lanes {
@@ -2367,6 +2413,25 @@ test "dense merge ranges retain exact sums and ordinals at 1, 4 and 16 workers" 
             try testing.expectEqualDeep(expected, cell);
         }
     }
+}
+
+test "dense lanes give large blocks' pages back from the pool and free everything" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var values: [2]u64 = @splat(0);
+    var axes = [_]Axis{.{ .values = .{ .int64 = &values }, .trans = &.{}, .file_base = &.{}, .bytes = 0 }};
+    const domain: Domain = .{ .axes = &axes, .bytes = 0 };
+    var lanes: [5]Lanes = undefined;
+    for (&lanes, 0..) |*l, i| {
+        l.* = .{ .domain = &domain, .calls = &Fixture.calls };
+        // The last lane is under a huge page: it is left alone and still freed.
+        const n: usize = if (i == lanes.len - 1) 100 else (4 << 20) / @sizeOf(CompactSum);
+        l.compact_sums = try testing.allocator.alloc(CompactSum, n);
+        @memset(std.mem.sliceAsBytes(l.compact_sums), 0xaa);
+    }
+    giveBack(&lanes);
+    for (lanes[0 .. lanes.len - 1]) |l| try testing.expectEqual(@as(u8, 0), std.mem.sliceAsBytes(l.compact_sums)[2 << 20]);
+    try testing.expectEqual(@as(u8, 0xaa), std.mem.sliceAsBytes(lanes[lanes.len - 1].compact_sums)[0]);
+    deinitAll(testing.allocator, &lanes);
 }
 
 test "dense count lanes preserve selected first rows, NULLs and allocation failures" {

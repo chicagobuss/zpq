@@ -2,130 +2,128 @@
 
 ## 0.5.2 — 2026-11-11
 
+- **Performance against 0.5.1 and the other engines.** On the release benchmark (464 queries: ClickBench, PDS-H and
+  390 synthetic aggregation cases, a fresh process per query, three repetitions, Ryzen 9 9950X), with 0.5.1, DuckDB
+  2.0.0 and Polars 2.0.0 timed in the same sessions, 0.5.2's geometric mean is 0.980× 0.5.1's time hot and 0.964×
+  cold. Hot, zpq 0.5.2 is faster than DuckDB 2.0.0 on 461 of the 464 queries and faster than Polars 2.0.0 on 450 of
+  the 455 where Polars' answer validated, and never more than 1.5× behind either. Two queries are slower than in
+  0.5.1, both accepted for this release: the study's `card10/q08_cd_k` cold, 9.7 to 10.3 ms (+6.3%), and the
+  `bench100/W4_filter_all_zstd` write hot, 170.6 to 192.9 ms (+13.1%).
 - **Two-key GROUP BY counts and sums are faster at the default thread count.** An exact `GROUP BY a, b` with
   `count(*)` or an integer `sum` now runs on one worker per L2 cache when more workers would push it off the dense plan,
-  and the merge of the workers' tables runs in parallel. On a Ryzen 9 9950X, `SELECT a, b, count(*), sum(v) ... GROUP BY
-  a, b` over a Zipf-distributed file is 47% faster (319 ms to 170 ms). `--threads N` keeps the plan it had.
+  and the merge of the workers' tables runs in parallel. `--threads N` keeps the plan it had.
 - **`LIKE` filters with a `MIN`, `MAX` or `COUNT(DISTINCT)` of the same string column read it once.** When a cheaper
   condition runs first, zpq now keeps the strings it already decoded for the rows that pass and replays them for the
-  aggregate instead of reading those pages again. On a Ryzen 9 9950X, ClickBench Q21 is 64% faster and Q22 70% faster
-  (Q21 584 ms to 209 ms), and a filter-only `LIKE` (Q20) is 13% faster.
+  aggregate instead of reading those pages again. In the release benchmark (hot, a fresh process per query), ClickBench
+  Q21 went from 574 to 320 ms and Q22 from 784 to 441 ms against 0.5.1.
 - **Re-encoded files read faster than the original.** Dictionary data pages are sized by their packed index bytes
   rather than a fixed row count, and integer pages choose PLAIN or DELTA_BINARY_PACKED by compressing a sample of the
   first page both ways. For strings, the v2 writer used to send a column to a dictionary only while the dictionary
   stayed within 1 MiB, so wide columns such as ClickBench's URL and Title, whose values repeat just as often, fell to
-  DELTA_BYTE_ARRAY, which the readers we measured decode slower than PLAIN (DuckDB and Polars read it 10–50% slower
-  than the original file, Polars 2.1.0 about twice as slow as PLAIN). A dictionary may now hold up to a quarter of the
-  values' bytes (still 1 MiB at least, never more than one dictionary page holds, and still a quarter or fewer
+  DELTA_BYTE_ARRAY, which the readers we measured decode slower than PLAIN. A dictionary may now hold up to a quarter
+  of the values' bytes (still 1 MiB at least, never more than one dictionary page holds, and still a quarter or fewer
   distinct values), and the other strings are PLAIN unless DELTA_BYTE_ARRAY or DELTA_LENGTH_BYTE_ARRAY saves bytes
-  after the codec (half for DELTA_BYTE_ARRAY, any for DELTA_LENGTH_BYTE_ARRAY), judged on the chunk's first page. A
-  Snappy re-encode of the 14.8 GB ClickBench file is 13% smaller than the original and reads 15% faster in DuckDB 2.0
-  and Polars 2.1 and 8% faster in PyArrow 26 (Ryzen 9 9950X, full-column reads). On the ClickBench `hits_0` shard at
-  its two row groups, reading every string column takes 0.78× (DuckDB 2.0.0) and 0.56× (Polars 2.1.0) the original
-  file's speed with 0.5.1's re-encode and 1.08× and 1.11× now (PyArrow 26: 1.09×); the Title column is 1.7× to 2.9×
-  faster, and the file is 98.7 MB where 0.5.1 wrote 116.3 MB and the original is 122.4 MB. Values don't change; file
-  bytes do.
+  after the codec (half for DELTA_BYTE_ARRAY, any for DELTA_LENGTH_BYTE_ARRAY), judged on the chunk's first page. In
+  the release read-back benchmark (full-column reads, hot, 16 threads), DuckDB 2.0.0 reads the default v2 Snappy
+  re-encode of the ClickBench `hits_0` shard 2.78× faster than the original and 1.28× faster than 0.5.1's re-encode,
+  and Polars 2.1.0 1.82× and 1.18×. On TPC-H SF1 lineitem, DuckDB reads it 1.39× faster than the original; Polars
+  reads it at about the original's speed (1.09× at 16 threads, 0.99× on one). Values don't change; file bytes do.
 - **Writes take one pass for column statistics.** A column chunk's statistics are merged from its pages' instead of
-  read from a second scan of the values: the same statistics, 2–4% less CPU when writing ClickBench or TPC-H data.
+  read from a second scan of the values: the same statistics, with less CPU per write.
 - **String filters read dictionaries, not rows.** A filter on a dictionary-encoded string column (`=`, `<>`, `IN`) now
-  compares each dictionary entry once and selects rows by code, whether or not the file has a page index. On a Ryzen 9
-  9950X, PDS-H-shaped filters such as `l_shipmode IN ('MAIL', 'SHIP')` with a date range are 1.8–6.3× faster.
-- **`LIKE '%text%'` is faster.** The substring search's tail now runs in vectors too: ClickBench Q20 is 11% faster.
+  compares each dictionary entry once and selects rows by code, whether or not the file has a page index.
+- **`LIKE '%text%'` is faster.** The substring search's tail now runs in vectors too. With the replay above, ClickBench
+  Q20 went from 343 to 252 ms in the release benchmark (hot).
 - **zpq builds with any Zig 0.17.x patch release,** not only 0.17.0, so 0.17.1 can be adopted when it ships.
 - **The Lambda fan-out coordinator makes no call before its workers start, and invokes on a kept connection.** Each
   worker now prepares the aggregate itself and answers its share with a fingerprint of its inputs' schema and a digest
   of its plan, through a new worker operation, `partial_aggregate` (docs/lambda_requests.md). The coordinator
   (`tools/serverless/fanout.py`) merges only when every worker agrees on both, and refuses the query naming the inputs
-  that differ; it no longer asks for capabilities or reads any footer first, which took about 90 ms warm and 250 ms
-  cold per query on 0.5.1. Row-group ranges can be fractions of an input that each worker resolves against its own
-  footer (`[start, end, of]`), so row-group counts a caller supplies only balance the work: a wrong count no longer
-  fails the query or loses rows. The coordinator signs each invoke itself and reuses the connection, and it no longer
-  asks Lambda for the log tail after the worker returns; at 128 workers that tail, and boto3's time under the GIL,
-  were the whole gap past the slowest worker. A warm coordinator Lambda also keeps its Lambda client, and so its
-  connections, across queries, where it used to build a new one per query, and reuses its thread pool. TPC-H Q6 at 128
-  workers is 384 ms warm (0.5.0 was 461 ms); the grouped line-item aggregate is 294 ms warm (0.5.0 was 524 ms). Inputs
-  given as `*` patterns keep the previous protocol, which caches the capability answer for a published worker version.
-  This changes the worker binary: a 0.5.1 or older worker refuses the new requests, and the coordinator says so.
+  that differ; it no longer asks for capabilities or reads any footer first. Row-group ranges can be fractions of an
+  input that each worker resolves against its own footer (`[start, end, of]`), so row-group counts a caller supplies
+  only balance the work: an incorrect count no longer fails the query or loses rows. The coordinator signs each invoke
+  itself and reuses the connection, and it no longer asks Lambda for the log tail after the worker returns; at 128
+  workers that tail, and boto3's time under the GIL, were the whole gap past the slowest worker. A warm coordinator
+  Lambda also keeps its Lambda client, and so its connections, across queries, where it used to build a new one per
+  query, and reuses its thread pool. Inputs given as `*` patterns keep the previous protocol, which caches the
+  capability answer for a published worker version. This changes the worker binary: a 0.5.1 or older worker refuses
+  the new requests, and the coordinator says so.
 - **Nullable columns decode faster.** For a nullable column that isn't nested, zpq now decodes the definition levels
   straight into a validity bitmap and places the values from it (an AVX2 lookup table in the default x86_64 build,
   a NEON table lookup on aarch64, and a portable word-at-a-time kernel in `-compat` and the x86_64 Lambda), where it
-  used to expand one 32-bit level per value. Reading a page with nulls is 4.7–5.6× faster in the default x86_64
-  build, about 1.7–2× faster on aarch64 (Neoverse-N1, Apple M5) and about 1.5× faster in `-compat`; pages without
-  nulls take the same path as before. Whole queries over nullable data are flat to 6% faster; the Arrow C stream
-  export of nullable columns is about 14% faster.
+  used to expand one 32-bit level per value. Pages without nulls take the same path as before, and the Arrow C
+  stream export of nullable columns uses the same bitmap.
 - **Smaller definition levels in written files.** zpq wrote the few values left over before a run as one-value runs;
-  it now packs them, so a re-encoded nullable file's definition levels are 63% smaller and PyArrow reads it about 6%
-  faster. Written bytes change; the values don't.
+  it now packs them, so a re-encoded nullable file's definition levels are smaller. Written bytes change; the values
+  don't.
 - **zpq sizes its work from the real caches on macOS.** It found no cache sizes on a Mac before (it read them only
   from Linux sysfs), so cache-sized strategies fell back to guesses. It now asks `sysctl`, taking the smallest
   per-worker share across Apple Silicon's core types, reads the cache line from the CPU on aarch64 Linux, and uses a
-  per-architecture default wherever a size can't be found. Grouped `COUNT(DISTINCT)` and top-count queries are
-  10–22% faster on an M5 Pro; Linux is unchanged.
+  per-architecture default wherever a size can't be found. Linux is unchanged.
 - **`EXPLAIN` no longer calls local files "remote input" off Linux.**
 - **The Mac archives run on macOS 11.0 and later.** They used to declare the build runner's macOS 15.0.
 - **`REGEXP_REPLACE` and selective `HAVING` are faster.** Anchored patterns made of literals, optional literals, one
   character-class run and a final `.*$` (the URL-host shape) now compile to a linear matcher instead of the general
   regex engine; other patterns run as before. A GROUP BY with a selective `HAVING` now drops the failing groups
-  before building their rows, where it used to build every group's row first. ClickBench Q28 is 25–29% faster on a
-  Ryzen 9 9950X, ahead of Polars 2.1.0 (1.73 s against 1.81 s at 16 threads); the rest of ClickBench is unchanged.
+  before building their rows, where it used to build every group's row first. In the release benchmark, ClickBench
+  Q28 went from 2.85 to 1.98 s hot and from 3.05 to 2.15 s cold against 0.5.1 (DuckDB 2.0.0: 4.72 s hot; Polars
+  2.0.0: 4.32 s).
 - **Grouped `COUNT(DISTINCT)` is faster.** When the group key and the distinct argument are both integers, zpq now
   folds (group, value) pairs as compact records, admitted only when each batch's values fit and checked as they
   arrive, and drops exact repeats before scattering them. A `COUNT(DISTINCT)` with `SUM`/`COUNT`/`AVG` beside it and
-  a `LIMIT` now takes the same path. These folds size their workers from the CPU's cache-sharing topology. On a
-  Ryzen 9 9950X, ClickBench Q08 is 16–26% faster and a skewed `GROUP BY k` with `count(DISTINCT x)` is 7–29% faster
-  depending on thread count; the rest of ClickBench is unchanged.
+  a `LIMIT` now takes the same path. These folds size their workers from the CPU's cache-sharing topology. In the
+  release benchmark, a skewed `GROUP BY k` with `count(DISTINCT x)` (the study's zipf11 and nullszipf `q09_grp_cd`)
+  went from 302–304 to 222–230 ms hot against 0.5.1.
 - **Exact DECIMAL `SUM` and `AVG` are faster.** zpq now decodes their columns a cache-sized tile at a time, reads
   dictionary codes where it can, and sums each tile in 64-bit integers when a bound computed from the values it read
   proves that can't overflow; any tile without that proof takes the full-width path as before, so answers and
-  overflow errors are unchanged. Filters also run a tile at a time. On a Ryzen 9 9950X, TPC-H Q1 on a 60 M-row
-  DECIMAL lineitem is 2.8× faster (174 → 63 ms hot) and Q6 2.2× faster; DOUBLE columns are unchanged.
+  overflow errors are unchanged. Filters also run a tile at a time. With the filter change below, PDS-H Q1 on the
+  60 M-row DECIMAL lineitem (SF10) went from 175 to 75 ms hot and from 198 to 110 ms cold in the release benchmark,
+  and Q6 from 82 to 44 ms hot; DOUBLE columns are unchanged.
 - **Top-k over long string keys is faster.** `GROUP BY k ORDER BY count(*)` (or a `SUM`/`MAX` of a column) `LIMIT n`
   over a long, mostly PLAIN string key now ranks its groups in the shared string table that full `GROUP BY` already
   uses, instead of a separate cut; dictionary-coded keys and selective filters keep their existing plans. Under a
-  filter, it decodes the keys in windows sized from their width, so the surviving keys stay in cache. A single
-  ordered `BIGINT` key with `SUM`/`AVG`/`MIN`/`MAX` beside the count now takes the packed top-k path. On a Ryzen 9
-  9950X, top-10 queries over 1 M distinct URL-like keys in 20 M rows are 1.4–2.3× faster (a filter keeping 30% of
-  the rows, about 17% faster), and the ordered-key case 1.2–1.5× faster at about 1.4× the peak memory; ClickBench is
-  unchanged.
+  filter, it decodes the keys in windows sized from their width, so the surviving keys stay in cache. A single ordered
+  `BIGINT` key with `SUM`/`AVG`/`MIN`/`MAX` beside the count now takes the packed top-k path. In the release
+  benchmark, top-count queries over 1 M distinct URL-like keys (the study's lstr1m `q01_topc`, `q04_topc_pay`,
+  `q14_topsum`) went from 796, 967 and 891 ms to 513, 658 and 684 ms hot against 0.5.1, and the ordered-key case
+  (sorted10m `q04_topc_pay`) from 272 to 198 ms; ClickBench is unchanged.
 - **Filtered DECIMAL sums are faster, and a corrupt page in rows the filter rejected no longer depends on the decode
   path.** Every decode path (whole row group, sliced, tiled, row subgroups) now evaluates a filter's AND conditions
   through one plan: a later condition is tested only on rows the earlier ones kept, reading dictionary codes where it
   can, and a page none of whose rows survive is never opened on any path. Dictionary codes now stream straight into
-  exact DECIMAL sums, and a sliced row group keeps its scratch memory for the next one. On a Ryzen 9 9950X, TPC-H Q1
-  and Q6 on a 60 M-row DECIMAL lineitem are 1.1–1.2× faster at the same peak memory, also under `--max-memory`.
+  exact DECIMAL sums, and a sliced row group keeps its scratch memory for the next one.
 - **Writing selected columns of a file that isn't cached is faster.** A write that copies column chunks unchanged used
   to read an uncached input one page fault at a time on one thread. Writes now plan their reads the way queries do:
   an uncached input is read in parallel, and a cached one stays memory-mapped. The copy also builds its Bloom
-  filters on worker threads. Output bytes don't change. On a Ryzen 9 9950X, copying three columns of a 175 MB file
-  went from 68 to 17 ms uncached and from 32 to 12 ms cached; other writes are flat to 15% faster uncached. Under a
+  filters on worker threads. Output bytes don't change. In the release benchmark, copying three columns of a 175 MB
+  file went from 82 to 29 ms uncached and from 48 to 26 ms cached, and four columns of TPC-H SF1 lineitem from 98 to
+  34 ms uncached. Under a
   tight `--max-memory`, a write whose row groups would not fit its workers' share reads through the mapping, and
   one the parallel reader runs out of memory on is run again mapped, so a write's result never depends on whether
   its input was cached.
 - **Re-encoding writes reuse their scratch memory.** A write that re-encodes rows (a filter, a projection that
   can't copy chunks, or a codec change) now keeps each worker's encode scratch between jobs, still charged to
-  `--max-memory`, instead of mapping fresh pages for every job. Page faults drop by about a third; rewriting a 60 M-row
-  lineitem is 5–13% faster at 16 threads on a Ryzen 9 9950X. Output bytes don't change.
-- **Re-encoding writes share the CPU between reading and encoding.** Their producers and encoders now take turns
-  from one budget of independent cores, so neither side starves the other. On a Ryzen 9 9950X, rewriting the 60 M-row
-  lineitem to zstd went from 14.4 to 4.8 s uncached at 16 threads, and from 4.5 to 3.8 s at the default threads with
-  45% less CPU time. Output bytes don't change. Turns are capped by the independent cores the process may run on and by
-  its cgroup CPU quota, for an explicit `-j` too, and a `-j 1` re-encode stays inside `--max-memory`.
+  `--max-memory`, instead of mapping fresh pages for every job, so page faults drop. Output bytes don't change.
+- **Re-encoding writes share the CPU between reading and encoding.** Their producers and encoders now take turns from
+  one budget of independent cores, so neither side starves the other. Output bytes don't change. Turns are capped by
+  the independent cores the process may run on and by its cgroup CPU quota, for an explicit `-j` too, and a `-j 1`
+  re-encode stays inside `--max-memory`.
 - **Uncached scans read ahead of their workers.** When a query reads a file that isn't in the page cache through
   its memory mapping, zpq now asks the kernel for each worker's next planned chunks just before they are needed,
   within a window bounded by `--max-memory` and one device queue. For a column behind a filter, it asks only for the
-  pages the filter keeps. Cached files are left alone. On a Ryzen 9 9950X, ClickBench run uncached is 7% faster
-  across all 43 queries (Q08 22%, Q21 3–11%), and cached queries are unchanged.
+  pages the filter keeps. Cached files are left alone.
 - **Uncached reads under a small `--max-memory` keep their speed.** The local reader now sizes its read window from
-  what the memory budget has free when it starts, not from the whole budget. A cold scan of lineitem SF10 at
-  `--max-memory 64MB` went from 10.2 to 0.73 s. A query whose other work already holds most of the budget now reads
+  what the memory budget has free when it starts, not from the whole budget, so a small budget no longer slows an
+  uncached scan down. A query whose other work already holds most of the budget now reads
   its input when uncached instead of refusing, so it answers the same with the file cached or not.
 - **Grouped `COUNT(DISTINCT)` is faster again.** Grouping on the distinct pairs now uses a partition count sized to
   each worker's share of L2, instead of one sized from the input's row count. A `COUNT(DISTINCT)` beside a count cut
   (`ORDER BY count(*) DESC LIMIT n`) now runs its distinct pass on per-group sets merged in parallel when one group the
   cut keeps holds more than a worker's share of their rows, keeps the grouped bitmap when the pass qualifies for it,
-  and reads ahead the dictionaries it plans from. On a Ryzen 9 9950X, ClickBench Q08 is 25–36% faster and Q09 8–23%
-  faster (flat when cached at the default thread count), both at lower peak memory, and the same query shape over
-  1,000 groups is 19–60% faster; other `COUNT(DISTINCT)` queries are unchanged.
+  and reads ahead the dictionaries it plans from. With the grouped `COUNT(DISTINCT)` change above, ClickBench Q08
+  went from 354 to 215 ms hot and from 384 to 234 ms cold in the release benchmark, and Q09 from 440 to 370 ms cold
+  (flat hot); other `COUNT(DISTINCT)` queries are unchanged.
 
 ## 0.5.1 (2026-10-31)
 

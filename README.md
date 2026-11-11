@@ -32,11 +32,11 @@ export PATH="$PWD/zpq/bin:$PATH"
 | macOS, Apple silicon | `zpq-aarch64-macos.tar.gz` |
 | macOS, Intel | `zpq-x86_64-macos.tar.gz` |
 
-**Debian, Ubuntu, Fedora, RHEL:** the release also carries `zpq_0.5.1_amd64.deb`, `zpq_0.5.1_arm64.deb`,
-`zpq-0.5.1-1.x86_64.rpm` and `zpq-0.5.1-1.aarch64.rpm`.
+**Debian, Ubuntu, Fedora, RHEL:** the release also carries `zpq_0.5.2_amd64.deb`, `zpq_0.5.2_arm64.deb`,
+`zpq-0.5.2-1.x86_64.rpm` and `zpq-0.5.2-1.aarch64.rpm`.
 
 ```bash
-sudo apt install ./zpq_0.5.1_amd64.deb      # or: sudo dnf install ./zpq-0.5.1-1.x86_64.rpm
+sudo apt install ./zpq_0.5.2_amd64.deb      # or: sudo dnf install ./zpq-0.5.2-1.x86_64.rpm
 ```
 
 The default Linux x86_64 build needs AVX2; on older CPUs use the `-compat` build.
@@ -140,8 +140,8 @@ the Parquet part: filter and project with zpq, write Parquet or NDJSON, and read
 ## How fast
 
 On 464 benchmark queries (ClickBench, PDS-H and 390 synthetic aggregation cases), run hot with a fresh process for
-every query, zpq 0.5.1 is faster than DuckDB 2.0 on 446 of them and faster than Polars 2.1 on 459, the fastest of the
-three on 442, and never more than 1.5× behind. Every query, the method, and the few places zpq is still behind are on
+every query, zpq 0.5.2 is faster than DuckDB 2.0.0 on 461 of them and faster than Polars 2.0.0 on 450 of the 455 where
+Polars' answer validated, the fastest of the three on 457, and never more than 1.5× behind (measured on a Ryzen 9 9950X). Every query, the method, and the few places zpq is still behind are on
 the site's [Benchmarks](https://zpq.chicagobuss.dev/numbers.html) page.
 
 ## Limits

@@ -177,6 +177,17 @@ class Replay(unittest.TestCase):
 
 @unittest.skipUnless(engines.POLARS.is_file(), "no Polars 2 interpreter")
 class PolarsAnswer(unittest.TestCase):
+    def test_a_scalar_returning_plan_is_one_positional_cell(self):
+        with tempfile.TemporaryDirectory() as d:
+            output = Path(d, "answer.json")
+            req = json.dumps({"runs": 1, "answers": [str(output)]})
+            code = ("import sys; sys.path.insert(0, 'bench'); import polars_run as p; "
+                    "p.plan = lambda pl, req: pl.DataFrame({'n': [3]}).item(); p.main()")
+            result = subprocess.check_output([str(engines.POLARS), "-c", code, req],
+                                             cwd=engines.ROOT, text=True)
+            self.assertEqual(json.loads(output.read_text()), [{"column_0": 3}])
+            self.assertEqual(len(json.loads(result)["engine_ns"]), 1)
+
     def test_a_derived_minute_named_event_time_is_not_a_timestamp(self):
         code = ("import sys, polars as pl; sys.path.insert(0, 'bench'); import polars_run as p; "
                 "f = pl.DataFrame({'EventTime': pl.Series([28], dtype=pl.Int8), 'n': [3]}); "

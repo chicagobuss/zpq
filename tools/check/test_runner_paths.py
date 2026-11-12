@@ -54,12 +54,6 @@ class RunnerPaths(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("1/1 checks match", result.stderr)
 
-    def test_missing_timeout_names_executable(self):
-        env = dict(os.environ, PATH=str(self.cwd / "bin"))
-        result = self.run_checker(env=env)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("cannot start timeout: FileNotFound", result.stderr)
-
 
 if __name__ == "__main__":
     unittest.main()

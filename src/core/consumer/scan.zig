@@ -484,14 +484,14 @@ pub fn scanRGForAgg(
     var in = in_group;
     in.fuse = !(if (ws.scratch.slice) |pool| pool.fusion_declined else false);
     var execution = ws;
-    // A join's build columns have no chunk to cost a cache window by: its row groups slice when memory asks (or a
-    // batch size is set), and one the slices cannot take publishes on the whole-row-group decode alone.
-    if (join_lookup.inFilter(in.filter)) {
+    // A join the slices cannot take publishes on the whole-row-group decode alone.
+    const join = join_lookup.inFilter(in.filter);
+    if (join and !joinSliceable(target)) {
         execution.auto_decode_batches = false;
-        if (!joinSliceable(target)) execution.decode_batch_rows = 0;
+        execution.decode_batch_rows = 0;
     }
     if (execution.auto_decode_batches and ws.decode_batch_rows == 0 and ws.expr_batch_rows != 0 and
-        (target != .grouped or exactTileTarget(in, target) or (decode_options.encoded and
+        (join or target != .grouped or exactTileTarget(in, target) or (decode_options.encoded and
             target.grouped.part == null and target.grouped.records == null)))
         execution.decode_batch_rows = automaticCacheRowsWithHints(ws.planning_charged orelse ws.charged orelse gpa, in, target, ws.scan_workers, ws.cache_hints) catch 0;
     if (ws.defer_decode_errors) return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution);
@@ -607,7 +607,8 @@ pub fn automaticCacheRows(gpa: std.mem.Allocator, in: AggRowGroup, target: AggTa
 }
 
 fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: AggTarget, workers: usize, hints: ?*CacheHints) !usize {
-    if (exactTileTarget(in, target)) return exactTileRows(in, target);
+    const join = join_lookup.inFilter(in.filter);
+    if (exactTileTarget(in, target)) return if (join) 0 else exactTileRows(in, target);
     var computed = false;
     for (target.calls()) |call| {
         if (call.where != null or call.func == .count_distinct or call.result == .bytes) return 0;
@@ -631,8 +632,14 @@ fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: 
     var fixed_keys: usize = 0;
     var whole_values: usize = 0;
     var largest_chunk: usize = 0;
+    var build_lanes: usize = 0;
     for (in.read, 0..) |needed, ci| {
         if (!needed) continue;
+        // A join's build column has no chunk: the lookup publishes a slot, a code and a value for each row.
+        if (ci >= in.rg.columns.items.len) {
+            build_lanes += 16;
+            continue;
+        }
         if (!SliceReader.supports(in.rg, in.meta, ci)) return 0;
         const cm = in.rg.columns.items[ci].meta_data orelse return 0;
         const n: usize = @intCast(@max(0, cm.num_values));
@@ -650,6 +657,8 @@ fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: 
             if (decimal_mod.exactKind(&se) != null) return 0;
         switch (cm.type) {
             .BYTE_ARRAY => {
+                // The slices read a string by value, where a join's whole decode filters its codes.
+                if (join) return 0;
                 const d = dictionary orelse return 0;
                 // decodeBytes can copy the same dictionary string on every row. Its entire encoded dictionary
                 // bounds one string's width, even when compression makes a footer's per-row estimate tiny.
@@ -678,7 +687,8 @@ fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: 
     const grouped = target == .grouped;
     const whole_dictionaries = fixed_keys;
     var space: usize = 1;
-    if (grouped) for (target.grouped.keys) |key| {
+    // A join's keys are its lookups' codes or slots: no dictionary of the row group's bounds their table.
+    if (grouped and !join) for (target.grouped.keys) |key| {
         const d = (if (hints) |h| h.get(in, key.col_ref.col_idx) else cacheDictionary(in, key.col_ref.col_idx)) orelse return 0;
         fixed_keys +|= agg_coded.plainKeyScratchBytes(d.entries) orelse return 0;
         space *|= d.entries +| 1;
@@ -698,7 +708,8 @@ fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: 
     if (grouped) for (target.calls()) |call| if (call.arg) |arg| {
         if (arg != .col_ref) expanded +|= cacheExpandedTreeBytes(arg);
     };
-    const live = inputs +| @max(plan.liveBytesPerRow(), expanded) +| key_bytes +| copied_bytes +| widened +| masks;
+    const live = inputs +| build_lanes +| @max(plan.liveBytesPerRow(), expanded) +| key_bytes +| copied_bytes +|
+        widened +| masks;
     const group_state = if (grouped) space *| (64 +| target.grouped.keys.len *| 32 +|
         target.calls().len *| (2 * @sizeOf(expr_agg.Accumulator) + 32) +| copied_bytes) else 0;
     const fixed = fixed_keys +| group_state +|
@@ -710,7 +721,8 @@ fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: 
     // the conservative L2 bound above: dictionary codes/presence, values/levels, one page and aggregate scratch.
     const l3 = @import("../hw.zig").l3BytesPerActiveWorker(workers);
     if (l3 != 0) {
-        var whole = whole_values +| largest_chunk +| rows / 8 +| whole_dictionaries +| group_state;
+        var whole = whole_values +| rows *| build_lanes +| largest_chunk +| rows / 8 +| whole_dictionaries +|
+            group_state;
         if (grouped) {
             whole +|= rows *| 4 +| plan.liveBytesPerRow() *|
                 expr_eval.floatBatchRows(plan.liveBytesPerRow(), group_state, null);

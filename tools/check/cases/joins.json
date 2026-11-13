@@ -130,6 +130,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     },
@@ -165,6 +171,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -206,6 +218,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     },
@@ -241,6 +259,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -282,6 +306,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     },
@@ -317,6 +347,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -358,6 +394,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     },
@@ -393,6 +435,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -434,6 +482,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     },
@@ -469,6 +523,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -510,6 +570,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     },
@@ -548,6 +614,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -579,6 +651,12 @@
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
      }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
     }
    ],
    "oracle": {
@@ -608,6 +686,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -645,6 +729,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -679,6 +769,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -710,6 +806,12 @@
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
      }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
     }
    ],
    "oracle": {
@@ -739,6 +841,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -898,6 +1006,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -929,6 +1043,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -966,6 +1086,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -997,6 +1123,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -1034,6 +1166,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -1065,6 +1203,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -1102,6 +1246,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -1133,6 +1283,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -1170,6 +1326,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -1201,6 +1363,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -1256,6 +1424,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -1434,6 +1608,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -1462,6 +1642,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -1496,6 +1682,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -1524,6 +1716,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -1558,6 +1756,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -1586,6 +1790,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -1620,6 +1830,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -1648,6 +1864,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -1682,6 +1904,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -1710,6 +1938,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -1820,6 +2054,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -1851,6 +2091,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -1888,6 +2134,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -1919,6 +2171,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -1956,6 +2214,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -1990,6 +2254,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -2021,6 +2291,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -2079,6 +2355,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "2M"
     }
@@ -2110,6 +2392,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -2147,6 +2435,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "8M"
     }
@@ -2178,6 +2472,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -2215,6 +2515,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "2M"
     }
@@ -2246,6 +2552,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -2283,6 +2595,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "2M"
     }
@@ -2314,6 +2632,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -2355,6 +2679,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     },
@@ -2390,6 +2720,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -2451,6 +2787,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -2560,6 +2902,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     },
@@ -2592,6 +2940,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -4102,6 +4456,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -4133,6 +4493,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -4170,6 +4536,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -4204,6 +4576,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "512K"
     }
@@ -4235,6 +4613,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -4293,6 +4677,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "2M"
     },
@@ -4330,6 +4720,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -4373,6 +4769,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "2M"
     },
@@ -4410,6 +4812,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -4453,6 +4861,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "2M"
     },
@@ -4490,6 +4904,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -4533,6 +4953,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "2M"
     },
@@ -4573,6 +4999,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "max_memory": "2M"
     },
@@ -4610,6 +5042,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -4656,6 +5094,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -4708,6 +5152,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "force": {
       "ZPQ_LATE_FETCH": "0"
@@ -4751,6 +5201,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -4800,6 +5256,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "force": {
       "ZPQ_LATE_FETCH": "0"
@@ -4843,6 +5305,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -4892,6 +5360,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "force": {
       "ZPQ_LATE_FETCH": "0"
@@ -4938,6 +5412,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 4,
      "force": {
       "ZPQ_LATE_FETCH": "0"
@@ -4981,6 +5461,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -5031,6 +5517,12 @@
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
      }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
     }
    ],
    "oracle": {
@@ -5063,6 +5555,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     }
    ],
@@ -5097,6 +5595,12 @@
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
      }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
     }
    ],
    "oracle": {
@@ -5129,6 +5633,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     }
    ],
@@ -5171,6 +5681,12 @@
      "jobs": 16,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -5220,6 +5736,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 1,
      "max_memory": "256K"
     }
@@ -5263,6 +5785,12 @@
      "jobs": 16,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     },
     {
@@ -5312,6 +5840,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 1,
      "max_memory": "256K"
     }
@@ -5358,6 +5892,12 @@
      }
     },
     {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
      "jobs": 1,
      "max_memory": "256K"
     }
@@ -5387,6 +5927,12 @@
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
      }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
     }
    ],
    "oracle": {
@@ -5413,6 +5959,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     }
    ],
@@ -5441,6 +5993,12 @@
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
      }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
     }
    ],
    "oracle": {
@@ -5467,6 +6025,12 @@
      "jobs": 3,
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
      }
     }
    ],
@@ -5495,6 +6059,12 @@
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
      }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
     }
    ],
    "oracle": {
@@ -5522,11 +6092,140 @@
      "force": {
       "ZPQ_DECODE_BATCH_ROWS": "512"
      }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
     }
    ],
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT count(*) AS n, sum(q) AS s FROM '{fixture:not_fact}' f, '{fixture:not_dim}' d WHERE (f.fk = d.pk AND NOT (d.grp = 5 AND d.w = 2)) OR (f.fk = d.pk AND NOT (f.q = 9 OR d.w > 0))"
+   }
+  },
+  {
+   "id": "join:slices:auto:build-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT grp, sum(amt * (amt - 1)) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND q < 5 GROUP BY grp ORDER BY grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_HW_L2_BYTES": "64K",
+      "ZPQ_HW_L3_BYTES": "64K"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_HW_L2_BYTES": "64K",
+      "ZPQ_HW_L3_BYTES": "64K"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT grp, sum(amt * (amt - 1)) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND q < 5 GROUP BY grp ORDER BY grp"
+   }
+  },
+  {
+   "id": "join:slices:auto:group-join",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, sum(amt * (amt - 1)) AS s, grp FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND q < 2 GROUP BY id, grp ORDER BY s DESC, id LIMIT 10"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_HW_L2_BYTES": "64K",
+      "ZPQ_HW_L3_BYTES": "64K"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_HW_L2_BYTES": "64K",
+      "ZPQ_HW_L3_BYTES": "64K"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, sum(amt * (amt - 1)) AS s, grp FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND q < 2 GROUP BY id, grp ORDER BY s DESC, id LIMIT 10"
+   }
+  },
+  {
+   "id": "join:slices:auto:residual",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(amt * (amt - 1)) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND w + q > 500"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_HW_L2_BYTES": "64K",
+      "ZPQ_HW_L3_BYTES": "64K"
+     }
+    },
+    {
+     "jobs": 16,
+     "force": {
+      "ZPQ_HW_L2_BYTES": "64K",
+      "ZPQ_HW_L3_BYTES": "64K"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(amt * (amt - 1)) AS s, count(*) AS n FROM '{fixture:fact}', '{fixture:dim}' WHERE fk = pk AND w + q > 500"
    }
   }
  ]

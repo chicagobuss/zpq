@@ -493,7 +493,7 @@ pub fn scanRGForAgg(
     if (execution.auto_decode_batches and ws.decode_batch_rows == 0 and ws.expr_batch_rows != 0 and
         (join or target != .grouped or exactTileTarget(in, target) or (decode_options.encoded and
             target.grouped.part == null and target.grouped.records == null)))
-        execution.decode_batch_rows = automaticCacheRowsWithHints(ws.planning_charged orelse ws.charged orelse gpa, in, target, ws.scan_workers, ws.cache_hints) catch 0;
+        execution.decode_batch_rows = automaticCacheRowsWithHints(in, target, ws.scan_workers, ws.cache_hints) catch 0;
     if (ws.defer_decode_errors) return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution);
     return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution) catch |err| {
         if (!isDecodeError(err)) return err;
@@ -602,11 +602,11 @@ fn wholeFloatTreeBytes(e: expr_ast.Expr) usize {
 
 /// Admit only computed fault-free float trees. Decoded inputs, all DAG results, key codes, selection and group
 /// IDs share the stable L2 worker budget; pages/dictionaries use the decoder's separate bounded buffers.
-pub fn automaticCacheRows(gpa: std.mem.Allocator, in: AggRowGroup, target: AggTarget, workers: usize) !usize {
-    return automaticCacheRowsWithHints(gpa, in, target, workers, null);
+pub fn automaticCacheRows(in: AggRowGroup, target: AggTarget, workers: usize) !usize {
+    return automaticCacheRowsWithHints(in, target, workers, null);
 }
 
-fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: AggTarget, workers: usize, hints: ?*CacheHints) !usize {
+fn automaticCacheRowsWithHints(in: AggRowGroup, target: AggTarget, workers: usize, hints: ?*CacheHints) !usize {
     const join = join_lookup.inFilter(in.filter);
     if (exactTileTarget(in, target)) return if (join) 0 else exactTileRows(in, target);
     var computed = false;
@@ -622,8 +622,11 @@ fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: 
         if (key != .col_ref or key.col_ref.unsigned_64 or key.col_ref.expr_type == .dec) return 0;
     };
     if (@import("../hw.zig").l2BytesPerWorker() == 0) return 0;
-    var planning = std.heap.ArenaAllocator.init(gpa);
-    defer planning.deinit();
+    // Planned on the stack, once per row group: an arena on the query's allocator maps and unmaps a page each time,
+    // and an unmap stalls a cold reader pinning its window (both take the address space's lock). A schema too wide
+    // for the buffer declines the slices, like any other refusal here.
+    var buf: [32 << 10]u8 = undefined;
+    var planning = std.heap.FixedBufferAllocator.init(&buf);
     const a = planning.allocator();
     const lookup = try a.alloc(?usize, in.meta.schema.items.len);
     @memset(lookup, null);

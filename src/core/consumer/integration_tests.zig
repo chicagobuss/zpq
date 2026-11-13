@@ -2069,25 +2069,20 @@ test "cache decode admission counts inputs and DAG, follows sharing, and release
     } };
     var call = [_]expr_agg.AggCall{.{ .func = .sum, .arg = sum, .result = .f64, .where = null, .alias = "s" }};
     const target: AggTarget = .{ .scalar = .{ .calls = &call, .accumulators = &.{} } };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
-        fn run(a: std.mem.Allocator, input: AggRowGroup, t: AggTarget) !void {
-            const n = try automaticCacheRows(a, input, t, 16);
-            try std.testing.expect(n >= 64 and n < 65553 and n % 64 == 0);
-        }
-    }.run, .{ in, target });
-    const small = try automaticCacheRows(std.testing.allocator, in, target, 16);
+    const small = try automaticCacheRows(in, target, 16);
+    try std.testing.expect(small >= 64 and small < 65553 and small % 64 == 0);
     hw.test_cpu.?.l2.bytes = 1280 << 10;
-    const larger = try automaticCacheRows(std.testing.allocator, in, target, 16);
+    const larger = try automaticCacheRows(in, target, 16);
     try std.testing.expect(larger > small);
     hw.test_cpu.?.l3.bytes = 16 << 20;
-    try std.testing.expectEqual(@as(usize, 0), try automaticCacheRows(std.testing.allocator, in, target, 1));
-    try std.testing.expect(try automaticCacheRows(std.testing.allocator, in, target, 16) > 0);
+    try std.testing.expectEqual(@as(usize, 0), try automaticCacheRows(in, target, 1));
+    try std.testing.expect(try automaticCacheRows(in, target, 16) > 0);
     hw.test_cpu.?.l3.bytes = 0;
     hw.test_cpu.?.l2.bytes = 0;
-    try std.testing.expectEqual(@as(usize, 0), try automaticCacheRows(std.testing.allocator, in, target, 16));
+    try std.testing.expectEqual(@as(usize, 0), try automaticCacheRows(in, target, 16));
     hw.test_cpu.?.l2.bytes = 1 << 20;
     call[0].arg = x;
-    try std.testing.expectEqual(@as(usize, 0), try automaticCacheRows(std.testing.allocator, in, target, 16));
+    try std.testing.expectEqual(@as(usize, 0), try automaticCacheRows(in, target, 16));
 }
 
 test "cache decode admission bounds dictionary strings and composite domains from every page header" {
@@ -2222,7 +2217,7 @@ test "cache decode admission bounds dictionary strings and composite domains fro
         uncached.deinit();
 
         try testing.expectEqual(@as(usize, @intCast(width)), proof.bytes);
-        const rows = try automaticCacheRows(testing.allocator, in, target, 16);
+        const rows = try automaticCacheRows(in, target, 16);
         if (width == 24) {
             small = rows;
             try testing.expect(small >= 64 and small < 65553);
@@ -2233,16 +2228,16 @@ test "cache decode admission bounds dictionary strings and composite domains fro
     in.src.bytes = try Fixture.bytes(a, 2, 24, .PLAIN);
     columns[1].meta_data.?.total_compressed_size = @intCast(in.src.bytes.len);
     try testing.expect(cacheDictionary(in, 1) == null);
-    try testing.expectEqual(@as(usize, 0), try automaticCacheRows(testing.allocator, in, target, 16));
+    try testing.expectEqual(@as(usize, 0), try automaticCacheRows(in, target, 16));
     in.src.bytes = try Fixture.bytes(a, 256, 4096, .RLE_DICTIONARY);
     columns[1].meta_data.?.total_compressed_size = @intCast(in.src.bytes.len);
     // Two individually bounded keys can still have a composite table much larger than L2.
     target.grouped.keys = &.{ key, key };
-    try testing.expectEqual(@as(usize, 0), try automaticCacheRows(testing.allocator, in, target, 16));
+    try testing.expectEqual(@as(usize, 0), try automaticCacheRows(in, target, 16));
     target.grouped.keys = &.{key};
     in.src.bytes = try Fixture.bytes(a, 257, 24, .RLE_DICTIONARY);
     columns[1].meta_data.?.total_compressed_size = @intCast(in.src.bytes.len);
-    try testing.expectEqual(@as(usize, 0), try automaticCacheRows(testing.allocator, in, target, 16));
+    try testing.expectEqual(@as(usize, 0), try automaticCacheRows(in, target, 16));
     columns[1].meta_data.?.dictionary_page_offset = -1;
     try testing.expect(cacheDictionary(in, 1) == null);
 }

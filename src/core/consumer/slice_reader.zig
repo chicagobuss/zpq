@@ -274,9 +274,9 @@ pub const SliceReader = struct {
 
     pub fn deinit(self: *SliceReader) void {
         if (self.retained) {
-            // Both stores are this row group's. The next group must not inherit them on top of its own page.
-            _ = self.pages.reset(.free_all);
-            if (self.dict_store) |d| _ = d.reset(.free_all);
+            // Reuse charged backing pages; the pool trims its retained capacity after the row group.
+            _ = self.pages.reset(.retain_capacity);
+            if (self.dict_store) |d| _ = d.reset(.retain_capacity);
             // The data page and its dictionary stay in the slot scratch for the next row group. Level buffers
             // used to die with the page arena; on the scratch they would keep that charge until the pool died.
             self.releaseLevelScratch();

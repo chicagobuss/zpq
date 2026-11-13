@@ -657,8 +657,6 @@ fn automaticCacheRowsWithHints(gpa: std.mem.Allocator, in: AggRowGroup, target: 
             if (decimal_mod.exactKind(&se) != null) return 0;
         switch (cm.type) {
             .BYTE_ARRAY => {
-                // The slices read a string by value, where a join's whole decode filters its codes.
-                if (join) return 0;
                 const d = dictionary orelse return 0;
                 // decodeBytes can copy the same dictionary string on every row. Its entire encoded dictionary
                 // bounds one string's width, even when compression makes a footer's per-row estimate tiny.
@@ -1447,10 +1445,13 @@ fn filterPhase(
     defer for (readers.items) |*r| r.deinit();
     for (columns) |ci| {
         const cm = in.rg.columns.items[ci].meta_data;
-        const coded = codes and cm != null and cm.?.dictionary_page_offset != null and
-            (cm.?.type == .INT32 or cm.?.type == .INT64);
+        const dict = cm != null and cm.?.dictionary_page_offset != null;
+        const coded = codes and dict and (cm.?.type == .INT32 or cm.?.type == .INT64);
         var options = decode_options;
-        if (coded) options.any_dictionary = true;
+        // A dictionary string the filter alone reads here is matched by its codes, as the whole decode matches it:
+        // one test per dictionary entry, not one string compare per row. A gated read keeps its values.
+        if (coded or (dict and !gate and cm.?.type == .BYTE_ARRAY and fusion(in, target, ci) == null))
+            options.any_dictionary = true;
         if (gate) {
             options.row_gate = survivors;
             adviseGated(in, ci, survivors, ws);

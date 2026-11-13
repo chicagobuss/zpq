@@ -587,6 +587,14 @@ pub const SliceReader = struct {
             got += want;
         }
         const dict = r.dictionary orelse return error.DictionaryMissing;
+        // Only NULL rows code against an empty dictionary. They go out as values, as a whole chunk's do
+        // (`readAllCodesImpl`): a consumer's per-entry table would have no entry for their placeholder code.
+        if (dict.len == 0) {
+            const values = try a.alloc(T, n);
+            @memset(values, if (T == []const u8) "" else 0);
+            const col = valuesCol(T, .{ .values = values, .def_levels = def, .has_nulls = r.has_nulls }, self.levels);
+            return @unionInit(filter_eval.Batch.Column, if (T == []const u8) "string" else @typeName(T), col);
+        }
         const col = codedCol(T, .{ .codes = codes, .def_levels = def, .has_nulls = r.has_nulls }, dict, self.levels);
         return @unionInit(filter_eval.Batch.Column, if (T == []const u8) "string" else @typeName(T), col);
     }

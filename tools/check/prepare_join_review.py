@@ -13,7 +13,8 @@ import pyarrow.parquet as pq
 
 def main():
     out = [pathlib.Path(p) for p in sys.argv[1:]]
-    fact, dim, dup, long_string, ts_f, ts_d, u_f, u_d, dec_f, dec_d, uniq, rdec_f, rdec_d, u32_f, u32_d, u32_g = out
+    (fact, dim, dup, long_string, ts_f, ts_d, u_f, u_d, dec_f, dec_d, uniq, rdec_f, rdec_d, u32_f, u32_d, u32_g,
+     empty_dict) = out
     pq.write_table(pa.table({
         "id": range(48),
         "fk": pa.array([None if i % 11 == 0 else i % 6 for i in range(48)], type=pa.int64()),
@@ -58,6 +59,18 @@ def main():
     }), u32_d)
     pq.write_table(pa.table({"gk": pa.array([3000000000, 7, 2147483648], type=pa.uint32()), "gname": ["big", "small", "edge"]}),
                    u32_g)
+
+    # Review of the sliced coded filters: a row group whose strings and integers are all NULL keeps an empty
+    # dictionary page, and its rows code against no entry: the float slices' strings, the exact tiles' integers. The second row group's dictionaries have entries.
+    pq.write_table(pa.table({
+        "s": pa.array([None] * 128 + ["a" if i % 2 else "b" for i in range(128)], type=pa.string()),
+        "k": pa.array([None] * 128 + [i % 3 for i in range(128)], type=pa.int64()),
+        "dk": pa.array([None] * 128 + [decimal.Decimal(i % 3) for i in range(128)], type=pa.decimal128(12, 2)),
+        "x": pa.array([float(i) for i in range(256)], type=pa.float64()),
+        "d": pa.array([decimal.Decimal(i) / 4 for i in range(256)], type=pa.decimal128(12, 2)),
+        "fk": pa.array([i % 4 for i in range(256)], type=pa.int64()),
+    }), empty_dict, use_dictionary=["s", "k", "dk"], write_statistics=False, compression="NONE", row_group_size=128,
+                   store_decimal_as_integer=True)
 
 
 if __name__ == "__main__":

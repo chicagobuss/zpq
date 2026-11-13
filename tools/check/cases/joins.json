@@ -92,7 +92,8 @@
     "review-rdec-d",
     "review-u32-f",
     "review-u32-d",
-    "review-u32-g"
+    "review-u32-g",
+    "review-empty-dict"
    ]
   },
   {
@@ -6414,6 +6415,294 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT sum(amt * (amt - 1)) AS s, count(*) AS n FROM '{fixture:sfact}', '{fixture:dim}' WHERE fk = pk AND (mode IS NULL OR inst > 'i0')"
+   }
+  },
+  {
+   "id": "review:slices:empty-dictionary:equal",
+   "fixture": "review-empty-dict",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(x * x) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE s = 'x'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "64"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(x * x) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE s = 'x'"
+   }
+  },
+  {
+   "id": "review:slices:empty-dictionary:not-equal",
+   "fixture": "review-empty-dict",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(x * x) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE s <> 'a'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "64"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(x * x) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE s <> 'a'"
+   }
+  },
+  {
+   "id": "review:slices:empty-dictionary:null-or-equal",
+   "fixture": "review-empty-dict",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(x * x) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE s = 'x' OR s IS NULL"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "64"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(x * x) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE s = 'x' OR s IS NULL"
+   }
+  },
+  {
+   "id": "review:slices:empty-dictionary:like",
+   "fixture": "review-empty-dict",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(x * x) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE s LIKE 'a%'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "64"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(x * x) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE s LIKE 'a%'"
+   }
+  },
+  {
+   "id": "review:slices:empty-dictionary:integer",
+   "fixture": "review-empty-dict",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(x * x) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE k <> 1"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "64"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(x * x) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE k <> 1"
+   }
+  },
+  {
+   "id": "review:slices:empty-dictionary:join",
+   "fixture": "review-empty-dict",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(x * x) AS s, count(*) AS n FROM '{fixture:review-empty-dict}', '{fixture:review-dim}' WHERE fk = pk AND s <> 'a'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "64"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(x * x) AS s, count(*) AS n FROM '{fixture:review-empty-dict}', '{fixture:review-dim}' WHERE fk = pk AND s <> 'a'"
+   }
+  },
+  {
+   "id": "review:slices:empty-dictionary:exact-integer",
+   "fixture": "review-empty-dict",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(d) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE k <> 1"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "64"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(d) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE k <> 1"
+   }
+  },
+  {
+   "id": "review:slices:empty-dictionary:exact-decimal",
+   "fixture": "review-empty-dict",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(d) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE dk <> 1"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 1,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "64"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "7"
+     }
+    },
+    {
+     "jobs": 3,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(d) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE dk <> 1"
    }
   }
  ]

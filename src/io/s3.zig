@@ -2033,7 +2033,7 @@ fn fakeGet(fake: *fake_s3.FakeS3, arena: std.mem.Allocator, stats: *Pool(4).Stat
 test "fake S3 serves a Parquet fixture to the Windows CLI" {
     const a = testing.allocator;
     const windows = @import("builtin").os.tag == .windows;
-    const fixture = if (windows) "D:\\zpq-win\\nullable_mix.parquet" else "ci/fixtures/parquet/nullable_mix.parquet";
+    const fixture = "ci/fixtures/parquet/nullable_mix.parquet";
     const data = try std.Io.Dir.cwd().readFileAlloc(testing.io, fixture, a, .limited(8 << 20));
     defer a.free(data);
     var fake: fake_s3.FakeS3 = undefined;
@@ -2060,7 +2060,7 @@ test "fake S3 serves a Parquet fixture to the Windows CLI" {
         try env.put("S3_ACCESS_KEY_ID", "ak");
         try env.put("S3_SECRET_ACCESS_KEY", "sk");
         try env.put("S3_REGION", "us-east-1");
-        const executable = "D:\\zpq-win\\zpq.exe";
+        const executable = ".\\zpq.exe";
         const local = try std.process.run(a, testing.io, .{ .argv = &.{ executable, "query", fixture, "-j", "1" }, .environ_map = &env });
         defer a.free(local.stdout);
         defer a.free(local.stderr);

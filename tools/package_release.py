@@ -14,9 +14,10 @@ import tarfile
 import tempfile
 import time
 import zlib
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ("x86_64-linux-musl", "aarch64-linux-musl", "aarch64-macos", "x86_64-macos")
+TARGETS = ("x86_64-linux-musl", "aarch64-linux-musl", "aarch64-macos", "x86_64-macos", "x86_64-windows-gnu")
 # Everything but the binary, by archive path. The guides are the ones help and the man page name.
 SHARED_FILES = {"LICENSE": ROOT / "LICENSE",
                 "THIRD_PARTY_NOTICES.md": ROOT / "THIRD_PARTY_NOTICES.md",
@@ -169,29 +170,41 @@ def main():
                                cwd=ROOT, check=True, timeout=args.build_timeout)
             finally:
                 print(f"{target + suffix} build elapsed: {time.monotonic() - started:.1f}s", flush=True)
-        binary = prefix / "bin/zpq"
+        windows = target == "x86_64-windows-gnu"
+        binary = prefix / ("bin/zpq.exe" if windows else "bin/zpq")
         if revision.encode() not in binary.read_bytes():
             raise SystemExit("binary lacks its manifest revision; refusing to package stale output")
         if target == "x86_64-linux-musl":
             version_output = subprocess.check_output([str(binary), "--version"], text=True, timeout=10)
             if version_output != f"zpq {version} ({revision})\n":
                 raise SystemExit(f"binary --version {version_output.strip()!r} differs from manifest {version}")
-        files = {"bin/zpq": binary, **SHARED_FILES}
+        files = {("bin/zpq.exe" if windows else "bin/zpq"): binary, **SHARED_FILES}
+        if windows:
+            files["share/doc/zpq/windows.md"] = ROOT / "docs/windows.md"
         # No version or revision in the name, so .../releases/latest/download/<name> works for every release; both
         # are in MANIFEST.json, release.json and `zpq --version`.
-        name = f"zpq-{target}{suffix}.tar.gz"
+        name = f"zpq-{target}{suffix}.{'zip' if windows else 'tar.gz'}"
         artifact = out / name
         metadata = {**{k: v for k, v in manifest.items() if k != "artifacts"}, "target": target, "cpu": cpu,
                     "binary_sha256": sha(binary), "files": {name: sha(p) for name, p in files.items()}}
-        with artifact.open("wb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as gz:
-            with tarfile.open(fileobj=gz, mode="w") as tar:
-                content = {name: p.read_bytes() for name, p in files.items()}
-                content["MANIFEST.json"] = (json.dumps(metadata, sort_keys=True, indent=2) + "\n").encode()
+        content = {name: p.read_bytes() for name, p in files.items()}
+        content["MANIFEST.json"] = (json.dumps(metadata, sort_keys=True, indent=2) + "\n").encode()
+        if windows:
+            date = time.gmtime(max(epoch, 315532800))[:6]
+            with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
                 for filename, body in sorted(content.items()):
-                    entry = tarfile.TarInfo(filename)
-                    entry.size, entry.mtime = len(body), epoch
-                    entry.mode = 0o755 if filename == "bin/zpq" else 0o644
-                    tar.addfile(entry, io.BytesIO(body))
+                    entry = zipfile.ZipInfo(filename, date_time=date)
+                    entry.compress_type = zipfile.ZIP_DEFLATED
+                    entry.external_attr = (0o755 if filename == "bin/zpq.exe" else 0o644) << 16
+                    archive.writestr(entry, body, compresslevel=9)
+        else:
+            with artifact.open("wb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as gz:
+                with tarfile.open(fileobj=gz, mode="w") as tar:
+                    for filename, body in sorted(content.items()):
+                        entry = tarfile.TarInfo(filename)
+                        entry.size, entry.mtime = len(body), epoch
+                        entry.mode = 0o755 if filename == "bin/zpq" else 0o644
+                        tar.addfile(entry, io.BytesIO(body))
         manifest["artifacts"][target + suffix] = {"file": name, "sha256": sha(artifact), "binary_sha256": sha(binary),
                                                   "cpu": cpu}
         (out / (name + ".sha256")).write_text(sha(artifact) + "  " + name + "\n")

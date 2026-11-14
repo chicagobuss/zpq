@@ -301,9 +301,9 @@ pub fn runMultiAggregate(gpa: std.mem.Allocator, arena: std.mem.Allocator, args:
     // its one table must hold all the refused tables held and more, and it only refuses, many times slower. Decode
     // memory the query's ledger refused also runs on one worker (`FastPath.decode_memory`), and there once more on a
     // small decode budget, so the tables have nearly all of the ledger. A plain grouping a cost rule chose over a cut
-    // gives way to that cut, whose refusal is final. Each step only narrows (`narrowed`): at most seven general scans,
-    // plus the shared-string prefix, an admitted record scan and its serial decode retry before the general chain,
-    // and each arms its paths only over inputs a scan reads again, whole, from the start.
+    // gives way to that cut, with a serial retry for parallel table refusals. Each step only narrows (`narrowed`):
+    // at most seven general scans, plus the shared-string prefix, an admitted record scan and its serial decode retry
+    // before the general chain. Each arms its paths only over inputs a scan reads again, whole, from the start.
     var attempt = joinPaths(args);
     const bound_filter = if (args.bound_aggregate) |b| b.filter else null;
     var chain: Chain = .{ .parts_tried = args.partagg };
@@ -1681,8 +1681,8 @@ fn prepareAggregateWithMetas(
         if (spill_on) taken.insert(.spill);
         // Chosen by the cost rules rather than asked for, a partitioned plan has the plain one to fall back to.
         if (part_on and !args.partagg and rescannable) taken.insert(.partitioned);
-        const shared = decision.strategy == .plain_hash or part_on;
-        if (shared and n_workers > 1 and rescannable) taken.insert(.worker_tables);
+        // Cuts hold worker tables too: competing quota draws must retain the serial retry.
+        if (decision.strategy != .scalar and n_workers > 1 and rescannable) taken.insert(.worker_tables);
         if (decision.strategy == .plain_hash and !use_blocks and partAggSupported(args, agg_calls, true) and
             (if (group_outputs) |outs| countCut(outs, agg_calls, args.result_order) == null else true))
             taken.insert(.partitions_fit);
@@ -1871,6 +1871,8 @@ fn prepareAggregateWithMetas(
         } else original;
         if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {
             for (workers) |*w| if (decodeHeld(w) and rescannable) taken.insert(.decode_memory);
+            if (taken.contains(.worker_tables) and try oneWorkerCuts(arena, plan_inputs))
+                taken.insert(.one_table_may_fit);
         };
         return e;
     };

@@ -2708,11 +2708,7 @@ test "filtered shared-string window sizes PLAIN chunks without dictionary-covere
 }
 
 test "shared string top-k cut refusals replay at every budget the old path answers" {
-    // Compare budget peaks with copies on both paths; in-place growth depends on neighboring allocations.
-    var copy_only = testing.allocator.vtable.*;
-    copy_only.resize = std.mem.Allocator.noResize;
-    copy_only.remap = std.mem.Allocator.noRemap;
-    const gpa: std.mem.Allocator = .{ .ptr = testing.allocator.ptr, .vtable = &copy_only };
+    const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2782,6 +2778,63 @@ test "shared string top-k cut refusals replay at every budget the old path answe
         }
     };
     try testing.expect(answered > 0);
+}
+
+test "parallel cuts preserve table refusal retries without decode pressure" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const file = try rankedStringFile(a, 8192, 2048, 60, 8191);
+    for ([_]bool{ true, false }) |first| {
+        var taken: std.EnumSet(FastPath) = .{};
+        var budget: core_memory.SharedBudget = .{ .limit = 64 << 20 };
+        const args: MultiAggArgs = .{
+            .inputs = &.{.{ .name = "cut-refusal", .bytes = file.bytes }},
+            .metas = &.{file.meta},
+            .aggregate = "count(*) AS c",
+            .group_by = "k",
+            .max_memory = budget.limit,
+            .ledger = &budget,
+            .parallelism = 4,
+            .min_bytes_per_worker = 1,
+            .plain_rules = false,
+            .shared_strings = false,
+            .ndv_policy = false,
+            .dense = false,
+            .spill = false,
+            .partition_cost = false,
+            .taken = &taken,
+            .sketch_topk = .{ .cell_bits = 4, .admit_per_row = 1, .hot = false, .census = first },
+            .result_order = if (first) .{ .limit = 2048 } else .{ .keys = &.{.{ .column = 1, .descending = true }}, .limit = 1 },
+        };
+        const explained = try explainAggregate(gpa, a, args);
+        try testing.expectEqual(@as(usize, 4), explained.workers);
+        try testing.expect(if (first) explained.plan.dispatch.strategy == .first_keys else explained.plan.dispatch.strategy == .sketch);
+        // Model peer tables winning the quota. Failure must retain the cut's own retry eligibility,
+        // independently of any decoder draw that happened to coincide with the table refusal.
+        const held = budget.drawExact(budget.limit - (256 << 10)).?;
+        try testing.expectError(error.ExceededMemoryBudget, prepareAggregate(gpa, a, args, false));
+        try testing.expectEqual(held, budget.used.load(.monotonic));
+        budget.release(held);
+        try testing.expect(taken.contains(.worker_tables));
+        try testing.expect(taken.contains(.one_table_may_fit));
+        taken.remove(.decode_memory);
+        taken.remove(.merge_memory);
+        var chain: Chain = .{ .parts_tried = false };
+        const retry = narrowed(args, args, taken, &chain, taken.contains(.one_table_may_fit)).?;
+        try testing.expectEqual(@as(usize, 1), retry.parallelism);
+        var want_args = args;
+        want_args.parallelism = 1;
+        want_args.taken = null;
+        var want = try runMultiAggregate(gpa, a, want_args);
+        defer want.deinit(gpa);
+        var got = try runMultiAggregate(gpa, a, retry);
+        defer got.deinit(gpa);
+        try want.output.applyResultOrder(gpa, args.result_order);
+        try got.output.applyResultOrder(gpa, args.result_order);
+        try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
+    }
 }
 
 test "shared string partition rank heaps draw the cut's charged allocator" {

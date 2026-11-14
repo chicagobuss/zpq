@@ -890,15 +890,23 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
         /// `plain`: a per-worker plain scan has run. `scans`: how many have.
         const State = struct { a: MultiAggArgs, chain: Chain, may_fit: bool, cut: bool, plain: bool, scans: usize };
 
-        /// Whether a scan of `st` can arm `t`, as `prepareAggregate` arms paths: a cut arms none; shared partitions
-        /// (the cost rules' or forced) arm no per-worker path; the dense fold excludes spill and pairs. A plan's
+        /// Whether a scan of `st` can arm `t`, as `prepareAggregate` arms paths: a cut arms serial/lean retries;
+        /// shared partitions (the cost rules' or forced) arm no per-worker path; the dense fold excludes spill
+        /// and pairs. A plan's
         /// facts are the same at every rerun (they read the mappings) but may differ from the first scan's (a
         /// reader's), so the cost rules' partitions come only in the first two scans, and a per-worker path armable
         /// at all was armed by the first per-worker plain scan.
         fn armable(st: State, t: S) bool {
             const a = st.a;
             if (t.contains(.integer_records)) return a.integer_records and a.typed_answer and t.count() == 1;
-            if (st.cut) return t.count() == 0;
+            if (st.cut) {
+                var allowed = S.initMany(&.{ .one_table_may_fit, .decode_memory });
+                if (a.parallelism != 1) {
+                    allowed.insert(.worker_tables);
+                    allowed.insert(.merge_memory);
+                }
+                return t.subsetOf(allowed);
+            }
             if (t.contains(.partitioned) and st.scans > 1) return false;
             if (st.plain and (t.contains(.dense) or t.contains(.spill) or t.contains(.pairs))) return false;
             if (t.contains(.plain_rule) and !a.plain_rules) return false;
@@ -1006,8 +1014,8 @@ test "runMultiAggregate: every refusal narrows, admitted runs retry shared parti
     try testing.expectEqual(@as(usize, 7), try Walk.longest(args, start, 0));
     var forced = args;
     forced.partagg = true;
-    // Forced partitions, one worker, one worker on a small decode budget.
-    try testing.expectEqual(@as(usize, 3), try Walk.longest(forced, .{
+    // A forced-partition request may take a cut: its cost-rule fallback, serial retry, then lean decode.
+    try testing.expectEqual(@as(usize, 4), try Walk.longest(forced, .{
         .a = forced,
         .chain = .{ .parts_tried = true },
         .may_fit = false,

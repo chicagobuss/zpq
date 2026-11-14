@@ -118,6 +118,7 @@ fn runMain(init: std.process.Init) !void {
     var iter = if (@import("builtin").os.tag == .windows) try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa) else std.process.Args.Iterator.init(init.minimal.args);
     defer if (@import("builtin").os.tag == .windows) iter.deinit();
     _ = iter.next(); // skip program name
+    // Fan-out shares its coordinator with the Lambda entry point.
     const cmd = iter.next() orelse {
         var ws: StdoutWriter = .{};
         defer ws.flush() catch {};
@@ -125,6 +126,18 @@ fn runMain(init: std.process.Init) !void {
         try ws.flush();
         return;
     };
+    if (std.mem.eql(u8, cmd, "fanout")) {
+        const result = @import("fanout.zig").run(init, &iter, gpa) catch |err| {
+            std.debug.print("zpq fanout: {s}\n", .{@errorName(err)});
+            return err;
+        };
+        defer gpa.free(result);
+        var out: StdoutWriter = .{};
+        try out.writeAll(result);
+        try out.writeAll("\n");
+        try out.flush();
+        return;
+    }
     if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "help")) {
         var ws: StdoutWriter = .{};
         defer ws.flush() catch {};

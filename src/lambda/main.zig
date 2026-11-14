@@ -76,6 +76,9 @@ pub fn main(init: std.process.Init) !void {
     };
     defer client.deinit();
 
+    var invoke_pool: zpq.io.invoke.Pool = undefined;
+    try invoke_pool.init(allocator);
+    defer invoke_pool.deinit();
     var pool: service.PersistentPool = .sized(zpq.core.system.discoverAvailableMemory(env));
     service.preconnectS3(io, allocator, env, &pool);
 
@@ -98,7 +101,10 @@ pub fn main(init: std.process.Init) !void {
             null else null;
         defer if (watcher) |t| watchdog.stop(t);
 
-        const response = service.handle(io, allocator, env, inv.body, &pool, legacy) catch |err| {
+        const response = (if (zpq.fanout.isCoordinator(allocator, inv.body))
+            zpq.fanout.handle(io, allocator, env, &invoke_pool, inv.body)
+        else
+            service.handle(io, allocator, env, inv.body, &pool, legacy)) catch |err| {
             if (watchdog.claim()) client.postError(inv.request_id, "HandlerError", @errorName(err)) catch |perr| {
                 std.debug.print("zpq lambda: postError failed: {s}\n", .{@errorName(perr)});
             };

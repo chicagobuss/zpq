@@ -4,6 +4,7 @@
 //! io.strategy.assertIsIOStrategy. Anything in core.* is pure logic and
 //! must remain free of allocations beyond what callers pass in.
 
+pub const fanout = @import("fanout.zig");
 pub const core = struct {
     pub const selected_batch = @import("core/selected_batch.zig");
     pub const schema = @import("core/schema.zig");
@@ -106,6 +107,7 @@ pub const io = struct {
     pub const http = @import("io/http.zig");
     pub const s3 = @import("io/s3.zig");
     pub const pool = @import("io/pool.zig");
+    pub const invoke = @import("io/invoke.zig");
     pub const coalescer = @import("io/coalescer.zig");
     pub const work_cursor = @import("io/work_cursor.zig");
     pub const multipart_sink = @import("io/multipart_sink.zig");

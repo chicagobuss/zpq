@@ -26,11 +26,11 @@ const CLI_BIN = integration_opts.cli_bin;
 // Fake runtime API server
 // ============================================================
 
-const FakeServer = struct {
+pub const FakeServer = struct {
     listen_fd: linux.fd_t,
     port: u16,
 
-    fn start() !FakeServer {
+    pub fn start() !FakeServer {
         const fd = try sysSocket();
         errdefer sysClose(fd);
 
@@ -54,13 +54,13 @@ const FakeServer = struct {
         return .{ .listen_fd = fd, .port = port };
     }
 
-    fn deinit(self: *FakeServer) void {
+    pub fn deinit(self: *FakeServer) void {
         sysClose(self.listen_fd);
     }
 
     /// Accept one connection, read the request, return the parsed
     /// method+path. Caller closes the conn via `replyAndClose`.
-    fn acceptRequest(self: *FakeServer, allocator: std.mem.Allocator) !Request {
+    pub fn acceptRequest(self: *FakeServer, allocator: std.mem.Allocator) !Request {
         const conn = try sysAccept(self.listen_fd);
         errdefer sysClose(conn);
 
@@ -77,7 +77,7 @@ const FakeServer = struct {
     }
 };
 
-const Request = struct {
+pub const Request = struct {
     conn: linux.fd_t,
     method: []const u8,
     path: []const u8,
@@ -85,13 +85,13 @@ const Request = struct {
     raw: []u8,
     allocator: std.mem.Allocator,
 
-    fn deinit(self: *Request) void {
+    pub fn deinit(self: *Request) void {
         sysClose(self.conn);
         self.allocator.free(self.raw);
         self.* = undefined;
     }
 
-    fn replyAndClose(
+    pub fn replyAndClose(
         self: *Request,
         allocator: std.mem.Allocator,
         status: u16,
@@ -239,7 +239,7 @@ const FakeS3 = struct {
     requests: std.atomic.Value(u32) = .init(0),
     idle_closes: std.atomic.Value(u32) = .init(0),
 
-    fn start(self: *FakeS3, object: []const u8, idle_close_ms: i32) !void {
+    pub fn start(self: *FakeS3, object: []const u8, idle_close_ms: i32) !void {
         const fd = try sysSocket();
         errdefer sysClose(fd);
         const yes: i32 = 1;
@@ -263,7 +263,7 @@ const FakeS3 = struct {
     }
 
     /// Call after the Lambda child is gone, so every connection thread has seen its peer close.
-    fn deinit(self: *FakeS3) void {
+    pub fn deinit(self: *FakeS3) void {
         _ = linux.shutdown(self.listen_fd, linux.SHUT.RDWR);
         self.accept_thread.join();
         for (self.conn_fds[0..self.conns], self.conn_threads[0..self.conns]) |fd, thread| {
@@ -402,7 +402,7 @@ fn pinToOneCpu(pid: linux.pid_t) void {
 }
 
 /// Serve one invocation of `body` and return the response body (caller frees).
-fn invoke(server: *FakeServer, allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+pub fn invoke(server: *FakeServer, allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     var poll = try server.acceptRequest(allocator);
     try poll.replyAndClose(allocator, 200, "Lambda-Runtime-Aws-Request-Id: req-s3\r\nContent-Type: application/json\r\n", body);
     var resp = try server.acceptRequest(allocator);
@@ -428,7 +428,7 @@ fn spawnLambda(allocator: std.mem.Allocator, runtime_endpoint: []const u8) !std.
     return spawnLambdaWithEnv(allocator, runtime_endpoint, &.{});
 }
 
-fn spawnLambdaWithEnv(
+pub fn spawnLambdaWithEnv(
     allocator: std.mem.Allocator,
     runtime_endpoint: []const u8,
     extra_env: []const [2][]const u8,
@@ -451,7 +451,7 @@ fn spawnLambdaWithEnv(
     });
 }
 
-fn killChild(child: *std.process.Child) void {
+pub fn killChild(child: *std.process.Child) void {
     // kill() in 0.16 internally reaps and clears child.id; no wait() after.
     child.kill(std.testing.io);
 }

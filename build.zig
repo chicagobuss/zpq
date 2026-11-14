@@ -104,6 +104,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // ----- Tests -----
+    b.step("test-fanout", "Run native fanout parity against real Lambda workers").dependOn(&b.addRunArtifact(a.fanout_tests).step);
     b.step("test-cli", "Run CLI inspection tests").dependOn(&b.addRunArtifact(a.cli_tests).step);
     b.step("test-cli-bin", "Install the CLI test executable without running it")
         .dependOn(&b.addInstallArtifact(a.cli_tests, .{ .dest_sub_path = "zpq-cli-test" }).step);
@@ -198,6 +199,7 @@ const Artifacts = struct {
     fuzz_tests: *std.Build.Step.Compile,
     unit_tests: []const UnitTest,
     integration_tests: *std.Build.Step.Compile,
+    fanout_tests: *std.Build.Step.Compile,
 };
 
 fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts {
@@ -312,6 +314,23 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
         .filters = filters,
     });
 
+    const fanout_opts = b.addOptions();
+    fanout_opts.addOptionPath("lambda_bin", lambda.getEmittedBin());
+    fanout_opts.addOptionPath("cli_bin", cli.getEmittedBin());
+    fanout_opts.addOption([]const u8, "duckdb", b.fmt("{s}/.cache/zpq-duckdb2/bin-2.0.0/duckdb", .{b.graph.environ_map.get("HOME") orelse ""}));
+    const fanout_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fanout.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "integration_opts", .module = fanout_opts.createModule() },
+                .{ .name = "zpq", .module = test_core.zpq },
+            },
+        }),
+        .filters = &.{"fanout"},
+    });
     return .{
         .deps = deps,
         .cli = cli,
@@ -326,6 +345,7 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
         .fuzz_tests = b.addTest(.{ .root_module = test_core.zpq, .filters = filters, .use_llvm = true }),
         .unit_tests = unit_tests,
         .integration_tests = integration_tests,
+        .fanout_tests = fanout_tests,
     };
 }
 
@@ -393,12 +413,11 @@ fn addTiers(b: *std.Build, cfg: Config) void {
             r.addArg("--");
             r.addArtifactArg(debug.integration_tests);
         }
-        // The fan-out coordinator against the same zpq-lambda behind a fake runtime, checked against DuckDB.
-        if (add(b, &stages, wanted, runner, dir, tier_name, "fanout-self", "plain", 300)) |r| {
-            r.addArgs(&.{ "--", python, "tools/serverless/test_fanout.py", "--duckdb", duckdb, "--lambda" });
-            r.addArtifactArg(debug.lambda);
-        }
     }
+    if (tier != .edit) if (add(b, &stages, wanted, runner, dir, tier_name, "fanout-self", "units", 300)) |r| {
+        r.addArg("--");
+        r.addArtifactArg(safe.fanout_tests);
+    };
     if (tier != .edit) if (add(b, &stages, wanted, runner, dir, tier_name, "check-self", "plain", 900)) |r| {
         r.addArg("--");
         r.addArtifactArg(runner);

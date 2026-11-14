@@ -28,6 +28,11 @@ usage:
             [-o <other.parquet>] [--fsync | --no-fsync] [--summary=json]
             rewrites only the pages holding matched rows, in place unless -o
             (docs/capabilities.md, UPDATE)
+  zpq fanout --function NAME[:VERSION] --input s3://bucket/file.parquet
+             --aggregate "sum(x) AS total" [--workers N] [--counts N,...]
+             [--endpoint http://host:port ...] [--region REGION]
+             [--group-by EXPR] [--filter EXPR] [--order-by EXPR] [--limit N]
+             [--concurrency N] [--request JSON] [--sign-endpoints]
   zpq schema <file.parquet>
   zpq inspect FILE... [--format json] [--detail]
   zpq conform <file.parquet>

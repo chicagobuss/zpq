@@ -20,27 +20,40 @@ more than 4 s are closed rather than reused (they do not survive a frozen sandbo
 is retried at once on a new one. See [`docs/lambda_capabilities.md`](lambda_capabilities.md) and the request and
 response format in [`docs/lambda_requests.md`](lambda_requests.md).
 
-## Fanning one query out: `tools/serverless/fanout.py`
+## Fanning one query out: `zpq fanout`
 
-One large file, or many, can be split across workers by row group. `tools/serverless/fanout.py` is a small
-coordinator (stdlib plus boto3) that reads each input's row-group count from its footer, cuts the row groups into N
-contiguous runs, invokes N `zpq-lambda` workers in parallel with the request's `row_groups` field, and merges their
-answers:
+The native Zig coordinator splits explicit inputs into contiguous fractional row-group runs, invokes workers in
+parallel and merges their partial states. It makes no footer or capability call before scattering explicit inputs.
+Optional `--counts` hints affect balancing, never coverage. Glob inputs first negotiate structured-plan v1 and
+prepare the inputs through a worker.
 
 ```sh
-python3 tools/serverless/fanout.py --function zpq-worker --workers 32 \
-  --input s3://bucket/lineitem.parquet --filter "l_shipdate <= '1998-09-02'" \
+zpq fanout --function zpq-worker:7 --workers 32 \
+  --input s3://bucket/lineitem.parquet \
   --aggregate "sum(l_quantity) AS qty, avg(l_discount) AS disc, count(*) AS n" \
   --group-by "l_returnflag, l_linestatus" --order-by "l_returnflag, l_linestatus"
 ```
 
-COUNT, SUM, MIN, MAX and AVG merge, with or without GROUP BY (AVG is asked of each worker as `avg_state` and divided
-once at the end, and decimal sums stay exact); ORDER BY and LIMIT apply after the merge. COUNT(DISTINCT), percentiles
-and other holistic aggregates, window functions and expressions over aggregates are refused before any worker runs.
-The same file is a coordinator Lambda: `fanout.handler` takes `{"function", "workers", "request", "order_by",
-"limit"}` and, optionally, `row_group_counts` to skip reading the footers. `tools/serverless/test_fanout.py` runs it
-against real `zpq-lambda` processes behind a fake Lambda runtime and checks the merged answers against one invocation
-and against DuckDB.
+Repeat `--endpoint http://host:port` to distribute invocations among local Lambda endpoints. A base URL gets the
+Lambda Invoke path; a URL with a path uses that path verbatim. Local endpoint requests are unsigned by default. Use `--sign-endpoints` with dummy environment credentials to exercise SigV4 against a local emulator. AWS Invoke uses
+the same HTTP/TLS pool and SigV4 signer as S3, with the Lambda service name. Function ARNs preserve the account;
+qualifiers stay attached to every request. AWS mode requires `--region` or `AWS_REGION` / `AWS_DEFAULT_REGION` and
+execution-role credentials in the environment.
+
+COUNT, SUM, MIN, MAX and AVG merge with or without GROUP BY. AVG stays sum/count until finalization. Numeric sums
+use checked decimal arithmetic and refuse overflow. Worker responses must agree on schema, plan and merge metadata.
+ORDER BY and LIMIT apply after merging, with NULLs last. Holistic aggregates and expressions over aggregates are
+refused by workers before input I/O. A failed worker never yields a partial answer.
+
+The same `zpq-lambda` binary coordinates events containing `"operation":"fanout"`:
+
+```json
+{"operation":"fanout","function":"zpq-worker:7","workers":32,"request":{"inputs":["s3://bucket/data.parquet"],"aggregate":"count(*) AS n"}}
+```
+
+Events also accept `endpoints`, `sign_endpoints`, `region`, `counts`, `concurrency`, `order_by` and `limit`. The CLI accepts a complete
+worker request as `--request JSON`. `zig build test-fanout -Doptimize=ReleaseSafe` exercises real worker processes
+behind localhost Runtime and Invoke APIs and compares answers with whole-query execution and DuckDB 2.0.0.
 
 S3 access: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION` (on Lambda, the execution
 role's). `S3_`-prefixed variables of the same names, plus `S3_ENDPOINT_URL`, take precedence and target S3-compatible

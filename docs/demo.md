@@ -288,3 +288,12 @@ What zpq is for:
 * **Writer schema drift is handled case-insensitively only** — if a
   workload reorders columns or adds optional fields, the CLI errors
   with `SchemaMismatch`. Schema evolution is a real follow-up.
+
+Native fan-out runs one aggregate across Lambda workers, or across a list of local Lambda Invoke endpoints:
+
+```sh
+zpq fanout --endpoint http://127.0.0.1:9001 --workers 4 \
+  --input s3://bucket/data.parquet --aggregate 'count(*) AS n, sum(amount) AS total'
+```
+
+See [Lambda and S3](lambda-and-s3.md) for function versions, endpoint lists, splitting and merge semantics.

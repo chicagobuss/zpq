@@ -548,7 +548,7 @@ pub fn rebaseChunk(
 /// `rebaseChunk` without the page index, for output that carries none.
 pub fn copiedChunk(input: []const u8, src: *const schema.ColumnChunk, delta: i64) schema.ColumnChunk {
     var chunk = shiftChunk(src, delta);
-    chunk.bloom_out = carriedFilter(input, src);
+    chunk.bloom_out = if (src.bloom_out.len > 0) src.bloom_out else carriedFilter(input, src);
     return chunk;
 }
 

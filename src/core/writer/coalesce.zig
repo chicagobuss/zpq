@@ -640,3 +640,32 @@ test "coalesce Bloom unions and dictionary rebuilds cover every source value" {
         try std.testing.expect(bloom.mightContainScalar(bloom.bitset(mixed.columns[0].filter).?, bloom.hashBytes(&raw)));
     }
 }
+
+test "coalesce owned window sources retain runtime filters and decode after the source is released" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = try testSource(a, &.{ 10, 20 }, &.{ 0, 1, 1, 0 }, false, false);
+    var b = try bloom.Builder.init(a, 2, 0.01);
+    defer b.deinit(a);
+    var raw: [4]u8 = undefined;
+    std.mem.writeInt(i32, &raw, 10, .little);
+    b.insert(bloom.hashBytes(&raw));
+    std.mem.writeInt(i32, &raw, 20, .little);
+    b.insert(bloom.hashBytes(&raw));
+    const filter = try b.serialize(a);
+    source.rg.columns.items[0].bloom_out = filter;
+    const owned = try source.own(a);
+    try std.testing.expectEqualSlices(u8, filter, owned.rg.columns.items[0].bloom_out);
+    const relocated = fast.rebaseChunk(a, owned.bytes, &owned.rg.columns.items[0], 17);
+    try std.testing.expectEqualSlices(u8, filter, relocated.bloom_out);
+    @memset(@constCast(source.bytes), 0);
+    const pair = [_]Source{ owned, owned };
+    const plan = (try Plan.init(a, &pair, null, .{})).?;
+    const streaming = @import("streaming.zig");
+    var sink: streaming.MemorySink = .{ .arena = a };
+    var out: streaming.SinkOut = .{ .sink = sink.sink() };
+    _ = try plan.write(a, &out);
+    var reader = @import("../parquet/column.zig").ColumnChunkReader(i32).init(sink.buffer.items, .UNCOMPRESSED, .{ .max_def = 0, .max_rep = 0 }, a);
+    try std.testing.expectEqualSlices(i32, &.{ 10, 20, 20, 10, 10, 20, 20, 10 }, (try reader.readAll(8)).values);
+}

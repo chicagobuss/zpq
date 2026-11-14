@@ -63,6 +63,7 @@ pub const Header = struct {
     /// The `CpuFeature`s this host lacks, read at run time (a fleet bundle targets a baseline CPU, so `builtin.cpu`
     /// is not the host's); null when unread, which accepts no hardware skip.
     cpu_lacks: ?[]const CpuFeature = null,
+    uring_available: ?bool = null,
 };
 
 pub const Receipt = struct {
@@ -186,7 +187,7 @@ pub fn assess(arena: Allocator, io: std.Io, dir: []const u8, name: []const u8, s
         }) };
         if (r.header.os.len == 0)
             return .{ .why = try std.fmt.allocPrint(arena, "{s} skipped for {t}; the host's OS is unrecorded", .{ skip.name, named }) };
-        if (named.metBy(r.header.os))
+        if (named.metBy(r.header.os) and !(named == .io_uring and r.header.uring_available == false))
             return .{ .why = try std.fmt.allocPrint(arena, "{s} skipped for {t} ({s}) on a {s} host", .{ skip.name, named, skip.what, r.header.os }) };
         by_os += 1;
         unmet.insert(named);
@@ -398,6 +399,7 @@ fn header(arena: Allocator, io: std.Io, gpa: Allocator, duckdb: []const u8, arti
                 "printf '%s=%s ' \"$f\" \"$(wc -c < \"$f\" | tr -d ' ')\"; done 2>/dev/null" }) orelse "",
         }),
         .cpu_lacks = cpuLacks(arena, io),
+        .uring_available = @import("zpq").io.local_reader.uringAvailable(),
     };
 }
 
@@ -574,6 +576,16 @@ test "a macOS unit run passes by the needs its tests named, and the same log fai
     const bad = try assess(a, io, dir, "units-core", sha);
     try testing.expect(bad.why != null);
     try testing.expect(std.mem.indexOf(u8, bad.why.?, "no named need") != null);
+    const ring_log = "1/2 pass...OK\n2/2 direct read..." ++ comptime test_skip.mark(.io_uring, "ring setup") ++
+        "SKIP\n1 passed; 1 skipped; 0 failed.\n";
+    rec.header.os = "Linux";
+    rec.counts = try parseCounts(a, .units, ring_log, 0);
+    for ([_]?bool{ false, true, null }) |available| {
+        rec.header.uring_available = available;
+        try writeReceipt(io, a, dir, rec, ring_log);
+        const ring = try assess(a, io, dir, "units-core", sha);
+        try testing.expectEqual(available == false, ring.why == null);
+    }
 }
 
 test "counts come from each runner's own summary, and a log without one ran nothing" {

@@ -503,7 +503,7 @@ test "an allocation failing anywhere in open, plan or start leaks nothing and le
 
 test "threads whose ring fails to set up read with pread, and say so" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    if (!uringAvailable()) return error.SkipZigTest;
+    if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var prng = std.Random.DefaultPrng.init(0xf1);
@@ -547,7 +547,7 @@ test "threads whose ring fails to set up read with pread, and say so" {
 
 test "a direct file whose rings never start is counted through the page cache" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
-    if (!uringAvailable()) return error.SkipZigTest;
+    if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 128 << 10);
@@ -912,7 +912,7 @@ test "pread, buffered io_uring and direct io_uring read the same bytes" {
 
 test "io_uring retries a refused enter and resubmits an EAGAIN completion" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
-    if (!uringAvailable()) return error.SkipZigTest;
+    if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
@@ -955,7 +955,7 @@ fn readFaulted(path: []const u8, data: []const u8, faults: *Faults) !void {
 
 test "io_uring past the retry bound finishes the unit with pread" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
-    if (!uringAvailable()) return error.SkipZigTest;
+    if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
@@ -991,7 +991,7 @@ test "io_uring past the retry bound finishes the unit with pread" {
 
 test "a short repair pread failure reaps the rest of its completion batch" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
-    if (!uringAvailable()) return error.SkipZigTest;
+    if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 128 << 10);
@@ -1007,7 +1007,7 @@ test "a short repair pread failure reaps the rest of its completion batch" {
 
 test "a submitted io_uring read is not published while its wait is interrupted" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
-    if (!uringAvailable()) return error.SkipZigTest;
+    if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 192 << 10);
@@ -1040,7 +1040,7 @@ test "a submitted io_uring read is not published while its wait is interrupted" 
 
 test "a file that cannot open O_DIRECT is still read through the page cache" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
-    if (!uringAvailable()) return error.SkipZigTest;
+    if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
@@ -1083,7 +1083,7 @@ test "a file that cannot open O_DIRECT is still read through the page cache" {
 
 test "a finished direct read of EINVAL is pread, and the direct fd stays open" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
-    if (!uringAvailable()) return error.SkipZigTest;
+    if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 128 << 10);
@@ -1132,7 +1132,7 @@ test "a finished direct read of EINVAL is pread, and the direct fd stays open" {
 
 test "an unaligned direct tail is read through the buffered fd and stays direct" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
-    if (!uringAvailable()) return error.SkipZigTest;
+    if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, (64 << 10) + 100);
@@ -1165,7 +1165,7 @@ test "an unaligned direct tail is read through the buffered fd and stays direct"
 
 test "a positive short completion repairs from an unaligned offset and stays direct" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
-    if (!uringAvailable()) return error.SkipZigTest;
+    if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
@@ -1203,7 +1203,7 @@ test "a positive short completion repairs from an unaligned offset and stays dir
 
 test "direct io opens its own fd and does not change a borrowed one" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
-    if (!uringAvailable()) return error.SkipZigTest;
+    if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
@@ -1277,7 +1277,7 @@ fn forgetFile(path: []const u8, size: usize) !void {
 
 test "a buffered read of a cold file leaves it cached for the next choice" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
-    if (!uringAvailable()) return error.SkipZigTest;
+    if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const page = std.heap.pageSize();

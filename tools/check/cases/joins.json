@@ -110,6 +110,7 @@
   }
  ],
  "cases": [
+  {"id": "join:late:path-parity", "fixture": "fact", "sql": "SELECT f.fk, kind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY n DESC, f.fk LIMIT 7", "oracle": {"compare": "ordered", "sql": "SELECT f.fk, kind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY n DESC, f.fk LIMIT 7"}},
   {
    "id": "join:inner:comma:scalar",
    "fixture": "fact",

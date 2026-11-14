@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Write the two writer-wire fixtures differential.py builds in its temp dir.
+"""Write the writer-wire fixtures, including empty dictionaries with all-NULL columns.
 
-argv: flba.parquet floats.parquet. Same seed, widths, and nulls as that script.
+argv: flba.parquet floats.parquet null_dict.parquet.
 """
 
 import random
@@ -35,6 +35,10 @@ def main():
         "dict_nan": pa.array([[nan, 0.0, 2.5][i % 3] for i in range(n)], pa.float64()),
         "nulls_nan": pa.array([None if i % 2 else (nan if i % 3 else 1.5) for i in range(n)], pa.float64()),
     }), floats, use_dictionary=False)
+    pq.write_table(pa.table({
+        "s": pa.array([None] * 301, pa.string()),
+        "i": pa.array([None] * 301, pa.int64()),
+    }), sys.argv[3], use_dictionary=True)
 
 
 if __name__ == "__main__":

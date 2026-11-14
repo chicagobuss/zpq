@@ -529,10 +529,10 @@ def test_arrow_types(z):
         check(rows == '{"v":1,"i":1}\n{"v":19724,"i":19724}\n', f"make_date JSON prints the days {rows!r}")
         keys = z.query_raw(f"SELECT make_date(i) AS v, count(*) AS n FROM '{src}' WHERE i > 0 GROUP BY v ORDER BY v")
         check(keys == '{"v":1,"n":1}\n{"v":19724,"n":1}\n', f"make_date key JSON prints the days {keys!r}")
-        for sql, reason in ((f"SELECT CAST(i AS VARCHAR) AS v FROM '{src}'", "TypeMismatch"),
-                            (f"SELECT CAST(s AS BIGINT) AS v FROM '{src}'", "UnknownFunction")):
-            r = z.run({"sql": sql}, check=False)
-            check(r.get("reason") == reason, f"refused cast {r}: {sql}")
+        text = z.query_raw(f"SELECT CAST(i AS VARCHAR) AS v FROM '{src}'")
+        check(text == '{"v":"0"}\n{"v":"1"}\n{"v":null}\n{"v":"19724"}\n', f"integer cast to text {text!r}")
+        r = z.run({"sql": f"SELECT CAST(s AS BIGINT) AS v FROM '{src}'"}, check=False)
+        check(r.get("reason") == "ConversionInvalid", f"invalid numeric text cast {r}")
 
 
 def test_arrow_consumers(z):

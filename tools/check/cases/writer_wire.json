@@ -1,6 +1,8 @@
 {
-  "fixtures": [{"script": "tools/check/prepare_wire.py", "files": ["flba", "floats"]}],
+  "fixtures": [{"script": "tools/check/prepare_wire.py", "files": ["flba", "floats", "null_dict"]}],
   "cases": [
+    {"id": "wire:empty-dictionary:rows", "fixture": "null_dict", "sql": "SELECT s,i FROM '{path}'", "emit": "rows", "oracle": {"compare": "ordered", "sql": "SELECT s,i FROM '{path}'"}},
+    {"id": "wire:empty-dictionary:aggregate", "fixture": "null_dict", "sql": "SELECT count(*), count(s), count(i) FROM '{path}'", "oracle": {"compare": "ordered", "sql": "SELECT count(*), count(s), count(i) FROM '{path}'"}},
     {"id": "wire:flba-reencode:pyarrow", "fixture": "flba", "query": {"filter": "id >= 1"}, "emit": "copy", "oracle": {"compare": "wire:pyarrow", "where": "id >= 1"}},
     {"id": "wire:flba-reencode:duck", "fixture": "flba", "query": {"filter": "id >= 1"}, "emit": "copy", "oracle": {"compare": "wire:duck", "where": "id >= 1"}},
     {"id": "wire:flba-reencode:bytes", "fixture": "flba", "query": {"filter": "id >= 1"}, "emit": "copy", "oracle": {"compare": "wire:bytes", "where": "id >= 1"}},

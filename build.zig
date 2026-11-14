@@ -414,6 +414,7 @@ fn addTiers(b: *std.Build, cfg: Config) void {
         .full => &.{
             .{ .name = "cases-fresh", .files = commit_cases, .fresh = true, .timeout = 3600 },
             .{ .name = "corpus", .files = &.{"tools/check/cases/corpus.json"}, .fresh = true, .timeout = 1800 },
+            .{ .name = "corpus-odd", .files = &.{ "tools/check/cases/corpus.json", "tools/check/cases/writer_wire.json" }, .fresh = true, .timeout = 1800 },
             .{ .name = "canonical", .files = &.{ "tools/check/cases/decode_errors.json", "tools/check/cases/hardware.json" }, .fresh = true, .timeout = 1800 },
             .{ .name = "clickbench", .files = &.{"tools/check/cases/clickbench.json"}, .fresh = true, .timeout = 7200, .data = clickbench },
         },
@@ -425,6 +426,7 @@ fn addTiers(b: *std.Build, cfg: Config) void {
         r.addArgs(&.{ "--duckdb", duckdb, "--python", python, "--work", b.fmt("zig-out/check-work-{s}", .{c.name}) });
         if (oracle_cache) |path| r.addArgs(&.{ "--cache", path });
         if (c.fresh) r.addArg("--no-cache");
+        if (std.mem.eql(u8, c.name, "corpus-odd")) r.addArgs(&.{ "--force", "ZPQ_DECODE_BATCH_ROWS=97" });
         if (c.data) |d| r.addArgs(&.{ "--data", d });
         r.addArg("--zpq");
         r.addArtifactArg(fast.cli);

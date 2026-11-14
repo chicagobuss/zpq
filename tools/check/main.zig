@@ -1180,8 +1180,8 @@ fn execute(
     const mem = try memoryOf(c);
     std.Io.Dir.cwd().deleteFile(run.io, out_path) catch {};
     if (c.sql) |sql| {
-        const pq = try zpq.core.expr.sql_parser.parseSqlPlan(gpa, sql);
-        defer pq.deinit(gpa);
+        // A diagnostic can borrow the plan's input name until executeAt renders it in the same case arena.
+        const pq = try zpq.core.expr.sql_parser.parseSqlPlan(arena, sql);
         if (c.emit == .values) return valuesOf(gpa, arena, ctx, pq, jobs, diag);
         const inputs = try expandInputs(arena, ctx, pq.table_name);
         var args: engine.QueryArgs = .{

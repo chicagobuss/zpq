@@ -1,5 +1,12 @@
 [
   {
+    "name": "ZPQ_LATE_FETCH",
+    "off": "0",
+    "cases": ["join:late:path-parity"],
+    "evidence": "unavailable",
+    "note": "late dimension payload fetch must preserve JSON and Parquet bytes"
+  },
+  {
     "name": "ZPQ_BYTE_RECORDS",
     "off": "0",
     "cases": [

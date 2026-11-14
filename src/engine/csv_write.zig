@@ -1666,8 +1666,8 @@ fn hasParquetMagic(path: []const u8) !bool {
     if (size < 8) return size == 0; // an empty file is reported by the Parquet path (or by name as CSV below)
     var head: [4]u8 = undefined;
     var tail: [4]u8 = undefined;
-    const linux = std.os.linux;
-    if (linux.pread(fd, &head, 4, 0) != 4 or linux.pread(fd, &tail, 4, @intCast(size - 4)) != 4) return true;
+    const os = std.posix.system;
+    if (os.pread(fd, &head, 4, 0) != 4 or os.pread(fd, &tail, 4, @intCast(size - 4)) != 4) return true;
     return std.mem.eql(u8, &head, "PAR1") and std.mem.eql(u8, &tail, "PAR1");
 }
 

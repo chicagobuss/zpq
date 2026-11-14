@@ -233,8 +233,8 @@ jobs:
           path: zig-out/receipts
 
   # The core suite natively on the other two release architectures: Linux ARM as the full tier's units-core shard
-  # runs it, and Apple silicon (16 KiB pages, 128-byte lines, no mremap) on the same fixtures. The tier's verdict
-  # allows no skip, and a Mac skips every Linux-only test, so there it fails on failures alone. The Mac builds
+  # runs it, and Apple silicon (16 KiB pages, 128-byte lines, no mremap) on the same fixtures. Receipts excuse
+  # only declared platform and CPU needs. The Mac builds
   # ReleaseSafe: in Debug the test allocator captures a stack on every free, which on macOS unwinds by DWARF CFI and
   # left one test running for over 50 minutes.
   native-core:
@@ -279,12 +279,10 @@ jobs:
 
       - name: Core suite (macOS)
         if: runner.os == 'macOS'
-        run: |
-          tools/check/fixtures.sh
-          zig build test-core -Doptimize=ReleaseSafe -j8
+        run: nice -n 10 zig build check -Dtier=edit -j3
 
       - name: Keep the receipts
-        if: always() && runner.os == 'Linux'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: receipts-core-${{ matrix.runner }}

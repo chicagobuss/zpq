@@ -33,6 +33,7 @@ import pyarrow.parquet as pq
 
 REPO = Path(__file__).resolve().parents[2]
 NEEDS = {
+    "non_root": "permission denial requires a non-root effective uid",
     "privileged": "loop-mounted filesystems and device-mapper error targets change the host: run with --privileged",
     "sudo": "--privileged needs passwordless sudo",
     "strace": "syscall tracing and fault injection need strace",
@@ -417,6 +418,8 @@ def binary_output_refuses_a_terminal(root, clean, corrupt, distinct, small):
 
 @contract
 def an_unwritable_directory_is_access_denied(root, clean, corrupt, distinct, small):
+    if os.geteuid() == 0:
+        raise Skip("non_root")
     locked = root / "locked"
     locked.mkdir()
     dst = locked / "out.parquet"

@@ -115,6 +115,7 @@ def run(args):
     args.out.mkdir(parents=True)
     records = []
     con = duckdb.connect()
+    con.execute("SET memory_limit='8GB'")
     con.execute("SET threads=2")
     started = time.monotonic()
     for knob in knobs:

@@ -23,17 +23,21 @@ const builtin = @import("builtin");
 pub const Need = enum {
     /// The Linux kernel interfaces the test drives: epoll, io_uring, mremap, madvise and mincore residency, procfs.
     linux,
+    /// Ring setup can also be refused by seccomp or kernel policy on Linux.
+    io_uring,
 
     /// Whether the OS named `os_name` (`uname`'s sysname) meets the need.
     pub fn metBy(self: Need, os_name: []const u8) bool {
         return switch (self) {
             .linux => std.ascii.eqlIgnoreCase(os_name, "linux"),
+            .io_uring => std.ascii.eqlIgnoreCase(os_name, "linux"),
         };
     }
 
     fn holds(self: Need) bool {
         return switch (self) {
             .linux => builtin.os.tag == .linux,
+            .io_uring => false, // runtime need; the caller probes ring setup
         };
     }
 };
@@ -79,6 +83,10 @@ pub fn parseLine(line: []const u8) ?Parsed {
 }
 
 const testing = std.testing;
+
+test "io_uring availability is a named runtime need" {
+    try testing.expect(parseLine("1/1 direct read...[skip needs io_uring: ring setup] SKIP") != null);
+}
 
 test "a named skip reads back as the runner printed it" {
     const printed = "12/40 io.epoll.test.timer fires within deadline..." ++ comptime mark(.linux, "epoll") ++ "SKIP";

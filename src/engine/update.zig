@@ -1401,6 +1401,14 @@ test "UPDATE keeps a replaced target when putting it back fails, and says where 
         before_publish = Hooks.replace;
         fail_rollback = fault;
         var problem: Problem = .{};
+        if (@import("builtin").os.tag != .linux) {
+            // Without exchange the changed target is refused before publishing, so no rollback can fail.
+            try std.testing.expectError(error.InputChanged, run(gpa, io, req, &problem));
+            try std.testing.expectEqualStrings(Hooks.other, try local_fs.readFile(a, target));
+            const files = try local_fs.listFiles(a, io, dir);
+            try std.testing.expectEqual(@as(usize, 1), files.len);
+            continue;
+        }
         try std.testing.expectError(error.RollbackFailed, run(gpa, io, req, &problem));
         // The other writer's bytes still exist, at the name the message gives; the target holds this UPDATE's result.
         const kept = for (try local_fs.listFiles(a, io, dir)) |name| {

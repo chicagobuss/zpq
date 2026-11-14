@@ -21,6 +21,7 @@ pub const OutputPublication = struct {
     hook_at: enum { sync, close } = .close,
     /// Tests only: the error `commitReplacing`'s exchange back fails with.
     fail_rollback: ?anyerror = null,
+    fail_parent_sync: if (@import("builtin").is_test) ?anyerror else void = if (@import("builtin").is_test) null else {},
 
     pub fn path(self: *const OutputPublication) []const u8 {
         return self.buffer[0..self.len];
@@ -66,8 +67,10 @@ pub const OutputPublication = struct {
     pub fn commit(self: *OutputPublication, io: std.Io) !void {
         const target = self.target orelse return;
         try self.seal(io);
+        const parent = if (self.fsync) try local_fs.openParent(target) else null;
+        defer if (parent) |fd| local_fs.close(fd);
         try local_fs.rename(self.path(), target);
-        self.target = null;
+        try self.published(parent);
     }
 
     /// `commit`, for a result that replaces the very file it was made from (`expected`, as it was read): published only
@@ -79,13 +82,15 @@ pub const OutputPublication = struct {
     pub fn commitReplacing(self: *OutputPublication, io: std.Io, expected: local_fs.Stamp) !void {
         const target = self.target orelse return;
         try self.seal(io);
+        const parent = if (self.fsync) try local_fs.openParent(target) else null;
+        defer if (parent) |fd| local_fs.close(fd);
         local_fs.exchange(self.path(), target) catch |err| switch (err) {
             error.NotFound => return error.InputChanged,
             error.Unsupported => {
                 const now = local_fs.pathStamp(target) catch return error.InputChanged;
                 if (!std.meta.eql(now, expected)) return error.InputChanged;
                 try local_fs.rename(self.path(), target);
-                self.target = null;
+                try self.published(parent);
                 return;
             },
             else => return err,
@@ -103,7 +108,16 @@ pub const OutputPublication = struct {
             return error.InputChanged;
         }
         local_fs.removeFile(self.path());
+        try self.published(parent);
+    }
+
+    fn published(self: *OutputPublication, parent: ?local_fs.fd_t) !void {
+        // Rename has published: abort must not remove a staging name recreated by another writer after this point.
         self.target = null;
+        if (parent) |fd| {
+            if (@import("builtin").is_test) if (self.fail_parent_sync) |err| return err;
+            try local_fs.syncDirectory(fd);
+        }
     }
 
     fn exchangeBack(self: *OutputPublication, target: []const u8) !void {
@@ -192,4 +206,32 @@ test "local publication syncs by default and permits an explicit opt out" {
     const opted_out: OutputPublication = .{ .fsync = false };
     try std.testing.expect(defaults.fsync);
     try std.testing.expect(!opted_out.fsync);
+}
+
+test "publication reports a post-rename directory sync error and preserves the published target" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const target = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/answer", .{tmp.sub_path});
+    for ([_]bool{ false, true }) |replacing| {
+        const old = try local_fs.createFile(target);
+        try local_fs.writeAll(old, "old");
+        local_fs.close(old);
+        const stamp = try local_fs.pathStamp(target);
+        var p: OutputPublication = .{ .fail_parent_sync = error.InputOutput };
+        _ = try p.prepare(t.io, target, &.{});
+        try local_fs.writeAll(p.fd.?, "new");
+        const result = if (replacing) p.commitReplacing(t.io, stamp) else p.commit(t.io);
+        try t.expectError(error.InputOutput, result);
+        p.abort();
+        const bytes = try local_fs.readFile(t.allocator, target);
+        defer t.allocator.free(bytes);
+        try t.expectEqualStrings("new", bytes);
+        var no_sync: OutputPublication = .{ .fsync = false, .fail_parent_sync = error.InputOutput };
+        _ = try no_sync.prepare(t.io, target, &.{});
+        try local_fs.writeAll(no_sync.fd.?, "opt-out");
+        try no_sync.commit(t.io);
+        no_sync.abort();
+    }
 }

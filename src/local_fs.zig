@@ -25,10 +25,28 @@ pub fn closeChecked(fd: fd_t) !void {
     }
 }
 
-/// Flush data and the metadata needed to read it before publication. Darwin has no fdatasync.
+/// Flush data and the metadata needed to read it before publication; Darwin also flushes the drive cache.
 pub fn syncData(fd: fd_t) !void {
+    return syncFd(fd, true);
+}
+
+pub fn syncDirectory(fd: fd_t) !void {
+    return syncFd(fd, false);
+}
+
+pub fn openParent(path: []const u8) !fd_t {
+    return posix.openat(posix.AT.FDCWD, std.fs.path.dirname(path) orelse ".", .{
+        .ACCMODE = .RDONLY,
+        .DIRECTORY = true,
+        .CLOEXEC = true,
+    }, 0);
+}
+
+fn syncFd(fd: fd_t, data_only: bool) !void {
     while (true) {
-        const rc = if (builtin.target.os.tag == .macos) posix.system.fsync(fd) else posix.system.fdatasync(fd);
+        const rc = if (builtin.target.os.tag == .macos)
+            posix.system.fcntl(fd, std.c.F.FULLFSYNC, @as(c_int, 0))
+        else if (data_only) posix.system.fdatasync(fd) else posix.system.fsync(fd);
         switch (posix.errno(rc)) {
             .SUCCESS => return,
             .INTR => continue,

@@ -63,7 +63,8 @@ pub const Error = error{
     error{ BadPageHeader, TruncatedPage, Overflow, ShortDecode } ||
     @import("../parquet/compression.zig").Error ||
     @import("../parquet/encoding/hybrid_rle.zig").Error ||
-    @import("../parquet/encoding/hybrid_rle.zig").LevelError;
+    @import("../parquet/encoding/hybrid_rle.zig").LevelError ||
+    @import("../parquet/column.zig").Error;
 
 /// The block copied bytes keep their offset modulo: a fixed 4 KiB, never the filesystem's block size, so the output's
 /// bytes do not depend on where it is written. It is the block size of every reflink filesystem's default format.

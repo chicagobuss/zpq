@@ -81,6 +81,7 @@ pub const Plan = struct {
             const ci = if (kept) |k| k[oi] else oi;
             const cm0 = first.rg.columns.items[ci].meta_data orelse return null;
             const elem = first.meta.getColumnSchema(cm0.path_in_schema.items) orelse return null;
+            if (schema.isFloat16(elem)) return null;
             col.* = .{ .ci = ci, .elem = elem, .maps = try a.alloc([]const u32, sources.len) };
             @memset(col.maps, &.{});
             var intern: std.StringHashMap(u32) = .init(a);
@@ -165,7 +166,7 @@ pub const Plan = struct {
                             }
                         }
                         if (ix) |x| if (pi < x.null_pages.items.len and pi < x.min_values.items.len and pi < x.max_values.items.len) {
-                            st = .{ .min_value = if (x.null_pages.items[pi]) null else x.min_values.items[pi], .max_value = if (x.null_pages.items[pi]) null else x.max_values.items[pi], .null_count = if (x.null_counts) |nc| if (pi < nc.items.len) nc.items[pi] else null else if (x.null_pages.items[pi]) @intCast(count) else null };
+                            st = .{ .min_value = if (x.null_pages.items[pi]) null else x.min_values.items[pi], .max_value = if (x.null_pages.items[pi]) null else x.max_values.items[pi], .null_count = if (x.null_counts) |nc| if (pi < nc.items.len) nc.items[pi] else null else if (x.null_pages.items[pi]) @intCast(count) else null, .nan_count = if (x.nan_counts) |nc| if (pi < nc.items.len) nc.items[pi] else null else null };
                         };
                         try col.pages.append(a, .{ .source = si, .offset = pos, .size = len, .header_len = r.pos, .header = h, .first_row = first_row + row, .rows = count, .stats = st });
                         row += count;
@@ -180,7 +181,7 @@ pub const Plan = struct {
             if (!stats_complete) col.statistics = null;
             if (col.statistics) |*st| {
                 st.distinct_count = null;
-                if (elem.type == .INT96) {
+                if (elem.type == .INT96 or elem.type == .FLOAT or elem.type == .DOUBLE) {
                     st.min = null;
                     st.max = null;
                     st.min_value = null;
@@ -196,7 +197,10 @@ pub const Plan = struct {
                 defer b.deinit(a);
                 for (col.entries.items) |entry| b.insert(bloom.hashBytes(if (cm0.type == .BYTE_ARRAY) entry[4..] else entry));
                 col.filter = try b.serialize(a);
-            } else if (has_filter) return null;
+            } else if (has_filter) {
+                const fpp = if (ci < opts.filter_fpp.len) opts.filter_fpp[ci] orelse 0.01 else 0.01;
+                col.filter = try rebuildFilter(a, sources, ci, fpp);
+            }
         }
         return .{ .sources = sources, .columns = columns, .rows = rows };
     }
@@ -274,6 +278,11 @@ pub const Plan = struct {
             if (chunk.column_index_out.len > 0) {
                 var r = thrift.Reader.init(chunk.column_index_out);
                 var ci = try schema.ColumnIndex.read(a, &r);
+                // Source page bounds remain valid, but no floating-point total ordering is inferred here.
+                if (col.elem.type == .FLOAT or col.elem.type == .DOUBLE) {
+                    ci.boundary_order = .UNORDERED;
+                    ci.nan_counts = null;
+                }
                 for (pages.items) |pg| if (pg.null_count < 0) {
                     ci.null_counts = null;
                     break;
@@ -282,11 +291,63 @@ pub const Plan = struct {
                 try ci.write(&w);
                 chunk.column_index_out = w.bytes();
             }
+            if (col.elem.type == .INT96) chunk.column_index_out = &.{};
             try columns.append(a, chunk);
         }
         return .{ .columns = columns, .num_rows = @intCast(p.rows), .total_byte_size = fast.uncompressedBytes(columns.items) };
     }
 };
+
+/// A filter union is unsafe if a source is missing or uses another bitset size. Decode only for rebuilding this
+/// optional filter; the original encoded value pages still go to the sink unchanged.
+fn rebuildFilter(a: std.mem.Allocator, sources: []const Source, ci: usize, fpp: f64) ![]const u8 {
+    var n: u64 = 0;
+    for (sources) |s| n += @intCast(s.rg.num_rows);
+    var builder = try bloom.Builder.init(a, n, fpp);
+    defer builder.deinit(a);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (sources) |s| {
+        _ = scratch.reset(.retain_capacity);
+        const sa = scratch.allocator();
+        const cm = s.rg.columns.items[ci].meta_data.?;
+        const range = fast.chunkRange(&cm, s.bytes.len) orelse return error.InvalidColumnOffsets;
+        const levels = s.meta.getColumnLevels(cm.path_in_schema.items);
+        switch (cm.type) {
+            inline else => |tag| {
+                const T = switch (tag) {
+                    .INT32 => i32,
+                    .INT64 => i64,
+                    .FLOAT => f32,
+                    .DOUBLE => f64,
+                    .BOOLEAN => bool,
+                    .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY, .INT96 => []const u8,
+                };
+                var reader = @import("../parquet/column.zig").ColumnChunkReader(T).init(s.bytes[range.start..][0..range.len], cm.codec, levels, sa);
+                if (T == []const u8) reader.type_length = if (tag == .INT96) 12 else if (tag == .FIXED_LEN_BYTE_ARRAY)
+                    @intCast((s.meta.getColumnSchema(cm.path_in_schema.items).?).type_length.?)
+                else
+                    0;
+                const leaves = try reader.readAll(@intCast(cm.num_values));
+                for (leaves.values, 0..) |v, i| {
+                    if (leaves.def_levels) |defs| if (defs[i] != @as(u32, @intCast(levels.max_def))) continue;
+                    const hash = if (T == []const u8) bloom.hashBytes(v) else blk: {
+                        var raw: [8]u8 = undefined;
+                        if (T == bool) {
+                            raw[0] = @intFromBool(v);
+                            break :blk bloom.hashBytes(raw[0..1]);
+                        }
+                        const U = @Int(.unsigned, @bitSizeOf(T));
+                        std.mem.writeInt(U, raw[0..@sizeOf(T)], @bitCast(v), .little);
+                        break :blk bloom.hashBytes(raw[0..@sizeOf(T)]);
+                    };
+                    builder.insert(hash);
+                }
+            },
+        }
+    }
+    return builder.serialize(a);
+}
 fn compatible(a: schema.SchemaElement, b: schema.SchemaElement) bool {
     return a.type == b.type and a.type_length == b.type_length and a.scale == b.scale and a.precision == b.precision and
         a.repetition_type == b.repetition_type and a.converted_type == b.converted_type and
@@ -570,5 +631,12 @@ test "coalesce Bloom unions and dictionary rebuilds cover every source value" {
             std.mem.writeInt(i32, &raw, v, .little);
             try std.testing.expect(bloom.mightContainScalar(bits, bloom.hashBytes(&raw)));
         }
+    }
+    sources[1] = try testSource(a, null, &.{ 30, 40 }, false, false);
+    const mixed = (try Plan.init(a, &sources, null, .{})).?;
+    for ([_]i32{ 10, 20, 30, 40 }) |v| {
+        var raw: [4]u8 = undefined;
+        std.mem.writeInt(i32, &raw, v, .little);
+        try std.testing.expect(bloom.mightContainScalar(bloom.bitset(mixed.columns[0].filter).?, bloom.hashBytes(&raw)));
     }
 }

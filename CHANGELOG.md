@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **q06-style composite GROUP BY with SUM is faster: dense keys sum straight into lanes.**
 - **Joins decode in L2-sized slices, and cold scans no longer stall on memory mapping.**
 - **Faster CSV aggregates.** A CSV aggregate's chunks parse into pooled per-worker arenas, fold without copies and drop their pages behind them, and a one-byte string's dictionary code is its byte.
 - **Joins keep a plain key plain.** A numeric build-side column stored PLAIN is no longer run through a dictionary just because the build's filter reads it.

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Native Windows x86_64: the CLI, Parquet reads and writes, S3 and TLS with system certificates, Unicode and verbatim (`\\?\`) paths, and a release zip.**
 - **Compaction coalesces small row groups by merging their pages, without re-encoding: DuckDB-like row groups at 2-4x DuckDB's speed.** Row groups already near the target are still byte-copied.
 - **Copy and compaction no longer add Bloom filters nobody asked for.**
 - **Fixed: statistics for variable-width BYTE_ARRAY DECIMAL were compared in the wrong byte order, which could make readers skip matching rows.** zpq now ignores BYTE_ARRAY DECIMAL statistics written by zpq before 0.6.0, on read, copy and recompression.

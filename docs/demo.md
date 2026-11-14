@@ -296,4 +296,6 @@ zpq fanout --endpoint http://127.0.0.1:9001 --workers 4 \
   --input s3://bucket/data.parquet --aggregate 'count(*) AS n, sum(amount) AS total'
 ```
 
-See [Lambda and S3](lambda-and-s3.md) for function versions, endpoint lists, splitting and merge semantics.
+For a fact/dimension aggregate, supply a `join` build description with `--request JSON`; each worker reads the
+bounded small side from S3 and joins its own fact split. See [Lambda and S3](lambda-and-s3.md) for the request,
+size limits, function versions, endpoint lists, splitting and merge semantics.

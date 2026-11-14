@@ -145,3 +145,12 @@ fn checkDepth(value: std.json.Value, depth: usize) error{PlanTooDeep}!void {
         else => {},
     }
 }
+
+/// Only the join engine binds the name-based build/probe description.
+pub fn decodeJoin(a: std.mem.Allocator, value: std.json.Value) !syntax.Join {
+    try checkDepth(value, 0);
+    return std.json.parseFromValueLeaky(syntax.Join, a, value, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidBoundPlan;
+    };
+}

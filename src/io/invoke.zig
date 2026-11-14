@@ -58,18 +58,18 @@ pub const Target = struct {
         }
         const r = region orelse return error.MissingRegion;
         if (r.len == 0) return error.MissingRegion;
-        var path = try std.fmt.allocPrint(a, "/2015-03-31/functions/{s}/invocations", .{try encode(a, name)});
+        var path = try std.fmt.allocPrint(a, "/2015-03-31/functions/{s}/invocations", .{try encode(a, name, false)});
         if (qualifier) |q| {
             if (q.len == 0) return error.InvalidFunction;
-            path = try std.fmt.allocPrint(a, "{s}?Qualifier={s}", .{ path, try encode(a, q) });
+            path = try std.fmt.allocPrint(a, "{s}?Qualifier={s}", .{ path, try encode(a, q, false) });
         }
         return .{ .region = r, .path = path };
     }
 };
-fn encode(a: A, raw: []const u8) ![]const u8 {
+fn encode(a: A, raw: []const u8, preserve_slashes: bool) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     for (raw) |ch| {
-        if (std.ascii.isAlphanumeric(ch) or std.mem.indexOfScalar(u8, "-_.~", ch) != null)
+        if (std.ascii.isAlphanumeric(ch) or std.mem.indexOfScalar(u8, "-_.~", ch) != null or (preserve_slashes and ch == '/'))
             try out.append(a, ch)
         else {
             const hex = "0123456789ABCDEF";
@@ -160,8 +160,10 @@ pub const Client = struct {
                 .body = body,
                 .total_ms = 900_000,
             }) catch |err| {
-                if (attempt == 0 and h.reused and (err == error.ClosedBeforeResponse or err == error.SendFailed))
+                if (attempt == 0 and h.reused and (err == error.ClosedBeforeResponse or err == error.SendFailed)) {
+                    self.pool.connections.noteRetry(self.io, .stale);
                     continue;
+                }
                 return err;
             };
             const close = if (response.header("Connection")) |v| std.ascii.eqlIgnoreCase(v, "close") else false;
@@ -183,7 +185,9 @@ pub const Client = struct {
             if (access.len == 0 or secret.len == 0) return error.MissingCredentials;
             const signer: SigV4 = .{ .region = region, .service = "lambda", .access_key = access, .secret_key = secret, .session_token = envValue(self.env, "AWS_SESSION_TOKEN") };
             const q = std.mem.indexOfScalar(u8, endpoint.path, '?') orelse endpoint.path.len;
-            const signed = try signer.sign(a, "POST", endpoint.authority, endpoint.path[0..q], if (q < endpoint.path.len) endpoint.path[q + 1 ..] else null, &.{.{ .name = "Content-Type", .value = "application/json" }}, body, .{});
+            // The shared S3 signer takes a canonical URI verbatim; Lambda escapes the wire path again.
+            const canonical_path = try encode(a, endpoint.path[0..q], true);
+            const signed = try signer.sign(a, "POST", endpoint.authority, canonical_path, if (q < endpoint.path.len) endpoint.path[q + 1 ..] else null, &.{.{ .name = "Content-Type", .value = "application/json" }}, body, .{});
             const out = try a.alloc(http.Header, signed.len);
             for (signed, out) |s, *d| d.* = .{ .name = s.name, .value = s.value };
             return out;
@@ -200,4 +204,15 @@ test "fanout invoke: preserve account region and qualifier" {
     try std.testing.expectEqualStrings("/2015-03-31/functions/arn%3Aaws%3Alambda%3Aeu-west-1%3A222222222222%3Afunction%3Aworker/invocations?Qualifier=7", target.path);
     const partial = try Target.init(arena.allocator(), "222222222222:function:worker:7", "eu-west-1");
     try std.testing.expectEqualStrings("/2015-03-31/functions/222222222222%3Afunction%3Aworker/invocations?Qualifier=7", partial.path);
+}
+
+test "fanout invoke: Lambda canonical ARN URI is escaped again, wire URI stays single encoded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const target = try Target.init(a, "123456789012:function:worker:7", "us-west-2");
+    const q = std.mem.indexOfScalar(u8, target.path, '?').?;
+    try std.testing.expectEqualStrings("/2015-03-31/functions/123456789012%253Afunction%253Aworker/invocations", try encode(a, target.path[0..q], true));
+    try std.testing.expectEqualStrings("/2015-03-31/functions/123456789012%3Afunction%3Aworker/invocations?Qualifier=7", target.path);
+    try std.testing.expectEqualStrings("/plain/path", try encode(a, "/plain/path", true));
 }

@@ -15,6 +15,7 @@ const local_fs = @import("../local_fs.zig");
 const Diag = @import("../core/diag.zig").Diag;
 const plans = @import("bound_plan.zig");
 const types = @import("types.zig");
+const s3 = @import("../io/s3.zig");
 
 /// Footers of the local files a join names, for the SQL frontend's binder (`sql_parser.parseSqlJoinPlan`). Each is
 /// read once; the build reads its file again here (`prepare`). The plan the binder returns borrows nothing of them, so
@@ -29,7 +30,7 @@ pub const LocalSchemas = struct {
         if (self.seen.get(path)) |m| return m;
         try self.maps.ensureUnusedCapacity(self.arena, 1);
         const opened = try open(self.arena, path);
-        self.maps.appendAssumeCapacity(opened.map);
+        self.maps.appendAssumeCapacity(opened.map.?);
         const m = try self.arena.create(schema.FileMetaData);
         m.* = opened.meta;
         try self.seen.put(self.arena, path, m);
@@ -43,14 +44,14 @@ pub const LocalSchemas = struct {
     }
 };
 
-const Opened = struct { map: local_fs.Mapped, meta: schema.FileMetaData };
+const Opened = struct { map: ?local_fs.Mapped, bytes: []const u8, meta: schema.FileMetaData };
 
 /// Builds read local files in this release: a build on S3 refuses, naming it. The caller owns the mapping.
 fn open(arena: std.mem.Allocator, path: []const u8) !Opened {
     if (std.mem.startsWith(u8, path, "s3://")) return error.JoinNotLocal;
     const m = try local_fs.mapFile(path);
     errdefer m.unmap();
-    return .{ .map = m, .meta = try metadata.open(arena, m.bytes) };
+    return .{ .map = m, .bytes = m.bytes, .meta = try metadata.open(arena, m.bytes) };
 }
 
 /// What `--explain` says of a join: copied out of the builds, which the query's end releases.
@@ -197,6 +198,9 @@ pub const Prepared = struct {
     /// builds' structures and dictionaries in `store`, their decode scratch beside it, the group-join's slots and
     /// partials. A build that does not fit refuses while it builds, not after.
     charge: core_memory.Charged = undefined,
+    replica_limit: ?usize = null,
+    replica_budget: core_memory.SharedBudget = undefined,
+    replica_charge: core_memory.Charged = undefined,
     /// The top-level builds, each with what it holds (`Task`): released together.
     tasks: []Task = &.{},
     order: expr_ast.ResultOrder,
@@ -499,6 +503,8 @@ fn semiKind(s: syntax.Semi) lookup.Kind {
 /// for the query: virtual leaves bind by the payloads' names, which the build footers own.
 const Task = struct {
     p: *Prepared,
+    ctx: types.Context,
+    snapshot: std.crypto.hash.sha2.Sha256 = .init(.{}),
     threads: usize,
     fk: []const u8,
     build: syntax.Build,
@@ -532,11 +538,11 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind) !Leaf {
     const p = t.p;
     const diag = &t.diag;
     try t.maps.ensureUnusedCapacity(arena, 1);
-    const file = open(arena, b.path) catch |err| {
+    const file = (if (p.replica_limit != null) openReplica(t, b.path) else open(arena, b.path)) catch |err| {
         Diag.setInput(diag, b.path, err);
         return err;
     };
-    t.maps.appendAssumeCapacity(file.map);
+    if (file.map) |m| t.maps.appendAssumeCapacity(m);
     const meta = try arena.create(schema.FileMetaData);
     meta.* = file.meta;
     var filter: ?filter_ast.Filter = if (b.filter) |f| try filters.bindSyntax(arena, f, meta, diag) else null;
@@ -561,7 +567,7 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind) !Leaf {
         return err;
     };
     const before = t.store.capacity();
-    const j = lookup.build(t.store.allocator(), p.charge.allocator(), file.map.bytes, meta, .{
+    const j = lookup.build(t.store.allocator(), p.charge.allocator(), file.bytes, meta, .{
         .kind = kind,
         .build_name = b.path,
         .key_name = b.key,
@@ -587,7 +593,7 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind) !Leaf {
         };
     }
     // The build read its file whole: one that changed meanwhile refuses, as a scanned input does.
-    file.map.intact(b.path) catch |err| {
+    if (file.map) |m| m.intact(b.path) catch |err| {
         Diag.setInput(diag, b.path, err);
         return err;
     };
@@ -597,10 +603,11 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind) !Leaf {
 }
 
 /// Read every build of `args`' join; null for a query without one. The probe's inputs must be local files too.
-pub fn prepare(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: types.QueryArgs, ledger: *core_memory.SharedBudget) !?*Prepared {
+pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryArgs, ledger: *core_memory.SharedBudget) !?*Prepared {
+    const gpa = ctx.gpa;
     const source = args.plan_source orelse return null;
     const sj = source.join orelse return null;
-    for (args.inputs) |path| if (std.mem.startsWith(u8, path, "s3://")) {
+    for (args.inputs) |path| if (args.replicated_join_limit == null and std.mem.startsWith(u8, path, "s3://")) {
         Diag.setInput(args.diag, path, null);
         return error.JoinNotLocal;
     };
@@ -608,18 +615,23 @@ pub fn prepare(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: types.Que
     const p = try arena.create(Prepared);
     p.* = .{ .main = undefined, .semis = &.{}, .ledger = ledger, .gpa = gpa, .order = args.result_order };
     p.charge = .{ .child = gpa, .budget = ledger };
+    p.replica_limit = args.replicated_join_limit;
+    p.replica_budget = .{ .limit = args.replicated_join_limit orelse ledger.limit, .parent = ledger };
+    p.replica_charge = .{ .child = gpa, .budget = &p.replica_budget };
+    const retained = if (p.replica_limit != null) p.replica_charge.allocator() else p.charge.allocator();
     // No group-join exists before the probe binds.
     errdefer p.releaseBuilds();
     // The main build, the probe's SEMI joins, then a star's dimensions: one task each.
     const tasks = try arena.alloc(Task, 1 + sj.semis.len + sj.dims.len);
     const task: Task = .{
         .p = p,
+        .ctx = ctx,
         .threads = threads,
         .fk = undefined,
         .build = undefined,
         .kind = undefined,
-        .arena = .init(gpa),
-        .store = .init(p.charge.allocator()),
+        .arena = .init(if (p.replica_limit != null) retained else gpa),
+        .store = .init(retained),
     };
     // A copy of an arena or a store that has allocated nothing is a fresh one.
     for (tasks) |*t| t.* = task;
@@ -648,9 +660,15 @@ pub fn prepare(gpa: std.mem.Allocator, arena: std.mem.Allocator, args: types.Que
             d.cause = t.diag.cause;
             d.detail = t.diag.detail;
         }
+        // S3 wraps allocator failures (including signing scratch) as transport errors.
+        if (p.replica_limit != null and p.replica_charge.refused.load(.monotonic)) {
+            if (args.diag) |d| d.cause = error.JoinBuildExceedsBudget;
+            return error.JoinBuildExceedsBudget;
+        }
         return err;
     };
     for (tasks) |t| p.charged += t.charged;
+    if (p.replica_limit != null) p.charged = p.replica_budget.used.load(.monotonic);
     p.main = tasks[0].leaf;
     p.main.join.main = true;
     p.main.join.publishes = true;
@@ -699,4 +717,50 @@ test "a build store gives each large array its own allocation and frees it all" 
     defer list.deinit(a);
     for (0..3 * Store.large_bytes) |i| try list.append(a, @truncate(i));
     try std.testing.expectEqual(@as(u8, @truncate(3 * Store.large_bytes - 1)), list.items[list.items.len - 1]);
+}
+
+/// A single bounded GET holds one immutable dimension generation. Its bytes and lookup share the replica cap.
+fn openReplica(t: *Task, path: []const u8) !Opened {
+    if (!std.mem.startsWith(u8, path, "s3://")) return error.ReplicatedJoinNeedsS3;
+    const limit = t.p.replica_limit.?;
+    if (limit == 0) return error.JoinBuildExceedsBudget;
+    const a = t.store.allocator();
+    const creds = try s3.Credentials.fromEnv(t.ctx.env);
+    const response = try s3.get(a, creds, try s3.Url.parse(path), .span(0, limit - 1));
+    if (response.status != 200 and response.status != 206) return error.JoinBuildReadFailed;
+    const size = if (response.status == 206) blk: {
+        const range = response.header("Content-Range") orelse return error.JoinBuildNoSnapshot;
+        const slash = std.mem.lastIndexOfScalar(u8, range, '/') orelse return error.JoinBuildNoSnapshot;
+        break :blk try std.fmt.parseInt(u64, range[slash + 1 ..], 10);
+    } else response.body.len;
+    if (size > limit) return error.JoinBuildExceedsBudget;
+    if (size != response.body.len) return error.JoinIncompleteBuild;
+    const etag = response.header("ETag") orelse return error.JoinBuildNoSnapshot;
+    if (etag.len == 0 or std.mem.startsWith(u8, etag, "W/")) return error.JoinBuildNoSnapshot;
+    const origin = creds.endpoint orelse creds.region;
+    snapshotWord(&t.snapshot, origin.len);
+    t.snapshot.update(origin);
+    snapshotWord(&t.snapshot, path.len);
+    t.snapshot.update(path);
+    snapshotWord(&t.snapshot, etag.len);
+    t.snapshot.update(etag);
+    snapshotWord(&t.snapshot, size);
+    return .{ .map = null, .bytes = response.body, .meta = try metadata.open(t.arena.allocator(), response.body) };
+}
+fn snapshotWord(hash: *std.crypto.hash.sha2.Sha256, n: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, n, .little);
+    hash.update(&bytes);
+}
+
+/// A replicated dimension generation is part of partial agreement, alongside the probe's value schema.
+pub fn replicaFingerprint(p: *const Prepared, schema_fingerprint: [16]u8) [16]u8 {
+    if (p.replica_limit == null) return schema_fingerprint;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(&schema_fingerprint);
+    for (p.tasks) |task| {
+        var snapshot = task.snapshot;
+        hash.update(&snapshot.finalResult());
+    }
+    return hash.finalResult()[0..16].*;
 }

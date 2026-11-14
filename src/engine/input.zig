@@ -452,6 +452,8 @@ const RemoteInputs = struct {
         };
         const metas_for_plan = try self.arena.alloc(schema.FileMetaData, specs.len);
         for (specs, metas_for_plan) |sp, *m| m.* = sp.meta;
+        // Fetch planning binds the same virtual columns as the scan, without changing cached raw footers.
+        if (self.args.join) |j| for (metas_for_plan) |*m| try j.extend(self.arena, m);
 
         // Bloom filters first: what they prove lands on the footers' chunks, so the plan below and the scan workers
         // after it prune the same row groups.

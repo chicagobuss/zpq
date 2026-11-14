@@ -326,7 +326,7 @@ fn executeAggregateOver(
     defer if (args_in.profiler) |p| p.noteLedger(ledger.peak.load(.monotonic), args_in.max_memory);
     // A join reads its builds first, on this ledger; the probe binds against footers given the build columns.
     var args = args_in;
-    const joined = try engine_join.prepare(ctx.gpa, arena, args_in, &ledger);
+    const joined = try engine_join.prepare(ctx, arena, args_in, &ledger);
     // A process about to exit leaves the builds to it, as the scan leaves its tables (`leave_regions`): unmapping a
     // large dimension's arrays is serial time the exit would only repeat. Builds that check for leaks free them.
     defer if (joined) |j| if (!ctx.exit_after or std.debug.runtime_safety) j.release();
@@ -532,7 +532,10 @@ fn executeAggregateOver(
             try o.intact();
         }
     }.check };
-    const fingerprint = if (metas) |ms| if (ms.len > 0) metadata.valuesFingerprint(ms[0].schema.items) else null else null;
+    var fingerprint = if (metas) |ms| if (ms.len > 0) metadata.valuesFingerprint(ms[0].schema.items) else null else null;
+    if (joined) |j| if (fingerprint) |fp| {
+        fingerprint = engine_join.replicaFingerprint(j, fp);
+    };
     return answerAggregate(ctx, arena, args, &r, &ledger, &t, probed, intact, fingerprint);
 }
 

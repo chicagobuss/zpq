@@ -86,7 +86,7 @@ pub fn partialPayload(a: A, request: V, part: Split) ![]const u8 {
     var top = object();
     for (request.object.keys(), request.object.values()) |key, value| {
         var omit = false;
-        for ([_][]const u8{ "inputs", "aggregate", "group_by", "filter", "sql", "row_groups", "operation", "plan_version", "plan" }) |k| {
+        for ([_][]const u8{ "inputs", "aggregate", "group_by", "filter", "sql", "row_groups", "operation", "plan_version", "plan", "join" }) |k| {
             if (std.mem.eql(u8, key, k)) omit = true;
         }
         if (!omit) try put(a, &top, key, value);
@@ -104,10 +104,11 @@ pub fn partialPayload(a: A, request: V, part: Split) ![]const u8 {
     try put(a, &partial, "inputs", urls);
     try put(a, &partial, "row_groups", ranges);
     try put(a, &partial, "aggregate", try member(request, "aggregate"));
-    for ([_][]const u8{ "group_by", "filter" }) |key| {
+    for ([_][]const u8{ "group_by", "filter", "join" }) |key| {
         if (request.object.get(key)) |v| try put(a, &partial, key, v);
     }
-    try put(a, &top, "operation", text("partial_aggregate"));
+    const joined = if (request.object.get("join")) |v| v != .null else false;
+    try put(a, &top, "operation", text(if (joined) "partial_join_aggregate" else "partial_aggregate"));
     try put(a, &top, "plan_version", try number(a, 1));
     try put(a, &top, "partial", partial);
     return std.json.Stringify.valueAlloc(a, top, .{});
@@ -118,7 +119,7 @@ fn checkWorker(answer: V) !void {
     if (answer.object.get("error") == null) return;
     const reason = answer.object.get("reason") orelse return error.WorkerFailed;
     if (reason != .string) return error.WorkerFailed;
-    inline for (.{ error.SchemaMismatch, error.PlanMismatch, error.RowGroupOutOfRange, error.UnmergeableAggregate, error.UnsupportedPlanVersion, error.ConflictingPlanFields, error.PlanTooDeep, error.InvalidBoundPlan, error.JoinNotLocal, error.MemoryLimitExceeded }) |err| {
+    inline for (.{ error.SchemaMismatch, error.PlanMismatch, error.RowGroupOutOfRange, error.UnmergeableAggregate, error.UnsupportedPlanVersion, error.ConflictingPlanFields, error.PlanTooDeep, error.InvalidBoundPlan, error.JoinNotLocal, error.MemoryLimitExceeded, error.JoinBuildExceedsBudget, error.ReplicatedJoinNeedsS3, error.JoinBuildReadFailed, error.JoinBuildNoSnapshot, error.JoinIncompleteBuild, error.JoinBuildNotUnique, error.DuplicateBuildKey, error.JoinKeyType, error.JoinPayloadType, error.ExceededMemoryBudget }) |err| {
         if (std.mem.eql(u8, reason.string, @errorName(err))) return err;
     }
     if (std.mem.eql(u8, reason.string, "MissingField")) return error.WorkerLacksPartialAggregate;
@@ -249,6 +250,16 @@ pub fn merge(a: A, answers: []const V) !V {
     try agree(a, answers);
     const aggs = try array(try member(answers[0], "aggregates"));
     const groups = try array(try member(answers[0], "groups"));
+    for (groups) |group| _ = try string(group);
+    for (aggs) |agg| {
+        const function = try string(try member(agg, "function"));
+        _ = try string(try member(agg, "name"));
+        var supported = false;
+        for ([_][]const u8{ "count", "sum", "min", "max", "avg" }) |name| {
+            if (std.mem.eql(u8, function, name)) supported = true;
+        }
+        if (!supported) return error.UnsupportedMergeFunction;
+    }
     if (groups.len == 0) {
         var acc = object();
         for (answers) |answer| try fold(a, &acc, try member(answer, "agg"), aggs);
@@ -308,36 +319,43 @@ pub const Options = struct {
     limit: ?usize = null,
 };
 
+pub const InvokeStat = struct { issue_ns: i64 = 0, elapsed_ns: i64 = 0, request_bytes: usize = 0, response_bytes: usize = 0 };
+pub const ScatterResult = struct { answers: []V, stats: []InvokeStat, decode_ns: i64 };
+
 const Slot = struct {
     arena: std.heap.ArenaAllocator,
     payload: []const u8,
     response: ?[]const u8 = null,
     failure: ?anyerror = null,
+    stat: InvokeStat = .{},
 };
 const Scatter = struct {
     transport: Transport,
     slots: []Slot,
+    started_ns: i64,
     cursor: std.atomic.Value(usize) = .init(0),
     fn work(self: *Scatter) void {
         while (true) {
             const i = self.cursor.fetchAdd(1, .monotonic);
             if (i >= self.slots.len) return;
             const slot = &self.slots[i];
+            const begin_ns = @import("../clock.zig").monoNs();
             slot.response = self.transport.invoke(self.transport.ctx, slot.arena.allocator(), i, slot.payload) catch |err| {
                 slot.failure = err;
                 continue;
             };
+            slot.stat = .{ .issue_ns = begin_ns - self.started_ns, .elapsed_ns = @import("../clock.zig").monoNs() - begin_ns, .request_bytes = slot.payload.len, .response_bytes = slot.response.?.len };
         }
     }
 };
 
 /// a is query scratch; backing is a thread-safe, ledger-charged allocator for independent invoke arenas.
-pub fn scatter(a: A, backing: A, transport: Transport, payloads: []const []const u8, concurrency: usize) ![]V {
+pub fn scatter(a: A, backing: A, transport: Transport, payloads: []const []const u8, concurrency: usize) !ScatterResult {
     if (concurrency == 0) return error.NoWorkersOrInputs;
     const slots = try a.alloc(Slot, payloads.len);
     for (slots, payloads) |*slot, payload| slot.* = .{ .arena = .init(backing), .payload = payload };
     defer for (slots) |*slot| slot.arena.deinit();
-    var state: Scatter = .{ .transport = transport, .slots = slots };
+    var state: Scatter = .{ .transport = transport, .slots = slots, .started_ns = @import("../clock.zig").monoNs() };
     const threads = try a.alloc(std.Thread, @min(concurrency, payloads.len));
     var started: usize = 0;
     // A spawn failure still joins every thread holding a pointer into this stack frame.
@@ -348,8 +366,11 @@ pub fn scatter(a: A, backing: A, transport: Transport, payloads: []const []const
     }
     for (threads[0..started]) |thread| thread.join();
     started = 0;
+    const decode_started_ns = @import("../clock.zig").monoNs();
     const answers = try a.alloc(V, slots.len);
-    for (slots, answers) |slot, *answer| {
+    const stats = try a.alloc(InvokeStat, slots.len);
+    for (slots, answers, stats) |slot, *answer, *stat| {
+        stat.* = slot.stat;
         if (slot.failure) |err| return err;
         // parse alloc_always detaches strings from the soon-to-be-freed response arena.
         answer.* = try std.json.parseFromSliceLeaky(V, a, slot.response.?, .{
@@ -357,7 +378,7 @@ pub fn scatter(a: A, backing: A, transport: Transport, payloads: []const []const
             .allocate = .alloc_always,
         });
     }
-    return answers;
+    return .{ .answers = answers, .stats = stats, .decode_ns = @import("../clock.zig").monoNs() - decode_started_ns };
 }
 
 const Order = struct { name: []const u8, desc: bool };
@@ -419,15 +440,22 @@ pub fn order(a: A, value: *V, order_by: ?[]const u8, limit: ?usize) !void {
 }
 
 pub fn run(a: A, backing: A, transport: Transport, request: V, opts: Options) !V {
+    const plan_started_ns = @import("../clock.zig").monoNs();
     if (opts.workers == 0 or opts.concurrency == 0 or opts.concurrency > 256) return error.NoWorkersOrInputs;
-    if (request != .object or request.object.get("sql") != null or request.object.get("row_groups") != null)
-        return error.UnsupportedFanoutQuery;
+    if (request != .object) return error.UnsupportedFanoutQuery;
+    for ([_][]const u8{ "sql", "row_groups" }) |key| if (request.object.get(key)) |v| {
+        if (v != .null) return error.UnsupportedFanoutQuery;
+    };
     const inputs = try array(try member(request, "inputs"));
     if (inputs.len == 0) return error.NoWorkersOrInputs;
-    _ = try string(try member(request, "aggregate"));
+    const aggregate = try string(try member(request, "aggregate"));
+    if (std.mem.trim(u8, aggregate, " \t\r\n").len == 0) return error.EmptyAggregate;
     var patterned = false;
     for (inputs) |url| if (std.mem.indexOfScalar(u8, try string(url), '*') != null) {
         patterned = true;
+    };
+    if (patterned) if (request.object.get("join")) |v| {
+        if (v != .null) return error.JoinGlobNotSupported;
     };
     var payloads: std.ArrayList([]const u8) = .empty;
     var prepared: ?V = null;
@@ -490,7 +518,8 @@ pub fn run(a: A, backing: A, transport: Transport, request: V, opts: Options) !V
         for (try split(a, counts, opts.workers)) |part| try payloads.append(a, try partialPayload(a, request, part));
     }
     const planned_ns = @import("../clock.zig").monoNs();
-    const answers = try scatter(a, backing, transport, payloads.items, opts.concurrency);
+    const scattered = try scatter(a, backing, transport, payloads.items, opts.concurrency);
+    const answers = scattered.answers;
     const scattered_ns = @import("../clock.zig").monoNs();
     // Structured-plan responses predate partial metadata: attach the preparation's merge contract.
     if (prepared) |p| for (answers) |*answer| {
@@ -506,6 +535,8 @@ pub fn run(a: A, backing: A, transport: Transport, request: V, opts: Options) !V
     var out = object();
     try put(a, &out, "agg", result);
     try put(a, &out, "workers", try number(a, answers.len));
+    try put(a, &out, "plan_ms", .{ .float = @as(f64, @floatFromInt(planned_ns - plan_started_ns)) / 1e6 });
+    try put(a, &out, "decode_ms", .{ .float = @as(f64, @floatFromInt(scattered.decode_ns)) / 1e6 });
     try put(a, &out, "scatter_ms", .{ .float = @as(f64, @floatFromInt(scattered_ns - planned_ns)) / 1e6 });
     try put(a, &out, "merge_ms", .{ .float = @as(f64, @floatFromInt(@import("../clock.zig").monoNs() - scattered_ns)) / 1e6 });
     try put(a, &out, "footer_ms", if (patterned) .null else .{ .integer = 0 });
@@ -514,7 +545,14 @@ pub fn run(a: A, backing: A, transport: Transport, request: V, opts: Options) !V
     for (payloads.items) |payload| payload_bytes += payload.len;
     try put(a, &out, "request_bytes", try number(a, payload_bytes));
     try put(a, &out, "protocol", text(if (patterned) "plan" else "partial"));
-    try put(a, &out, "worker_stats", .{ .array = std.json.Array.fromOwnedSlice(a, answers) });
+    var stats = seq(a);
+    var response_bytes: usize = 0;
+    for (answers, scattered.stats) |answer, stat| {
+        try stats.array.append(try workerStats(a, answer, stat));
+        response_bytes += stat.response_bytes;
+    }
+    try put(a, &out, "response_bytes", try number(a, response_bytes));
+    try put(a, &out, "worker_stats", stats);
     return out;
 }
 
@@ -614,4 +652,69 @@ test "fanout: only explicit immutable transport acknowledgement is cached; bool 
     try std.testing.expectEqual(4, mock.caps.load(.monotonic));
     mock.bad = true;
     try std.testing.expectError(error.UnsupportedPlanVersion, run(alloc, std.heap.smp_allocator, .{ .ctx = &mock, .invoke = Mock.invoke }, req, .{ .workers = 1 }));
+}
+
+fn workerStats(a: A, answer: V, measured: InvokeStat) !V {
+    var stats = object();
+    for ([_][]const u8{ "total_ms", "rows_in", "bytes_in", "row_groups_in", "files_in", "wall_ms", "worker_ms" }) |key| {
+        try put(a, &stats, key, answer.object.get(key) orelse .null);
+    }
+    const total = answer.object.get("total_ms") orelse .null;
+    try put(a, &stats, "duration_ms", total);
+    var billed: V = .null;
+    if (total != .null) {
+        if (total != .number_string) return error.InvalidWorkerResponse;
+        const ms = try std.fmt.parseFloat(f64, total.number_string);
+        if (!std.math.isFinite(ms) or ms < 0 or ms >= @as(f64, @floatFromInt(std.math.maxInt(u64))))
+            return error.InvalidWorkerResponse;
+        billed = try number(a, @as(u64, @intFromFloat(@ceil(ms))));
+    }
+    try put(a, &stats, "billed_ms", billed);
+    try put(a, &stats, "issue_ms", .{ .float = @as(f64, @floatFromInt(measured.issue_ns)) / 1e6 });
+    try put(a, &stats, "invoke_ms", .{ .float = @as(f64, @floatFromInt(measured.elapsed_ns)) / 1e6 });
+    try put(a, &stats, "request_bytes", try number(a, measured.request_bytes));
+    try put(a, &stats, "response_bytes", try number(a, measured.response_bytes));
+    return stats;
+}
+
+test "fanout: worker statistics retain cost and phase counters without partial rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const answer = try parse(a, "{\"total_ms\":12.2,\"rows_in\":9,\"agg\":[{\"_g0\":\"large result\"}],\"wall_ms\":{\"fetch\":1}}");
+    const stats = try workerStats(a, answer, .{ .issue_ns = 2_000_000, .elapsed_ns = 25_000_000, .request_bytes = 30, .response_bytes = 40 });
+    try std.testing.expect(stats.object.get("agg") == null);
+    try std.testing.expectEqual(@as(i256, 13), (try Decimal.read(try member(stats, "billed_ms"))).coefficient);
+    try std.testing.expectEqual(@as(f64, 25), (try member(stats, "invoke_ms")).float);
+    try std.testing.expectEqual(@as(f64, 2), (try member(stats, "issue_ms")).float);
+    try std.testing.expectEqualStrings("9", (try member(stats, "rows_in")).number_string);
+    try std.testing.expect((try member(stats, "wall_ms")) == .object);
+}
+
+test "fanout: a legacy worker must not silently ignore a replicated join" {
+    const Old = struct {
+        fn invoke(_: *anyopaque, a: A, _: usize, bytes: []const u8) ![]const u8 {
+            const req = try parse(a, bytes);
+            if (req.object.get("inputs") != null) return error.OldWorkerOpenedInput;
+            if (std.mem.eql(u8, (try member(req, "operation")).string, "partial_aggregate")) {
+                // A legacy aggregate worker would execute this count while ignoring the unknown join member.
+                return a.dupe(u8, "{\"partial_version\":1,\"schema_fingerprint\":\"s\",\"plan_digest\":\"p\",\"groups\":[],\"aggregates\":[{\"function\":\"count\",\"name\":\"n\"}],\"agg\":{\"_a0\":100}}");
+            }
+            return a.dupe(u8, "{\"error\":\"bad_json\",\"reason\":\"BadFieldType\",\"field\":\"operation\"}");
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ctx: u8 = 0;
+    const req = try parse(a, "{\"inputs\":[\"missing.parquet\"],\"aggregate\":\"count(*) AS n\",\"join\":{\"kind\":\"inner\",\"fk\":\"k\",\"build\":{\"path\":\"s3://b/d\",\"key\":\"k\"}}}");
+    try std.testing.expectError(error.WorkerRefused, run(a, std.heap.smp_allocator, .{ .ctx = &ctx, .invoke = Old.invoke }, req, .{ .workers = 1 }));
+}
+
+test "fanout: empty grouped answers cannot acknowledge an unsupported merge function" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const answer = try parse(a, "{\"partial_version\":1,\"schema_fingerprint\":\"s\",\"plan_digest\":\"p\",\"groups\":[\"k\"],\"aggregates\":[{\"function\":\"median\",\"name\":\"m\"}],\"agg\":[]}");
+    try std.testing.expectError(error.UnsupportedMergeFunction, merge(a, &.{answer}));
 }

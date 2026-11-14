@@ -10,7 +10,16 @@ pub const plan_version = 1;
 /// `partial_aggregate`: the worker prepares the aggregate itself and answers its partial with what the coordinator
 /// merges by and checks (`handler.zig`); its inputs and query ride in the `partial` object.
 pub const partial_version = 1;
-pub const Operation = enum { query, capabilities, prepare_aggregate, partial_aggregate };
+pub const Operation = enum {
+    query,
+    capabilities,
+    prepare_aggregate,
+    partial_aggregate,
+    partial_join_aggregate,
+    pub fn isPartial(self: Operation) bool {
+        return self == .partial_aggregate or self == .partial_join_aggregate;
+    }
+};
 
 pub const Error = error{
     /// A known field holds the wrong JSON type; `Request.parse` names it.
@@ -58,15 +67,17 @@ const Wire = struct {
     row_group_bytes: ?std.json.Value = null,
     row_groups: ?std.json.Value = null,
     partial: ?std.json.Value = null,
+    join: ?std.json.Value = null,
 };
 
 /// The fields `partial_aggregate` takes inside its `partial` object, and only there. A worker that predates the
 /// operation finds no `inputs`, `s3_url` or `sql` at the top level and refuses the request before opening anything.
-const partial_fields = .{ "inputs", "s3_url", "row_groups", "aggregate", "group_by", "filter" };
+const partial_fields = .{ "inputs", "s3_url", "row_groups", "aggregate", "group_by", "filter", "join" };
 
 pub const Request = struct {
     operation: Operation = .query,
     plan: ?std.json.Value = null,
+    join: ?std.json.Value = null,
     parsed: std.json.Parsed(Wire),
     sql: ?[]const u8 = null,
     parallelism: usize = 0,
@@ -132,7 +143,7 @@ pub const Request = struct {
         const version = if (parsed.value.plan_version) |v| (if (v == .null) null else v) else null;
         if (version) |v| {
             if (v != .integer or v.integer != plan_version) return error.UnsupportedPlanVersion;
-        } else if (req.operation == .prepare_aggregate or req.operation == .partial_aggregate or has_plan)
+        } else if (req.operation == .prepare_aggregate or req.operation.isPartial() or has_plan)
             return error.UnsupportedPlanVersion;
         if (parsed.value.plan) |v| if (v != .null) {
             inline for (.{ "sql", "filter", "select", "aggregate", "group_by", "columns", "column_order" }) |name| {
@@ -143,7 +154,7 @@ pub const Request = struct {
         };
         // `partial_aggregate` reads its inputs and query from `partial` (`partial_fields`), which no other request has.
         var inner: Wire = .{};
-        const src: *const Wire = if (req.operation == .partial_aggregate) blk: {
+        const src: *const Wire = if (req.operation.isPartial()) blk: {
             inline for (partial_fields ++ .{ "sql", "plan", "select", "columns", "column_order", "output_url" }) |name| {
                 if (@field(parsed.value, name)) |v| if (v != .null) return error.ConflictingPlanFields;
             }
@@ -225,6 +236,10 @@ pub const Request = struct {
         req.select = try f.string("select");
         req.aggregate = try q.string("aggregate");
         req.group_by = try q.string("group_by");
+        req.join = if (src.join) |v| (if (v == .null) null else v) else null;
+        if (req.operation == .partial_join_aggregate) {
+            if (req.join == null or req.join.? != .object) return q.bad("join");
+        } else if (req.join != null) return error.ConflictingPlanFields;
         req.column_order = try f.string("column_order");
         req.scan_all = try f.boolean("scan_all");
         req.trust_stats = try f.boolean("trust_stats");
@@ -315,7 +330,7 @@ pub const Request = struct {
         }
         if (req.operation == .prepare_aggregate and (req.sql != null or req.select != null or req.columns != null or
             req.column_order != null or req.output_url != null or req.row_groups != null)) return error.ConflictingPlanFields;
-        if (req.operation == .partial_aggregate and (req.aggregate == null or req.aggregate.?.len == 0))
+        if (req.operation.isPartial() and (req.aggregate == null or req.aggregate.?.len == 0))
             return error.MissingField;
         return req;
     }

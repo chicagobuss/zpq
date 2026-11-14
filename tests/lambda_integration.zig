@@ -223,13 +223,17 @@ fn readUntilHeadersOrBody(allocator: std.mem.Allocator, fd: linux.fd_t) ![]u8 {
 /// Plain-HTTP, path-style S3 stand-in that serves one object under every key: ranged and conditional GETs on
 /// keep-alive connections, one thread per connection. With `idle_close_ms` > 0 it drops a connection left idle that
 /// long, the way S3 and the network path drop a pooled keep-alive socket while a Lambda sandbox is frozen.
-const FakeS3 = struct {
+pub const FakeS3 = struct {
     const MAX_CONNS = 256;
     const ETAG = "fake-etag";
 
     listen_fd: linux.fd_t,
     port: u16,
     object: []const u8,
+    secondary: ?[]const u8 = null,
+    changing_dimension: std.atomic.Value(bool) = .init(false),
+    dimension_generation: std.atomic.Value(u32) = .init(0),
+    reported_dimension_size: std.atomic.Value(u64) = .init(0),
     idle_close_ms: i32,
     accept_thread: std.Thread = undefined,
     conn_fds: [MAX_CONNS]linux.fd_t = @splat(-1),
@@ -240,6 +244,9 @@ const FakeS3 = struct {
     idle_closes: std.atomic.Value(u32) = .init(0),
 
     pub fn start(self: *FakeS3, object: []const u8, idle_close_ms: i32) !void {
+        return self.startPair(object, null, idle_close_ms);
+    }
+    pub fn startPair(self: *FakeS3, object: []const u8, secondary: ?[]const u8, idle_close_ms: i32) !void {
         const fd = try sysSocket();
         errdefer sysClose(fd);
         const yes: i32 = 1;
@@ -257,6 +264,7 @@ const FakeS3 = struct {
             .listen_fd = fd,
             .port = std.mem.bigToNative(u16, bound.port),
             .object = object,
+            .secondary = secondary,
             .idle_close_ms = idle_close_ms,
         };
         self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
@@ -314,7 +322,16 @@ const FakeS3 = struct {
 
     fn respond(self: *FakeS3, fd: linux.fd_t, head: []const u8) !void {
         _ = self.requests.fetchAdd(1, .monotonic);
-        const obj = self.object;
+        const first_line = head[0 .. std.mem.indexOf(u8, head, "\r\n") orelse head.len];
+        const dimension = std.mem.indexOf(u8, first_line, "/dimension.parquet") != null;
+        const obj = if (dimension) self.secondary orelse self.object else self.object;
+        const reported = if (dimension) self.reported_dimension_size.load(.acquire) else 0;
+        const total_size = if (reported != 0) reported else obj.len;
+        var etag_buffer: [64]u8 = undefined;
+        const etag = if (dimension and self.changing_dimension.load(.acquire))
+            try std.fmt.bufPrint(&etag_buffer, "generation-{d}", .{self.dimension_generation.fetchAdd(1, .monotonic)})
+        else
+            ETAG;
         var range: ?[]const u8 = null;
         var if_none_match: ?[]const u8 = null;
         var lines = std.mem.splitSequence(u8, head, "\r\n");
@@ -326,8 +343,8 @@ const FakeS3 = struct {
             if (std.ascii.eqlIgnoreCase(line[0..colon], "if-none-match")) if_none_match = value;
         }
         var hdr_buf: [256]u8 = undefined;
-        if (if_none_match) |v| if (std.mem.eql(u8, std.mem.trim(u8, v, "\""), ETAG)) {
-            return writeAllFd(fd, "HTTP/1.1 304 Not Modified\r\nETag: \"" ++ ETAG ++ "\"\r\n\r\n");
+        if (if_none_match) |v| if (std.mem.eql(u8, std.mem.trim(u8, v, "\""), etag)) {
+            return writeAllFd(fd, try std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 304 Not Modified\r\nETag: \"{s}\"\r\n\r\n", .{etag}));
         };
         var first: usize = 0;
         var end: usize = obj.len; // exclusive
@@ -341,11 +358,11 @@ const FakeS3 = struct {
                 if (dash + 1 < spec.len) end = @min(obj.len, try std.fmt.parseInt(usize, spec[dash + 1 ..], 10) + 1);
             }
             const hdr = try std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 206 Partial Content\r\nContent-Length: {d}\r\n" ++
-                "Content-Range: bytes {d}-{d}/{d}\r\nETag: \"" ++ ETAG ++ "\"\r\n\r\n", .{ end - first, first, end - 1, obj.len });
+                "Content-Range: bytes {d}-{d}/{d}\r\nETag: \"{s}\"\r\n\r\n", .{ end - first, first, end - 1, total_size, etag });
             try writeAllFd(fd, hdr);
         } else {
             const hdr = try std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n" ++
-                "ETag: \"" ++ ETAG ++ "\"\r\n\r\n", .{obj.len});
+                "ETag: \"{s}\"\r\n\r\n", .{ obj.len, etag });
             try writeAllFd(fd, hdr);
         }
         try writeAllFd(fd, obj[first..end]);
@@ -364,7 +381,7 @@ fn writeAllFd(fd: linux.fd_t, bytes: []const u8) !void {
 /// `path` with `pad` zero bytes spliced in before its footer. Column-chunk offsets are absolute, so they still point at
 /// the unmoved chunks and the file stays valid Parquet; the padding pushes every chunk out of the footer suffix zpq
 /// reads first (1 MiB unless `ZPQ_S3_FOOTER_PROBE` is set), so a query also runs the parallel range-fetch stage.
-fn paddedParquet(allocator: std.mem.Allocator, path: []const u8, pad: usize) ![]u8 {
+pub fn paddedParquet(allocator: std.mem.Allocator, path: []const u8, pad: usize) ![]u8 {
     const raw = try readFileSlice(allocator, path);
     defer allocator.free(raw);
     const footer_len = std.mem.readInt(u32, raw[raw.len - 8 ..][0..4], .little);

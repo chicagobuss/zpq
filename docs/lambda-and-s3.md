@@ -51,9 +51,34 @@ The same `zpq-lambda` binary coordinates events containing `"operation":"fanout"
 {"operation":"fanout","function":"zpq-worker:7","workers":32,"request":{"inputs":["s3://bucket/data.parquet"],"aggregate":"count(*) AS n"}}
 ```
 
-Events also accept `endpoints`, `sign_endpoints`, `region`, `counts`, `concurrency`, `order_by` and `limit`. The CLI accepts a complete
+Events also accept `endpoints`, `sign_endpoints`, `region`, `counts` (or `row_group_counts`), `concurrency`, `order_by` and `limit`. The CLI accepts a complete
 worker request as `--request JSON`. `zig build test-fanout -Doptimize=ReleaseSafe` exercises real worker processes
 behind localhost Runtime and Invoke APIs and compares answers with whole-query execution and DuckDB 2.0.0.
+
+Each response reports planning, scatter, decoding and merge time, transport connection counts and wait time, and
+per-worker issue offsets, Invoke time and request/response bytes. Worker statistics contain execution metadata;
+partial rows are consumed by the coordinator and omitted from its response.
+
+### Replicated small-side joins
+
+For fact/dimension queries, each worker can read the small side from S3 and join it against its assigned fact row
+groups. Pass the join description in `--request` (or the coordinator event's `request`):
+
+```json
+{"inputs":["s3://bucket/facts.parquet"],"aggregate":"count(*) AS n, sum(amount) AS total","group_by":"region","join":{"kind":"inner","fk":"customer_id","build":{"path":"s3://bucket/customers.parquet","key":"id","columns":["region"]}}}
+```
+
+The fact inputs must be explicit S3 paths; joins with glob inputs are refused. Every build input must also be S3.
+Inner and left joins require unique build keys; semi joins test membership, and anti joins use `NOT IN` NULL
+semantics. Keys must use the engine's integer-compatible key types. String and composite keys are not supported.
+The existing join description also accepts small-side stars. Geography, nation/region and similar dimension joins
+qualify when all build sides fit; large fact/fact and self joins require a different execution strategy.
+
+The worker caps retained build objects and lookup storage together at the smaller of 64 MiB and one eighth of its
+query memory budget. Oversized builds fail with `JoinBuildExceedsBudget`. Each object needs a strong ETag, and all
+workers must agree on build snapshots as well as the fact schema. A changed build generation fails the query.
+Workers use the versioned `partial_join_aggregate` operation so older workers refuse the request before reading
+inputs. No rows move between workers.
 
 S3 access: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION` (on Lambda, the execution
 role's). `S3_`-prefixed variables of the same names, plus `S3_ENDPOINT_URL`, take precedence and target S3-compatible

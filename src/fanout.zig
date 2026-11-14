@@ -16,6 +16,7 @@ pub const Event = struct {
     concurrency: usize = 128,
     request: std.json.Value,
     counts: ?[]const u64 = null,
+    row_group_counts: ?[]const u64 = null,
     order_by: ?[]const u8 = null,
     limit: ?usize = null,
 };
@@ -39,6 +40,7 @@ fn handleOver(io: std.Io, gpa: std.mem.Allocator, env: std.process.Environ, pool
     const event = try std.json.parseFromSliceLeaky(Event, a, body, .{ .parse_numbers = false });
     const region = event.region orelse envValue(env, "AWS_REGION") orelse envValue(env, "AWS_DEFAULT_REGION");
     // Local endpoints need no region; function path construction still has one uniform contract.
+    if (event.counts != null and event.row_group_counts != null) return error.ConflictingCounts;
     const target = try invoke.Target.init(a, event.function, region orelse if (event.endpoints.len > 0) "local" else null);
     const urls = if (event.endpoints.len > 0) event.endpoints else &.{
         try std.fmt.allocPrint(a, "https://lambda.{s}.amazonaws.com", .{target.region}),
@@ -46,13 +48,35 @@ fn handleOver(io: std.Io, gpa: std.mem.Allocator, env: std.process.Environ, pool
     const endpoints = try a.alloc(invoke.Endpoint, urls.len);
     for (urls, endpoints) |url, *endpoint| endpoint.* = try invoke.Endpoint.init(a, url, target.path);
     var client: invoke.Client = .{ .io = io, .env = env, .pool = pool, .endpoints = endpoints, .region = if (event.endpoints.len == 0 or event.sign_endpoints) target.region else null };
+    const ready_ns = clock.monoNs();
+    const before = pool.connections.snapshotStats();
     var out = try coordinator.run(a, backing, client.transport(), event.request, .{
         .workers = event.workers,
         .concurrency = event.concurrency,
-        .counts = event.counts,
+        .counts = event.counts orelse event.row_group_counts,
         .order_by = event.order_by,
         .limit = event.limit,
     });
+    const after = pool.connections.snapshotStats();
+    var transport: std.json.Value = .{ .object = .{} };
+    inline for (.{ "acquires", "opens", "reuses", "stale_retries", "idle_evictions" }) |key| {
+        try transport.object.put(a, key, .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{@field(after, key) -| @field(before, key)}) });
+    }
+    try transport.object.put(a, "acquire_wait_ms", .{ .float = @as(f64, @floatFromInt(after.acquire_wait_ns -| before.acquire_wait_ns)) / 1e6 });
+    try transport.object.put(a, "acquire_lock_ms", .{ .float = @as(f64, @floatFromInt(after.acquire_lock_ns -| before.acquire_lock_ns)) / 1e6 });
+    try out.object.put(a, "transport", transport);
+    try out.object.put(a, "coordinator_setup_ms", .{ .float = @as(f64, @floatFromInt(ready_ns - started)) / 1e6 });
     try out.object.put(a, "e2e_ms", .{ .float = @as(f64, @floatFromInt(clock.monoNs() - started)) / 1e6 });
     return std.json.Stringify.valueAlloc(gpa, out, .{});
+}
+
+test "fanout event: legacy count hints decode and conflicting aliases refuse before endpoint I/O" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const event = try std.json.parseFromSliceLeaky(Event, arena.allocator(), "{\"request\":{},\"row_group_counts\":[8]}", .{});
+    try std.testing.expectEqual(@as(u64, 8), event.row_group_counts.?[0]);
+    var pool: invoke.Pool = undefined;
+    try pool.init(std.testing.allocator);
+    defer pool.deinit();
+    try std.testing.expectError(error.ConflictingCounts, handle(std.testing.io, std.testing.allocator, .empty, &pool, "{\"endpoints\":[\"invalid\"],\"request\":{},\"counts\":[8],\"row_group_counts\":[8]}"));
 }

@@ -104,6 +104,8 @@ pub const QueryArgs = struct {
     plan_source: ?bound_plan.Source = null,
     /// The query's join once its builds are read (`engine/join.zig`); set by the engine, never by a caller.
     join: ?*@import("join.zig").Prepared = null,
+    // Replicated fan-out builds: source bytes and retained lookup state share this sub-limit.
+    replicated_join_limit: ?usize = null,
     /// Internal synchronous handoff; callers supply plan_source, never a cache retained across invocations.
     plan_cache: ?*bound_plan.Cache = null,
     /// Force eligible GROUP BY queries through shared partitions.

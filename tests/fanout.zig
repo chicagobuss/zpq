@@ -15,7 +15,7 @@ const Worker = struct {
     child: std.process.Child,
     thread: ?std.Thread = null,
     failure: ?anyerror = null,
-    fn start(self: *Worker) !void {
+    fn startWithEnv(self: *Worker, override: []const [2][]const u8) !void {
         self.runtime = try fake.FakeServer.start();
         errdefer self.runtime.deinit();
         self.endpoint = try fake.FakeServer.start();
@@ -27,6 +27,7 @@ const Worker = struct {
         for ([_][]const u8{ "S3_ENDPOINT_URL", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_REGION" }) |name| {
             if (std.testing.environ.getPosix(name)) |value| try extra.append(a, .{ name, value });
         }
+        try extra.appendSlice(a, override);
         self.child = try fake.spawnLambdaWithEnv(a, address, extra.items);
         errdefer fake.killChild(&self.child);
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
@@ -62,11 +63,14 @@ const Fixture = struct {
     arena: std.heap.ArenaAllocator,
     started: usize = 0,
     fn start(self: *Fixture) !void {
+        return self.startWithEnv(&.{});
+    }
+    fn startWithEnv(self: *Fixture, override: []const [2][]const u8) !void {
         self.* = .{ .arena = .init(a) };
         errdefer self.stopWorkers();
         for (&self.workers, &self.endpoints) |*worker, *endpoint| {
             worker.* = .{ .runtime = undefined, .endpoint = undefined, .child = undefined };
-            try worker.start();
+            try worker.startWithEnv(override);
             self.started += 1;
             const url = try std.fmt.allocPrint(self.arena.allocator(), "http://127.0.0.1:{d}", .{worker.endpoint.port});
             endpoint.* = try zpq.io.invoke.Endpoint.init(self.arena.allocator(), url, "/2015-03-31/functions/worker/invocations");
@@ -309,4 +313,144 @@ test "fanout parity: schema disagreement and plan version refusals before I/O" {
     try deep.append(scratch, '}');
     const response = try zpq.engine.fanout.parse(scratch, try client.transport().invoke(client.transport().ctx, scratch, 0, deep.items));
     try std.testing.expectEqualStrings("PlanTooDeep", (try get(response, "reason")).string);
+}
+
+test "fanout joins: bounded replicated S3 dimensions, inner left semi anti, generation disagreement" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const fact = "zig-out/fanout-join-fact.parquet";
+    const dim = "zig-out/fanout-join-dimension.parquet";
+    defer std.Io.Dir.cwd().deleteFile(io, fact) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, dim) catch {};
+    const made = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-c", "SET memory_limit='1GB'; SET threads=1; COPY (SELECT i::BIGINT AS id, CASE WHEN i%64=0 THEN NULL ELSE (i%4)::BIGINT END AS fk, i::BIGINT AS amount FROM range(8192) t(i)) TO '" ++ fact ++ "' (FORMAT parquet, ROW_GROUP_SIZE 2048); COPY (SELECT k::BIGINT AS dim_key, 'r'||k AS region FROM range(3) t(k)) TO '" ++ dim ++ "' (FORMAT parquet);" } });
+    if (made.term != .exited or made.term.exited != 0) return error.OracleFailed;
+    const fact_bytes = try fake.paddedParquet(scratch, fact, 2 << 20);
+    const dim_bytes = try std.Io.Dir.cwd().readFileAlloc(io, dim, scratch, .limited(64 << 20));
+    var store: fake.FakeS3 = undefined;
+    try store.startPair(fact_bytes, dim_bytes, 0);
+    defer store.deinit();
+    var fixture: Fixture = undefined;
+    try fixture.startWithEnv(&.{
+        .{ "S3_ENDPOINT_URL", try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}", .{store.port}) },
+        .{ "S3_ACCESS_KEY_ID", "fake" },
+        .{ "S3_SECRET_ACCESS_KEY", "fake" },
+        .{ "S3_REGION", "us-east-1" },
+        .{ "ZPQ_S3_PRECONNECT", "0" },
+    });
+    defer fixture.stop();
+    var client = fixture.client();
+    for ([_][]const u8{ "inner", "left", "semi", "anti" }) |kind| {
+        const simple = std.mem.eql(u8, kind, "semi") or std.mem.eql(u8, kind, "anti");
+        const req = try zpq.engine.fanout.parse(scratch, try std.json.Stringify.valueAlloc(scratch, .{
+            .inputs = &.{"s3://test/fact.parquet"},
+            .aggregate = "count(*) AS c, sum(amount) AS s, avg(amount) AS a",
+            .group_by = if (simple) "fk" else "region",
+            .join = .{ .kind = kind, .fk = "fk", .build = .{
+                .path = "s3://test/dimension.parquet",
+                .key = "dim_key",
+                .columns = if (simple) @as([]const []const u8, &.{}) else @as([]const []const u8, &.{"region"}),
+            } },
+        }, .{}));
+        const parts = try zpq.engine.fanout.split(scratch, &.{4}, 1);
+        const probe = try zpq.engine.fanout.parse(scratch, try client.transport().invoke(client.transport().ctx, scratch, 0, try zpq.engine.fanout.partialPayload(scratch, req, parts[0])));
+        if (probe.object.get("error") != null) {
+            std.debug.print("join {s} worker: {s}\n", .{ kind, try std.json.Stringify.valueAlloc(scratch, probe, .{}) });
+            return error.WorkerJoinFailed;
+        }
+        const out = try zpq.engine.fanout.run(scratch, a, client.transport(), req, .{ .workers = 4, .concurrency = 4 });
+        const sql = if (std.mem.eql(u8, kind, "anti"))
+            try std.fmt.allocPrint(scratch, "SET memory_limit='1GB'; SET threads=1; SELECT fk, count(*) AS c, sum(amount) AS s, avg(amount) AS a FROM read_parquet('{s}') WHERE fk NOT IN (SELECT dim_key FROM read_parquet('{s}')) GROUP BY ALL;", .{ fact, dim })
+        else
+            try std.fmt.allocPrint(scratch, "SET memory_limit='1GB'; SET threads=1; SELECT {s}, count(*) AS c, sum(amount) AS s, avg(amount) AS a FROM read_parquet('{s}') f {s} JOIN read_parquet('{s}') d ON f.fk=d.dim_key GROUP BY ALL;", .{ if (simple) "fk" else "region", fact, kind, dim });
+        const reference = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-json", "-c", sql } });
+        if (reference.term != .exited or reference.term.exited != 0) return error.OracleFailed;
+        try std.testing.expect(same(try get(out, "agg"), try zpq.engine.fanout.parse(scratch, reference.stdout)));
+        if (!simple) {
+            var filtered = req;
+            filtered.object = try req.object.clone(scratch);
+            try filtered.object.put(scratch, "filter", .{ .string = "region = 'r1'" });
+            const filtered_out = try zpq.engine.fanout.run(scratch, a, client.transport(), filtered, .{ .workers = 4, .concurrency = 4 });
+            const filtered_sql = try std.fmt.allocPrint(scratch, "SET memory_limit='1GB'; SET threads=1; SELECT region,count(*) AS c,sum(amount) AS s,avg(amount) AS a FROM read_parquet('{s}') f {s} JOIN read_parquet('{s}') d ON f.fk=d.dim_key WHERE region='r1' GROUP BY ALL;", .{ fact, kind, dim });
+            const filtered_ref = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-json", "-c", filtered_sql } });
+            if (filtered_ref.term != .exited or filtered_ref.term.exited != 0) return error.OracleFailed;
+            try std.testing.expect(same(try get(filtered_out, "agg"), try zpq.engine.fanout.parse(scratch, filtered_ref.stdout)));
+        }
+        if (std.mem.eql(u8, kind, "inner")) {
+            var compact = req;
+            compact.object = try req.object.clone(scratch);
+            try compact.object.put(scratch, "aggregate", .{ .string = "count(*) AS c, sum(amount) AS s" });
+            var twice = std.json.Array.init(scratch);
+            try twice.append(.{ .string = "s3://test/fact.parquet" });
+            try twice.append(.{ .string = "s3://test/fact.parquet" });
+            try compact.object.put(scratch, "inputs", .{ .array = twice });
+            const compact_out = try zpq.engine.fanout.run(scratch, a, client.transport(), compact, .{ .workers = 3, .concurrency = 3, .counts = &.{ 4, 4 } });
+            try std.testing.expectEqual((try get(out, "agg")).array.items.len, (try get(compact_out, "agg")).array.items.len);
+            for ((try get(compact_out, "agg")).array.items) |row| {
+                const key = try get(row, "region");
+                var matched = false;
+                for ((try get(out, "agg")).array.items) |original| {
+                    if (same(key, try get(original, "region"))) {
+                        try std.testing.expectEqual(2 * try numeric(try get(original, "c")), try numeric(try get(row, "c")));
+                        try std.testing.expectEqual(2 * try numeric(try get(original, "s")), try numeric(try get(row, "s")));
+                        matched = true;
+                    }
+                }
+                try std.testing.expect(matched);
+            }
+            var star = req;
+            star.object = try req.object.clone(scratch);
+            var star_join = try get(req, "join");
+            star_join.object = try star_join.object.clone(scratch);
+            var star_build = try get(star_join, "build");
+            star_build.object = try star_build.object.clone(scratch);
+            try star_build.object.put(scratch, "columns", .{ .array = std.json.Array.init(scratch) });
+            try star_join.object.put(scratch, "build", star_build);
+            try star_join.object.put(scratch, "dims", try zpq.engine.fanout.parse(scratch, "[{\"fk\":\"fk\",\"build\":{\"path\":\"s3://test/dimension.parquet\",\"key\":\"dim_key\",\"columns\":[\"region\"]}}]"));
+            try star.object.put(scratch, "join", star_join);
+            const star_out = try zpq.engine.fanout.run(scratch, a, client.transport(), star, .{ .workers = 4, .concurrency = 4 });
+            try std.testing.expect(same(try get(out, "agg"), try get(star_out, "agg")));
+            var tiny = req;
+            tiny.object = try req.object.clone(scratch);
+            try tiny.object.put(scratch, "max_memory", .{ .integer = 32 * 1024 });
+            const tiny_probe = try zpq.engine.fanout.parse(scratch, try client.transport().invoke(client.transport().ctx, scratch, 0, try zpq.engine.fanout.partialPayload(scratch, tiny, parts[0])));
+            if (!std.mem.eql(u8, (try get(tiny_probe, "reason")).string, "JoinBuildExceedsBudget")) {
+                std.debug.print("replica budget refusal: {s}\n", .{try std.json.Stringify.valueAlloc(scratch, tiny_probe, .{})});
+                return error.UnexpectedReplicaBudgetRefusal;
+            }
+            try std.testing.expectError(error.JoinBuildExceedsBudget, zpq.engine.fanout.run(scratch, a, client.transport(), tiny, .{ .workers = 1, .concurrency = 1 }));
+            store.reported_dimension_size.store((64 << 20) + 1, .release);
+            const oversized = zpq.engine.fanout.run(scratch, a, client.transport(), req, .{ .workers = 1, .concurrency = 1 });
+            store.reported_dimension_size.store(0, .release);
+            try std.testing.expectError(error.JoinBuildExceedsBudget, oversized);
+            store.changing_dimension.store(true, .release);
+            const changed = zpq.engine.fanout.run(scratch, a, client.transport(), req, .{ .workers = 4, .concurrency = 4 });
+            store.changing_dimension.store(false, .release);
+            try std.testing.expectError(error.SchemaMismatch, changed);
+        }
+    }
+    const dim_null = "zig-out/fanout-join-dimension-null.parquet";
+    defer std.Io.Dir.cwd().deleteFile(io, dim_null) catch {};
+    const null_made = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-c", "SET memory_limit='1GB'; SET threads=1; COPY (SELECT k::BIGINT AS dim_key FROM range(3) t(k) UNION ALL SELECT NULL::BIGINT) TO '" ++ dim_null ++ "' (FORMAT parquet);" } });
+    if (null_made.term != .exited or null_made.term.exited != 0) return error.OracleFailed;
+    var null_store: fake.FakeS3 = undefined;
+    try null_store.startPair(fact_bytes, try std.Io.Dir.cwd().readFileAlloc(io, dim_null, scratch, .limited(64 << 20)), 0);
+    defer null_store.deinit();
+    var null_fixture: Fixture = undefined;
+    try null_fixture.startWithEnv(&.{
+        .{ "S3_ENDPOINT_URL", try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}", .{null_store.port}) },
+        .{ "S3_ACCESS_KEY_ID", "fake" },
+        .{ "S3_SECRET_ACCESS_KEY", "fake" },
+        .{ "S3_REGION", "us-east-1" },
+        .{ "ZPQ_S3_PRECONNECT", "0" },
+    });
+    defer null_fixture.stop();
+    var null_client = null_fixture.client();
+    const null_req = try zpq.engine.fanout.parse(scratch, "{\"inputs\":[\"s3://test/fact.parquet\"],\"aggregate\":\"count(*) AS n\",\"group_by\":\"fk\",\"join\":{\"kind\":\"anti\",\"fk\":\"fk\",\"build\":{\"path\":\"s3://test/dimension.parquet\",\"key\":\"dim_key\"}}}");
+    const null_out = try zpq.engine.fanout.run(scratch, a, null_client.transport(), null_req, .{ .workers = 4, .concurrency = 4 });
+    try std.testing.expectEqual(0, (try get(null_out, "agg")).array.items.len);
+    const null_ref = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-json", "-c", "SET memory_limit='1GB'; SET threads=1; SELECT count(*) AS n FROM read_parquet('" ++ fact ++ "') WHERE fk NOT IN (SELECT dim_key FROM read_parquet('" ++ dim_null ++ "'));" } });
+    if (null_ref.term != .exited or null_ref.term.exited != 0) return error.OracleFailed;
+    const null_reference = try zpq.engine.fanout.parse(scratch, null_ref.stdout);
+    try std.testing.expectEqual(@as(f64, 0), try numeric(try get(null_reference.array.items[0], "n")));
 }

@@ -232,6 +232,8 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
                 .structured_plan_versions = .{request.plan_version},
                 .prepare_aggregate_version = request.plan_version,
                 .partial_aggregate_version = request.partial_version,
+                .partial_join_aggregate_version = request.partial_version,
+                .replicated_join_max_bytes = @as(usize, 64 << 20),
             }, .{});
 
         const decoded_plan: ?engine.fanout_plan.Query = if (req.plan) |value|
@@ -397,18 +399,22 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
                 .worker_io = pool.worker_io,
             }, qa, result_cap.bytes, request.plan_version) catch |err| return engineError(allocator, err, &diag);
         }
-        if (req.operation == .partial_aggregate) {
+        if (req.operation.isPartial()) {
             // The worker prepares the query itself, as `prepare_aggregate` would, and answers its partial with what
             // the coordinator merges by and checks across workers (`fanout_plan.partialMembers`, the schema
             // fingerprint), so the coordinator reads no footer and makes no call before the scatter.
             var arena_state = std.heap.ArenaAllocator.init(allocator);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
-            const merged = engine.fanout_plan.mergeable(arena, req.aggregate.?, req.group_by, req.filter) catch |err| {
+            var merged = engine.fanout_plan.mergeable(arena, req.aggregate.?, req.group_by, req.filter) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 return engineError(allocator, err, &Diag{});
             };
+            if (req.join) |value| {
+                merged.query.join = engine.fanout_plan.decodeJoin(arena, value) catch |err| return engineError(allocator, err, &Diag{});
+            }
             var pa = qa;
+            if (req.join != null) pa.replicated_join_limit = @min(64 << 20, pa.max_memory / 8);
             pa.plan_source = engine.syntax_plan.source(&merged.query);
             pa.aggregate = null;
             pa.group_by = null;

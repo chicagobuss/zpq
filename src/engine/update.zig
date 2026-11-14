@@ -146,13 +146,16 @@ fn runCharged(footers: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, re
         return err;
     };
     defer local_fs.close(lock_fd);
-    const locked_ok = if (@import("builtin").os.tag == .windows)
-        try local_fs.tryWindowsUpdateLock(lock_fd)
-    else
-        std.posix.errno(std.posix.system.flock(lock_fd, std.posix.LOCK.EX | std.posix.LOCK.NB)) == .SUCCESS;
-    if (!locked_ok) {
-        problem.set("another UPDATE of {s} is running", .{req.target});
-        return error.UpdateRefused;
+    if (@import("builtin").os.tag == .windows) {
+        if (!try local_fs.tryWindowsUpdateLock(lock_fd)) {
+            problem.set("another UPDATE of {s} is running", .{req.target});
+            return error.UpdateRefused;
+        }
+    } else {
+        if (std.posix.errno(std.posix.system.flock(lock_fd, std.posix.LOCK.EX | std.posix.LOCK.NB)) != .SUCCESS) {
+            problem.set("another UPDATE of {s} is running", .{req.target});
+            return error.UpdateRefused;
+        }
     }
     const map = try local_fs.mapFile(req.target);
     defer map.unmap();
@@ -311,10 +314,12 @@ fn runCharged(footers: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, re
             publication.fail_rollback = fail_rollback;
         }
         publication.commitReplacing(io, map.stamp) catch |err| {
-            if (err == error.BackupRecoveryFailed) problem.set(
-                "{s} could not be restored after UPDATE failed; the original remains at {s}.backup",
-                .{ req.target, publication.path() },
-            );
+            if (@import("builtin").os.tag == .windows) {
+                if (err == error.BackupRecoveryFailed) problem.set(
+                    "{s} could not be restored after UPDATE failed; the original remains at {s}.backup",
+                    .{ req.target, publication.path() },
+                );
+            }
             if (err == error.RollbackFailed) problem.set(
                 "{s} was replaced while UPDATE ran and could not be put back: that file is now {s}, and {s} holds this UPDATE's result",
                 .{ req.target, publication.path(), req.target },

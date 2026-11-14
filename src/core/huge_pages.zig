@@ -323,7 +323,7 @@ pub const pair_cache = struct {
     var pairs: [256]Region.Pair = undefined;
     var len: usize = 0;
     var cap: usize = 0;
-    var owner_pid: u32 = 0;
+    var owner_pid: if (builtin.os.tag == .windows) u32 else std.posix.pid_t = 0;
 
     fn capacity() usize {
         if (cap == 0) cap = @min(pairs.len, std.Thread.getCpuCount() catch 64);
@@ -416,9 +416,9 @@ pub fn drainPairs() void {
     pair_cache.len = 0;
 }
 
-fn currentPid() u32 {
+fn currentPid() if (builtin.os.tag == .windows) u32 else std.posix.pid_t {
     if (builtin.target.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
-    return @intCast(if (builtin.target.os.tag == .linux) std.os.linux.getpid() else std.c.getpid());
+    return if (builtin.target.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
 }
 
 /// Drop `span`'s pages now. Linux keeps the mapping; Darwin's MADV_DONTNEED may keep the

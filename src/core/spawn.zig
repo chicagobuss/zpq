@@ -175,7 +175,7 @@ pub const Pool = struct {
     var lock: std.Io.Mutex = .init;
     var idle: ?*Slot = null;
     var all: ?*Slot = null;
-    var owner_pid: u32 = 0;
+    var owner_pid: if (builtin.os.tag == .windows) u32 else std.posix.pid_t = 0;
     var holders: usize = 0;
 
     /// A warm idle thread, or null when none is idle.
@@ -267,9 +267,9 @@ pub const Pool = struct {
         idle = s;
     }
 
-    fn currentPid() u32 {
+    fn currentPid() if (builtin.os.tag == .windows) u32 else std.posix.pid_t {
         if (builtin.target.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
-        return @intCast(if (builtin.target.os.tag == .linux) std.os.linux.getpid() else std.c.getpid());
+        return if (builtin.target.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
     }
 
     /// Threads the pool holds, idle or busy.

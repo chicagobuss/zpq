@@ -33,6 +33,10 @@ static enum ssl_verify_result_t verify_windows(SSL *ssl, uint8_t *alert) {
     }
     CERT_CHAIN_PARA params = {0};
     params.cbSize = sizeof(params);
+    LPSTR server_auth[] = {szOID_PKIX_KP_SERVER_AUTH};
+    params.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
+    params.RequestedUsage.Usage.cUsageIdentifier = 1;
+    params.RequestedUsage.Usage.rgpszUsageIdentifier = server_auth;
     if (!CertGetCertificateChain(NULL, leaf, NULL, extra, &params, 0, NULL, &built)) goto done;
     SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl_policy = {0};
     ssl_policy.cbSize = sizeof(ssl_policy);

@@ -28,8 +28,9 @@ def prepare(paths):
     save(decimal, data, meta)
     if len(paths) > 6:
         released = Path(paths[6])
+        # Keep the poisoned bounds in page headers too, so codec recompression must sanitize them.
         pq.write_table(pa.table({'d': [b'\x01', b'\x01\x00', b'\x7f']}), released,
-                       compression='snappy', use_dictionary=False, write_page_index=True)
+                       compression='snappy', use_dictionary=False, write_page_index=False)
         data, old_meta = load(released)
         field(old_meta, 2)[2][1][1] = leaf
         old_meta[:] = [f for f in old_meta if f[0] != 5]

@@ -59,6 +59,8 @@ pub fn policy(created_by: ?[]const u8, physical: schema.Type, elem: ?schema.Sche
     const writer = parse(created_by) orelse return .trust;
     if (writer.app == .zpq) {
         if (physical == .BYTE_ARRAY and writer.version.numericOrder(.{ 0, 6, 0 }) == .lt) {
+            // The schema-less metadata probe must request a leaf walk before recompression sees the chunks.
+            if (elem == null) return .absent;
             if (elem) |e| if (decimal.kindFromSchema(&e) != null) return .absent;
         }
         return .trust;
@@ -234,13 +236,31 @@ test "review: released zpq byte-array DECIMAL bounds cannot prune values" {
     try std.testing.expectEqual(Policy.trust, policy("zpq version 0.5.2", .FIXED_LEN_BYTE_ARRAY, elem));
 }
 
+test "review: old zpq BYTE_ARRAY probe requires a leaf provenance walk" {
+    const binary: schema.SchemaElement = .{
+        .name = "s",
+        .type = .BYTE_ARRAY,
+        .type_length = null,
+        .repetition_type = .REQUIRED,
+        .num_children = null,
+        .scale = null,
+        .precision = null,
+        .field_id = null,
+    };
+    for ([_][]const u8{ "zpq version 0.5.2", "zpq version broken" }) |writer| {
+        try testing.expectEqual(Policy.absent, policy(writer, .BYTE_ARRAY, null));
+        try testing.expectEqual(Policy.trust, policy(writer, .BYTE_ARRAY, binary));
+    }
+    try testing.expectEqual(Policy.trust, policy("zpq version 0.6.0", .BYTE_ARRAY, null));
+}
+
 test "writer statistics: unknown applications stay modern and malformed known versions are distrusted" {
     const modern = [_]?[]const u8{
         null,
         "",
         "unknown",
         "parquet-mr-other version 1.0.0",
-        "zpq version 0.5.0",
+        "zpq version 0.6.0",
         "parquet-cpp-arrow version 24.0.0",
         "Arrow version 1.0.0",
         "DuckDB version v2.0.0",

@@ -8,6 +8,10 @@ Copy and recompression paths remove affected footer, page-header and index
 statistics before an output can advertise another writer, including mixed inputs and a fully matching
 filter copied beside encoded data. Raw input metadata remains available for inspection.
 
+The schema-less BYTE_ARRAY policy probe conservatively requests a leaf walk for old
+zpq files. That walk distinguishes DECIMAL from ordinary binary/string columns and
+sets chunk provenance before any codec worker rewrites page headers.
+
 | Writer | Statistics declined |
 | --- | --- |
 | `parquet-cpp` before 1.3.0 | Non-signed-order columns, unless both encoded extrema are equal |

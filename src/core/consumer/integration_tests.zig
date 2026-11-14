@@ -1366,6 +1366,102 @@ test "recompressChunk: a codec round trip gives back the chunk byte for byte" {
     }
 }
 
+test "review: old zpq DECIMAL page bounds are stripped before codec recompression" {
+    const testing = std.testing;
+    var storage = std.heap.ArenaAllocator.init(testing.allocator);
+    defer storage.deinit();
+    const a = storage.allocator();
+    // The released raw-byte writer orders 1, 256, 127 lexically, excluding 256 from its page bounds.
+    const body = "\x01\x00\x00\x00\x01\x02\x00\x00\x00\x01\x00\x01\x00\x00\x00\x7f";
+    // Schema's decoded header deliberately skips statistics, so write the poisoned record on the wire.
+    var header_writer_out = thrift.Writer.init(a);
+    header_writer_out.writeStructBegin();
+    try header_writer_out.writeFieldI32(1, 0);
+    try header_writer_out.writeFieldI32(2, body.len);
+    try header_writer_out.writeFieldI32(3, body.len);
+    try header_writer_out.writeFieldBegin(.Struct, 5);
+    header_writer_out.writeStructBegin();
+    try header_writer_out.writeFieldI32(1, 3);
+    try header_writer_out.writeFieldI32(2, @backingInt(schema.Encoding.PLAIN));
+    try header_writer_out.writeFieldI32(3, @backingInt(schema.Encoding.RLE));
+    try header_writer_out.writeFieldI32(4, @backingInt(schema.Encoding.RLE));
+    try header_writer_out.writeFieldBegin(.Struct, 5);
+    const poisoned: schema.Statistics = .{ .min_value = "\x01", .max_value = "\x7f", .null_count = 0 };
+    try poisoned.write(&header_writer_out);
+    try header_writer_out.writeStructEnd();
+    try header_writer_out.writeStructEnd();
+    const page = try std.mem.concat(a, u8, &.{ header_writer_out.bytes(), body });
+    var elements = [_]schema.SchemaElement{
+        .{
+            .name = "schema",
+            .type = null,
+            .type_length = null,
+            .repetition_type = .REQUIRED,
+            .num_children = 1,
+            .scale = null,
+            .precision = null,
+            .field_id = null,
+        },
+        .{
+            .name = "d",
+            .type = .BYTE_ARRAY,
+            .type_length = null,
+            .repetition_type = .REQUIRED,
+            .num_children = null,
+            .converted_type = .DECIMAL,
+            .scale = 0,
+            .precision = 9,
+            .field_id = null,
+        },
+    };
+    var path = [_][]const u8{"d"};
+    var columns = [_]schema.ColumnChunk{.{
+        .file_path = null,
+        .file_offset = 0,
+        .meta_data = .{
+            .type = .BYTE_ARRAY,
+            .encodings = .empty,
+            .path_in_schema = .fromOwnedSlice(&path),
+            .codec = .UNCOMPRESSED,
+            .num_values = 3,
+            .total_uncompressed_size = @intCast(page.len),
+            .total_compressed_size = @intCast(page.len),
+            .data_page_offset = 0,
+            .index_page_offset = null,
+            .dictionary_page_offset = null,
+        },
+    }};
+    var groups = [_]schema.RowGroup{.{
+        .columns = .fromOwnedSlice(&columns),
+        .total_byte_size = @intCast(page.len),
+        .num_rows = 3,
+    }};
+    const original: schema.FileMetaData = .{
+        .version = 1,
+        .schema = .fromOwnedSlice(&elements),
+        .num_rows = 3,
+        .row_groups = .fromOwnedSlice(&groups),
+        .created_by = "zpq version 0.5.2",
+    };
+    var footer = thrift.Writer.init(a);
+    try original.write(&footer);
+    var reader = thrift.Reader.init(footer.bytes());
+    const parsed = try schema.FileMetaData.read(a, &reader);
+    for ([_]usize{ 1, 4 }) |workers| {
+        var timings: Timings = .{};
+        const recoded = try recompressRowGroup(a, testing.allocator, &parsed.row_groups.items[0], .{
+            .bytes = page,
+            .byte_origin = 0,
+        }, null, .ZSTD, .{}, &timings, workers);
+        var r = thrift.Reader.init(recoded[0].?.bytes);
+        _ = try schema.PageHeader.read(&r);
+        const raw_header = recoded[0].?.bytes[0..r.pos];
+        try testing.expectEqualSlices(u8, try header_writer.rewrite(a, raw_header, null, .absent), raw_header);
+        const decoded = try compression.decompress(a, recoded[0].?.bytes[r.pos..], .ZSTD, body.len);
+        try testing.expectEqualSlices(u8, body, decoded);
+    }
+}
+
 test "recompressRowGroup over several threads writes the bytes one thread writes, and fails where it fails" {
     const testing = std.testing;
     const paths = [_][]const u8{
@@ -2221,7 +2317,6 @@ test "cache decode admission bounds dictionary strings and composite domains fro
     columns[1].meta_data.?.dictionary_page_offset = -1;
     try testing.expect(cacheDictionary(in, 1) == null);
 }
-
 
 test "filter-only and hash-only strings stream a cache-sized window, other strings do not" {
     const hw = @import("../hw.zig");

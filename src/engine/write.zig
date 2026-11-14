@@ -1280,7 +1280,7 @@ test "FdSink segments keep one contiguous writeback range across page and vector
 }
 
 test "FdSink range copies write the input's bytes whether the kernel copies all, part or none of them" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "FdSink copy_file_range faults");
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -1342,7 +1342,7 @@ test "FdSink range copies write the input's bytes whether the kernel copies all,
 }
 
 test "FdSink takes plain writes into a pipe" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "pipe syscall");
     var fds: [2]i32 = undefined;
     try std.testing.expectEqual(@as(usize, 0), std.os.linux.pipe(&fds));
     defer local_fs.close(fds[0]);

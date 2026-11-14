@@ -2660,7 +2660,8 @@ test "a windowed byte copy places the bytes a direct copy writes, its ranges cop
             const self: *@This() = @ptrCast(@alignCast(ctx));
             const at = self.buf.items.len;
             try self.buf.resize(self.gpa, at + r.len);
-            const n = std.os.linux.pread(r.fd, self.buf.items[at..].ptr, r.len, @intCast(r.offset));
+            const file: std.Io.File = .{ .handle = r.fd, .flags = .{ .nonblocking = false } };
+            const n = try file.readPositionalAll(t.io, self.buf.items[at..], r.offset);
             try t.expectEqual(r.len, n);
             self.took += n;
             return n;

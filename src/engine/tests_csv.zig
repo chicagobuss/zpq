@@ -293,8 +293,9 @@ const ReportHook = struct {
         if (h.calls == h.at) switch (h.mode) {
             .fail => return null,
             .touch => {
-                const later = [2]std.os.linux.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
-                _ = std.os.linux.utimensat(std.os.linux.AT.FDCWD, h.path.ptr, &later, 0);
+                const os = std.posix.system;
+                const later = [2]os.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
+                std.debug.assert(os.utimensat(std.posix.AT.FDCWD, h.path.ptr, &later, 0) == 0);
             },
         };
         return h.base.rawAlloc(len, alignment, ret);

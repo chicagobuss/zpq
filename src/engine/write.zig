@@ -499,7 +499,7 @@ const WriteRows = struct {
     has_coalesced: bool = false,
 
     fn copySource(self: *WriteRows, s: fastpath.coalesce.Source) !void {
-        const written = try consumer.copyRG(self.arena, s.rg, .{ .bytes = s.bytes, .byte_origin = 0, .fd = s.fd, .file_offsets = s.file_offsets }, if (self.kept_set != null) self.kept_arr else null, self.sink, &self.out_offset, &self.t.core, true, null, .{ .fpp = self.blooms.leaves, .meta = s.meta, .scratch = self.ctx.gpa, .dictionary_bloom = self.args.bloom_filters_enabled });
+        const written = try consumer.copyRG(self.arena, s.rg, .{ .bytes = s.bytes, .byte_origin = 0, .fd = s.fd, .file_offsets = s.file_offsets }, if (self.kept_set != null) self.kept_arr else null, self.sink, &self.out_offset, &self.t.core, true, null, .{ .fpp = self.blooms.leaves, .meta = s.meta, .scratch = self.ctx.gpa });
         if (written.rg) |rg| {
             try self.new_row_groups.append(self.arena, rg);
             self.rg_kept += 1;
@@ -507,16 +507,19 @@ const WriteRows = struct {
         self.rows_kept += written.surviving_rows;
     }
 
-    fn flushSources(self: *WriteRows, parent: std.mem.Allocator, sources: []const fastpath.coalesce.Source, kept: ?[]const usize) !void {
+    fn flushSources(self: *WriteRows, scratch: *std.heap.ArenaAllocator, sources: []const fastpath.coalesce.Source, kept: ?[]const usize) !void {
         var at: usize = 0;
         while (at < sources.len) {
             var used = sources.len - at;
             while (used > 1) : (used -= 1) {
-                var scratch = std.heap.ArenaAllocator.init(parent);
-                defer scratch.deinit();
-                const candidate = fastpath.coalesce.Plan.init(scratch.allocator(), sources[at..][0..used], kept, .{ .dictionary_bloom = self.args.bloom_filters_enabled, .filter_fpp = self.blooms.leaves }) catch |err|
+                // Keep a bounded working set across groups instead of faulting and unmapping every dictionary map.
+                defer _ = scratch.reset(.{ .retain_with_limit = self.args.max_memory / 4 });
+                const candidate = fastpath.coalesce.Plan.init(scratch.allocator(), sources[at..][0..used], kept, .{ .filter_fpp = self.blooms.leaves }) catch |err|
                     switch (err) {
-                        error.OutOfMemory => null,
+                        error.OutOfMemory => blk: {
+                            _ = scratch.reset(.free_all);
+                            break :blk null;
+                        },
                         else => return err,
                     };
                 if (candidate) |plan| {
@@ -559,6 +562,8 @@ const WriteRows = struct {
         }
         var pending = std.heap.ArenaAllocator.init(parent);
         defer pending.deinit();
+        var scratch = std.heap.ArenaAllocator.init(parent);
+        defer scratch.deinit();
         var sources: std.ArrayList(fastpath.coalesce.Source) = .empty;
         var rows: u64 = 0;
         var encoded_bytes: u64 = 0;
@@ -577,7 +582,7 @@ const WriteRows = struct {
                 }
                 const whole = target.reached(nr, nb);
                 if (whole and sources.items.len > 0) {
-                    try self.flushSources(parent, sources.items, kept);
+                    try self.flushSources(&scratch, sources.items, kept);
                     _ = pending.reset(.free_all);
                     sources = .empty;
                     rows = 0;
@@ -593,7 +598,9 @@ const WriteRows = struct {
                 }
                 self.stageSource(pending.allocator(), parent, &sources, source, in.gate != null) catch |err| {
                     if (err != error.OutOfMemory) return err;
-                    try self.flushSources(parent, sources.items, kept);
+                    _ = scratch.reset(.free_all);
+                    try self.flushSources(&scratch, sources.items, kept);
+                    _ = scratch.reset(.free_all);
                     _ = pending.reset(.free_all);
                     sources = .empty;
                     rows = 0;
@@ -604,7 +611,7 @@ const WriteRows = struct {
                 rows += nr;
                 encoded_bytes +|= nb;
                 if (target.reached(rows, encoded_bytes)) {
-                    try self.flushSources(parent, sources.items, kept);
+                    try self.flushSources(&scratch, sources.items, kept);
                     _ = pending.reset(.free_all);
                     sources = .empty;
                     rows = 0;
@@ -612,7 +619,7 @@ const WriteRows = struct {
                 }
             }
         }
-        try self.flushSources(parent, sources.items, kept);
+        try self.flushSources(&scratch, sources.items, kept);
         for (self.metas) |*m| try self.copied_from.append(self.arena, m);
     }
 

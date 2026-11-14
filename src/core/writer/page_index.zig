@@ -20,23 +20,35 @@ pub fn columnIndex(
     pages: []const encoder.PageInfo,
     elem: *const schema.SchemaElement,
 ) !?schema.ColumnIndex {
+    return columnIndexWithOptions(arena, pages, elem, .{});
+}
+
+pub const Options = struct { unordered: bool = false, omit_bounds: bool = false };
+
+fn columnIndexWithOptions(arena: std.mem.Allocator, pages: []const encoder.PageInfo, elem: *const schema.SchemaElement, options: Options) !?schema.ColumnIndex {
+    if (options.omit_bounds) return null;
     if (pages.len == 0) return null;
     var ci: schema.ColumnIndex = .{};
     var nulls: std.ArrayList(i64) = .empty;
     var nans: std.ArrayList(i64) = .empty;
+    var known_nulls = true;
+    var known_nans = true;
     const float = elem.type == .FLOAT or elem.type == .DOUBLE;
     for (pages) |p| {
         const null_page = p.null_count == @as(i64, @intCast(p.rows));
         if (!null_page and (p.min == null or p.max == null)) return null;
+        if (!null_page and (compare(elem, p.min.?, p.max.?) orelse return null) == .gt) return null;
         try ci.null_pages.append(arena, null_page);
         try ci.min_values.append(arena, if (null_page) "" else p.min.?);
         try ci.max_values.append(arena, if (null_page) "" else p.max.?);
         try nulls.append(arena, p.null_count);
+        known_nulls = known_nulls and p.null_count >= 0;
+        known_nans = known_nans and p.nan_count != null;
         if (float) try nans.append(arena, p.nan_count orelse 0);
     }
-    ci.null_counts = nulls;
-    if (float) ci.nan_counts = nans;
-    ci.boundary_order = boundaryOrder(pages, elem);
+    if (known_nulls) ci.null_counts = nulls;
+    if (float and known_nans) ci.nan_counts = nans;
+    ci.boundary_order = if (options.unordered) .UNORDERED else boundaryOrder(pages, elem);
     return ci;
 }
 
@@ -51,8 +63,8 @@ fn boundaryOrder(pages: []const encoder.PageInfo, elem: *const schema.SchemaElem
         if (p.min == null) continue;
         bounded += 1;
         if (prev) |q| {
-            const lo = compare(elem, q.min.?, p.min.?);
-            const hi = compare(elem, q.max.?, p.max.?);
+            const lo = compare(elem, q.min.?, p.min.?) orelse return .UNORDERED;
+            const hi = compare(elem, q.max.?, p.max.?) orelse return .UNORDERED;
             if (lo == .gt or hi == .gt) asc = false;
             if (lo == .lt or hi == .lt) desc = false;
         }
@@ -66,13 +78,22 @@ fn boundaryOrder(pages: []const encoder.PageInfo, elem: *const schema.SchemaElem
 
 /// Two bounds of a column of `elem`'s type, in its type-defined order (unsigned integers unsigned, byte arrays
 /// bytewise unsigned). Bounds never hold NaN.
-pub fn compare(elem: *const schema.SchemaElement, a: []const u8, b: []const u8) std.math.Order {
+pub fn compare(elem: *const schema.SchemaElement, a: []const u8, b: []const u8) ?std.math.Order {
+    const width: usize = switch (elem.type orelse return null) {
+        .INT32, .FLOAT => 4,
+        .INT64, .DOUBLE => 8,
+        .BOOLEAN => 1,
+        .INT96 => 12,
+        .FIXED_LEN_BYTE_ARRAY => std.math.cast(usize, elem.type_length orelse return null) orelse return null,
+        .BYTE_ARRAY => if (decimal_mod.kindFromSchema(elem) != null) 1 else 0,
+    };
+    if (a.len < width or b.len < width) return null;
     const unsigned = schema.isUnsignedInt(elem.*);
     return switch (elem.type orelse return .eq) {
         .INT32 => if (unsigned) order(u32, a, b) else order(i32, a, b),
         .INT64 => if (unsigned) order(u64, a, b) else order(i64, a, b),
-        .FLOAT => std.math.order(@as(f32, @bitCast(read(u32, a))), @as(f32, @bitCast(read(u32, b)))),
-        .DOUBLE => std.math.order(@as(f64, @bitCast(read(u64, a))), @as(f64, @bitCast(read(u64, b)))),
+        .FLOAT => floatOrder(f32, u32, a, b),
+        .DOUBLE => floatOrder(f64, u64, a, b),
         .BOOLEAN => std.math.order(a[0], b[0]),
         .BYTE_ARRAY, .FIXED_LEN_BYTE_ARRAY, .INT96 => if (decimal_mod.kindFromSchema(elem) != null)
             signedBigEndian(a, b)
@@ -81,13 +102,23 @@ pub fn compare(elem: *const schema.SchemaElement, a: []const u8, b: []const u8) 
     };
 }
 
-/// Two's-complement big-endian integers of one width, a DECIMAL's bounds: by sign, then bytewise.
-fn signedBigEndian(a: []const u8, b: []const u8) std.math.Order {
-    if (a.len == 0 or b.len == 0) return std.math.order(a.len, b.len);
-    const sa: i8 = @bitCast(a[0]);
-    const sb: i8 = @bitCast(b[0]);
-    if (sa != sb) return std.math.order(sa, sb);
-    return std.mem.order(u8, a[1..], b[1..]);
+/// BYTE_ARRAY DECIMAL can use different widths for the same signed integer.
+fn signedBigEndian(left: []const u8, right: []const u8) std.math.Order {
+    var a = left;
+    var b = right;
+    const negative = a[0] & 0x80 != 0;
+    if (negative != (b[0] & 0x80 != 0)) return if (negative) .lt else .gt;
+    while (a.len > 1 and ((a[0] == 0 and a[1] & 0x80 == 0) or (a[0] == 0xff and a[1] & 0x80 != 0))) a = a[1..];
+    while (b.len > 1 and ((b[0] == 0 and b[1] & 0x80 == 0) or (b[0] == 0xff and b[1] & 0x80 != 0))) b = b[1..];
+    if (a.len != b.len) return if (negative) std.math.order(b.len, a.len) else std.math.order(a.len, b.len);
+    return std.mem.order(u8, a, b);
+}
+
+fn floatOrder(comptime F: type, comptime U: type, a: []const u8, b: []const u8) ?std.math.Order {
+    const x: F = @bitCast(read(U, a));
+    const y: F = @bitCast(read(U, b));
+    if (std.math.isNan(x) or std.math.isNan(y)) return null;
+    return std.math.order(x, y);
 }
 
 fn read(comptime T: type, bytes: []const u8) T {
@@ -124,9 +155,13 @@ pub fn attach(
     pages: []const encoder.PageInfo,
     elem: *const schema.SchemaElement,
 ) !void {
+    return attachWithOptions(arena, chunk, pages, elem, .{});
+}
+
+pub fn attachWithOptions(arena: std.mem.Allocator, chunk: *schema.ColumnChunk, pages: []const encoder.PageInfo, elem: *const schema.SchemaElement, options: Options) !void {
     if (pages.len == 0) return;
     const start: u64 = @intCast(chunkStart(chunk));
-    if (try columnIndex(arena, pages, elem)) |ci| chunk.column_index_out = try serialize(arena, &ci);
+    if (try columnIndexWithOptions(arena, pages, elem, options)) |ci| chunk.column_index_out = try serialize(arena, &ci);
     chunk.offset_index_out = try serialize(arena, &(try offsetIndex(arena, pages, start)));
 }
 
@@ -196,6 +231,45 @@ pub const Deferred = struct {
 
 const testing = std.testing;
 
+test "review: variable-width signed decimal bounds include sign extension and length" {
+    var e = elemOf(.BYTE_ARRAY);
+    e.converted_type = .DECIMAL;
+    e.scale = 0;
+    e.precision = 9;
+    try testing.expectEqual(std.math.Order.lt, compare(&e, "\xff\x00", "\xf6"));
+    try testing.expectEqual(std.math.Order.lt, compare(&e, "\x7f", "\x01\x00"));
+    try testing.expectEqual(std.math.Order.eq, compare(&e, "\x00\x7f", "\x7f"));
+    try testing.expectEqual(std.math.Order.eq, compare(&e, "\xff\xff\x00", "\xff\x00"));
+    const pages = [_]encoder.PageInfo{
+        .{ .offset = 0, .size = 1, .first_row = 0, .rows = 1, .null_count = 0, .min = "\xf6", .max = "\xf6" },
+        .{ .offset = 1, .size = 1, .first_row = 1, .rows = 1, .null_count = 0, .min = "\xff\x00", .max = "\xff\x00" },
+        .{ .offset = 2, .size = 1, .first_row = 2, .rows = 1, .null_count = 0, .min = "\x64", .max = "\x64" },
+    };
+    try testing.expectEqual(schema.BoundaryOrder.UNORDERED, boundaryOrder(&pages, &e));
+}
+
+test "review: malformed and NaN page bounds produce no column index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]schema.Type{ .FLOAT, .DOUBLE, .INT32, .INT64, .BOOLEAN }) |t| {
+        const e = elemOf(t);
+        const pages = [_]encoder.PageInfo{
+            .{ .offset = 0, .size = 1, .first_row = 0, .rows = 1, .null_count = 0, .min = "", .max = "" },
+            .{ .offset = 1, .size = 1, .first_row = 1, .rows = 1, .null_count = 0, .min = "", .max = "" },
+        };
+        try testing.expect((try columnIndex(a, &pages, &e)) == null);
+    }
+    var nan: [8]u8 = @splat(0);
+    for ([_]schema.Type{ .FLOAT, .DOUBLE }) |t| {
+        const e = elemOf(t);
+        const width: usize = if (t == .FLOAT) 4 else 8;
+        if (t == .FLOAT) std.mem.writeInt(u32, nan[0..4], 0x7fc00000, .little) else std.mem.writeInt(u64, &nan, 0x7ff8000000000000, .little);
+        const pages = [_]encoder.PageInfo{.{ .offset = 0, .size = 1, .first_row = 0, .rows = 1, .null_count = 0, .min = nan[0..width], .max = nan[0..width] }};
+        try testing.expect((try columnIndex(a, &pages, &e)) == null);
+    }
+}
+
 fn elemOf(t: schema.Type) schema.SchemaElement {
     return .{
         .type = t,
@@ -231,10 +305,15 @@ test "boundary order follows the type's order, skips null pages, and a single pa
     try testing.expectEqual(schema.BoundaryOrder.ASCENDING, ci.boundary_order);
     try testing.expectEqualSlices(bool, &.{ false, true, false }, ci.null_pages.items);
     try testing.expectEqualSlices(i64, &.{ 0, 2, 0 }, ci.null_counts.?.items);
-    // Unsigned: -5 is the largest value, so the same bounds are no longer ascending.
+    // Unsigned: -5 is the largest value; valid page bounds in that order are not monotone.
     e.converted_type = .UINT_32;
-    try testing.expectEqual(schema.BoundaryOrder.UNORDERED, (try columnIndex(a, &asc, &e)).?.boundary_order);
-    try testing.expectEqual(schema.BoundaryOrder.UNORDERED, (try columnIndex(a, asc[0..1], &e)).?.boundary_order);
+    try testing.expect((try columnIndex(a, &asc, &e)) == null); // The first signed pair is inverted unsigned.
+    var unsigned = [_]P{ asc[0], asc[2], asc[2] };
+    unsigned[0].max = unsigned[0].min;
+    unsigned[1].max = unsigned[1].min;
+    unsigned[2].min = unsigned[2].max;
+    try testing.expectEqual(schema.BoundaryOrder.UNORDERED, (try columnIndex(a, &unsigned, &e)).?.boundary_order);
+    try testing.expectEqual(schema.BoundaryOrder.UNORDERED, (try columnIndex(a, unsigned[0..1], &e)).?.boundary_order);
     const desc = [_]P{ asc[2], asc[0] };
     e.converted_type = null;
     try testing.expectEqual(schema.BoundaryOrder.DESCENDING, (try columnIndex(a, &desc, &e)).?.boundary_order);

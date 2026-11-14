@@ -4,9 +4,10 @@
 
 const std = @import("std");
 const schema = @import("../schema.zig");
+const decimal = @import("decimal.zig");
 
 const spaces = " \t\r\n\x0b\x0c";
-const Writer = struct { app: enum { cpp, mr }, version: Version };
+const Writer = struct { app: enum { cpp, mr, zpq }, version: Version };
 
 const Version = struct {
     number: [3]u31 = .{ 0, 0, 0 },
@@ -56,6 +57,12 @@ pub const Policy = enum {
 
 pub fn policy(created_by: ?[]const u8, physical: schema.Type, elem: ?schema.SchemaElement) Policy {
     const writer = parse(created_by) orelse return .trust;
+    if (writer.app == .zpq) {
+        if (physical == .BYTE_ARRAY and writer.version.numericOrder(.{ 0, 6, 0 }) == .lt) {
+            if (elem) |e| if (decimal.kindFromSchema(&e) != null) return .absent;
+        }
+        return .trust;
+    }
     if (writer.app == .mr and (physical == .BYTE_ARRAY or physical == .FIXED_LEN_BYTE_ARRAY)) {
         const binary_fixed: Version = .{ .number = .{ 1, 8, 0 } };
         // Conservative like Arrow: CDH's backport banner does not re-enable pre-1.8 binary statistics.
@@ -115,6 +122,7 @@ fn parse(created_by: ?[]const u8) ?Writer {
     const kind: @FieldType(Writer, "app") = kind: {
         if (std.mem.eql(u8, app, "parquet-mr")) break :kind .mr;
         if (std.mem.eql(u8, app, "parquet-cpp")) break :kind .cpp;
+        if (std.mem.eql(u8, app, "zpq")) break :kind .zpq;
         return null;
     };
     const unknown: Writer = .{ .app = kind, .version = .{} };
@@ -216,6 +224,14 @@ test "writer statistics: numeric boundaries equal extrema and conservative CDH r
         }
         try testing.expectEqual(c.bytes, usable(c.writer, .BYTE_ARRAY, null, null, null));
     }
+}
+
+test "review: released zpq byte-array DECIMAL bounds cannot prune values" {
+    const elem: schema.SchemaElement = .{ .name = "d", .type = .BYTE_ARRAY, .type_length = null, .repetition_type = .REQUIRED, .num_children = null, .converted_type = .DECIMAL, .scale = 0, .precision = 9, .field_id = null };
+    try std.testing.expectEqual(Policy.absent, policy("zpq version 0.5.2", .BYTE_ARRAY, elem));
+    try std.testing.expectEqual(Policy.absent, policy("zpq version broken", .BYTE_ARRAY, elem));
+    try std.testing.expectEqual(Policy.trust, policy("zpq version 0.6.0", .BYTE_ARRAY, elem));
+    try std.testing.expectEqual(Policy.trust, policy("zpq version 0.5.2", .FIXED_LEN_BYTE_ARRAY, elem));
 }
 
 test "writer statistics: unknown applications stay modern and malformed known versions are distrusted" {

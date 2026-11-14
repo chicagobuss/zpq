@@ -201,7 +201,6 @@ pub const FilterJobs = copy_module.FilterJobs;
 pub const Recompress = copy_module.Recompress;
 pub const RecompressedChunk = copy_module.RecompressedChunk;
 pub const recompressRowGroup = copy_module.recompressRowGroup;
-const dictionaryBloom = copy_module.dictionaryBloom;
 const PageMove = copy_module.PageMove;
 const recompressChunk = copy_module.recompressChunk;
 const sourceBytes = types.sourceBytes;

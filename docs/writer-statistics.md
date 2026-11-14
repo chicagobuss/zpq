@@ -13,6 +13,7 @@ filter copied beside encoded data. Raw input metadata remains available for insp
 | `parquet-cpp` before 1.3.0 | Non-signed-order columns, unless both encoded extrema are equal |
 | `parquet-mr` before 1.10.0 | The same non-signed-order rule |
 | `parquet-mr` before semantic version 1.8.0 | BYTE_ARRAY and FIXED_LEN_BYTE_ARRAY, even with equal extrema or a CDH backport banner |
+| `zpq` before 0.6.0 | BYTE_ARRAY DECIMAL: raw-byte encoder bounds could use unsigned byte order and exclude present values |
 
 Unlike parquet-mr's CDH exception for `[1.5.0-cdh5.5.0, 1.5.0)`, zpq conservatively
 rejects all pre-1.8 binary statistics, as Arrow does. Numeric version boundaries
@@ -27,13 +28,13 @@ removes statistics; it never makes previously unreadable bounds usable.
 ASCII whitespace, optional `(build ...)`, numeric major/minor/patch (omitted minor
 or patch becomes zero), and rc/prerelease/build suffixes are recognized. Parsing
 must succeed completely before a version is classified. A recognized application
-(`parquet-mr` or `parquet-cpp`) with a missing or malformed version is **0.0.0**,
+(`parquet-mr`, `parquet-cpp` or `zpq`) with a missing or malformed version is **0.0.0**,
 so the corresponding old-writer rules apply. Missing/empty `created_by` or an unknown
 application means **modern**: no writer-specific suppression. This follows Arrow's
 permissive unknown-application choice and conservative known-application fallback;
 it deliberately differs from parquet-mr's conservative unknown-binary-writer rule.
 It is not evidence that unknown writers' statistics are true. Other applications,
-including `parquet-cpp-arrow`, zpq, DuckDB, Polars and Spark, get no special rule;
+including `parquet-cpp-arrow`, DuckDB, Polars and Spark, get no special rule;
 Spark files identifying as `parquet-mr` are checked by that advertised version.
 
 Sources: Arrow's [ApplicationVersion parser and HasCorrectStatistics](https://github.com/apache/arrow/blob/main/cpp/src/parquet/metadata.cc),

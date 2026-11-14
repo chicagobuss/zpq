@@ -405,8 +405,8 @@ may overshoot by one source group. A source group already at target copies whole
 and only nonidentity dictionary index streams are remapped; existing PLAIN, DELTA and BYTE_STREAM_SPLIT pages stay
 encoded. The explicit memory limit applies the same one-sixteenth byte cap as reencoding, using encoded bytes here.
 Different codecs, unsupported chunk shapes, dictionary-page overflow or insufficient merge working memory can end
-a run early; the whole-group copy remains available. Compatible
-carried Bloom filters are unioned; otherwise a filter is rebuilt from a complete dictionary or decoded values,
+a run early; the whole-group copy remains available. Compatible carried Bloom filters are unioned; incomplete or
+incompatible coverage is omitted. Copies create or rebuild filters only for explicit `--bloom-filter` requests,
 while the encoded pages remain unchanged. Floating-point and INT96 chunk bounds are omitted conservatively when
 merging; floating-point page indexes retain source bounds with unordered boundaries and unknown NaN counts.
 Set `--row-group-size 1` for copy-only grouping. Codec-changing copies and row groups a filter's

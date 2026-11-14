@@ -1,5 +1,9 @@
 {
-  "fixtures": [{"script": "tools/check/prepare_wire.py", "files": ["flba", "floats", "null_dict"]}],
+  "fixtures": [
+    {"script": "tools/check/prepare_wire.py", "files": ["flba", "floats", "null_dict"]},
+    {"script": "tools/check/prepare_compaction.py", "files": ["compact_decimal", "compact_a", "compact_b", "compact_empty", "compact_nan", "compact_short", "released_decimal"]},
+    {"name": "compact_decimal_merged", "zpq": ["query", "{fixture:compact_decimal}", "-o", "{path}", "--no-bloom-filters"]}
+  ],
   "cases": [
     {"id": "wire:empty-dictionary:rows", "fixture": "null_dict", "sql": "SELECT s,i FROM '{path}'", "emit": "rows", "oracle": {"compare": "ordered", "sql": "SELECT s,i FROM '{path}'"}},
     {"id": "wire:empty-dictionary:aggregate", "fixture": "null_dict", "sql": "SELECT count(*), count(s), count(i) FROM '{path}'", "oracle": {"compare": "ordered", "sql": "SELECT count(*), count(s), count(i) FROM '{path}'"}},
@@ -19,6 +23,13 @@
     {"id": "wire:flba-copy:pyarrow", "fixture": "flba", "query": {"columns": ["id", "rand", "lo"]}, "emit": "copy", "oracle": {"compare": "wire:pyarrow"}},
     {"id": "wire:flba-copy:duck", "fixture": "flba", "query": {"columns": ["id", "rand", "lo"]}, "emit": "copy", "oracle": {"compare": "wire:duck"}},
     {"id": "wire:flba-copy:bytes", "fixture": "flba", "query": {"columns": ["id", "rand", "lo"]}, "emit": "copy", "oracle": {"compare": "wire:bytes"}},
-    {"id": "wire:flba-copy:encodings", "fixture": "flba", "query": {"columns": ["id", "rand", "lo"]}, "emit": "copy", "oracle": {"compare": "wire:encodings"}}
+    {"id": "wire:flba-copy:encodings", "fixture": "flba", "query": {"columns": ["id", "rand", "lo"]}, "emit": "copy", "oracle": {"compare": "wire:encodings"}},
+    {"id": "review:decimal:pruning-keeps-negative", "fixture": "compact_decimal_merged", "sql": "SELECT count(*) AS c FROM '{path}' WHERE d = -256", "emit": "answer", "oracle": {"compare": "golden", "golden": "contract/compaction-one.json"}},
+    {"id": "review:released-decimal:pruning", "fixture": "released_decimal", "sql": "SELECT count(*) AS c FROM '{path}' WHERE d = 256", "emit": "answer", "oracle": {"compare": "golden", "golden": "contract/compaction-one.json"}},
+    {"id": "review:staged-fallback:explicit", "fixture": "compact_a", "cli": ["query", "{path}", "{fixture:compact_b}", "-o", "{out}", "--bloom-filter", "a"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}' UNION ALL SELECT * FROM '{fixture:compact_b}'"}},
+    {"id": "review:staged-fallback:projected-window", "fixture": "compact_a", "cli": ["query", "{path}", "{fixture:compact_b}", "-o", "{out}", "--columns", "a"], "axes": [{"force": {"ZPQ_IO_PROFILE": "pread"}}, {"force": {"ZPQ_IO_PROFILE": "uring"}}], "oracle": {"compare": "written_as", "sql": "SELECT a FROM '{path}' UNION ALL SELECT a FROM '{fixture:compact_b}'"}},
+    {"id": "review:bounds:nan", "fixture": "compact_nan", "cli": ["query", "{path}", "-o", "{out}"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'"}},
+    {"id": "review:bounds:short", "fixture": "compact_short", "cli": ["query", "{path}", "-o", "{out}"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{path}'"}},
+    {"id": "review:empty-chunk", "fixture": "compact_empty", "cli": ["query", "{path}", "{fixture:compact_a}", "-o", "{out}"], "oracle": {"compare": "written_as", "sql": "SELECT * FROM '{fixture:compact_a}'"}}
   ]
 }

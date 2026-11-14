@@ -23,10 +23,6 @@ pub const Source = struct {
     rg: *const schema.RowGroup,
     fd: ?std.posix.fd_t = null,
     file_offsets: bool = false,
-    pub fn own(s: Source, a: std.mem.Allocator) !Source {
-        return s.ownProjected(a, null);
-    }
-
     pub fn ownProjected(s: Source, a: std.mem.Allocator, kept: ?[]const bool) !Source {
         var start: usize = s.bytes.len;
         var end: usize = 0;
@@ -36,7 +32,10 @@ pub const Source = struct {
             start = @min(start, range.start);
             end = @max(end, range.start + range.len);
         }
-        if (end < start) return error.InvalidColumnOffsets;
+        if (end < start) {
+            start = 0;
+            end = 0;
+        }
         const rg = try a.create(schema.RowGroup);
         rg.* = s.rg.*;
         rg.columns = .empty;
@@ -53,7 +52,6 @@ pub const Source = struct {
     }
 };
 pub const Options = struct {
-    dictionary_bloom: bool = true,
     dictionary_limit: ?usize = null,
     filter_fpp: []const ?f64 = &.{},
 };
@@ -109,6 +107,7 @@ pub const Plan = struct {
             for (sources) |s| {
                 const cm = s.rg.columns.items[ci].meta_data orelse return null;
                 const range = fast.chunkRange(&cm, s.bytes.len) orelse return error.InvalidColumnOffsets;
+                if (range.len == 0) return null;
                 var r = thrift.Reader.init(s.bytes[range.start..][0..range.len]);
                 const h = try schema.PageHeader.read(&r);
                 if (h.type != .DICTIONARY_PAGE) continue;
@@ -123,7 +122,8 @@ pub const Plan = struct {
                 entry_bound = try std.math.add(usize, entry_bound, @intCast(dh.num_values));
                 byte_bound = try std.math.add(usize, byte_bound, @intCast(h.uncompressed_page_size));
             }
-            const numeric = cm0.type == .INT32 or cm0.type == .INT64 or cm0.type == .FLOAT or cm0.type == .DOUBLE;
+            const numeric = cm0.type == .INT32 or cm0.type == .INT64 or cm0.type == .FLOAT or cm0.type == .DOUBLE or
+                (cm0.type == .FIXED_LEN_BYTE_ARRAY and elem.type_length != null and elem.type_length.? > 0 and elem.type_length.? <= 8);
             var fixed: ?enc.Interner(u64) = null;
             var general: ?enc.MapInterner(u64) = null;
             if (numeric and entry_bound > 0) fixed = try enc.Interner(u64).init(a, entry_bound) else try intern.ensureTotalCapacity(std.math.cast(u32, entry_bound) orelse return null);
@@ -256,15 +256,15 @@ pub const Plan = struct {
             if (has_filter and filters_complete) {
                 var header: [bloom.max_header_bytes]u8 = undefined;
                 col.filter = try std.mem.concat(a, u8, &.{ bloom.writeHeader(@intCast(filter_bits.?.len), &header), filter_bits.? });
-            } else if (col.has_dictionary and col.all_dictionary and (has_filter or opts.dictionary_bloom)) {
-                const fpp = if (ci < opts.filter_fpp.len) opts.filter_fpp[ci] orelse 0.01 else 0.01;
-                var b = try bloom.Builder.init(a, col.entries.items.len, fpp);
-                defer b.deinit(a);
-                for (col.entries.items) |entry| b.insert(bloom.hashBytes(if (cm0.type == .BYTE_ARRAY) entry[4..] else entry));
-                col.filter = try b.serialize(a);
-            } else if (has_filter) {
-                const fpp = if (ci < opts.filter_fpp.len) opts.filter_fpp[ci] orelse 0.01 else 0.01;
-                col.filter = try rebuildFilter(a, sources, ci, fpp);
+            } else if (ci < opts.filter_fpp.len) {
+                if (opts.filter_fpp[ci]) |fpp| {
+                    if (col.has_dictionary and col.all_dictionary) {
+                        var b = try bloom.Builder.init(a, col.entries.items.len, fpp);
+                        defer b.deinit(a);
+                        for (col.entries.items) |entry| b.insert(bloom.hashBytes(if (cm0.type == .BYTE_ARRAY) entry[4..] else entry));
+                        col.filter = try b.serialize(a);
+                    } else col.filter = try rebuildFilter(a, sources, ci, fpp);
+                }
             }
         }
         return .{ .sources = sources, .columns = columns, .rows = rows };
@@ -339,24 +339,10 @@ pub const Plan = struct {
                 try countEncoding(a, cm, h.type, encoding);
             }
             cm.total_compressed_size = @intCast(out.pos() - start);
-            try index.attach(a, &chunk, pages.items, &col.elem);
-            if (chunk.column_index_out.len > 0) {
-                var r = thrift.Reader.init(chunk.column_index_out);
-                var ci = try schema.ColumnIndex.read(a, &r);
-                // Source page bounds remain valid, but no floating-point total ordering is inferred here.
-                if (col.elem.type == .FLOAT or col.elem.type == .DOUBLE) {
-                    ci.boundary_order = .UNORDERED;
-                    ci.nan_counts = null;
-                }
-                for (pages.items) |pg| if (pg.null_count < 0) {
-                    ci.null_counts = null;
-                    break;
-                };
-                var w: thrift.Writer = .init(a);
-                try ci.write(&w);
-                chunk.column_index_out = w.bytes();
-            }
-            if (col.elem.type == .INT96) chunk.column_index_out = &.{};
+            try index.attachWithOptions(a, &chunk, pages.items, &col.elem, .{
+                .unordered = col.elem.type == .FLOAT or col.elem.type == .DOUBLE,
+                .omit_bounds = col.elem.type == .INT96,
+            });
             try columns.append(a, chunk);
         }
         return .{ .columns = columns, .num_rows = @intCast(p.rows), .total_byte_size = fast.uncompressedBytes(columns.items) };
@@ -414,7 +400,13 @@ fn rebuildFilter(a: std.mem.Allocator, sources: []const Source, ci: usize, fpp: 
     return builder.serialize(a);
 }
 fn numericKey(raw: []const u8) u64 {
-    return if (raw.len == 4) std.mem.readInt(u32, raw[0..4], .little) else std.mem.readInt(u64, raw[0..8], .little);
+    if (raw.len == 4) return std.mem.readInt(u32, raw[0..4], .little);
+    if (raw.len == 8) return std.mem.readInt(u64, raw[0..8], .little);
+    // A column has one fixed width. Exact-width loads preserve raw bits without a per-entry memcpy.
+    inline for (1..8) |n| {
+        if (raw.len == n) return std.mem.readInt(@Int(.unsigned, n * 8), raw[0..n], .little);
+    }
+    unreachable;
 }
 
 fn compatible(a: schema.SchemaElement, b: schema.SchemaElement) bool {
@@ -466,14 +458,15 @@ fn countEncoding(a: std.mem.Allocator, cm: *schema.ColumnMetaData, t: schema.Pag
 fn mergeStats(acc: *schema.Statistics, s: schema.Statistics, elem: *const schema.SchemaElement) void {
     acc.null_count = if (acc.null_count != null and s.null_count != null) acc.null_count.? + s.null_count.? else null;
     acc.nan_count = if (acc.nan_count != null and s.nan_count != null) acc.nan_count.? + s.nan_count.? else null;
-    const lo = acc.min_value orelse acc.min;
-    const hi = acc.max_value orelse acc.max;
+    const omit_bounds = elem.type == .FLOAT or elem.type == .DOUBLE or elem.type == .INT96;
+    const lo = if (omit_bounds) null else acc.min_value orelse acc.min;
+    const hi = if (omit_bounds) null else acc.max_value orelse acc.max;
     const slo = s.min_value orelse s.min;
     const shi = s.max_value orelse s.max;
     acc.min = null;
     acc.max = null;
-    acc.min_value = if (lo != null and slo != null) if (index.compare(elem, lo.?, slo.?) == .gt) slo else lo else null;
-    acc.max_value = if (hi != null and shi != null) if (index.compare(elem, hi.?, shi.?) == .lt) shi else hi else null;
+    acc.min_value = if (lo != null and slo != null) if (index.compare(elem, lo.?, slo.?)) |o| if (o == .gt) slo else lo else null else null;
+    acc.max_value = if (hi != null and shi != null) if (index.compare(elem, hi.?, shi.?)) |o| if (o == .lt) shi else hi else null else null;
     acc.is_min_value_exact = false;
     acc.is_max_value_exact = false;
     acc.distinct_count = null;
@@ -654,28 +647,6 @@ test "coalesce empty dictionaries with all NULL chunks have no fabricated values
     try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0, 0, 0 }, values.def_levels.?);
 }
 
-test "coalesce buffer and streaming assemblers share layout and preserve whole-source cuts" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const x = try testSource(a, &.{ 1, 2 }, &.{ 0, 1, 0 }, false, false);
-    const y = try testSource(a, &.{ 3, 4 }, &.{ 1, 0, 1 }, false, false);
-    const files = [_]fast.FileSpec{ .{ .bytes = x.bytes, .meta = x.meta, .survivors = &.{true} }, .{ .bytes = y.bytes, .meta = y.meta, .survivors = &.{true} } };
-    const target: Target = .{ .rows = 5 };
-    const bytes = try fast.buildMultiCoalesced(a, &files, null, target);
-    const streaming = @import("streaming.zig");
-    var sink: streaming.MemorySink = .{ .arena = a };
-    _ = try streaming.buildCoalesced(a, sink.sink(), &files, null, target);
-    try std.testing.expectEqualSlices(u8, bytes, sink.buffer.items);
-    const m = try @import("../parquet/metadata.zig").open(a, bytes);
-    try std.testing.expectEqual(@as(usize, 1), m.row_groups.items.len);
-    try std.testing.expectEqual(@as(i64, 6), m.row_groups.items[0].num_rows);
-    try std.testing.expectEqualStrings(schema.ZPQ_CREATED_BY, m.created_by.?);
-    const owned = try x.own(a);
-    const pair = [_]Source{ owned, y };
-    try std.testing.expect((try Plan.init(a, &pair, null, .{})) != null);
-}
-
 test "coalesce Bloom unions and dictionary rebuilds cover every source value" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -693,7 +664,8 @@ test "coalesce Bloom unions and dictionary rebuilds cover every source value" {
     }
     for (0..2) |mode| {
         if (mode == 1) sources[1].rg.columns.items[0].bloom_out = &.{};
-        const plan = (try Plan.init(a, &sources, null, .{})).?;
+        if (mode == 1) try std.testing.expectEqual(@as(usize, 0), (try Plan.init(a, &sources, null, .{})).?.columns[0].filter.len);
+        const plan = (try Plan.init(a, &sources, null, .{ .filter_fpp = &.{0.01} })).?;
         const bits = bloom.bitset(plan.columns[0].filter).?;
         for ([_]i32{ 10, 20, 30 }) |v| {
             var raw: [4]u8 = undefined;
@@ -701,13 +673,40 @@ test "coalesce Bloom unions and dictionary rebuilds cover every source value" {
             try std.testing.expect(bloom.mightContainScalar(bits, bloom.hashBytes(&raw)));
         }
     }
+    var different = try bloom.Builder.init(a, 1000, 0.01);
+    defer different.deinit(a);
+    for ([_]i32{ 20, 30 }) |v| {
+        var raw: [4]u8 = undefined;
+        std.mem.writeInt(i32, &raw, v, .little);
+        different.insert(bloom.hashBytes(&raw));
+    }
+    sources[1].rg.columns.items[0].bloom_out = try different.serialize(a);
+    try std.testing.expectEqual(@as(usize, 0), (try Plan.init(a, &sources, null, .{})).?.columns[0].filter.len);
+    const rebuilt = (try Plan.init(a, &sources, null, .{ .filter_fpp = &.{0.01} })).?;
+    try std.testing.expect(rebuilt.columns[0].filter.len > 0);
     sources[1] = try testSource(a, null, &.{ 30, 40 }, false, false);
-    const mixed = (try Plan.init(a, &sources, null, .{})).?;
+    try std.testing.expectEqual(@as(usize, 0), (try Plan.init(a, &sources, null, .{})).?.columns[0].filter.len);
+    const mixed = (try Plan.init(a, &sources, null, .{ .filter_fpp = &.{0.01} })).?;
     for ([_]i32{ 10, 20, 30, 40 }) |v| {
         var raw: [4]u8 = undefined;
         std.mem.writeInt(i32, &raw, v, .little);
         try std.testing.expect(bloom.mightContainScalar(bloom.bitset(mixed.columns[0].filter).?, bloom.hashBytes(&raw)));
     }
+}
+
+test "coalesce and whole copies create no unrequested Bloom filters" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try testSource(a, &.{ 10, 20 }, &.{ 0, 1 }, false, false);
+    const plan = (try Plan.init(a, &.{ s, s }, null, .{})).?;
+    try std.testing.expectEqual(@as(usize, 0), plan.columns[0].filter.len);
+    const streaming = @import("streaming.zig");
+    var sink: streaming.MemorySink = .{ .arena = a };
+    var offset: u64 = 0;
+    var timing: @import("../consumer/types.zig").Timings = .{};
+    const copied = try @import("../consumer/copy.zig").copyRG(a, s.rg, .{ .bytes = s.bytes, .byte_origin = 0 }, null, sink.sink(), &offset, &timing, true, null, .{ .meta = s.meta, .scratch = a });
+    try std.testing.expectEqual(@as(usize, 0), copied.rg.?.columns.items[0].bloom_out.len);
 }
 
 test "coalesce owned window sources retain runtime filters and decode after the source is released" {
@@ -724,7 +723,7 @@ test "coalesce owned window sources retain runtime filters and decode after the 
     b.insert(bloom.hashBytes(&raw));
     const filter = try b.serialize(a);
     source.rg.columns.items[0].bloom_out = filter;
-    const owned = try source.own(a);
+    const owned = try source.ownProjected(a, null);
     try std.testing.expectEqualSlices(u8, filter, owned.rg.columns.items[0].bloom_out);
     const relocated = fast.rebaseChunk(a, owned.bytes, &owned.rg.columns.items[0], 17);
     try std.testing.expectEqualSlices(u8, filter, relocated.bloom_out);
@@ -765,4 +764,102 @@ test "coalesce numeric dictionary collisions preserve IDs when promoting the enc
     const got = try r.readAll(keys.len * 2);
     try std.testing.expectEqualSlices(i32, &keys, got.values[0..keys.len]);
     try std.testing.expectEqualSlices(i32, &keys, got.values[keys.len..]);
+}
+
+test "review: a staged fallback copies its serialized column index onto output ownership" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var pending = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer pending.deinit();
+    const a = arena.allocator();
+    const s = try testSource(a, null, &.{42}, false, false);
+    const bound = [_]u8{ 42, 0, 0, 0 };
+    try index.attach(pending.allocator(), &s.rg.columns.items[0], &.{.{ .offset = 0, .size = @intCast(s.bytes.len), .first_row = 0, .rows = 1, .null_count = 0, .min = &bound, .max = &bound }}, &s.meta.schema.items[1]);
+    const held = try @import("../consumer/copy.zig").prepareCoalesceSource(pending.allocator(), a, s, &.{0.01});
+    const expected = try a.dupe(u8, held.rg.columns.items[0].column_index_out);
+    const streaming = @import("streaming.zig");
+    var sink: streaming.MemorySink = .{ .arena = a };
+    var offset: u64 = 0;
+    var timing: @import("../consumer/types.zig").Timings = .{};
+    const copied = try @import("../consumer/copy.zig").copyRG(a, held.rg, .{ .bytes = held.bytes, .byte_origin = 0 }, null, sink.sink(), &offset, &timing, true, null, .{});
+    @memset(@constCast(held.rg.columns.items[0].column_index_out), 0x55);
+    try std.testing.expectEqualSlices(u8, expected, copied.rg.?.columns.items[0].column_index_out);
+}
+
+test "coalesce seven-byte fixed dictionary keys preserve raw entries and remap order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const first = "\x00\x00\x00\x00\x00\x00\x01";
+    const second = "\xff\xff\xff\xff\xff\xff\xff";
+    var sources: [2]Source = undefined;
+    for (&sources, 0..) |*s, i| {
+        s.* = try testSource(a, null, &.{0}, false, false);
+        const e = &s.meta.schema.items[1];
+        e.type = .FIXED_LEN_BYTE_ARRAY;
+        e.type_length = 7;
+        e.converted_type = .DECIMAL;
+        e.scale = 0;
+        e.precision = 16;
+        var values: [64][]const u8 = undefined;
+        for (&values, 0..) |*v, j| v.* = if ((j + i) % 2 == 0) first else second;
+        const encoded = try enc.encodeColumn(a, .{
+            .values = .{ .string = .{ .values = &values } },
+            .schema_elem = e,
+            .path_in_schema = &.{"x"},
+            .dictionary_bloom = false,
+        });
+        s.bytes = encoded.bytes;
+        s.rg.columns.items[0].meta_data = encoded.meta;
+        // This test supplies raw entries to the low-level byte encoder, not exact-decimal statistics.
+        s.rg.columns.items[0].meta_data.?.statistics = null;
+        s.meta.row_groups.items[0].num_rows = values.len;
+        @constCast(s.meta).num_rows = values.len;
+    }
+    const plan = (try Plan.init(a, &sources, null, .{})).?;
+    try std.testing.expectEqual(@as(usize, 2), plan.columns[0].entries.items.len);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, plan.columns[0].maps[0]);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 0 }, plan.columns[0].maps[1]);
+    try std.testing.expectEqualSlices(u8, first, plan.columns[0].entries.items[0]);
+    try std.testing.expectEqualSlices(u8, second, plan.columns[0].entries.items[1]);
+}
+
+test "review: untrusted staged column index cannot survive writer safety" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try testSource(a, null, &.{1}, false, false);
+    s.rg.columns.items[0].meta_data.?.writer_stats = .absent;
+    s.rg.columns.items[0].column_index_out = "untrusted index";
+    const safe = fast.writerSafeChunk(a, s.bytes, &s.rg.columns.items[0], null);
+    try std.testing.expectEqual(@as(usize, 0), safe.column_index_out.len);
+}
+
+test "review: zero-byte chunks refuse merging and can be staged at EOF" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const s = try testSource(a, null, &.{}, false, false);
+    const cm = &s.rg.columns.items[0].meta_data.?;
+    cm.total_compressed_size = 0;
+    cm.total_uncompressed_size = 0;
+    cm.data_page_offset = @intCast(s.bytes.len);
+    const owned = try s.ownProjected(a, null);
+    try std.testing.expectEqual(@as(usize, 0), owned.bytes.len);
+    try std.testing.expect((try Plan.init(a, &.{ s, s }, null, .{})) == null);
+}
+
+test "review: NaN chunk bounds are discarded without comparison" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nan = [_]u8{ 0, 0, 0xc0, 0x7f };
+    const sources = [_]Source{ try testSource(a, null, &.{0}, false, false), try testSource(a, null, &.{0}, false, false) };
+    for (sources) |s| {
+        s.meta.schema.items[1].type = .FLOAT;
+        s.rg.columns.items[0].meta_data.?.type = .FLOAT;
+        s.rg.columns.items[0].meta_data.?.statistics = .{ .min_value = &nan, .max_value = &nan, .null_count = 0 };
+    }
+    const plan = (try Plan.init(a, &sources, null, .{})).?;
+    try std.testing.expect(plan.columns[0].statistics.?.min_value == null);
 }

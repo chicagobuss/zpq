@@ -146,17 +146,6 @@ pub fn buildMulti(
 }
 
 /// `assemble` output collecting the whole file in one buffer.
-pub fn buildMultiCoalesced(
-    arena: std.mem.Allocator,
-    files: []const FileSpec,
-    kept_columns: ?[]const usize,
-    target: coalesce.Target,
-) ![]u8 {
-    var out: BufferOut = .{ .arena = arena };
-    try assembleWithTarget(arena, &out, files, kept_columns, target);
-    return out.bytes.toOwnedSlice(arena);
-}
-
 const BufferOut = struct {
     arena: std.mem.Allocator,
     bytes: std.ArrayList(u8) = .empty,
@@ -197,16 +186,6 @@ pub fn assemble(
     files: []const FileSpec,
     kept_columns: ?[]const usize,
 ) !void {
-    return assembleWithTarget(arena, out, files, kept_columns, null);
-}
-
-pub fn assembleWithTarget(
-    arena: std.mem.Allocator,
-    out: anytype,
-    files: []const FileSpec,
-    kept_columns: ?[]const usize,
-    target: ?coalesce.Target,
-) !void {
     try validateInputs(files, kept_columns);
     const copied_len = try copiedLen(files, kept_columns);
     const column_orders = try copiedColumnOrders(arena, files, kept_columns);
@@ -217,51 +196,7 @@ pub fn assembleWithTarget(
     var new_row_groups: std.ArrayList(schema.RowGroup) = .empty;
     errdefer new_row_groups.deinit(arena);
     var total_rows: i64 = 0;
-    var merged = false;
-    if (target) |t| {
-        var sources: std.ArrayList(coalesce.Source) = .empty;
-        for (files) |f| for (f.survivors, f.meta.row_groups.items) |keep, *rg| {
-            if (keep) try sources.append(arena, .{ .bytes = f.bytes, .meta = f.meta, .rg = rg });
-        };
-        var at: usize = 0;
-        while (at < sources.items.len) {
-            var end = at;
-            var rows: u64 = 0;
-            var bytes: u64 = 0;
-            while (end < sources.items.len) {
-                const rg = sources.items[end].rg;
-                const nr: u64 = @intCast(rg.num_rows);
-                var nb: u64 = 0;
-                for (rg.columns.items, 0..) |c, ci| {
-                    if (kept_columns) |kc| if (std.mem.indexOfScalar(usize, kc, ci) == null) continue;
-                    nb +|= @intCast(@max(0, c.meta_data.?.total_uncompressed_size));
-                }
-                if (end > at and t.reached(nr, nb)) break;
-                rows += nr;
-                bytes +|= nb;
-                end += 1;
-                if (t.reached(rows, bytes)) break;
-            }
-            var used = end - at;
-            while (used > 1) : (used -= 1) {
-                var scratch = std.heap.ArenaAllocator.init(arena);
-                defer scratch.deinit();
-                if (try coalesce.Plan.init(scratch.allocator(), sources.items[at..][0..used], kept_columns, .{})) |p| {
-                    const rg = try p.write(arena, out);
-                    try new_row_groups.append(arena, rg);
-                    total_rows += rg.num_rows;
-                    merged = true;
-                    break;
-                }
-            } else {
-                const s = sources.items[at];
-                const rg = if (kept_columns) |kc| try copyProjectedRowGroup(arena, out, s.bytes, s.rg, kc, s.meta) else try copyRowGroup(arena, out, s.bytes, s.rg, s.meta) orelse return error.InvalidColumnOffsets;
-                try new_row_groups.append(arena, rg);
-                total_rows += rg.num_rows;
-            }
-            at += used;
-        }
-    } else for (files) |f| for (f.survivors, f.meta.row_groups.items) |keep, *rg| {
+    for (files) |f| for (f.survivors, f.meta.row_groups.items) |keep, *rg| {
         if (!keep) continue;
         const new_rg = if (kept_columns) |kc|
             try copyProjectedRowGroup(arena, out, f.bytes, rg, kc, f.meta)
@@ -276,14 +211,13 @@ pub fn assembleWithTarget(
 
     // The schema is shared by reference unless projecting, which needs a reduced list.
     const meta0 = files[0].meta;
-    if (merged) for (new_row_groups.items) |*rg| for (rg.columns.items) |*c| schema.dropForeignDeprecatedBounds(c);
     const new_meta: schema.FileMetaData = .{
         .version = meta0.version,
         .schema = if (kept_columns) |kc| try projectSchema(arena, meta0.schema, kc) else meta0.schema,
         .num_rows = total_rows,
         // A pure byte copy: every page and statistic is the source writer's, so its name stays (see
         // `schema.ZPQ_CREATED_BY`).
-        .created_by = if (merged) schema.ZPQ_CREATED_BY else meta0.created_by,
+        .created_by = meta0.created_by,
         .row_groups = new_row_groups,
         .column_orders = column_orders,
     };
@@ -506,9 +440,11 @@ pub fn writerSafeChunk(
     const usable_index = keep: {
         // Binary corruption rejects every possible extrema pair, without reading the index at all.
         if (policy == .absent) break :keep false;
-        const co = src.column_index_offset orelse return chunk;
-        const cl = src.column_index_length orelse return chunk;
-        const bytes = sliceInBounds(input, co, cl) orelse break :keep false;
+        const bytes = if (src.column_index_out.len > 0) src.column_index_out else from_input: {
+            const co = src.column_index_offset orelse return chunk;
+            const cl = src.column_index_length orelse return chunk;
+            break :from_input sliceInBounds(input, co, cl) orelse break :keep false;
+        };
         var r = thrift.Reader.init(bytes);
         var ci = schema.ColumnIndex.read(a, &r) catch break :keep false;
         defer ci.null_pages.deinit(a);
@@ -526,6 +462,7 @@ pub fn writerSafeChunk(
     if (!usable_index) {
         chunk.column_index_offset = null;
         chunk.column_index_length = null;
+        chunk.column_index_out = &.{};
     }
     return chunk;
 }
@@ -702,7 +639,7 @@ fn carryPageIndex(
     delta: i64,
     chunk: *schema.ColumnChunk,
 ) void {
-    if (src.column_index_out.len > 0) chunk.column_index_out = src.column_index_out;
+    if (src.column_index_out.len > 0) chunk.column_index_out = arena.dupe(u8, src.column_index_out) catch &.{};
     if (src.offset_index_out.len > 0)
         chunk.offset_index_out = reserializeOffsetIndexShifted(arena, src.offset_index_out, delta) orelse &.{};
     if (src.column_index_offset) |co| if (src.column_index_length) |cl| {

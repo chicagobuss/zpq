@@ -12,6 +12,30 @@
 //! into the file footer.
 
 const std = @import("std");
+test "review: raw-byte DECIMAL writer bounds cannot exclude a present value" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var elem: schema.SchemaElement = .{ .name = "d", .type = .BYTE_ARRAY, .type_length = null, .repetition_type = .REQUIRED, .num_children = null, .converted_type = .DECIMAL, .scale = 0, .precision = 9, .field_id = null };
+    const samples = [_][]const []const u8{ &.{ "\xf6", "\xff\x00", "\x64" }, &.{ "\x01", "\x01\x00", "\x7f" } };
+    for (samples) |sample| for ([_]usize{ 3, 192 }) |n| {
+        const values = try a.alloc([]const u8, n);
+        for (values, 0..) |*v, i| v.* = sample[i % sample.len];
+        const encoded = try encodeColumn(a, .{ .values = .{ .string = .{ .values = values } }, .schema_elem = &elem, .path_in_schema = &.{"d"}, .dictionary_bloom = false });
+        const st = encoded.meta.statistics.?;
+        const kind = decimal_mod.kindFromSchema(&elem).?;
+        for (values) |v| {
+            const x = decimal_mod.statToI128(v, kind).?;
+            if (st.min_value) |lo| try std.testing.expect(decimal_mod.statToI128(lo, kind).? <= x);
+            if (st.max_value) |hi| try std.testing.expect(decimal_mod.statToI128(hi, kind).? >= x);
+        }
+        for (encoded.pages) |pg| for (values[@intCast(pg.first_row)..][0..@intCast(pg.rows)]) |v| {
+            const x = decimal_mod.statToI128(v, kind).?;
+            if (pg.min) |lo| try std.testing.expect(decimal_mod.statToI128(lo, kind).? <= x);
+            if (pg.max) |hi| try std.testing.expect(decimal_mod.statToI128(hi, kind).? >= x);
+        };
+    };
+}
 test "a proven unique integer column skips only a declined dictionary attempt" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -294,8 +318,12 @@ pub const Plan = struct {
                     &.{};
                 if (self.kind == .values) {
                     if (sub == .string) {
-                        bounds = bytesBounds(sub.string.values, def_levels, self.max_def);
-                        if (bounds) |b| page_stats = bytesStats(arena, b, boundCut(self.in.schema_elem.*));
+                        if (decimal_mod.kindFromSchema(self.in.schema_elem) != null) {
+                            page_stats = .{ .null_count = countNulls(def_levels, self.max_def, @intCast(rows)) };
+                        } else {
+                            bounds = bytesBounds(sub.string.values, def_levels, self.max_def);
+                            if (bounds) |b| page_stats = bytesStats(arena, b, boundCut(self.in.schema_elem.*));
+                        }
                     } else page_stats = computeStats(arena, sub, def_levels, self.max_def, self.in.schema_elem);
                 }
                 break :blk try std.mem.concat(arena, u8, &.{ rep_prefix, def_prefix, values_bytes });
@@ -515,6 +543,8 @@ fn mergePageStats(arena: std.mem.Allocator, in: ColumnInput, pages: []const Buil
         nan_count += st.nan_count orelse 0;
     };
     if (!any) return null;
+    if (in.values == .string and decimal_mod.kindFromSchema(in.schema_elem) != null)
+        return .{ .null_count = null_count };
     const unsigned = schema.isUnsignedInt(in.schema_elem.*);
     return switch (in.values) {
         .string => {
@@ -2234,6 +2264,9 @@ pub fn computeStats(
     max_def: u32,
     elem: *const schema.SchemaElement,
 ) ?schema.Statistics {
+    // Raw byte lanes do not use unsigned byte order for DECIMAL. Exact numeric lanes retain their bounds.
+    if (c == .string and decimal_mod.kindFromSchema(elem) != null)
+        return .{ .null_count = countNulls(def_levels, max_def, @intCast(valueCount(c))) };
     // An unsigned column's bounds are ordered unsigned. The deprecated min/max pair is signed-ordered by definition,
     // so it is left unset rather than written in the wrong order.
     if (schema.isUnsignedInt(elem.*)) {

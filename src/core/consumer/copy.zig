@@ -13,7 +13,6 @@ const column_mod = @import("../parquet/column.zig");
 const page_mod = @import("../parquet/page.zig");
 const compression = @import("../parquet/compression.zig");
 const metadata = @import("../parquet/metadata.zig");
-const int96_mod = @import("../parquet/int96.zig");
 const header_writer = @import("../writer/page_header.zig");
 const WriterStatsPolicy = @import("../parquet/writer_statistics.zig").Policy;
 const filter_eval = @import("../filter/eval.zig");
@@ -204,11 +203,8 @@ fn requestedFilter(
         copied.bloom_out = try out_arena.dupe(u8, copied.bloom_out);
         return;
     }
-    const explicit = bloom_write.at(ci);
-    if (explicit == null and !bloom_write.dictionary_bloom) return;
+    if (bloom_write.at(ci) == null) return;
     if (bloom_write.meta == null) return;
-    const cm = rg.columns.items[ci].meta_data orelse return;
-    if (explicit == null and cm.dictionary_page_offset == null) return;
     if (bloom_write.jobs) |jobs| return jobs.spawn(rg, ci, src, bloom_write, col);
     var scratch = std.heap.ArenaAllocator.init(bloom_write.scratch orelse return);
     defer scratch.deinit();
@@ -216,8 +212,7 @@ fn requestedFilter(
     copied.bloom_out = try out_arena.dupe(u8, filter);
 }
 
-/// The filter `requestedFilter` builds for column `ci` of `rg`, on `a`: from the dictionary, or by decoding the chunk
-/// for an explicit `--bloom-filter`. Null when there is none to build. Reads only the chunk's own bytes.
+/// Decode only for an explicit `--bloom-filter`; copying never adds an unsolicited filter.
 fn buildFilter(
     a: std.mem.Allocator,
     rg: *const schema.RowGroup,
@@ -225,7 +220,7 @@ fn buildFilter(
     src: RGSrc,
     bloom_write: BloomWrite,
 ) !?[]u8 {
-    const explicit = bloom_write.at(ci);
+    const fpp = bloom_write.at(ci) orelse return null;
     const meta = bloom_write.meta orelse return null;
     const chunk = &rg.columns.items[ci];
     const cm = chunk.meta_data orelse return null;
@@ -234,11 +229,6 @@ fn buildFilter(
     const levels = meta.getColumnLevels(cm.path_in_schema.items);
     // A decode error names this chunk, whichever thread builds its filter.
     types.enterChunk(rg, ci);
-    if (explicit == null) {
-        if (cm.dictionary_page_offset == null) return null;
-        return dictionaryBloom(a, bytes, cm, levels, meta);
-    }
-    const fpp = explicit.?;
     const n: usize = @intCast(cm.num_values);
     const col: filter_eval.Batch.Column = switch (cm.type) {
         .INT32 => .{ .i32 = try decodeColumnT(i32, a, bytes, cm.codec, levels, n) },
@@ -401,52 +391,6 @@ pub const FilterJobs = struct {
         for (self.jobs.items) |job| if (job.filter.len > 0) self.results.free(job.filter);
     }
 };
-
-/// Verify every data page uses the dictionary before filtering its entries; mixed chunks must never omit values.
-pub fn dictionaryBloom(
-    a: std.mem.Allocator,
-    bytes: []const u8,
-    cm: schema.ColumnMetaData,
-    levels: schema.Levels,
-    meta: *const schema.FileMetaData,
-) !?[]u8 {
-    inline for (.{ i32, i64, f32, f64, []const u8 }) |T| {
-        const matches = switch (T) {
-            i32 => cm.type == .INT32,
-            i64 => cm.type == .INT64,
-            f32 => cm.type == .FLOAT,
-            f64 => cm.type == .DOUBLE,
-            []const u8 => cm.type == .BYTE_ARRAY or cm.type == .FIXED_LEN_BYTE_ARRAY or cm.type == .INT96,
-            else => unreachable,
-        };
-        if (matches) {
-            var reader = column_mod.ColumnChunkReader(T).initWithOptions(
-                bytes,
-                cm.codec,
-                levels,
-                a,
-                column_mod.chunkOptions(.{}, meta, cm),
-                null,
-            );
-            if (T == []const u8) {
-                if (cm.type == .INT96) reader.type_length = int96_mod.INT96_WIDTH else if (cm.type == .FIXED_LEN_BYTE_ARRAY)
-                    reader.type_length = flbaWidth(meta.getColumnSchema(cm.path_in_schema.items));
-            }
-            const entries = try reader.dictionaryOfEveryPage() orelse return null;
-            if (T == []const u8 and cm.type == .INT96) for (entries) |entry| {
-                // Noncanonical times can equal another day's timestamp; a reader may hash that canonical form.
-                const nanos = std.mem.readInt(i64, entry[0..8], .little);
-                if (nanos < 0 or nanos >= std.time.ns_per_day) return null;
-            };
-            const tag = if (T == []const u8) "string" else @typeName(T);
-            const col = @unionInit(filter_eval.Batch.Column, tag, .{ .values = entries });
-            // INT96 PLAIN is 12 raw bytes, hashed as a fixed byte array, without converting its timestamp.
-            const hash_type = if (cm.type == .INT96) .FIXED_LEN_BYTE_ARRAY else cm.type;
-            return encoder.bloomFilter(a, col, hash_type, 0.01);
-        }
-    }
-    return null;
-}
 
 const sourceBytes = types.sourceBytes;
 

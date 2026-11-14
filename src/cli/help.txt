@@ -126,7 +126,9 @@ usage:
                  ignored either way; a null count the bounds contradict
                  or fail to back is used only with this flag.
   --no-bloom-filters
-                 Skip automatic dictionary Bloom filters (on by default).
+                 Skip automatic dictionary Bloom filters on newly
+                 encoded chunks (on by default). Copies create filters
+                 only for explicit requests.
                  Explicit --bloom-filter specs still apply; copied source
                  filters are preserved. Automatic filters use FPP 0.01.
   --bloom-filter write a split-block Bloom filter for output column COL

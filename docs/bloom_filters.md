@@ -81,11 +81,11 @@ The query summary's `membership` object reports what was probed, read and pruned
 
 ## Writing them
 
-By default, every fully dictionary-encoded output chunk gets a split-block filter at false-positive probability
-0.01, built from its dictionary entries rather than by hashing every row. A re-encoded dictionary contains exactly
-the distinct present values. A copied dictionary may also contain unused entries, which only add false positives;
-the copy path checks every page header for dictionary encoding before building a filter, without decoding data pages.
-A chunk that falls back to non-dictionary pages gets no automatic filter. Existing source filters are preserved.
+By default, every newly encoded, fully dictionary-encoded output chunk gets a split-block filter at false-positive
+probability 0.01, built from its dictionary entries rather than by hashing every row. A chunk that falls back to
+non-dictionary pages gets no automatic filter. Whole-group copies preserve source filters. Page merging unions
+complete compatible source filters, dropping incomplete or incompatible coverage. Neither copies nor codec changes
+create a filter unless `--bloom-filter` asks for one; only explicit requests rebuild an incompatible filter.
 Automatic filters are initially sized from the dictionary entry count; their retained bytes, like explicitly requested
 filters, are outside `--max-memory`.
 

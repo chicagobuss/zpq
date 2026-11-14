@@ -75,19 +75,6 @@ pub fn build(
     return out.offset;
 }
 
-/// The same assembler with approximate whole-source-group boundaries.
-pub fn buildCoalesced(
-    arena: std.mem.Allocator,
-    sink: Sink,
-    files: []const fastpath.FileSpec,
-    kept_columns: ?[]const usize,
-    target: fastpath.coalesce.Target,
-) !u64 {
-    var out: SinkOut = .{ .sink = sink };
-    try fastpath.assembleWithTarget(arena, &out, files, kept_columns, target);
-    return out.offset;
-}
-
 /// `fastpath`'s output protocol over a `Sink`, which is opaque about how
 /// far it has got, so the output offset is tracked here.
 pub const SinkOut = struct {

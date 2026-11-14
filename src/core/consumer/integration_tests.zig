@@ -158,7 +158,6 @@ const BloomWrite = copy_module.BloomWrite;
 const Recompress = copy_module.Recompress;
 const RecompressedChunk = copy_module.RecompressedChunk;
 const recompressRowGroup = copy_module.recompressRowGroup;
-const dictionaryBloom = copy_module.dictionaryBloom;
 const PageMove = copy_module.PageMove;
 const recompressChunk = copy_module.recompressChunk;
 const sourceBytes = types.sourceBytes;
@@ -2223,61 +2222,6 @@ test "cache decode admission bounds dictionary strings and composite domains fro
     try testing.expect(cacheDictionary(in, 1) == null);
 }
 
-test "copied INT96 dictionary filters hash raw entries and decline noncanonical times" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    const bloom = @import("../parquet/bloom.zig");
-    var elem: schema.SchemaElement = .{
-        .name = "t",
-        .type = .FIXED_LEN_BYTE_ARRAY,
-        .type_length = int96_mod.INT96_WIDTH,
-        .repetition_type = .REQUIRED,
-        .num_children = 0,
-        .scale = null,
-        .precision = null,
-        .field_id = null,
-    };
-    var raw: [2][12]u8 = @splat(@splat(0));
-    for (&raw) |*v| std.mem.writeInt(u32, v[8..12], 2440588, .little);
-    var values: [256][]const u8 = undefined;
-    for (&values, 0..) |*v, i| v.* = &raw[i % 2];
-    for ([_]bool{ false, true }) |noncanonical| {
-        std.mem.writeInt(i64, raw[1][0..8], if (noncanonical) std.time.ns_per_day else 2_000_000_000, .little);
-        const encoded = try encoder.encodeColumn(a, .{
-            .values = .{ .string = .{ .values = &values } },
-            .schema_elem = &elem,
-            .path_in_schema = &.{"t"},
-            .dictionary_bloom = false,
-        });
-        var cm = encoded.meta;
-        cm.type = .INT96;
-        var root = elem;
-        root.name = "root";
-        root.type = null;
-        root.type_length = null;
-        root.num_children = 1;
-        var meta: schema.FileMetaData = .{
-            .version = 2,
-            .schema = .empty,
-            .num_rows = values.len,
-            .created_by = schema.ZPQ_CREATED_BY,
-            .row_groups = .empty,
-        };
-        try meta.schema.append(a, root);
-        var leaf = elem;
-        leaf.type = .INT96;
-        leaf.type_length = null;
-        try meta.schema.append(a, leaf);
-        const filter = try dictionaryBloom(a, encoded.bytes, cm, .{ .max_def = 0, .max_rep = 0 }, &meta);
-        if (noncanonical) {
-            try std.testing.expect(filter == null);
-        } else {
-            const bits = bloom.bitset(filter.?).?;
-            for (raw) |v| try std.testing.expect(bloom.Probe.init(bloom.hashBytes(&v)).mightContain(bits));
-        }
-    }
-}
 
 test "filter-only and hash-only strings stream a cache-sized window, other strings do not" {
     const hw = @import("../hw.zig");

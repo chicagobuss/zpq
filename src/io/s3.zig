@@ -24,6 +24,13 @@
 
 const std = @import("std");
 const winEnvValue = @import("../core/system.zig").winEnvValue;
+// The native environment map and POSIX environment provide the same lookup at this seam.
+const WindowsEnvironment = struct {
+    environ: std.process.Environ,
+    inline fn getPosix(self: @This(), name: []const u8) ?[]const u8 {
+        return winEnvValue(self.environ, name);
+    }
+};
 const builtin = @import("builtin");
 const Io = std.Io;
 const tls = @import("tls.zig");
@@ -171,17 +178,18 @@ pub const Credentials = struct {
     path_style: bool = false,
 
     pub fn fromEnv(env: std.process.Environ) Error!Credentials {
+        const vars = if (builtin.os.tag == .windows) WindowsEnvironment{ .environ = env } else env;
         // `S3_NO_SIGN_REQUEST` (any value but empty or `0`) asks for anonymous
         // requests: no keys are read, and the empty access key tells the
         // signer to leave the Authorization header off. Only buckets that
         // allow public access answer these.
-        if (winEnvValue(env, "S3_NO_SIGN_REQUEST")) |v| {
+        if (vars.getPosix("S3_NO_SIGN_REQUEST")) |v| {
             if (v.len > 0 and !std.mem.eql(u8, v, "0")) {
                 return .{
                     .access_key = "",
                     .secret_key = "",
-                    .region = winEnvValue(env, "S3_REGION") orelse winEnvValue(env, "AWS_REGION") orelse return error.NoRegion,
-                    .endpoint = winEnvValue(env, "S3_ENDPOINT_URL"),
+                    .region = vars.getPosix("S3_REGION") orelse vars.getPosix("AWS_REGION") orelse return error.NoRegion,
+                    .endpoint = vars.getPosix("S3_ENDPOINT_URL"),
                     .timeouts = .fromEnv(env),
                 };
             }
@@ -197,26 +205,26 @@ pub const Credentials = struct {
         // issued for — never mix S3_* credentials with AWS_SESSION_TOKEN.
         // R2 (and most S3-compat servers) reject `X-Amz-Security-Token`
         // entirely, returning HTTP 400 InvalidArgument.
-        const s3_ak = winEnvValue(env, "S3_ACCESS_KEY_ID");
-        const ak = s3_ak orelse winEnvValue(env, "AWS_ACCESS_KEY_ID") orelse return error.NoCredentials;
+        const s3_ak = vars.getPosix("S3_ACCESS_KEY_ID");
+        const ak = s3_ak orelse vars.getPosix("AWS_ACCESS_KEY_ID") orelse return error.NoCredentials;
         const sk = if (s3_ak != null)
-            winEnvValue(env, "S3_SECRET_ACCESS_KEY") orelse return error.NoCredentials
+            vars.getPosix("S3_SECRET_ACCESS_KEY") orelse return error.NoCredentials
         else
-            winEnvValue(env, "AWS_SECRET_ACCESS_KEY") orelse return error.NoCredentials;
+            vars.getPosix("AWS_SECRET_ACCESS_KEY") orelse return error.NoCredentials;
         const region = if (s3_ak != null)
-            winEnvValue(env, "S3_REGION") orelse winEnvValue(env, "AWS_REGION") orelse return error.NoRegion
+            vars.getPosix("S3_REGION") orelse vars.getPosix("AWS_REGION") orelse return error.NoRegion
         else
-            winEnvValue(env, "AWS_REGION") orelse winEnvValue(env, "S3_REGION") orelse return error.NoRegion;
+            vars.getPosix("AWS_REGION") orelse vars.getPosix("S3_REGION") orelse return error.NoRegion;
         const session_token = if (s3_ak != null)
-            winEnvValue(env, "S3_SESSION_TOKEN")
+            vars.getPosix("S3_SESSION_TOKEN")
         else
-            winEnvValue(env, "AWS_SESSION_TOKEN");
+            vars.getPosix("AWS_SESSION_TOKEN");
         return .{
             .access_key = ak,
             .secret_key = sk,
             .session_token = session_token,
             .region = region,
-            .endpoint = winEnvValue(env, "S3_ENDPOINT_URL"),
+            .endpoint = vars.getPosix("S3_ENDPOINT_URL"),
             .timeouts = .fromEnv(env),
         };
     }

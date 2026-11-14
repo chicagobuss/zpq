@@ -45,9 +45,9 @@ fn cliLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptim
     if (!machine_diagnostics) std.log.defaultLog(level, scope, fmt, args);
 }
 
-fn wantsJsonSummary(args: std.process.Args, gpa: std.mem.Allocator) !bool {
-    var it = try std.process.Args.Iterator.initAllocator(args, gpa);
-    defer it.deinit();
+fn wantsJsonSummary(args: std.process.Args, gpa: std.mem.Allocator) if (@import("builtin").os.tag == .windows) anyerror!bool else bool {
+    var it = if (@import("builtin").os.tag == .windows) try std.process.Args.Iterator.initAllocator(args, gpa) else std.process.Args.Iterator.init(args);
+    defer if (@import("builtin").os.tag == .windows) it.deinit();
     _ = it.next();
     const command = it.next() orelse return false;
     if (!std.mem.eql(u8, command, "query")) return false;
@@ -107,16 +107,16 @@ pub fn main(init: std.process.Init) void {
 fn runMain(init: std.process.Init) !void {
     zpq.cpu_level.require();
     const gpa = zpq.core.memory.processAllocator(init.gpa);
-    try zpq.core.system.initWindowsEnv(init.minimal.environ, gpa);
-    defer zpq.core.system.deinitWindowsEnv();
+    if (@import("builtin").os.tag == .windows) try zpq.core.system.initWindowsEnv(init.minimal.environ, gpa);
+    defer if (@import("builtin").os.tag == .windows) zpq.core.system.deinitWindowsEnv();
     local_fs.raiseOpenFileLimit();
     zpq.core.memory.fixHeapThreshold();
-    machine_diagnostics = try wantsJsonSummary(init.minimal.args, gpa);
+    machine_diagnostics = if (@import("builtin").os.tag == .windows) try wantsJsonSummary(init.minimal.args, gpa) else wantsJsonSummary(init.minimal.args, gpa);
     // Human diagnostics print unbounded; machine ones are captured into the JSON error.
     if (machine_diagnostics) zpq.frontend.diagnostic_fn = captureSqlDiagnostic;
     defer zpq.frontend.diagnostic_fn = null;
-    var iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
-    defer iter.deinit();
+    var iter = if (@import("builtin").os.tag == .windows) try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa) else std.process.Args.Iterator.init(init.minimal.args);
+    defer if (@import("builtin").os.tag == .windows) iter.deinit();
     _ = iter.next(); // skip program name
     const cmd = iter.next() orelse {
         var ws: StdoutWriter = .{};
@@ -937,7 +937,7 @@ fn runParsed(
             .csv = csv_opts,
         };
         const ctx: engine.Context = .{ .gpa = gpa, .env = env, .io = io };
-        var ws: StdoutWriter = .{};
+        var ws: StdoutWriter = if (@import("builtin").os.tag == .windows) .{} else .{ .fd = 1 };
         defer ws.flush() catch {};
         // A CSV input's aggregate folds during the parse (`csv_agg`): its own plan, not a Parquet scan's.
         if (try engine.csv_write.csvInput(explain_args)) |path| {
@@ -957,12 +957,12 @@ fn runParsed(
         .inputs = inputs,
         .plan_source = plan_source,
         .output = if (fmt == .parquet) engine_output orelse "-" else null,
-        .output_fd = if (fmt == .parquet) (if (to_stdout) std.Io.File.stdout().handle else publication.fd) else null,
+        .output_fd = if (fmt == .parquet) (if (to_stdout) (if (@import("builtin").os.tag == .windows) std.Io.File.stdout().handle else 1) else publication.fd) else null,
         .output_restartable = fmt == .parquet and !to_stdout and publication.fd != null,
         .typed_answer = fmt == .parquet,
         .text_output = if (fmt != .parquet) .{
             .format = fmt,
-            .fd = if (to_stdout) std.Io.File.stdout().handle else publication.fd orelse return error.BadOutputUrl,
+            .fd = if (to_stdout) (if (@import("builtin").os.tag == .windows) std.Io.File.stdout().handle else 1) else publication.fd orelse return error.BadOutputUrl,
         } else null,
         .quiet_diagnostics = machine_diagnostics,
         .empty_scalar = group_by == null and (limit == 0 or result_order.offset > 0),
@@ -1021,7 +1021,7 @@ fn runParsed(
             diagnosticPrint("zpq query: this output format does not support S3 destinations\n", .{});
             return error.BadArgs;
         }
-        const fd: local_fs.fd_t = if (to_stdout) std.Io.File.stdout().handle else publication.fd orelse return error.BadOutputUrl;
+        const fd: local_fs.fd_t = if (to_stdout) (if (@import("builtin").os.tag == .windows) std.Io.File.stdout().handle else 1) else publication.fd orelse return error.BadOutputUrl;
         const printed = try engine.runPrintTo(ctx, query_args, fmt, limit, fd, @intCast(result_order.offset));
         rows = printed.rows;
         output_started_ns = printed.timings.output_started_ns;
@@ -1342,8 +1342,8 @@ const ProfileOut = struct {
 /// The command line as typed, arguments with spaces or quotes single-quoted, for the profile's metadata.
 fn commandLine(arena: std.mem.Allocator, args: std.process.Args) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    var it = try std.process.Args.Iterator.initAllocator(args, arena);
-    defer it.deinit();
+    var it = if (@import("builtin").os.tag == .windows) try std.process.Args.Iterator.initAllocator(args, arena) else std.process.Args.Iterator.init(args);
+    defer if (@import("builtin").os.tag == .windows) it.deinit();
     var first = true;
     while (it.next()) |a| {
         if (!first) try out.append(arena, ' ');

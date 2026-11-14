@@ -89,7 +89,11 @@ usage:
                  -j or memory. Data pages target 1 MiB or 20,000
                  rows; dictionary pages can hold more rows within
                  their byte budgets. Each has a page index entry.
-                 A plain copy keeps its input's row groups.
+                 A plain copy coalesces small source row groups at
+                 whole-group boundaries. Its byte target counts
+                 encoded uncompressed pages plus headers, while
+                 re-encoding counts PLAIN values. Groups already at
+                 target copy whole; incompatible chunks end a run.
   --threads / -j N
                  Requested CPU parallelism. Re-encoding shares CPU turns
                  between decode and encode, capped by the affinity's

@@ -496,11 +496,106 @@ const WriteRows = struct {
     copied_from: std.ArrayList(*const schema.FileMetaData) = .empty,
     win_slots: []Slot = &.{},
     page_indexes: page_index.Deferred = .{},
-    /// The byte copy's filter jobs, their pool and the ledger view they draw on: the filters they build are the
-    /// chunks' `bloom_out` until the footer is written, so they live as long as the row groups do.
-    filter_charged: core_memory.Charged = undefined,
-    filter_threaded: ?std.Io.Threaded = null,
-    filters: ?consumer.FilterJobs = null,
+    has_coalesced: bool = false,
+
+    fn copySource(self: *WriteRows, s: fastpath.coalesce.Source) !void {
+        const written = try consumer.copyRG(self.arena, s.rg, .{ .bytes = s.bytes, .byte_origin = 0, .fd = s.fd, .file_offsets = s.file_offsets }, if (self.kept_set != null) self.kept_arr else null, self.sink, &self.out_offset, &self.t.core, true, null, .{ .fpp = self.blooms.leaves, .meta = s.meta, .scratch = self.ctx.gpa, .dictionary_bloom = self.args.bloom_filters_enabled });
+        if (written.rg) |rg| {
+            try self.new_row_groups.append(self.arena, rg);
+            self.rg_kept += 1;
+        }
+        self.rows_kept += written.surviving_rows;
+    }
+
+    fn flushSources(self: *WriteRows, parent: std.mem.Allocator, sources: []const fastpath.coalesce.Source) !void {
+        var kept: ?[]usize = null;
+        defer if (kept) |k| parent.free(k);
+        if (self.kept_set != null) {
+            var count: usize = 0;
+            for (self.kept_arr) |b| {
+                if (b) count += 1;
+            }
+            kept = try parent.alloc(usize, count);
+            var at: usize = 0;
+            for (self.kept_arr, 0..) |b, ci| if (b) {
+                kept.?[at] = ci;
+                at += 1;
+            };
+        }
+        var at: usize = 0;
+        while (at < sources.len) {
+            var used = sources.len - at;
+            while (used > 1) : (used -= 1) {
+                var scratch = std.heap.ArenaAllocator.init(parent);
+                defer scratch.deinit();
+                if (try fastpath.coalesce.Plan.init(scratch.allocator(), sources[at..][0..used], kept, .{ .dictionary_bloom = self.args.bloom_filters_enabled, .filter_fpp = self.blooms.leaves })) |plan| {
+                    var out: streaming.SinkOut = .{ .sink = self.sink, .offset = @intCast(self.out_offset) };
+                    const merged = try plan.write(self.arena, &out);
+                    self.out_offset = out.offset;
+                    try self.new_row_groups.append(self.arena, merged);
+                    self.rows_kept += merged.num_rows;
+                    self.rg_kept += 1;
+                    self.has_coalesced = true;
+                    break;
+                }
+            } else try self.copySource(sources[at]);
+            at += used;
+        }
+    }
+
+    fn coalesceSources(self: *WriteRows) !void {
+        var charged: core_memory.Charged = .{ .child = self.ctx.gpa, .budget = self.ledger };
+        const parent = charged.allocator();
+        var pending = std.heap.ArenaAllocator.init(parent);
+        defer pending.deinit();
+        var sources: std.ArrayList(fastpath.coalesce.Source) = .empty;
+        var rows: u64 = 0;
+        var encoded_bytes: u64 = 0;
+        const target: fastpath.coalesce.Target = .{ .rows = self.args.row_group.rows, .encoded_uncompressed_bytes = self.args.row_group.bytes };
+        for (self.inputs, self.metas, 0..) |in, *meta, ii| {
+            self.bytes_in += in.bytes.len;
+            for (meta.row_groups.items, 0..) |*rg, ri| {
+                self.rgs_in += 1;
+                self.rows_in += rg.num_rows;
+                const nr: u64 = @intCast(rg.num_rows);
+                var nb: u64 = 0;
+                for (rg.columns.items, 0..) |c, ci| {
+                    if (self.kept_set != null and !self.kept_arr[ci]) continue;
+                    nb +|= @intCast(@max(0, (c.meta_data orelse return error.InvalidColumnOffsets).total_uncompressed_size));
+                }
+                const whole = target.reached(nr, nb);
+                if (whole and sources.items.len > 0) {
+                    try self.flushSources(parent, sources.items);
+                    _ = pending.reset(.free_all);
+                    sources = .empty;
+                    rows = 0;
+                    encoded_bytes = 0;
+                }
+                if (in.gate) |g| try g.wait(g.ctx, ri);
+                // Release before waiting for the next fetch: retaining several gates can exhaust a one-group window.
+                defer if (in.gate) |g| g.done(g.ctx, ri, 1);
+                var source: fastpath.coalesce.Source = .{ .bytes = in.bytes, .meta = meta, .rg = rg, .fd = self.inputFd(ii), .file_offsets = self.fileOffsets(ii) };
+                if (whole) {
+                    try self.copySource(source);
+                    continue;
+                }
+                source = try consumer.prepareCoalesceSource(pending.allocator(), parent, source, self.blooms.leaves);
+                if (in.gate != null) source = try source.own(pending.allocator());
+                try sources.append(pending.allocator(), source);
+                rows += nr;
+                encoded_bytes +|= nb;
+                if (target.reached(rows, encoded_bytes)) {
+                    try self.flushSources(parent, sources.items);
+                    _ = pending.reset(.free_all);
+                    sources = .empty;
+                    rows = 0;
+                    encoded_bytes = 0;
+                }
+            }
+        }
+        try self.flushSources(parent, sources.items);
+        for (self.metas) |*m| try self.copied_from.append(self.arena, m);
+    }
 
     fn inputFd(self: *const WriteRows, i: usize) ?local_fs.fd_t {
         return if (i < self.input_fds.len) self.input_fds[i] else null;
@@ -511,8 +606,6 @@ const WriteRows = struct {
     }
 
     fn deinit(self: *WriteRows) void {
-        if (self.filters) |*f| f.deinit();
-        if (self.filter_threaded) |*runtime| runtime.deinit();
         for (self.win_slots) |*slot| slot.meta_arena.deinit();
     }
 
@@ -583,82 +676,7 @@ const WriteRows = struct {
                 consumer.addCopyCounts(&self.t.core, rw.core);
             }
         } else if (!self.need_encoder) {
-            // Byte copy: kept column chunks verbatim, in order, on this thread; a chunk stored in another codec than
-            // the one requested is recompressed. The Bloom filters it builds (from a chunk's dictionary, or an
-            // explicit --bloom-filter) are the costly part, so they go to the pool (`consumer.FilterJobs`).
-            const recompress: ?consumer.Recompress = if (self.args.codec) |c|
-                .{ .codec = c, .zstd = self.zstd, .scratch = self.ctx.gpa }
-            else
-                null;
-            // Filters built on the pool draw their working memory from the write's ledger. One it has no room for is
-            // built alone and uncharged, as the inline path builds every filter: a write fits any budget.
-            self.filter_charged = .{ .child = self.ctx.gpa, .budget = self.ledger };
-            const budget = if (self.args.parallelism > 0)
-                self.args.parallelism
-            else
-                system.discoverAvailableParallelism(self.ctx.env);
-            // This thread is one of the budget; with no other, the filters are built inline, as each chunk is copied.
-            const filter_io: ?std.Io = if (budget <= 1) null else self.ctx.worker_io orelse blk: {
-                self.filter_threaded = .init(self.ctx.gpa, .{ .async_limit = .limited(budget - 1) });
-                break :blk self.filter_threaded.?.io();
-            };
-            if (filter_io) |io| self.filters = .{
-                .io = io,
-                .charged = &self.filter_charged,
-                .results = self.ctx.gpa,
-                .arena = self.arena,
-            };
-            for (self.inputs, self.metas, 0..) |in, *meta_i, ii| {
-                self.bytes_in += in.bytes.len;
-                const rg_src: consumer.RGSrc = .{
-                    .bytes = in.bytes,
-                    .byte_origin = 0,
-                    .fd = self.inputFd(ii),
-                    .file_offsets = self.fileOffsets(ii),
-                };
-                for (meta_i.row_groups.items, 0..) |*src_rg, ri| {
-                    self.rgs_in += 1;
-                    self.rows_in += src_rg.num_rows;
-                    const rg_span = profile.Span.begin(self.prof);
-                    defer rg_span.end(.copy_rg, profile.args(.{src_rg.total_byte_size}));
-                    if (in.gate) |g| try g.wait(g.ctx, ri);
-                    // Given back once this copy and every filter job reading the row group are done.
-                    const hold = try self.arena.create(consumer.FilterJobs.Hold);
-                    hold.* = if (in.gate) |g| .{ .gate_ctx = g.ctx, .done = g.done, .rg = ri } else .{};
-                    defer hold.drop();
-                    if (self.filters) |*f| f.hold = hold;
-                    const first_job = if (self.filters) |f| f.jobs.items.len else 0;
-                    const bloom_write: consumer.BloomWrite = .{
-                        .fpp = self.blooms.leaves,
-                        .meta = meta_i,
-                        .scratch = self.ctx.gpa,
-                        .dictionary_bloom = self.args.bloom_filters_enabled,
-                        .jobs = if (self.filters) |*f| f else null,
-                    };
-                    const out = try consumer.copyRG(
-                        self.arena,
-                        src_rg,
-                        rg_src,
-                        if (self.kept_set != null) self.kept_arr else null,
-                        self.sink,
-                        &self.out_offset,
-                        &self.t.core,
-                        true,
-                        recompress,
-                        bloom_write,
-                    );
-                    if (out.rg) |new_rg| {
-                        try self.new_row_groups.append(self.arena, new_rg);
-                        if (self.filters) |f| for (f.jobs.items[first_job..]) |job| {
-                            job.out_rg = self.new_row_groups.items.len - 1;
-                        };
-                    }
-                    self.rows_kept += out.surviving_rows;
-                    if (out.surviving_rows > 0) self.rg_kept += 1;
-                }
-            }
-            if (self.filters) |*f| try f.finish(self.new_row_groups.items);
-            for (self.metas) |*m| try self.copied_from.append(self.arena, m);
+            try self.coalesceSources();
         } else {
             // Windowed re-encode: one path for all environments. Concurrency is
             // bounded by the CPU budget (quota- and Lambda-aware); in-flight
@@ -873,12 +891,12 @@ const WriteRows = struct {
         const kept_map: ?[]const usize = if (self.select_items == null and self.kept_set != null) kept_in_order else null;
         // Encoded column data makes the file zpq's (row groups copied beside it keep only bounds no writer quirk
         // reads differently); a pure byte copy or recompression stays its source's.
-        if (self.need_encoder) for (self.new_row_groups.items) |*rg| for (rg.columns.items) |*c| schema.dropForeignDeprecatedBounds(c);
+        if (self.need_encoder or self.has_coalesced) for (self.new_row_groups.items) |*rg| for (rg.columns.items) |*c| schema.dropForeignDeprecatedBounds(c);
         const new_meta: schema.FileMetaData = .{
             .version = self.args.parquet_version.footer(),
             .schema = new_schema_items,
             .num_rows = self.rows_kept,
-            .created_by = if (self.need_encoder) schema.ZPQ_CREATED_BY else self.meta0.created_by,
+            .created_by = if (self.need_encoder or self.has_coalesced) schema.ZPQ_CREATED_BY else self.meta0.created_by,
             .row_groups = self.new_row_groups,
             .column_orders = try schema.FileMetaData.outputColumnOrders(self.arena, footer_leaves, kept_map, self.copied_from.items),
         };

@@ -195,6 +195,7 @@ const compactRows = pruning.compactRows;
 
 const copy_module = @import("consumer/copy.zig");
 pub const copyRG = copy_module.copyRG;
+pub const prepareCoalesceSource = copy_module.prepareCoalesceSource;
 pub const BloomWrite = copy_module.BloomWrite;
 pub const FilterJobs = copy_module.FilterJobs;
 pub const Recompress = copy_module.Recompress;

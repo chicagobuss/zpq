@@ -66,7 +66,7 @@ fn boundaryOrder(pages: []const encoder.PageInfo, elem: *const schema.SchemaElem
 
 /// Two bounds of a column of `elem`'s type, in its type-defined order (unsigned integers unsigned, byte arrays
 /// bytewise unsigned). Bounds never hold NaN.
-fn compare(elem: *const schema.SchemaElement, a: []const u8, b: []const u8) std.math.Order {
+pub fn compare(elem: *const schema.SchemaElement, a: []const u8, b: []const u8) std.math.Order {
     const unsigned = schema.isUnsignedInt(elem.*);
     return switch (elem.type orelse return .eq) {
         .INT32 => if (unsigned) order(u32, a, b) else order(i32, a, b),

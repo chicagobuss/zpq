@@ -27,6 +27,23 @@ const SliceReader = @import("slice_reader.zig").SliceReader;
 const flbaWidth = @import("column.zig").flbaWidth;
 const core_memory = @import("../memory.zig");
 
+/// Explicit Bloom requests use the established builder before a source gate is released. The coalescer can union
+/// compatible filters or rebuild a complete dictionary's filter without decoding value pages again.
+pub fn prepareCoalesceSource(a: std.mem.Allocator, scratch: std.mem.Allocator, source: fastpath.coalesce.Source, fpp: []const ?f64) !fastpath.coalesce.Source {
+    if (fpp.len == 0) return source;
+    var result = source;
+    const rg = try a.create(schema.RowGroup);
+    rg.* = source.rg.*;
+    rg.columns = .empty;
+    for (source.rg.columns.items, 0..) |*chunk, ci| {
+        var copied = fastpath.rebaseChunk(a, source.bytes, chunk, 0);
+        try requestedFilter(a, &copied, source.rg, ci, .{ .bytes = source.bytes, .byte_origin = 0 }, .{ .fpp = fpp, .meta = source.meta, .scratch = scratch, .dictionary_bloom = false }, ci);
+        try rg.columns.append(a, copied);
+    }
+    result.rg = rg;
+    return result;
+}
+
 /// Byte-copy one row group into `sink` and return a clone of it whose
 /// chunk offsets (and carried page indexes) point at the new stream
 /// position.

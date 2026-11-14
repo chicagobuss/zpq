@@ -397,8 +397,15 @@ string pages also retain their string-byte budget. Each chunk gets a page index 
 after the row groups, column by column). The bytes written depend only on the inputs and the options: the same file at every `-j`, on every machine.
 An explicit `--max-memory` caps row groups at a sixteenth of it, so there the file can depend on that value (never
 on `-j`). Holding a row group's decoded rows until it is encoded is the write's largest fixed cost: with the default
-budget a machine needs a few times `--row-group-bytes` of memory, or an explicit `--max-memory`. Plain copies and row
-groups a filter's statistics prove fully matching are copied as they are, keeping their source's row groups. Computed
+budget a machine needs a few times `--row-group-bytes` of memory, or an explicit `--max-memory`.
+Plain copies coalesce consecutive small source row groups without decoding values. They close at the first source
+boundary reaching the row target or the sum of source chunks' encoded `total_uncompressed_size` (pages plus headers)
+reaching the byte target. This encoded accounting differs from the reencoder's PLAIN value accounting above; cuts
+may overshoot by one source group. A source group already at target copies whole. Dictionary entries are interned
+and only nonidentity dictionary index streams are remapped; existing PLAIN, DELTA and BYTE_STREAM_SPLIT pages stay
+encoded. Different codecs, unsupported chunk shapes, dictionary-page overflow or incompatible carried filters can
+end a run early. Set `--row-group-size 1` for copy-only grouping. Codec-changing copies and row groups a filter's
+statistics prove fully matching retain their source grouping. Computed
 columns are evaluated only for the rows the filter keeps.
 
 **Copies share blocks.** A copied run of input bytes (a whole row group, or one projected column chunk) is placed at

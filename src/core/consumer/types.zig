@@ -44,6 +44,8 @@ pub const RGSrc = struct {
     /// The chunks' offsets are the input file's own (a local file), not positions in a buffer of fetched ranges (S3):
     /// a byte copy keeps its runs at those offsets modulo `fastpath.share_block`, whatever `fd` holds.
     file_offsets: bool = false,
+    /// Add to rebased chunk offsets for file-copy placement; byte_origin still governs buffer slicing.
+    file_offset_delta: usize = 0,
 };
 
 /// Per-phase wall-clock counters in nanoseconds. Both consumers

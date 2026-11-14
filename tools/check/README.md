@@ -102,6 +102,9 @@ The gates are build.zig steps; CI and the justfile call them.
 | full | `zig build check -Dtier=full [-Dshard=NAME]` | fixtures, every unit-test binary in Debug, Lambda integration, the self-tests, every case uncached, the corpus, decode errors and hardware parity, ClickBench, path parity, OS contracts, `cross-macos`, libzpq |
 | fleet | `tools/check/fleet.sh [--full]` | each push's architecture check over the fleet; with `--full`, also the full tier's shards (tools/check/shards.json) |
 
+For a canonical corruption/hardware recheck, `zig build check -Dtier=full -Dshard=canonical` runs fixtures and
+the canonical stage alone. This is a shard pass, not a full-tier pass.
+
 Each stage runs through `zpq-check stage` under its timeout (a hang fails the stage, its process group killed) and
 leaves `zig-out/receipts/NAME.log` and `NAME.json`: the SHA and whether the tree was clean, the host, compiler and
 oracle, the case files' tree hash, the fixtures, and the counts its runner printed. `zpq-check verdict` passes a tier

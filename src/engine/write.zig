@@ -499,7 +499,17 @@ const WriteRows = struct {
     has_coalesced: bool = false,
 
     fn copySource(self: *WriteRows, s: fastpath.coalesce.Source) !void {
-        const written = try consumer.copyRG(self.arena, s.rg, .{ .bytes = s.bytes, .byte_origin = 0, .fd = s.fd, .file_offsets = s.file_offsets }, if (self.kept_set != null) self.kept_arr else null, self.sink, &self.out_offset, &self.t.core, true, null, .{ .fpp = self.blooms.leaves, .meta = s.meta, .scratch = self.ctx.gpa });
+        const written = try consumer.copyRG(self.arena, s.rg, .{
+            .bytes = s.bytes,
+            .byte_origin = 0,
+            .fd = s.fd,
+            .file_offsets = s.file_offsets,
+            .file_offset_delta = s.file_offset_delta,
+        }, if (self.kept_set != null) self.kept_arr else null, self.sink, &self.out_offset, &self.t.core, true, null, .{
+            .fpp = self.blooms.leaves,
+            .meta = s.meta,
+            .scratch = self.ctx.gpa,
+        });
         if (written.rg) |rg| {
             try self.new_row_groups.append(self.arena, rg);
             self.rg_kept += 1;

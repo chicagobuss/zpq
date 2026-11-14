@@ -409,7 +409,7 @@ fn timedWrite(out: *streaming.SinkOut, bytes: []const u8, timings: *Timings) !vo
 /// Copy verbatim input bytes `bytes` (at `start` in `src`) as `fastpath.copyRun` places them; returns where they went.
 fn timedRun(out: *streaming.SinkOut, src: RGSrc, start: usize, bytes: []const u8, timings: *Timings) !usize {
     const t_sink_start = nowMonoNs();
-    const placed = try fastpath.copyRun(out, src.fd, src.file_offsets, start, bytes);
+    const placed = try fastpath.copyRun(out, src.fd, src.file_offsets, start + src.file_offset_delta, bytes);
     const t_sink_end = nowMonoNs();
     timings.sink_ns += @intCast(t_sink_end - t_sink_start);
     timings.copied_bytes += bytes.len;

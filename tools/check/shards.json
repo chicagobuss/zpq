@@ -5,6 +5,7 @@
     "units": {"stages": ["units-lambda", "units-cli", "units-service", "units-libzpq"], "minutes": 3},
     "cases": {"stages": ["integration", "check-self", "bench-self", "fanout-self", "cases-fresh"], "minutes": 9},
     "corpus": {"stages": ["corpus", "corpus-odd", "canonical"], "minutes": 4},
+    "canonical": {"stages": ["canonical"], "minutes": 1},
     "clickbench": {"stages": ["clickbench"], "minutes": 4, "needs": ["clickbench"]},
     "os": {"stages": ["contracts", "path-parity", "cross-macos"], "minutes": 5},
     "cpu": {"stages": ["cpu-parity"], "minutes": 6},

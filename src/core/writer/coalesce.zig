@@ -23,6 +23,8 @@ pub const Source = struct {
     rg: *const schema.RowGroup,
     fd: ?std.posix.fd_t = null,
     file_offsets: bool = false,
+    /// Restore original file placement after owned staging rebases chunk offsets.
+    file_offset_delta: usize = 0,
     pub fn ownProjected(s: Source, a: std.mem.Allocator, kept: ?[]const bool) !Source {
         var start: usize = s.bytes.len;
         var end: usize = 0;
@@ -48,7 +50,13 @@ pub const Source = struct {
             moved.bloom_out = try a.dupe(u8, moved.bloom_out);
             try rg.columns.append(a, moved);
         }
-        return .{ .bytes = try a.dupe(u8, s.bytes[start..end]), .meta = s.meta, .rg = rg };
+        return .{
+            .bytes = try a.dupe(u8, s.bytes[start..end]),
+            .meta = s.meta,
+            .rg = rg,
+            .file_offsets = s.file_offsets,
+            .file_offset_delta = s.file_offset_delta + start,
+        };
     }
 };
 pub const Options = struct {
@@ -316,7 +324,7 @@ pub const Plan = struct {
                     if (v != i) break false;
                 } else true;
                 if (!coded or identity) {
-                    _ = try out.copyRange(source.fd, pg.offset, original);
+                    _ = try out.copyRange(source.fd, pg.offset + source.file_offset_delta, original);
                     cm.total_uncompressed_size += @intCast(pg.header_len + @as(usize, @intCast(h.uncompressed_page_size)));
                 } else {
                     const rewritten = try remap(sa, source.meta, cm0, h, original[pg.header_len..], map, col.entries.items.len);
@@ -784,6 +792,53 @@ test "review: a staged fallback copies its serialized column index onto output o
     const copied = try @import("../consumer/copy.zig").copyRG(a, held.rg, .{ .bytes = held.bytes, .byte_origin = 0 }, null, sink.sink(), &offset, &timing, true, null, .{});
     @memset(@constCast(held.rg.columns.items[0].column_index_out), 0x55);
     try std.testing.expectEqualSlices(u8, expected, copied.rg.?.columns.items[0].column_index_out);
+}
+
+test "coalesce staged copy fallback keeps original file alignment across ownership" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const streaming = @import("streaming.zig");
+    const consumer = @import("../consumer/copy.zig");
+    const Timings = @import("../consumer/types.zig").Timings;
+    var values: [4096]u32 = undefined;
+    for (&values, 0..) |*v, i| v.* = @intCast(i);
+    for ([_]bool{ false, true }) |v2| {
+        var source = try testSource(a, null, &values, v2, false);
+        const prefix = try a.alloc(u8, 98);
+        @memset(prefix, 0xa5);
+        const original = source.bytes;
+        source.bytes = try std.mem.concat(a, u8, &.{ prefix, original });
+        source.rg.columns.items[0] = fast.rebaseChunk(a, original, &source.rg.columns.items[0], @intCast(prefix.len));
+        source.file_offsets = true;
+        // The final source can fall back after earlier groups have merged to an unrelated output position.
+        const owned = try source.ownProjected(a, null);
+        const restaged = try owned.ownProjected(a, null);
+        for ([_]?[]const bool{ null, &.{true} }) |kept| {
+            var expected: ?[]const u8 = null;
+            var expected_start: ?i64 = null;
+            for ([_]Source{ source, owned, restaged }) |s| {
+                var sink: streaming.MemorySink = .{ .arena = a };
+                try sink.buffer.appendSlice(a, "PAR1");
+                var offset: u64 = 4;
+                var timings: Timings = .{};
+                const copied = try consumer.copyRG(a, s.rg, .{
+                    .bytes = s.bytes,
+                    .byte_origin = 0,
+                    .file_offsets = s.file_offsets,
+                    .file_offset_delta = s.file_offset_delta,
+                }, kept, sink.sink(), &offset, &timings, true, null, .{});
+                const start = copied.rg.?.columns.items[0].meta_data.?.data_page_offset;
+                if (expected) |bytes| {
+                    try std.testing.expectEqualSlices(u8, bytes, sink.buffer.items);
+                    try std.testing.expectEqual(expected_start.?, start);
+                } else {
+                    expected = sink.buffer.items;
+                    expected_start = start;
+                }
+            }
+        }
+    }
 }
 
 test "coalesce seven-byte fixed dictionary keys preserve raw entries and remap order" {

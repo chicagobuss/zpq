@@ -97,9 +97,14 @@ def main():
             # Basename glob expansion and ordering must be the same frontend.
             sql = f"SELECT count(*) AS n FROM '{d}/*.parquet'"
             assert z.query_raw(sql).encode() == cli(sql, 1).stdout
+            # Windows use the CLI's staged frontend; the in-process parser still refuses them.
+            window = f"SELECT row_number() OVER (ORDER BY id) AS rn FROM '{path}'"
+            assert cli(window, 1).returncode == 0
+            refused = z.run({"sql": window}, check=False)
+            assert refused["reason"] == "WindowNotSupported", refused
+            assert refused["message"] == "sql: window functions (OVER) are not supported yet\nWindowNotSupported", refused
             errors = ["SELECT", f"SELECT absent FROM '{path}'", "SELECT * FROM 'missing.parquet'",
                       f"SELECT * FROM '{d}/missing*.parquet'", "SELECT 1; SELECT 2;",
-                      f"SELECT row_number() OVER (ORDER BY id) FROM '{path}'",
                       "SELECT * FROM '" + "x" * 5000 + "'",
                       f"SELECT * FROM '{d}/" + "x" * 5000 + "*'",
                       "SELECT * FROM '" + "x" * 17000 + "'"]

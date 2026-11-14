@@ -125,10 +125,6 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, req: Request, problem: *Problem) 
 /// `footers` holds the file's parsed footer, outside the budget as a SELECT's footers are; everything else is
 /// drawn through `gpa`, the charged allocator.
 fn runCharged(footers: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, req: Request, problem: *Problem) !Summary {
-    if (@import("builtin").os.tag == .windows) {
-        problem.set("UPDATE is not supported on Windows", .{});
-        return error.UpdateRefused;
-    }
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -150,7 +146,11 @@ fn runCharged(footers: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, re
         return err;
     };
     defer local_fs.close(lock_fd);
-    if (std.posix.errno(std.posix.system.flock(lock_fd, std.posix.LOCK.EX | std.posix.LOCK.NB)) != .SUCCESS) {
+    const locked_ok = if (@import("builtin").os.tag == .windows)
+        try local_fs.tryWindowsUpdateLock(lock_fd)
+    else
+        std.posix.errno(std.posix.system.flock(lock_fd, std.posix.LOCK.EX | std.posix.LOCK.NB)) == .SUCCESS;
+    if (!locked_ok) {
         problem.set("another UPDATE of {s} is running", .{req.target});
         return error.UpdateRefused;
     }
@@ -311,6 +311,10 @@ fn runCharged(footers: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, re
             publication.fail_rollback = fail_rollback;
         }
         publication.commitReplacing(io, map.stamp) catch |err| {
+            if (err == error.BackupRecoveryFailed) problem.set(
+                "{s} could not be restored after UPDATE failed; the original remains at {s}.backup",
+                .{ req.target, publication.path() },
+            );
             if (err == error.RollbackFailed) problem.set(
                 "{s} was replaced while UPDATE ran and could not be put back: that file is now {s}, and {s} holds this UPDATE's result",
                 .{ req.target, publication.path(), req.target },
@@ -1120,7 +1124,6 @@ fn patchSizeStatistics(a: std.mem.Allocator, raw: []const u8, e: *const ChunkEdi
 }
 
 test "UPDATE rewrites only the pages it changes, keeps every other byte at its offset modulo the block, and reads back" {
-    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX file fixture or UPDATE locking");
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const fixture = "ci/fixtures/parquet/filtered_records_ordered.parquet";
@@ -1242,7 +1245,6 @@ fn footerLen(bytes: []const u8) usize {
 }
 
 test "UPDATE refuses a target replaced or removed while it ran, even after its sync, and a second UPDATE of the same file" {
-    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX file fixture or UPDATE locking");
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const fixture = "ci/fixtures/parquet/filtered_records_ordered.parquet";
@@ -1264,7 +1266,10 @@ test "UPDATE refuses a target replaced or removed while it ran, even after its s
             const fd = local_fs.createFile(other) catch unreachable;
             local_fs.writeAll(fd, replacement) catch unreachable;
             local_fs.close(fd);
-            local_fs.rename(other, path) catch unreachable;
+            if (@import("builtin").os.tag == .windows)
+                local_fs.replaceWindows(other, path) catch unreachable
+            else
+                local_fs.rename(other, path) catch unreachable;
         }
         fn remove(path: []const u8) void {
             local_fs.removeFile(path);
@@ -1296,7 +1301,10 @@ test "UPDATE refuses a target replaced or removed while it ran, even after its s
     local_fs.close(fd);
     const held = try local_fs.openRead(target);
     defer local_fs.close(held);
-    try std.testing.expect(std.posix.errno(std.posix.system.flock(held, std.posix.LOCK.EX | std.posix.LOCK.NB)) == .SUCCESS);
+    try std.testing.expect(if (@import("builtin").os.tag == .windows)
+        try local_fs.tryWindowsUpdateLock(held)
+    else
+        std.posix.errno(std.posix.system.flock(held, std.posix.LOCK.EX | std.posix.LOCK.NB)) == .SUCCESS);
     var problem: Problem = .{};
     try std.testing.expectError(error.UpdateRefused, run(gpa, io, req, &problem));
     try std.testing.expect(std.mem.indexOf(u8, problem.text(), "another UPDATE") != null);
@@ -1304,7 +1312,6 @@ test "UPDATE refuses a target replaced or removed while it ran, even after its s
 }
 
 test "UPDATE that grows a page moves only its chunk, at its offset modulo the block, and nothing else" {
-    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX file fixture or UPDATE locking");
     // REQ-060-D: a dictionary append grew the dictionary page, every byte after it moved, and the page indexes,
     // Blooms and footer after the data (61 MB of a 2.7 GB file) were written instead of shared.
     const gpa = std.testing.allocator;

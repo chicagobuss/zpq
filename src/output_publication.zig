@@ -85,6 +85,13 @@ pub const OutputPublication = struct {
     pub fn commitReplacing(self: *OutputPublication, io: std.Io, expected: local_fs.Stamp) !void {
         const target = self.target orelse return;
         try self.seal(io);
+        if (@import("builtin").os.tag == .windows) {
+            const now = local_fs.pathStamp(target) catch return error.InputChanged;
+            if (!std.meta.eql(now, expected)) return error.InputChanged;
+            try local_fs.replaceWindows(self.path(), target);
+            try self.published(null);
+            return;
+        }
         const parent = if (@import("builtin").os.tag != .windows and self.fsync) try local_fs.openParent(target) else null;
         defer if (parent) |fd| local_fs.close(fd);
         local_fs.exchange(self.path(), target) catch |err| switch (err) {

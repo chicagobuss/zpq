@@ -37,6 +37,9 @@ const win = struct {
     extern "kernel32" fn WriteFile(w.HANDLE, [*]const u8, u32, *u32, ?*anyopaque) callconv(.winapi) w.BOOL;
     extern "kernel32" fn FlushFileBuffers(w.HANDLE) callconv(.winapi) w.BOOL;
     extern "kernel32" fn MoveFileExW([*:0]const u16, [*:0]const u16, u32) callconv(.winapi) w.BOOL;
+    extern "kernel32" fn ReplaceFileW([*:0]const u16, [*:0]const u16, ?[*:0]const u16, u32, ?*anyopaque, ?*anyopaque) callconv(.winapi) w.BOOL;
+    const Overlapped = extern struct { internal: usize = 0, internal_high: usize = 0, offset: u32 = 0xfffffffe, offset_high: u32 = 0x7fffffff, event: ?w.HANDLE = null };
+    extern "kernel32" fn LockFileEx(w.HANDLE, u32, u32, u32, u32, *Overlapped) callconv(.winapi) w.BOOL;
     extern "kernel32" fn DeleteFileW([*:0]const u16) callconv(.winapi) w.BOOL;
     extern "kernel32" fn CreateFileMappingW(w.HANDLE, ?*anyopaque, u32, u32, u32, ?[*:0]const u16) callconv(.winapi) ?w.HANDLE;
     extern "kernel32" fn MapViewOfFile(w.HANDLE, u32, u32, u32, usize) callconv(.winapi) ?*anyopaque;
@@ -70,6 +73,167 @@ const win = struct {
         return .{ .dev = st.volume, .ino = (@as(u64, st.index_high) << 32) | st.index_low, .size = (@as(u64, st.size_high) << 32) | st.size_low, .mtime_sec = @intCast(ticks / 10_000_000), .mtime_nsec = @intCast((ticks % 10_000_000) * 100) };
     }
 };
+
+/// Hold an UPDATE lock beyond the data range until the handle is closed.
+pub fn tryWindowsUpdateLock(fd: fd_t) error{LockFailed}!bool {
+    var overlap: win.Overlapped = .{};
+    if (win.LockFileEx(fd, 3, 0, 1, 0, &overlap).toBool()) return true;
+    if (win.GetLastError() == 33) return false; // ERROR_LOCK_VIOLATION
+    return error.LockFailed;
+}
+
+fn recoverWindowsBackup(backup: [*:0]const u16, target: [*:0]const u16) bool {
+    return win.MoveFileExW(backup, target, 0).toBool();
+}
+
+/// Replace an existing file while readers still have it mapped or open.
+pub fn replaceWindows(from: []const u8, to: []const u8) error{ RenameFailed, BackupRecoveryFailed }!void {
+    return replaceWindowsUsing(from, to, struct {
+        fn replace(target: [*:0]const u16, staged: [*:0]const u16, backup: [*:0]const u16) u32 {
+            if (win.ReplaceFileW(target, staged, backup, 0, null, null).toBool()) return 0;
+            return win.GetLastError();
+        }
+    });
+}
+
+fn replaceWindowsUsing(from: []const u8, to: []const u8, comptime api: type) error{ RenameFailed, BackupRecoveryFailed }!void {
+    const a = win.path(from) catch return error.RenameFailed;
+    defer std.heap.page_allocator.free(a);
+    const b = win.path(to) catch return error.RenameFailed;
+    defer std.heap.page_allocator.free(b);
+    const backup = std.fmt.allocPrint(std.heap.page_allocator, "{s}.backup", .{from}) catch return error.RenameFailed;
+    defer std.heap.page_allocator.free(backup);
+    const wide_backup = win.path(backup) catch return error.RenameFailed;
+    defer std.heap.page_allocator.free(wide_backup);
+    // ReplaceFileW overwrites an existing backup name, so reserve one that belongs to this publication.
+    const backup_fd = createNewFile(backup) catch return error.RenameFailed;
+    close(backup_fd);
+    var keep_backup = false;
+    defer if (!keep_backup) removeFile(backup);
+    const result = api.replace(b.ptr, a.ptr, wide_backup.ptr);
+    if (result == 0) return;
+    if (result == 1177) {
+        // The original moved to the backup, but publication failed. Never overwrite a new target during recovery.
+        if (!recoverWindowsBackup(wide_backup.ptr, b.ptr)) {
+            keep_backup = true;
+            return error.BackupRecoveryFailed;
+        }
+    }
+    return error.RenameFailed;
+}
+
+test "Windows UPDATE restores or retains the backup when replacement fails midway" {
+    if (comptime builtin.os.tag != .windows) return;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/target", .{tmp.sub_path});
+    defer a.free(target);
+    const staged = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/staged", .{tmp.sub_path});
+    defer a.free(staged);
+    const backup = try std.fmt.allocPrint(a, "{s}.backup", .{staged});
+    defer a.free(backup);
+    const Fault = struct {
+        var block_restore = false;
+        fn replace(t: [*:0]const u16, _: [*:0]const u16, b: [*:0]const u16) u32 {
+            // Model the documented 1177 state: the original has moved to the backup name.
+            if (!win.MoveFileExW(t, b, 1).toBool()) unreachable;
+            if (block_restore) {
+                const fd = win.CreateFileW(t, 0x40000000, 7, null, 1, 0x80, null);
+                if (fd == win.w.INVALID_HANDLE_VALUE) unreachable;
+                var written: u32 = 0;
+                if (!win.WriteFile(fd, "other", 5, &written, null).toBool() or written != 5) unreachable;
+                close(fd);
+            }
+            return 1177;
+        }
+    };
+    for ([_]bool{ false, true }) |blocked| {
+        Fault.block_restore = blocked;
+        var fd = try createFile(target);
+        try writeAll(fd, "original");
+        close(fd);
+        fd = try createFile(staged);
+        try writeAll(fd, "new");
+        close(fd);
+        const held = try openRead(target);
+        defer close(held);
+        try std.testing.expect(try tryWindowsUpdateLock(held));
+        const map = try mapFile(target);
+        defer map.unmap();
+        if (blocked) {
+            try std.testing.expectError(error.BackupRecoveryFailed, replaceWindowsUsing(staged, target, Fault));
+            const other = try readFile(a, target);
+            defer a.free(other);
+            try std.testing.expectEqualStrings("other", other);
+            const kept = try readFile(a, backup);
+            defer a.free(kept);
+            try std.testing.expectEqualStrings("original", kept);
+            removeFile(backup);
+        } else {
+            try std.testing.expectError(error.RenameFailed, replaceWindowsUsing(staged, target, Fault));
+            const restored = try readFile(a, target);
+            defer a.free(restored);
+            try std.testing.expectEqualStrings("original", restored);
+            try std.testing.expectError(error.FileNotFound, openRead(backup));
+        }
+        removeFile(target);
+        removeFile(staged);
+    }
+}
+
+test "Windows UPDATE locks and replacement preserve open targets and backup ownership" {
+    if (comptime builtin.os.tag != .windows) return;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/target", .{tmp.sub_path});
+    defer a.free(target);
+    const staged = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/staged", .{tmp.sub_path});
+    defer a.free(staged);
+    const backup = try std.fmt.allocPrint(a, "{s}.backup", .{staged});
+    defer a.free(backup);
+    var fd = try createFile(target);
+    try writeAll(fd, "original");
+    close(fd);
+    fd = try createFile(staged);
+    try writeAll(fd, "new");
+    close(fd);
+    const first = try openRead(target);
+    defer close(first);
+    try std.testing.expect(try tryWindowsUpdateLock(first));
+    const second = try openRead(target);
+    defer close(second);
+    try std.testing.expect(!(try tryWindowsUpdateLock(second)));
+    const map = try mapFile(target);
+    defer map.unmap();
+    try replaceWindows(staged, target);
+    const result = try readFile(a, target);
+    defer a.free(result);
+    try std.testing.expectEqualStrings("new", result);
+    try std.testing.expectError(error.FileNotFound, openRead(backup));
+    // A backup name owned by somebody else must never be overwritten.
+    fd = try createFile(staged);
+    try writeAll(fd, "later");
+    close(fd);
+    fd = try createFile(backup);
+    try writeAll(fd, "keep");
+    close(fd);
+    try std.testing.expectError(error.RenameFailed, replaceWindows(staged, target));
+    const kept = try readFile(a, backup);
+    defer a.free(kept);
+    try std.testing.expectEqualStrings("keep", kept);
+    const wb = try win.path(backup);
+    defer std.heap.page_allocator.free(wb);
+    const wt = try win.path(target);
+    defer std.heap.page_allocator.free(wt);
+    try std.testing.expect(!recoverWindowsBackup(wb.ptr, wt.ptr));
+    removeFile(target);
+    try std.testing.expect(recoverWindowsBackup(wb.ptr, wt.ptr));
+    const restored = try readFile(a, target);
+    defer a.free(restored);
+    try std.testing.expectEqualStrings("keep", restored);
+}
 
 pub fn close(fd: fd_t) void {
     if (builtin.os.tag == .windows) return std.os.windows.CloseHandle(fd);

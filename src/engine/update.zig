@@ -1120,6 +1120,7 @@ fn patchSizeStatistics(a: std.mem.Allocator, raw: []const u8, e: *const ChunkEdi
 }
 
 test "UPDATE rewrites only the pages it changes, keeps every other byte at its offset modulo the block, and reads back" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX file fixture or UPDATE locking");
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const fixture = "ci/fixtures/parquet/filtered_records_ordered.parquet";
@@ -1241,6 +1242,7 @@ fn footerLen(bytes: []const u8) usize {
 }
 
 test "UPDATE refuses a target replaced or removed while it ran, even after its sync, and a second UPDATE of the same file" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX file fixture or UPDATE locking");
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const fixture = "ci/fixtures/parquet/filtered_records_ordered.parquet";
@@ -1302,6 +1304,7 @@ test "UPDATE refuses a target replaced or removed while it ran, even after its s
 }
 
 test "UPDATE that grows a page moves only its chunk, at its offset modulo the block, and nothing else" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX file fixture or UPDATE locking");
     // REQ-060-D: a dictionary append grew the dictionary page, every byte after it moved, and the page indexes,
     // Blooms and footer after the data (61 MB of a 2.7 GB file) were written instead of shared.
     const gpa = std.testing.allocator;
@@ -1365,6 +1368,7 @@ test "UPDATE that grows a page moves only its chunk, at its offset modulo the bl
 }
 
 test "UPDATE keeps a replaced target when putting it back fails, and says where it is" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX file fixture or UPDATE locking");
     // REVIEW v6: ENOSPC or EIO on the exchange back made the abort unlink the other writer's file.
     const gpa = std.testing.allocator;
     const io = std.testing.io;

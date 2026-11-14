@@ -206,9 +206,9 @@ test "Arrow columnar handoff applies the same row cut as text output" {
     var args: QueryArgs = .{ .inputs = &.{"ci/fixtures/parquet/nullable_mix.parquet"}, .columns = &.{"id"}, .parallelism = 1 };
     var text: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer text.deinit();
-    const want = try runPrintSink(ctx, args, .jsonl, 3, -1, 1, &text.writer);
+    const want = try runPrintSink(ctx, args, .jsonl, 3, local_fs.invalidTestFd(), 1, &text.writer);
     args.columnar_sink = .{ .ctx = &capture, .schema_fn = Capture.schemaFn, .batch_fn = Capture.batchFn };
-    const got = try runPrintSink(ctx, args, .jsonl, 3, -1, 1, null);
+    const got = try runPrintSink(ctx, args, .jsonl, 3, local_fs.invalidTestFd(), 1, null);
     try std.testing.expectEqual(@as(usize, 1), capture.schemas);
     try std.testing.expectEqual(want.rows, capture.rows);
     try std.testing.expectEqual(want.rows, got.rows);
@@ -711,7 +711,7 @@ pub const PrintResult = struct {
 };
 
 pub fn runPrint(ctx: Context, args: QueryArgs, format: PrintFormat, limit: ?usize) !void {
-    _ = try runPrintTo(ctx, args, format, limit, 1, 0);
+    _ = try runPrintTo(ctx, args, format, limit, std.Io.File.stdout().handle, 0);
 }
 
 pub fn runPrintTo(
@@ -936,6 +936,7 @@ fn runPrintSinkOver(
 }
 
 test "limited Parquet row sink restores borrowed buffers on every allocation failure" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX file fixture or UPDATE locking");
     const Test = struct {
         fn run(gpa: std.mem.Allocator, fd: local_fs.fd_t) !void {
             var arena = std.heap.ArenaAllocator.init(gpa);

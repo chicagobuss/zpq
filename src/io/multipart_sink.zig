@@ -17,7 +17,7 @@ const builtin = @import("builtin");
 const clock = @import("../clock.zig");
 const nowMonoNs = clock.monoNs;
 const Io = std.Io;
-const posix = std.posix;
+const posix = if (builtin.os.tag == .windows) @import("win_test_socket.zig") else std.posix;
 const s3 = @import("s3.zig");
 const tls = @import("tls.zig");
 const http = @import("http.zig");

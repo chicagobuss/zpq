@@ -11,3 +11,5 @@ x86_64-linux/libcrypto.a 59eff4094d83d6ee1881e9d8b03226512f885c7dcfc45d2164e9196
 x86_64-linux/libssl.a 59b6f95819515c9537d2bf5dc177cc5e7d23007ef69d57e4033de64d0483d3ad https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-linux/libssl.a
 x86_64-macos/libcrypto.a 84a6e14fcf8ebdab7803984b1765640a74b4d28d355df9d7ea535c80d347f02e https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-macos/libcrypto.a
 x86_64-macos/libssl.a cb3787887ae9a1fc9af23fad1adaa2b5d434eb9bf4df154bb3293c2373802d5c https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-macos/libssl.a
+x86_64-windows/libcrypto.a fba0701fd1c57c9468083b395b92a8cd9c8422d699ec9fd13dfebd352a4ce1ff https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-windows/libcrypto.a
+x86_64-windows/libssl.a e59faa778c3d7c2135e876bf32b4e42a8bbfaf3041e8173bfbf5909dd71430f2 https://pub-4d2e7e2925bb43dc9d3c0323d6d61a84.r2.dev/boring_tls/x86_64-windows/libssl.a

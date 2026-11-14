@@ -48,6 +48,16 @@ pub const Guard = struct {
 fn stackLow() ?usize {
     if (!builtin.link_libc) return null;
     switch (builtin.os.tag) {
+        .windows => {
+            const win = struct {
+                extern "kernel32" fn GetCurrentThreadStackLimits(*usize, *usize) callconv(.winapi) void;
+            };
+            var low: usize = 0;
+            var high: usize = 0;
+            win.GetCurrentThreadStackLimits(&low, &high);
+            if (low == 0 or low >= high) return null;
+            return low;
+        },
         .linux => {
             var attr: std.c.pthread_attr_t = undefined;
             if (pthread_getattr_np(std.c.pthread_self(), &attr) != 0) return null;

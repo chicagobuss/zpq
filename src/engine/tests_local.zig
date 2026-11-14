@@ -427,7 +427,7 @@ test "a row query prints the same bytes at every parallelism, in every text form
                 .max_memory = c.max_memory,
                 .diag = &diag,
             };
-            const rows = if (runPrintSink(ctx, args, format, null, 1, c.offset, &out.writer)) |p| rows: {
+            const rows = if (runPrintSink(ctx, args, format, null, std.Io.File.stdout().handle, c.offset, &out.writer)) |p| rows: {
                 try std.testing.expect(c.err == null);
                 break :rows p.rows;
             } else |e| rows: {
@@ -676,6 +676,7 @@ test "a select output naming one column twice is rejected and named, like aggreg
 }
 
 test "an S3 query with no region says so rather than blaming the credentials" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     const gpa = std.testing.allocator;
     const Case = struct { env: []const ?[*:0]const u8, want: anyerror };
     const cases = [_]Case{
@@ -1405,7 +1406,7 @@ test "regression: inputs whose schema roots alone are named apart read together"
     try std.testing.expectEqual(@as(i128, 6), r.aggregate.output.aggs[1].value.i);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const printed = try runPrintSink(ctx, .{ .inputs = both }, .jsonl, null, -1, 0, &out.writer);
+    const printed = try runPrintSink(ctx, .{ .inputs = both }, .jsonl, null, local_fs.invalidTestFd(), 0, &out.writer);
     try std.testing.expectEqual(@as(usize, 8), printed.rows);
 }
 
@@ -1451,14 +1452,14 @@ test "regression: a BYTE_ARRAY DECIMAL past 38 digits prints, or is refused for 
     // Text output reads the column as a double (`initOutputAggregator`); coercing its schema to FLBA panicked.
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    const printed = try runPrintSink(ctx, .{ .inputs = p40 }, .jsonl, 3, -1, 0, &out.writer);
+    const printed = try runPrintSink(ctx, .{ .inputs = p40 }, .jsonl, 3, local_fs.invalidTestFd(), 0, &out.writer);
     try std.testing.expectEqual(@as(usize, 3), printed.rows);
     var bin: std.Io.Writer.Allocating = .init(gpa);
     defer bin.deinit();
     var diag: Diag = .{};
     try std.testing.expectError(
         error.UnsupportedDecimalPrecision,
-        runPrintSink(ctx, .{ .inputs = p40, .diag = &diag }, .parquet, 3, -1, 0, &bin.writer),
+        runPrintSink(ctx, .{ .inputs = p40, .diag = &diag }, .parquet, 3, local_fs.invalidTestFd(), 0, &bin.writer),
     );
     try std.testing.expectEqualStrings("value", diag.column.get());
     try std.testing.expectError(
@@ -1559,6 +1560,7 @@ test "regression: the local reader reads the file mapped, even once another is r
 }
 
 test "regression: more local inputs than the open-file limit allows still answer" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     const posix = std.posix;
     if (posix.rlimit_resource == void) return error.SkipZigTest;
     const fixture = "ci/fixtures/parquet/nullable_mix.parquet";
@@ -1686,7 +1688,7 @@ test "regression: DELTA_BYTE_ARRAY values are charged where they decode, and a r
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         const print_args: QueryArgs = .{ .inputs = &.{path}, .filter = "s = 'x'", .max_memory = budget };
-        const printed = runPrintSink(ctx, print_args, .jsonl, null, -1, 0, &out.writer);
+        const printed = runPrintSink(ctx, print_args, .jsonl, null, local_fs.invalidTestFd(), 0, &out.writer);
         if (budget == 2 << 20) try std.testing.expectError(error.DecodeExceededBudget, printed) else {
             try std.testing.expectEqual(@as(usize, 0), (try printed).rows);
         }

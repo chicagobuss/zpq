@@ -5,6 +5,7 @@ const c = tls.c;
 pub const TlsError = tls.TlsError;
 
 const BUFFER_SIZE = tls.BUFFER_SIZE;
+extern fn zpq_windows_trust(*c.SSL_CTX) void;
 
 pub const TlsClientOptions = struct {
     /// Verify the server's certificate chain and that the certificate names the host given to `init`.
@@ -59,32 +60,36 @@ pub const ClientContext = struct {
                 return err;
             };
         } else if (options.verify_certificate) {
-            c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
+            if (@import("builtin").os.tag == .windows) {
+                zpq_windows_trust(ctx);
+            } else {
+                c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
 
-            // Try explicit CA bundle first (macOS), then fall back to default paths
-            const ca_paths = [_][*:0]const u8{
-                "/etc/ssl/cert.pem",
-                "/opt/homebrew/etc/ca-certificates/cert.pem",
-                "/usr/local/etc/ca-certificates/cert.pem",
-            };
+                // Try explicit CA bundle first (macOS), then fall back to default paths
+                const ca_paths = [_][*:0]const u8{
+                    "/etc/ssl/cert.pem",
+                    "/opt/homebrew/etc/ca-certificates/cert.pem",
+                    "/usr/local/etc/ca-certificates/cert.pem",
+                };
 
-            var loaded = false;
-            for (ca_paths) |ca_path| {
-                if (c.SSL_CTX_load_verify_locations(ctx, ca_path, null) == 1) {
-                    loaded = true;
-                    break;
+                var loaded = false;
+                for (ca_paths) |ca_path| {
+                    if (c.SSL_CTX_load_verify_locations(ctx, ca_path, null) == 1) {
+                        loaded = true;
+                        break;
+                    }
                 }
-            }
 
-            if (!loaded) {
-                // Fall back to default paths (works on Linux)
-                if (c.SSL_CTX_set_default_verify_paths(ctx) != 1) {
-                    std.log.warn("Failed to load CA certificates", .{});
+                if (!loaded) {
+                    // Fall back to default paths (works on Linux)
+                    if (c.SSL_CTX_set_default_verify_paths(ctx) != 1) {
+                        std.log.warn("Failed to load CA certificates", .{});
+                    }
                 }
+                // Failed probes of absent paths leave errors queued on this thread, where a later SSL_get_error would
+                // find them.
+                c.ERR_clear_error();
             }
-            // Failed probes of absent paths leave errors queued on this thread, where a later SSL_get_error would
-            // find them.
-            c.ERR_clear_error();
         } else {
             c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_NONE, null);
         }
@@ -122,6 +127,7 @@ pub const TlsClient = struct {
     hostname: []const u8,
     buffers: tls.TlsBuffers = .{},
     verify_certificate: bool = true,
+    windows_name: ?[:0]u8 = null,
 
     const Self = @This();
 
@@ -129,6 +135,16 @@ pub const TlsClient = struct {
     pub fn init(allocator: std.mem.Allocator, context: *const ClientContext, hostname: []const u8) !Self {
         const ssl = try createSslConnection(context.ctx);
         errdefer c.SSL_free(ssl);
+
+        const windows_name = if (@import("builtin").os.tag == .windows and context.verify_certificate) blk: {
+            const name = try allocator.allocSentinel(u8, hostname.len, 0);
+            @memcpy(name, hostname);
+            break :blk name;
+        } else null;
+        errdefer if (windows_name) |name| allocator.free(name);
+        if (windows_name) |name| {
+            if (c.SSL_set_ex_data(ssl, 0, name.ptr) != 1) return TlsError.TlsContextFailed;
+        }
 
         try setSniHostname(ssl, hostname);
         if (context.verify_certificate) try setExpectedPeer(ssl, hostname);
@@ -147,12 +163,14 @@ pub const TlsClient = struct {
             .bio_write = bio_write,
             .hostname = hostname,
             .verify_certificate = context.verify_certificate,
+            .windows_name = windows_name,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.buffers.deinit(self.allocator);
         c.SSL_free(self.ssl);
+        if (self.windows_name) |name| self.allocator.free(name);
     }
 
     pub fn startHandshake(self: *Self) !tls.ProcessResult {

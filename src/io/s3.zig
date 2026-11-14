@@ -1746,6 +1746,7 @@ fn testEnviron(comptime entries: []const [*:0]const u8) std.process.Environ {
 }
 
 test "ZPQ_S3_PRECONNECT defaults to 4 and 0 disables it" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try testing.expectEqual(@as(usize, 4), preconnectCount(testEnviron(&.{})));
     try testing.expectEqual(@as(usize, 0), preconnectCount(testEnviron(&.{"ZPQ_S3_PRECONNECT=0"})));
     try testing.expectEqual(@as(usize, 2), preconnectCount(testEnviron(&.{"ZPQ_S3_PRECONNECT=2"})));
@@ -1753,6 +1754,7 @@ test "ZPQ_S3_PRECONNECT defaults to 4 and 0 disables it" {
 }
 
 test "S3_NO_SIGN_REQUEST yields anonymous credentials instead of NoCredentials" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     const anon = try Credentials.fromEnv(testEnviron(&.{ "AWS_REGION=us-east-1", "S3_NO_SIGN_REQUEST=1" }));
     try testing.expectEqualStrings("", anon.access_key);
     try testing.expectEqualStrings("", anon.secret_key);
@@ -1868,6 +1870,7 @@ test "fetchManyRanges instantiates and short-circuits on an empty range list" {
 /// A stand-in for `Pool(N)` that scripts what each `acquire` yields, for driving the retry loops without a network.
 /// A live connection is a socketpair whose peer has the response already queued; a dead one's peer has shut down
 /// writing, so the request goes out and EOF comes back before any response byte.
+const test_posix = if (builtin.os.tag == .windows) @import("win_test_socket.zig") else std.posix;
 const ScriptedPool = struct {
     pub const capacity: usize = 1;
     pub const Step = union(enum) {
@@ -1875,7 +1878,7 @@ const ScriptedPool = struct {
         live: struct { reused: bool, response: []const u8 },
         dead: struct { reused: bool },
     };
-    pub const Slot = struct { conn: tls.Connection, peer: std.posix.fd_t };
+    pub const Slot = struct { conn: tls.Connection, peer: test_posix.fd_t };
     pub const Handle = struct { conn: *tls.Connection, node: *Slot, permit: usize, reused: bool };
 
     steps: []const Step,
@@ -1890,7 +1893,7 @@ const ScriptedPool = struct {
             .fail => {},
             else => {
                 slot.conn.deinit();
-                _ = std.posix.system.close(slot.peer);
+                _ = test_posix.system.close(slot.peer);
             },
         };
     }
@@ -1907,14 +1910,14 @@ const ScriptedPool = struct {
             .live => |l| .{ l.reused, l.response },
             .dead => |d| .{ d.reused, null },
         };
-        var fds: [2]std.posix.fd_t = undefined;
-        if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+        var fds: [2]test_posix.fd_t = undefined;
+        if (test_posix.errno(test_posix.system.socketpair(test_posix.AF.UNIX, test_posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
             return error.SkipZigTest;
         slot.* = .{ .conn = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true }, .peer = fds[1] };
         if (response) |r| {
-            _ = std.posix.system.write(fds[1], r.ptr, r.len);
+            _ = test_posix.system.write(fds[1], r.ptr, r.len);
         } else {
-            _ = std.posix.system.shutdown(fds[1], std.posix.SHUT.WR);
+            _ = test_posix.system.shutdown(fds[1], test_posix.SHUT.WR);
         }
         return .{ .conn = &slot.conn, .node = slot, .permit = 0, .reused = reused };
     }
@@ -2465,6 +2468,7 @@ test "S3_IN_FLIGHT is 8 on aarch64 and 16 on x86_64" {
 }
 
 test "inFlight: S3_IN_FLIGHT on Lambda, the pool's size elsewhere, ZPQ_S3_IN_FLIGHT within it" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try testing.expectEqual(S3_IN_FLIGHT, inFlight(testEnviron(&.{"AWS_LAMBDA_FUNCTION_NAME=f"})));
     try testing.expectEqual(S3_IN_FLIGHT_MAX, inFlight(testEnviron(&.{"AWS_REGION=us-east-1"})));
     try testing.expectEqual(@as(usize, 32), inFlight(testEnviron(&.{ "AWS_LAMBDA_FUNCTION_NAME=f", "ZPQ_S3_IN_FLIGHT=32" })));

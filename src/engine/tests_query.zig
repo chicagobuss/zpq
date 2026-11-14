@@ -185,6 +185,7 @@ const runPrintSink = engine_print.runPrintSink;
 const pageIndexTestChunk = engine_s3_rebase.pageIndexTestChunk;
 
 test "explainAggregate: local IO and environment knobs preserve dispatch, and every read mode bounds dictionaries" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     const gpa = std.testing.allocator;
     const modes = [_][*:0]const u8{ "ZPQ_IO_PROFILE=mmap", "ZPQ_IO_PROFILE=pread", "ZPQ_IO_PROFILE=uring" };
     for (modes, 0..) |mode, i| for ([_]bool{ false, true }) |disabled|
@@ -227,6 +228,7 @@ test "explainAggregate: local IO and environment knobs preserve dispatch, and ev
 }
 
 test "a row group past half the query's budget is read through the mapping, whatever read mode is asked for" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     const gpa = std.testing.allocator;
     for ([_][*:0]const u8{ "ZPQ_IO_PROFILE=pread", "ZPQ_IO_PROFILE=uring" }) |mode| for ([_]usize{ 1 << 30, 4096 }) |mm| {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -246,6 +248,7 @@ test "a row group past half the query's budget is read through the mapping, what
 }
 
 test "explainAggregate: the facts a plan was made from, the admissible strategies and the winner" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const lines = [_:null]?[*:0]const u8{"ZPQ_IO_PROFILE=mmap"};
@@ -291,6 +294,7 @@ test "explainAggregate: the facts a plan was made from, the admissible strategie
 }
 
 test "explainAggregate: partitioned force agrees for API and environment" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     for ([_]bool{ false, true }) |api| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
@@ -347,6 +351,7 @@ fn topnPrint(gpa: std.mem.Allocator, env: std.process.Environ, c: TopnCase, j: u
 }
 
 test "the parallel plain-row Top-N prints what reading every row group in order prints, at every -j" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     std.Io.Dir.cwd().access(std.testing.io, topn_gather_inputs[1], .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -518,6 +523,7 @@ const PeakAllocator = struct {
 };
 
 test "the parallel plain-row Top-N answers within the memory budget wherever reading in order does" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     // Review repros: winners scattered through one dictionary-coded row group, so the gather reads many short runs.
     const small = "ci/fixtures/parquet/topn_budget_80.parquet";
     const wide = "ci/fixtures/parquet/topn_budget_12k.parquet";
@@ -1271,40 +1277,52 @@ const OomSweep = struct {
 };
 
 test "oom sweep filtered read" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try OomSweep.sweep(.filtered);
 }
 test "oom sweep projection NDJSON" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try OomSweep.sweep(.jsonl);
 }
 test "oom sweep projection CSV" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try OomSweep.sweep(.csv);
 }
 test "oom sweep group one worker" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try OomSweep.sweep(.group1);
 }
 test "oom sweep group four workers" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try OomSweep.sweep(.group4);
 }
 test "oom sweep count distinct" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try OomSweep.sweep(.distinct);
 }
 test "oom sweep top k" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try OomSweep.sweep(.topk);
 }
 test "oom sweep decimal sum and average" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try OomSweep.sweep(.decimal);
 }
 test "oom sweep parquet write" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try OomSweep.sweep(.parquet);
 }
 test "oom sweep string groups" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try OomSweep.sweep(.strings);
 }
 test "oom sweep explain" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try OomSweep.sweep(.explain);
 }
 
 test "DISTINCT second passes survive cold auto pread and uring readers on a large file" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     if (@import("builtin").os.tag != .linux) return;
     const gpa = std.testing.allocator;
     var held = std.heap.ArenaAllocator.init(gpa);
@@ -1386,6 +1404,7 @@ test "DISTINCT second passes survive cold auto pread and uring readers on a larg
 }
 
 test "cold mapped passes read ahead of their workers and answer as the faulting mapping, at every -j" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     if (@import("builtin").os.tag != .linux) return;
     const read_ahead = @import("../core/scan/read_ahead.zig");
     const gpa = std.testing.allocator;

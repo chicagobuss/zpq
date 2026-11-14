@@ -215,6 +215,7 @@ test "a size of 2^64 bytes or more is invalid, not a conversion overflow" {
 }
 
 test "a Lambda memory size no machine has is ignored, not an overflow" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     var big_env = [_:null]?[*:0]const u8{"AWS_LAMBDA_FUNCTION_MEMORY_SIZE=17592186044416"};
     try std.testing.expectEqual(@as(?usize, null), getLambdaMemory(.{ .block = .{ .slice = &big_env } }));
     var ok_env = [_:null]?[*:0]const u8{"AWS_LAMBDA_FUNCTION_MEMORY_SIZE=1024"};

@@ -2632,6 +2632,7 @@ test "piece allocation failures release their rows" {
 }
 
 test "a windowed byte copy places the bytes a direct copy writes, its ranges copied from the input" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX file fixture or UPDATE locking");
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();

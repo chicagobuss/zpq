@@ -1297,6 +1297,7 @@ test "a handshake that fails before any certificate is a retryable failure, not 
 }
 
 test "Timeouts.fromEnv takes positive overrides and keeps the defaults otherwise" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     const block = [_:null]?[*:0]const u8{
         "ZPQ_S3_CONNECT_TIMEOUT_MS=250",
         "ZPQ_S3_HANDSHAKE_TIMEOUT_MS=0",

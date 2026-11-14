@@ -95,7 +95,7 @@ test "bound frontend: projection and row ordering ignore legacy expression field
         .select = frontend.text,
         .filter = frontend.filter,
         .result_order = .{ .rows = &.{.{ .expr = "x", .descending = false }} },
-    }, .jsonl, 3, 1, 1, &expected);
+    }, .jsonl, 3, std.Io.File.stdout().handle, 1, &expected);
     var got_buf: [4096]u8 = undefined;
     var got: std.Io.Writer = .fixed(&got_buf);
     _ = try printing.runPrintSink(ctx, .{
@@ -104,7 +104,7 @@ test "bound frontend: projection and row ordering ignore legacy expression field
         .select = "invalid select",
         .filter = "invalid filter",
         .result_order = .{ .rows = &.{.{ .expr = "invalid order", .descending = false }} },
-    }, .jsonl, 3, 1, 1, &got);
+    }, .jsonl, 3, std.Io.File.stdout().handle, 1, &got);
     try std.testing.expectEqual(@as(usize, 1), count);
     try std.testing.expectEqualStrings(expected.buffered(), got.buffered());
 }
@@ -286,8 +286,8 @@ test "syntax: SQL hands the engine owned nodes and separate aliases and output s
             try @import("text.zig").writeAggregateJsonValue(&want, expected.aggregate.output, expected.aggregate.text_kinds, expected.aggregate.output.rowCount());
             try @import("text.zig").writeAggregateJsonValue(&got, actual.aggregate.output, actual.aggregate.text_kinds, actual.aggregate.output.rowCount());
         } else {
-            _ = try printing.runPrintSink(ctx, args, .jsonl, 3, 1, 1, &want);
-            _ = try printing.runPrintSink(ctx, bound, .jsonl, 3, 1, 1, &got);
+            _ = try printing.runPrintSink(ctx, args, .jsonl, 3, std.Io.File.stdout().handle, 1, &want);
+            _ = try printing.runPrintSink(ctx, bound, .jsonl, 3, std.Io.File.stdout().handle, 1, &got);
         }
         try std.testing.expectEqualStrings(want.buffered(), got.buffered());
     }
@@ -531,6 +531,7 @@ fn denseCountFixture(a: std.mem.Allocator, sub_path: []const u8) ![]const u8 {
 }
 
 test "regression: SQL syntax hands a filtered integer COUNT top-H the plan its text fragments chose" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     const sql = @import("../core/expr/sql_parser.zig");
     if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
     const a = std.testing.allocator;
@@ -576,6 +577,7 @@ test "regression: SQL syntax hands a filtered integer COUNT top-H the plan its t
 }
 
 test "regression: a structured fanout plan of a filtered integer COUNT plans as its text fragments do" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     const a = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
@@ -632,6 +634,7 @@ test "regression: a structured fanout plan of a filtered integer COUNT plans as 
 }
 
 test "regression: a structured plan without text fragments answers a grouped DISTINCT per group" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     const sql = @import("../core/expr/sql_parser.zig");
     if (comptime !@hasDecl(sql, "parseSqlPlan")) return;
     const a = std.testing.allocator;

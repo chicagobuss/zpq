@@ -12,6 +12,11 @@ const posix = std.posix;
 
 pub const fd_t = posix.fd_t;
 
+/// Sentinel for tests whose output is captured in memory instead of a file.
+pub fn invalidTestFd() fd_t {
+    return if (builtin.os.tag == .windows) std.os.windows.INVALID_HANDLE_VALUE else -1;
+}
+
 const win = struct {
     const w = std.os.windows;
     const Info = extern struct {
@@ -172,13 +177,13 @@ test "device sync falls back when Darwin full sync is unsupported for data or di
     for ([_]posix.E{ .INVAL, .NOTTY, .OPNOTSUPP }) |failure| for ([_]bool{ false, true }) |data| {
         Fake.failure = failure;
         Fake.calls = 0;
-        try syncUsing(-1, data, true, Fake);
+        try syncUsing(invalidTestFd(), data, true, Fake);
         try std.testing.expectEqual(@as(usize, 1), Fake.calls);
         try std.testing.expect(!Fake.data_arg);
     };
     Fake.failure = .IO;
     Fake.calls = 0;
-    try std.testing.expectError(error.InputOutput, syncUsing(-1, true, true, Fake));
+    try std.testing.expectError(error.InputOutput, syncUsing(invalidTestFd(), true, true, Fake));
     try std.testing.expectEqual(@as(usize, 0), Fake.calls);
 }
 

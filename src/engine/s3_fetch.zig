@@ -19,6 +19,7 @@ pub fn s3FetchWindow(env: ?std.process.Environ, max_memory: usize) u64 {
 }
 
 test "S3 fetch window caps only the Lambda default and preserves explicit overrides" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try std.testing.expectEqual(@as(u64, 128 << 20), lambda_window_cap);
     const lambda = [_:null]?[*:0]const u8{"AWS_LAMBDA_FUNCTION_MEMORY_SIZE=3008"};
     const override = [_:null]?[*:0]const u8{
@@ -134,6 +135,7 @@ test "a footer suffix whose Content-Range total is smaller than its body is a ba
 }
 
 test "footer probe defaults to 1 MiB and ZPQ_S3_FOOTER_PROBE overrides it" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     try std.testing.expectEqual(FOOTER_PROBE_DEFAULT, footerProbeBytes(.empty));
     const set = [_:null]?[*:0]const u8{"ZPQ_S3_FOOTER_PROBE=65536"};
     try std.testing.expectEqual(@as(u64, 65536), footerProbeBytes(.{ .block = .{ .slice = &set } }));

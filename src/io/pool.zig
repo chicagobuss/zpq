@@ -574,8 +574,9 @@ pub fn Lane(comptime P: type, comptime M: usize) type {
 const testing = std.testing;
 
 /// A listening localhost socket: plain connections to it complete in the kernel backlog without an `accept`.
+const TestListenerFd = if (@import("builtin").os.tag == .windows) usize else std.posix.fd_t;
 const TestListener = struct {
-    fd: std.posix.fd_t,
+    fd: TestListenerFd,
     port: u16,
 
     fn open() !TestListener {
@@ -584,7 +585,7 @@ const TestListener = struct {
 
     /// Listen on `ip`:`port` (0: any free port). Skips the test where `ip` is not a local address.
     fn openOn(ip: tls.Ipv4, port: u16) !TestListener {
-        const posix = std.posix;
+        const posix = if (@import("builtin").os.tag == .windows) @import("win_test_socket.zig") else std.posix;
         const rc = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
         if (posix.errno(rc) != .SUCCESS) return error.SkipZigTest;
         const fd: posix.fd_t = @intCast(rc);
@@ -598,7 +599,8 @@ const TestListener = struct {
     }
 
     fn close(self: TestListener) void {
-        _ = std.posix.system.close(self.fd);
+        const posix = if (@import("builtin").os.tag == .windows) @import("win_test_socket.zig") else std.posix;
+        _ = posix.system.close(self.fd);
     }
 
     fn criteria(self: TestListener) Criteria {
@@ -795,21 +797,22 @@ test "a preconnect across two addresses of a full listen queue stops without han
     try testing.expect(elapsed_ms <= 30_000);
 }
 
-fn holdAccepted(fd: std.posix.fd_t, stop: *std.atomic.Value(bool)) void {
-    var held: [4]std.posix.fd_t = undefined;
+fn holdAccepted(fd: TestListenerFd, stop: *std.atomic.Value(bool)) void {
+    const posix = if (@import("builtin").os.tag == .windows) @import("win_test_socket.zig") else std.posix;
+    var held: [4]posix.fd_t = undefined;
     var n: usize = 0;
     while (n < held.len and !stop.load(.monotonic)) {
-        var addr: std.posix.sockaddr.in = undefined;
-        var len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-        const rc = std.posix.system.accept(fd, @ptrCast(&addr), &len);
-        if (std.posix.errno(rc) != .SUCCESS) break;
+        var addr: posix.sockaddr.in = undefined;
+        var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+        const rc = posix.system.accept(fd, @ptrCast(&addr), &len);
+        if (posix.errno(rc) != .SUCCESS) break;
         held[n] = @intCast(rc);
         n += 1;
     }
     while (!stop.load(.monotonic)) {
         clock.sleepNs(20 * std.time.ns_per_ms);
     }
-    for (held[0..n]) |cfd| _ = std.posix.system.close(cfd);
+    for (held[0..n]) |cfd| _ = posix.system.close(cfd);
 }
 
 test "acquire reuses a connection idle for less than the timeout and closes one idle for longer" {

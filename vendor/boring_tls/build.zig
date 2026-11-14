@@ -123,6 +123,11 @@ pub fn build(b: *std.Build) !void {
     openssl_c.addIncludePath(boringssl_dep.path("include"));
     boring_tls_mod.addImport("openssl_c", openssl_c.createModule());
 
+    if (target.result.os.tag == .windows) {
+        boring_tls_mod.addCSourceFile(.{ .file = b.path("src/windows_trust.c"), .flags = &.{} });
+        boring_tls_mod.linkSystemLibrary("crypt32", .{});
+    }
+
     if (source_build) {
         for (try sourceLibraries(b, boringssl_dep, target, optimize)) |lib| boring_tls_mod.linkLibrary(lib);
     } else {

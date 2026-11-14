@@ -25,12 +25,15 @@ pub const Need = enum {
     linux,
     /// Ring setup can also be refused by seccomp or kernel policy on Linux.
     io_uring,
+    /// POSIX-specific test fixtures or system calls.
+    posix,
 
     /// Whether the OS named `os_name` (`uname`'s sysname) meets the need.
     pub fn metBy(self: Need, os_name: []const u8) bool {
         return switch (self) {
             .linux => std.ascii.eqlIgnoreCase(os_name, "linux"),
             .io_uring => std.ascii.eqlIgnoreCase(os_name, "linux"),
+            .posix => !std.ascii.eqlIgnoreCase(os_name, "windows"),
         };
     }
 
@@ -38,6 +41,7 @@ pub const Need = enum {
         return switch (self) {
             .linux => builtin.os.tag == .linux,
             .io_uring => false, // runtime need; the caller probes ring setup
+            .posix => builtin.os.tag != .windows,
         };
     }
 };

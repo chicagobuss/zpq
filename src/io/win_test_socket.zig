@@ -103,8 +103,8 @@ pub const system = struct {
     pub fn getsockname(fd: fd_t, addr: *sockaddr, len: *socklen_t) c_int {
         return @call(.auto, @field(@import("win_test_socket.zig"), "getsockname"), .{ fd, addr, @as(*c_int, @ptrCast(len)) });
     }
-    pub fn accept(fd: fd_t, addr: ?*sockaddr, len: ?*c_int) isize {
-        return @bitCast(@call(.auto, @field(@import("win_test_socket.zig"), "accept"), .{ fd, addr, len }));
+    pub fn accept(fd: fd_t, addr: ?*sockaddr, len: ?*socklen_t) isize {
+        return @bitCast(@call(.auto, @field(@import("win_test_socket.zig"), "accept"), .{ fd, addr, @as(?*c_int, @ptrCast(len)) }));
     }
     pub fn shutdown(fd: fd_t, how: c_int) c_int {
         return @call(.auto, @field(@import("win_test_socket.zig"), "shutdown"), .{ fd, how });

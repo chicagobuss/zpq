@@ -8,6 +8,19 @@ const blocking = @import("blocking.zig");
 
 pub const huge_page_size: usize = 2 << 20;
 
+const win = struct {
+    extern "kernel32" fn VirtualAlloc(?*anyopaque, usize, u32, u32) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn VirtualFree(?*anyopaque, usize, u32) callconv(.winapi) std.os.windows.BOOL;
+
+    fn commit(ptr: [*]u8, len: usize) bool {
+        if (len == 0) return true;
+        const page = std.heap.pageSize();
+        const begin = std.mem.alignBackward(usize, @intFromPtr(ptr), page);
+        const end = std.mem.alignForward(usize, @intFromPtr(ptr) + len, page);
+        return VirtualAlloc(@ptrFromInt(begin), end - begin, 0x1000, 0x04) != null;
+    }
+};
+
 /// A worker's private bump region: one reserved, 2 MiB-aligned span of address space that blocks are carved from
 /// front to back, and released with a single `munmap`. Meant as the child of a
 /// scan worker's decode arena and scratch, which allocate a row group's buffers and grow them in place:
@@ -77,6 +90,14 @@ pub const Region = struct {
 
     fn map(child: std.mem.Allocator, reserve: usize) Region {
         var r: Region = .{ .child = child };
+        if (builtin.os.tag == .windows) {
+            const len = std.mem.alignForward(usize, reserve, huge_page_size) + huge_page_size;
+            const p = win.VirtualAlloc(null, len, 0x2000, 0x04) orelse return r;
+            const lo = std.mem.alignForward(usize, @intFromPtr(p), huge_page_size);
+            r.mapping = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(p)))[0..len];
+            r.buf = @as([*]u8, @ptrFromInt(lo))[0 .. len - huge_page_size];
+            return r;
+        }
         if (builtin.target.os.tag != .linux and !builtin.target.os.tag.isDarwin()) return r;
         const len = std.mem.alignForward(usize, reserve, huge_page_size) + huge_page_size;
         var flags: std.posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
@@ -89,7 +110,11 @@ pub const Region = struct {
     }
 
     pub fn deinit(self: *Region) void {
-        if (builtin.os.tag != .windows) if (self.mapping.len > 0) std.posix.munmap(self.mapping);
+        if (self.mapping.len > 0) {
+            if (builtin.os.tag == .windows) {
+                _ = win.VirtualFree(self.mapping.ptr, 0, 0x8000);
+            } else std.posix.munmap(self.mapping);
+        }
         if (self.budget) |b| b.release(self.charged);
         self.* = .{ .child = self.child, .budget = self.budget, .spilled = self.spilled };
     }
@@ -213,7 +238,13 @@ pub const Region = struct {
         const base = @intFromPtr(self.buf.ptr);
         const start = alignment.forward(base + self.end) - base;
         if (self.buf.len > 0 and start <= self.buf.len and len <= self.buf.len - start) {
+            const old_charge = self.charged;
             if (!self.chargeTo(start + len)) return null;
+            if (builtin.os.tag == .windows and !win.commit(self.buf.ptr + start, len)) {
+                if (self.budget) |b| b.release(self.charged - old_charge);
+                self.charged = old_charge;
+                return null;
+            }
             self.last = start;
             self.end = start + len;
             self.touched = @max(self.touched, self.end);
@@ -239,7 +270,13 @@ pub const Region = struct {
         }
         if (self.isLast(memory)) {
             if (new_len > self.buf.len - self.last) return false;
+            const old_charge = self.charged;
             if (!self.chargeTo(self.last + new_len)) return false;
+            if (builtin.os.tag == .windows and new_len > memory.len and !win.commit(memory.ptr + memory.len, new_len - memory.len)) {
+                if (self.budget) |b| b.release(self.charged - old_charge);
+                self.charged = old_charge;
+                return false;
+            }
             self.end = self.last + new_len;
             self.touched = @max(self.touched, self.end);
             return true;
@@ -357,7 +394,11 @@ pub fn retirePair(pair: *Region.Pair) void {
         pair_cache.len += 1;
     }
     pair_cache.lock.unlock(blocking.io);
-    if (builtin.os.tag != .windows) if (!fits) std.posix.munmap(arena.mapping);
+    if (!fits) {
+        if (builtin.os.tag == .windows) {
+            _ = win.VirtualFree(arena.mapping.ptr, 0, 0x8000);
+        } else std.posix.munmap(arena.mapping);
+    }
     pair.* = .{ .scratch = .{ .child = std.heap.page_allocator }, .arena = .{ .child = arena.child } };
 }
 
@@ -365,8 +406,12 @@ pub fn retirePair(pair: *Region.Pair) void {
 pub fn drainPairs() void {
     pair_cache.lock.lockUncancelable(blocking.io);
     defer pair_cache.lock.unlock(blocking.io);
-    if (builtin.os.tag != .windows and pair_cache.owner_pid == currentPid()) {
-        for (pair_cache.pairs[0..pair_cache.len]) |p| std.posix.munmap(p.arena.mapping);
+    if (pair_cache.owner_pid == currentPid()) {
+        for (pair_cache.pairs[0..pair_cache.len]) |p| {
+            if (builtin.os.tag == .windows) {
+                _ = win.VirtualFree(p.arena.mapping.ptr, 0, 0x8000);
+            } else std.posix.munmap(p.arena.mapping);
+        }
     }
     pair_cache.len = 0;
 }
@@ -379,7 +424,9 @@ fn currentPid() u32 {
 /// Drop `span`'s pages now. Linux keeps the mapping; Darwin's MADV_DONTNEED may keep the
 /// pages resident, so the span is mapped afresh in place (a failed remap leaves them until `deinit`).
 fn release(span: []align(std.heap.page_size_min) u8) void {
-    if (builtin.target.os.tag == .linux) {
+    if (builtin.target.os.tag == .windows) {
+        if (span.len > 0) _ = win.VirtualFree(span.ptr, span.len, 0x4000);
+    } else if (builtin.target.os.tag == .linux) {
         _ = std.os.linux.madvise(span.ptr, span.len, std.os.linux.MADV.DONTNEED);
     } else if (builtin.target.os.tag.isDarwin()) {
         var flags: std.posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true };

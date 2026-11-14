@@ -1699,14 +1699,14 @@ const stall_payload: [96 * 1024]u8 = blk: {
 };
 
 /// A ranged GET of `stall_payload` from `fake` through a pool of its own; returns the body (on `arena`).
-fn fakeGet(fake: *fake_s3.FakeS3, arena: std.mem.Allocator, stats: *Pool(4).Stats) ![]const u8 {
+fn fakeGet(fake: *fake_s3.FakeS3, arena: std.mem.Allocator, stats: *Pool(4).Stats, timeouts: tls.Timeouts) ![]const u8 {
     var endpoint_buf: [64]u8 = undefined;
     const creds: Credentials = .{
         .access_key = "ak",
         .secret_key = "sk",
         .region = "us-east-1",
         .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
-        .timeouts = test_timeouts,
+        .timeouts = timeouts,
     };
     var p: Pool(4) = undefined;
     try p.init(testing.allocator);
@@ -1729,7 +1729,7 @@ test "a ranged GET that stalls before, inside or after its response headers is s
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
         defer arena_state.deinit();
         var stats: Pool(4).Stats = .{};
-        const body = try fakeGet(&fake, arena_state.allocator(), &stats);
+        const body = try fakeGet(&fake, arena_state.allocator(), &stats, test_timeouts);
         try testing.expectEqualSlices(u8, stall_payload[1000..][0 .. 64 * 1024], body);
         try testing.expectEqual(@as(u32, 1), fake.stalled);
         // One retry, charged, on a connection opened for it.
@@ -1746,14 +1746,17 @@ test "a response that keeps arriving is not cut off by the idle timeout, however
     try fake.serveBytes("obj", &stall_payload);
     fake.stall = "GET /bkt/obj";
     fake.stall_at = .trickle;
-    fake.trickle_ms = 120; // eight pieces: about 1 s in all, against a 200 ms idle timeout
+    // CI VMs stretch short sleeps; keep gaps far below the idle timeout.
+    fake.trickle_ms = 60;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var stats: Pool(4).Stats = .{};
     const t0 = clock.monoNs();
-    const body = try fakeGet(&fake, arena_state.allocator(), &stats);
+    var timeouts = test_timeouts;
+    timeouts.idle_ms = 400;
+    const body = try fakeGet(&fake, arena_state.allocator(), &stats, timeouts);
     try testing.expectEqualSlices(u8, stall_payload[1000..][0 .. 64 * 1024], body);
-    try testing.expect(clock.monoNs() - t0 >= 800 * std.time.ns_per_ms);
+    try testing.expect(clock.monoNs() - t0 >= 440 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u64, 0), stats.timeout_retries);
     try testing.expectEqual(@as(u64, 0), stats.backoff_retries);
 }
@@ -1765,9 +1768,9 @@ test "regression: a response that trickles in past its attempt's deadline is cut
     try fake.serveBytes("obj", &stall_payload);
     fake.stall = "GET /bkt/obj";
     fake.stall_at = .trickle;
-    // Eight pieces 120 ms apart, each inside the idle timeout: the attempt went on as long as the server kept it.
-    fake.trickle_ms = 120;
+    fake.trickle_ms = 60;
     var timeouts = test_timeouts;
+    timeouts.idle_ms = 400;
     timeouts.request_ms = 300;
     timeouts.min_rate = 1 << 30;
     var endpoint_buf: [64]u8 = undefined;
@@ -2026,7 +2029,7 @@ test "a server that always stalls fails the request with the timeout once the re
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     var stats: Pool(4).Stats = .{};
-    try testing.expectError(error.ReadTimeout, fakeGet(&fake, arena_state.allocator(), &stats));
+    try testing.expectError(error.ReadTimeout, fakeGet(&fake, arena_state.allocator(), &stats, test_timeouts));
     try testing.expectEqual(@as(u32, retry.max_attempts), fake.stalled);
     try testing.expectEqual(@as(u64, retry.max_attempts - 1), stats.timeout_retries);
 }

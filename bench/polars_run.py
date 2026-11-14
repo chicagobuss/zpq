@@ -102,9 +102,9 @@ def main():
             query.sink_parquet(sink[i], compression=req.get("codec") or "snappy", **level)
             frame = None
         else:
-            # Some published ClickBench forms end in `.rows()[0]`: a plain tuple is one positional row.
-            frame = (query if isinstance(query, pl.DataFrame) else
-                     pl.DataFrame([list(query)], orient="row") if isinstance(query, tuple) else query.collect())
+            # Published ClickBench forms can return a frame, a positional tuple or a scalar.
+            frame = (query if isinstance(query, pl.DataFrame) else query.collect() if isinstance(query, pl.LazyFrame) else
+                     pl.DataFrame([list(query) if isinstance(query, tuple) else [query]], orient="row"))
         times.append(time.monotonic_ns() - start)
         if frame is not None:
             Path(req["answers"][i]).write_text(answer(pl, frame, req))

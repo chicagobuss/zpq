@@ -156,7 +156,7 @@ jobs:
   smoke:
     needs: build
     name: Native release smoke (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ github.server_url != 'https://github.com' && matrix.target == 'aarch64-macos' && 'macos-14' || matrix.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false

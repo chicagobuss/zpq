@@ -255,7 +255,7 @@ const PiecePool = struct {
     fn give(pool: *PiecePool, p: *Piece) void {
         if (pool.ledger) |l| if (l.tight()) return p.destroy(pool.gpa);
         if (p.arena.queryCapacity() > pool.limit) return p.destroy(pool.gpa);
-        _ = p.arena.reset(.retain_capacity);
+        consumer.RowGroupArena.reuseNodes(&p.arena);
         pool.mutex.lockUncancelable(pool.io);
         defer pool.mutex.unlock(pool.io);
         const bytes = p.arena.queryCapacity();
@@ -2592,6 +2592,31 @@ test "idle pieces stay bounded, reuse their rows and remain charged until freed"
         reused.unref(gpa);
     }
     try std.testing.expectEqual(@as(usize, 0), ledger.used.load(.monotonic));
+}
+
+test "recycling a piece keeps its blocks without allocating or unmapping" {
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = counting.allocator();
+    var ledger: core_memory.SharedBudget = .{ .limit = 1 << 20 };
+    var charged: core_memory.Charged = .{ .child = gpa, .budget = &ledger };
+    var pool: PiecePool = .{ .gpa = gpa, .rows_alloc = charged.allocator(), .io = std.testing.io, .limit = ledger.limit };
+    defer pool.deinit();
+    try pool.free.ensureTotalCapacity(gpa, 1);
+    const p = try pool.take();
+    _ = try p.arena.allocator().alloc(u8, 4096);
+    _ = try p.arena.allocator().alloc(u8, 8192);
+    const allocations = counting.allocations;
+    const deallocations = counting.deallocations;
+    const used = ledger.used.load(.monotonic);
+    p.unref(gpa);
+    try std.testing.expectEqual(allocations, counting.allocations);
+    try std.testing.expectEqual(deallocations, counting.deallocations);
+    try std.testing.expectEqual(used, ledger.used.load(.monotonic));
+    const reused = try pool.take();
+    defer reused.unref(gpa);
+    _ = try reused.arena.allocator().alloc(u8, 4096);
+    _ = try reused.arena.allocator().alloc(u8, 8192);
+    try std.testing.expectEqual(allocations, counting.allocations);
 }
 
 test "piece allocation failures release their rows" {

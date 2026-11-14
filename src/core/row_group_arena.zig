@@ -117,7 +117,12 @@ pub const RowGroupArena = struct {
             if (self.spill) |sp| sp.nextRowGroup();
             return r.rewind();
         }
-        const state = &self.arena.state;
+        reuseNodes(&self.arena);
+    }
+
+    /// Rewind an ordinary arena without replacing its backing blocks.
+    pub fn reuseNodes(arena: *std.heap.ArenaAllocator) void {
+        const state = &arena.state;
         // The used list is newest-first. Reversing it hands the nodes back oldest-first, so the next row group fills
         // them in the order this one did and touches the same pages, not a scatter across every node's tail.
         var reversed = state.free_list;

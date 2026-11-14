@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const test_skip = @import("../../test_skip.zig");
 const agg = @import("agg.zig");
 const agg_coded = @import("agg_coded.zig");
 const expr_ast = @import("ast.zig");
@@ -2270,7 +2271,7 @@ test "dense merge ranges retain exact sums and ordinals at 1, 4 and 16 workers" 
 }
 
 test "dense lanes give large blocks' pages back from the pool and free everything" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "madvise page release");
     var values: [2]u64 = @splat(0);
     var axes = [_]Axis{.{ .values = .{ .int64 = &values }, .trans = &.{}, .file_base = &.{}, .bytes = 0 }};
     const domain: Domain = .{ .axes = &axes, .bytes = 0 };

@@ -88,7 +88,7 @@ pub const OutputPublication = struct {
         if (@import("builtin").os.tag == .windows) {
             const now = local_fs.pathStamp(target) catch return error.InputChanged;
             if (!std.meta.eql(now, expected)) return error.InputChanged;
-            try local_fs.replaceWindows(self.path(), target);
+            try local_fs.replaceWindowsChecked(self.path(), target, expected);
             try self.published(null);
             return;
         }

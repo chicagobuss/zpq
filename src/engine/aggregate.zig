@@ -14,6 +14,12 @@ const engine_print = @import("print.zig");
 const std = @import("std");
 const scan_rows = @import("../core/scan/rows.zig");
 const winEnvValue = @import("../core/system.zig").winEnvValue;
+const WindowsEnvironment = struct {
+    environ: std.process.Environ,
+    inline fn getPosix(self: @This(), name: []const u8) ?[]const u8 {
+        return winEnvValue(self.environ, name);
+    }
+};
 const nowMonoNs = @import("../clock.zig").monoNs;
 const profile = @import("../profile.zig");
 const local_fs = @import("../local_fs.zig");
@@ -411,7 +417,8 @@ fn executeAggregateOver(
     var scan_args = aggregateScanArgs(ctx, args, agg_str, opened.inputs, metas, cut_args.result_order, &ledger);
     // Passes over the mapping read their planned chunks ahead of the workers. `ZPQ_IO_ADVISE=off`: they fault them in;
     // `=always`: they advise resident pages too (coverage of the advice path on resident test inputs).
-    const advise = winEnvValue(ctx.env, "ZPQ_IO_ADVISE") orelse "";
+    const vars = if (@import("builtin").os.tag == .windows) WindowsEnvironment{ .environ = ctx.env } else ctx.env;
+    const advise = vars.getPosix("ZPQ_IO_ADVISE") orelse "";
     if (!std.mem.eql(u8, advise, "off")) if (io.read_ahead) |ra| {
         scan_args.read_ahead = ra;
         scan_args.read_ahead.?.force = std.mem.eql(u8, advise, "always");
@@ -649,7 +656,8 @@ inline fn aggregateScanArgs(
     order: expr_ast.ResultOrder,
     ledger: *core_memory.SharedBudget,
 ) scan.MultiAggArgs {
-    const decode_rows_env = winEnvValue(ctx.env, "ZPQ_DECODE_BATCH_ROWS");
+    const vars = if (@import("builtin").os.tag == .windows) WindowsEnvironment{ .environ = ctx.env } else ctx.env;
+    const decode_rows_env = vars.getPosix("ZPQ_DECODE_BATCH_ROWS");
     var scan_args: scan.MultiAggArgs = .{
         .inputs = inputs,
         .metas = metas,
@@ -663,7 +671,7 @@ inline fn aggregateScanArgs(
         // present. The forced legacy path is for cross-checks; dictionary consumers already make this proof.
         .fast_levels = args.fast_levels or !envDisables(ctx.env, "ZPQ_LEVEL_RUNS"),
         .level_runs = blk: {
-            const v = winEnvValue(ctx.env, "ZPQ_LEVEL_RUNS") orelse break :blk null;
+            const v = vars.getPosix("ZPQ_LEVEL_RUNS") orelse break :blk null;
             if (std.mem.eql(u8, v, "0")) break :blk false;
             break :blk if (std.mem.eql(u8, v, "1")) true else null;
         },
@@ -675,7 +683,7 @@ inline fn aggregateScanArgs(
         .dependent_keys = !envDisables(ctx.env, "ZPQ_GROUP_KEY_FD"),
         // Under a LIMIT, fetched values wait for the cut (`fetchAfterCut`).
         .defer_fetches = args.result_order.limit != null and !envDisables(ctx.env, "ZPQ_LATE_FETCH"),
-        .expr_batch_rows = if (winEnvValue(ctx.env, "ZPQ_EXPR_BATCH_ROWS")) |v|
+        .expr_batch_rows = if (vars.getPosix("ZPQ_EXPR_BATCH_ROWS")) |v|
             std.fmt.parseInt(usize, v, 10) catch null
         else
             null,
@@ -689,16 +697,16 @@ inline fn aggregateScanArgs(
         .integer_records = !envDisables(ctx.env, "ZPQ_INTEGER_RECORDS"),
         .sorted_count_stream = !envDisables(ctx.env, "ZPQ_SORTED_COUNT_STREAM"),
         .msd_records = !envDisables(ctx.env, "ZPQ_MSD_RECORDS"),
-        .msd_cache_rows = if (winEnvValue(ctx.env, "ZPQ_MSD_CACHE_ROWS")) |v|
+        .msd_cache_rows = if (vars.getPosix("ZPQ_MSD_CACHE_ROWS")) |v|
             std.fmt.parseInt(usize, v, 10) catch null
         else
             null,
         .byte_records = !envDisables(ctx.env, "ZPQ_BYTE_RECORDS"),
-        .byte_top_partitions = if (winEnvValue(ctx.env, "ZPQ_BYTE_TOP_PARTITIONS")) |v|
+        .byte_top_partitions = if (vars.getPosix("ZPQ_BYTE_TOP_PARTITIONS")) |v|
             std.fmt.parseInt(usize, v, 10) catch null
         else
             null,
-        .byte_top_batch_rows = if (winEnvValue(ctx.env, "ZPQ_BYTE_TOP_BATCH_ROWS")) |v|
+        .byte_top_batch_rows = if (vars.getPosix("ZPQ_BYTE_TOP_BATCH_ROWS")) |v|
             std.fmt.parseInt(usize, v, 10) catch null
         else
             null,
@@ -713,7 +721,7 @@ inline fn aggregateScanArgs(
         .partagg = args.partagg or envFlag(ctx.env, "ZPQ_PARTAGG"),
         .spill = !envDisables(ctx.env, "ZPQ_SPILL"),
         // Tests: a small threshold makes a small input move to the runs.
-        .spill_groups = if (winEnvValue(ctx.env, "ZPQ_SPILL_GROUPS")) |v|
+        .spill_groups = if (vars.getPosix("ZPQ_SPILL_GROUPS")) |v|
             std.fmt.parseInt(usize, v, 10) catch (1 << 18)
         else
             1 << 18,

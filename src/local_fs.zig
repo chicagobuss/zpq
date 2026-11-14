@@ -62,6 +62,14 @@ const win = struct {
             else => error.OpenFailed,
         };
     }
+    fn openIdentity(s: []const u8) !fd_t {
+        const wide = try path(s);
+        defer std.heap.page_allocator.free(wide);
+        // FILE_FLAG_BACKUP_SEMANTICS allows identity checks on directories as well as files.
+        const fd = CreateFileW(wide.ptr, 0, 7, null, 3, 0x02000000, null);
+        if (fd == w.INVALID_HANDLE_VALUE) return error.OpenFailed;
+        return fd;
+    }
     fn info(fd: fd_t) !Info {
         var result: Info = undefined;
         if (!GetFileInformationByHandle(fd, &result).toBool()) return error.StatFailed;
@@ -87,16 +95,23 @@ fn recoverWindowsBackup(backup: [*:0]const u16, target: [*:0]const u16) bool {
 }
 
 /// Replace an existing file while readers still have it mapped or open.
-pub fn replaceWindows(from: []const u8, to: []const u8) error{ RenameFailed, BackupRecoveryFailed }!void {
-    return replaceWindowsUsing(from, to, struct {
-        fn replace(target: [*:0]const u16, staged: [*:0]const u16, backup: [*:0]const u16) u32 {
-            if (win.ReplaceFileW(target, staged, backup, 0, null, null).toBool()) return 0;
-            return win.GetLastError();
-        }
-    });
+pub fn replaceWindows(from: []const u8, to: []const u8) error{ RenameFailed, BackupRecoveryFailed, InputChanged }!void {
+    return replaceWindowsUsing(from, to, null, WindowsReplacement);
 }
 
-fn replaceWindowsUsing(from: []const u8, to: []const u8, comptime api: type) error{ RenameFailed, BackupRecoveryFailed }!void {
+/// Replace an input only if the file moved to the backup is the one read by UPDATE.
+pub fn replaceWindowsChecked(from: []const u8, to: []const u8, expected: Stamp) error{ RenameFailed, BackupRecoveryFailed, InputChanged }!void {
+    return replaceWindowsUsing(from, to, expected, WindowsReplacement);
+}
+
+const WindowsReplacement = struct {
+    fn replace(target: [*:0]const u16, staged: [*:0]const u16, backup: [*:0]const u16) u32 {
+        if (win.ReplaceFileW(target, staged, backup, 0, null, null).toBool()) return 0;
+        return win.GetLastError();
+    }
+};
+
+fn replaceWindowsUsing(from: []const u8, to: []const u8, expected: ?Stamp, comptime api: type) error{ RenameFailed, BackupRecoveryFailed, InputChanged }!void {
     const a = win.path(from) catch return error.RenameFailed;
     defer std.heap.page_allocator.free(a);
     const b = win.path(to) catch return error.RenameFailed;
@@ -111,7 +126,20 @@ fn replaceWindowsUsing(from: []const u8, to: []const u8, comptime api: type) err
     var keep_backup = false;
     defer if (!keep_backup) removeFile(backup);
     const result = api.replace(b.ptr, a.ptr, wide_backup.ptr);
-    if (result == 0) return;
+    if (result == 0) {
+        if (expected) |want| {
+            const actual = pathStamp(backup) catch null;
+            if (actual == null or !std.meta.eql(actual.?, want)) {
+                // Never discard a file another writer put at the target after the preflight check.
+                if (!win.MoveFileExW(wide_backup.ptr, b.ptr, 1).toBool()) {
+                    keep_backup = true;
+                    return error.BackupRecoveryFailed;
+                }
+                return error.InputChanged;
+            }
+        }
+        return;
+    }
     if (result == 1177) {
         // The original moved to the backup, but publication failed. Never overwrite a new target during recovery.
         if (!recoverWindowsBackup(wide_backup.ptr, b.ptr)) {
@@ -162,7 +190,7 @@ test "Windows UPDATE restores or retains the backup when replacement fails midwa
         const map = try mapFile(target);
         defer map.unmap();
         if (blocked) {
-            try std.testing.expectError(error.BackupRecoveryFailed, replaceWindowsUsing(staged, target, Fault));
+            try std.testing.expectError(error.BackupRecoveryFailed, replaceWindowsUsing(staged, target, null, Fault));
             const other = try readFile(a, target);
             defer a.free(other);
             try std.testing.expectEqualStrings("other", other);
@@ -171,7 +199,7 @@ test "Windows UPDATE restores or retains the backup when replacement fails midwa
             try std.testing.expectEqualStrings("original", kept);
             removeFile(backup);
         } else {
-            try std.testing.expectError(error.RenameFailed, replaceWindowsUsing(staged, target, Fault));
+            try std.testing.expectError(error.RenameFailed, replaceWindowsUsing(staged, target, null, Fault));
             const restored = try readFile(a, target);
             defer a.free(restored);
             try std.testing.expectEqualStrings("original", restored);
@@ -207,7 +235,7 @@ test "Windows UPDATE locks and replacement preserve open targets and backup owne
     try std.testing.expect(!(try tryWindowsUpdateLock(second)));
     const map = try mapFile(target);
     defer map.unmap();
-    try replaceWindows(staged, target);
+    try replaceWindowsChecked(staged, target, try fdStamp(first));
     const result = try readFile(a, target);
     defer a.free(result);
     try std.testing.expectEqualStrings("new", result);
@@ -375,9 +403,9 @@ pub fn openRead(path: []const u8) !fd_t {
 /// Inodes are only unique within a device; follow aliases so hard links are also rejected.
 pub fn sameFile(a: []const u8, b: []const u8) !bool {
     if (builtin.os.tag == .windows) {
-        const af = try openRead(a);
+        const af = try win.openIdentity(a);
         defer close(af);
-        const bf = try openRead(b);
+        const bf = try win.openIdentity(b);
         defer close(bf);
         const x = try win.stamp(af);
         const y = try win.stamp(bf);
@@ -1414,5 +1442,58 @@ test "ordered segment writes preserve empty buffers and vector batch boundaries 
         close(pipe[0]);
         defer close(pipe[1]);
         try testing.expectError(error.BrokenPipe, writeSegments(pipe[1], &.{ "", "a", "b" }));
+    }
+}
+
+test "review_windows: UPDATE preserves a writer arriving immediately before replacement" {
+    if (comptime builtin.os.tag != .windows) return;
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/target", .{tmp.sub_path});
+    defer a.free(target);
+    const staged = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/staged", .{tmp.sub_path});
+    defer a.free(staged);
+    const backup = try std.fmt.allocPrint(a, "{s}.backup", .{staged});
+    defer a.free(backup);
+    const Race = struct {
+        var block_restore = false;
+        var held: ?win.w.HANDLE = null;
+        fn replace(t: [*:0]const u16, s: [*:0]const u16, b: [*:0]const u16) u32 {
+            const f = win.CreateFileW(t, 0x40000000, 7, null, 2, 0x80, null);
+            if (f == win.w.INVALID_HANDLE_VALUE) unreachable;
+            var n: u32 = 0;
+            if (!win.WriteFile(f, "concurrent writer", 17, &n, null).toBool() or n != 17) unreachable;
+            close(f);
+            if (win.ReplaceFileW(t, s, b, 0, null, null).toBool()) {
+                if (block_restore) {
+                    const h = win.CreateFileW(t, 0x80000000, 3, null, 3, 0x80, null);
+                    if (h == win.w.INVALID_HANDLE_VALUE) unreachable;
+                    held = h;
+                }
+                return 0;
+            }
+            return win.GetLastError();
+        }
+    };
+    for ([_]bool{ false, true }) |blocked| {
+        Race.block_restore = blocked;
+        var fd = try createFile(target);
+        try writeAll(fd, "original");
+        close(fd);
+        fd = try createFile(staged);
+        try writeAll(fd, "updated");
+        close(fd);
+        const expected = try pathStamp(target);
+        const result: anyerror!void = replaceWindowsUsing(staged, target, expected, Race);
+        if (Race.held) |h| close(h);
+        Race.held = null;
+        try std.testing.expectError(if (blocked) error.BackupRecoveryFailed else error.InputChanged, result);
+        const bytes = try readFile(a, if (blocked) backup else target);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("concurrent writer", bytes);
+        removeFile(target);
+        removeFile(staged);
+        removeFile(backup);
     }
 }

@@ -105,6 +105,8 @@ pub fn build(b: *std.Build) void {
 
     // ----- Tests -----
     b.step("test-cli", "Run CLI inspection tests").dependOn(&b.addRunArtifact(a.cli_tests).step);
+    b.step("test-cli-bin", "Install the CLI test executable without running it")
+        .dependOn(&b.addInstallArtifact(a.cli_tests, .{ .dest_sub_path = "zpq-cli-test" }).step);
     // The fuzz targets (`test "fuzz: ..."`) live in the core unit tests alone; `zig build fuzz --fuzz[=N]` searches
     // them without the other test binaries, which have none and so no coverage to report.
     b.step("fuzz", "Run the core unit tests built for `--fuzz` (with -Dtest-filter=\"fuzz:\")")
@@ -119,6 +121,8 @@ pub fn build(b: *std.Build) void {
     const test_bin_step = b.step("test-bin", "Install all unit-test executables without running them");
     if (target.result.os.tag != .windows) {
         for (a.unit_tests) |t| test_bin_step.dependOn(&b.addInstallArtifact(t.exe, .{ .dest_sub_path = t.bin }).step);
+    } else {
+        test_bin_step.dependOn(&b.addInstallArtifact(a.cli_tests, .{ .dest_sub_path = "zpq-cli-test" }).step);
     }
     test_bin_step.dependOn(&b.addInstallArtifact(a.core_tests, .{ .dest_sub_path = "zpq-core-test" }).step);
     // Spawns the built zpq-lambda against an in-process fake runtime API.

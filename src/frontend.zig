@@ -755,6 +755,8 @@ pub fn expandGlob(arena: std.mem.Allocator, io: std.Io, pattern: []const u8, env
         return single;
     }
 
+    if (@import("builtin").os.tag == .windows) return expandWindowsGlob(arena, io, pattern);
+
     const last_slash = std.mem.lastIndexOfScalar(u8, pattern, '/');
     const dir_path: []const u8 = if (last_slash) |i| pattern[0..i] else ".";
     const basename: []const u8 = if (last_slash) |i| pattern[i + 1 ..] else pattern;
@@ -783,6 +785,37 @@ pub fn expandGlob(arena: std.mem.Allocator, io: std.Io, pattern: []const u8, env
         }
     }.lt);
     return out.items;
+}
+
+fn expandWindowsGlob(arena: std.mem.Allocator, io: std.Io, pattern: []const u8) ![][]const u8 {
+    const dir_part = std.fs.path.dirnameWindows(pattern);
+    const dir = dir_part orelse ".";
+    const basename = std.fs.path.basenameWindows(pattern);
+    if (std.mem.indexOfScalar(u8, dir, '*') != null) {
+        diagnosticPrint("zpq query: glob in directory portion not supported: {s}\n", .{pattern});
+        return error.BadArgs;
+    }
+    const names = local_fs.listFiles(arena, io, dir) catch {
+        diagnosticPrint("zpq query: cannot open dir {s}\n", .{dir});
+        return error.OpenFailed;
+    };
+    var out: std.ArrayList([]const u8) = .empty;
+    for (names) |name| {
+        if (!matchSimpleGlob(basename, name)) continue;
+        try out.append(arena, try windowsGlobJoin(arena, dir_part, name));
+    }
+    std.sort.pdq([]const u8, out.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return out.items;
+}
+
+fn windowsGlobJoin(arena: std.mem.Allocator, dir: ?[]const u8, name: []const u8) ![]const u8 {
+    const parent = dir orelse return name;
+    if (parent.len == 2 and parent[1] == ':') return std.fmt.allocPrint(arena, "{s}{s}", .{ parent, name });
+    return std.fs.path.join(arena, &.{ parent, name });
 }
 
 /// Expand an `s3://bucket/prefix/*.parquet` pattern via ListObjectsV2.
@@ -870,4 +903,42 @@ fn matchSimpleGlob(pat: []const u8, name: []const u8) bool {
     if (!std.mem.startsWith(u8, name, prefix)) return false;
     if (!std.mem.endsWith(u8, name, suffix)) return false;
     return true;
+}
+
+test "review_windows: local glob handles backslashes" {
+    if (comptime @import("builtin").os.tag != .windows) return;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache\\tmp\\{s}", .{tmp.sub_path});
+    const file = try std.fmt.allocPrint(arena, "{s}\\one.parquet", .{dir});
+    const fd = try local_fs.createFile(file);
+    local_fs.close(fd);
+    const pattern = try std.fmt.allocPrint(arena, "{s}\\*.parquet", .{dir});
+    const files = try expandGlob(arena, std.testing.io, pattern, .empty, null);
+    try std.testing.expectEqual(@as(usize, 1), files.len);
+    try std.testing.expect(std.mem.endsWith(u8, files[0], "one.parquet"));
+    const cwd = try std.process.currentPathAlloc(std.testing.io, arena);
+    const absolute_dir = try std.fs.path.join(arena, &.{ cwd, dir });
+    const absolute = try std.fmt.allocPrint(arena, "{s}\\*.parquet", .{absolute_dir});
+    try std.testing.expectEqual(@as(usize, 1), (try expandGlob(arena, std.testing.io, absolute, .empty, null)).len);
+    const verbatim = try std.fmt.allocPrint(arena, "\\\\?\\{s}\\*.parquet", .{absolute_dir});
+    const verbatim_files = try expandGlob(arena, std.testing.io, verbatim, .empty, null);
+    try std.testing.expectEqual(@as(usize, 1), verbatim_files.len);
+    try std.testing.expect(std.mem.startsWith(u8, verbatim_files[0], "\\\\?\\"));
+    try std.testing.expectError(error.BadArgs, expandGlob(arena, std.testing.io, "C:\\dir*\\*.parquet", .empty, null));
+    try std.testing.expectError(error.BadArgs, expandGlob(arena, std.testing.io, "\\\\server\\sha*re\\*.parquet", .empty, null));
+    const local_name = try std.fmt.allocPrint(arena, "review-{s}.parquet", .{tmp.sub_path});
+    const local_fd = try local_fs.createFile(local_name);
+    local_fs.close(local_fd);
+    defer local_fs.removeFile(local_name);
+    const relative_pattern = try std.fmt.allocPrint(arena, "{s}review-{s}*.parquet", .{ cwd[0..2], tmp.sub_path });
+    const relative = try expandGlob(arena, std.testing.io, relative_pattern, .empty, null);
+    try std.testing.expectEqual(@as(usize, 1), relative.len);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{s}{s}", .{ cwd[0..2], local_name }), relative[0]);
+    try std.testing.expectEqualStrings("C:one.parquet", try windowsGlobJoin(arena, std.fs.path.dirnameWindows("C:*.parquet"), "one.parquet"));
+    try std.testing.expectEqualStrings("C:\\one.parquet", try windowsGlobJoin(arena, std.fs.path.dirnameWindows("C:\\*.parquet"), "one.parquet"));
+    try std.testing.expectEqualStrings("\\\\server\\share\\one.parquet", try windowsGlobJoin(arena, std.fs.path.dirnameWindows("\\\\server\\share\\*.parquet"), "one.parquet"));
 }

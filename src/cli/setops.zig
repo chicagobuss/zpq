@@ -81,6 +81,10 @@ const Run = struct {
 
     fn path(self: *Run, comptime stem: []const u8) ![]const u8 {
         self.next_file += 1;
+        if (@import("builtin").os.tag == .windows) {
+            const name = try std.fmt.allocPrint(self.arena, stem ++ "{d}.parquet", .{self.next_file});
+            return windowsScratchJoin(self.arena, self.dir, name);
+        }
         return std.fmt.allocPrint(self.arena, "{s}/" ++ stem ++ "{d}.parquet", .{ self.dir, self.next_file });
     }
 
@@ -235,10 +239,15 @@ const Run = struct {
         self.next_file += 1;
         const id = self.next_file;
         for (files, 0..) |f, i| {
-            const to = try self.format("{s}/g{d}_{d}.parquet", .{ self.dir, id, i });
+            const to = if (@import("builtin").os.tag == .windows)
+                try windowsScratchJoin(self.arena, self.dir, try self.format("g{d}_{d}.parquet", .{ id, i }))
+            else
+                try self.format("{s}/g{d}_{d}.parquet", .{ self.dir, id, i });
             try local_fs.rename(f, to);
             @constCast(files)[i] = to;
         }
+        if (@import("builtin").os.tag == .windows)
+            return windowsScratchJoin(self.arena, self.dir, try self.format("g{d}_*.parquet", .{id}));
         return self.format("{s}/g{d}_*.parquet", .{ self.dir, id });
     }
 };
@@ -316,6 +325,29 @@ pub fn scratchParent(leaves: []const []const u8, dir_hint: ?[]const u8) []const 
     return if (!readsFrom(leaves, "/tmp")) "/tmp" else preferred;
 }
 
+/// Resolve Windows' configured temporary directory without borrowing a process environment value.
+pub fn scratchParentWindows(arena: std.mem.Allocator, leaves: []const []const u8, dir_hint: ?[]const u8) ![]const u8 {
+    const api = struct {
+        extern "kernel32" fn GetTempPathW(u32, [*]u16) callconv(.winapi) u32;
+    };
+    const wide = try arena.alloc(u16, 32768);
+    defer arena.free(wide);
+    const len = api.GetTempPathW(@intCast(wide.len), wide.ptr);
+    if (len == 0 or len >= wide.len) return error.TempPathUnavailable;
+    const temp = try std.unicode.wtf16LeToWtf8Alloc(arena, wide[0..len]);
+    const preferred = dir_hint orelse temp;
+    if (!readsFrom(leaves, preferred)) return preferred;
+    return if (!readsFrom(leaves, temp)) temp else preferred;
+}
+
+/// Join a Windows scratch path while retaining drive and separator roots.
+pub fn windowsScratchJoin(arena: std.mem.Allocator, parent: []const u8, name: []const u8) ![]const u8 {
+    if (parent.len == 2 and parent[1] == ':') return std.fmt.allocPrint(arena, "{s}{s}", .{ parent, name });
+    const trimmed = std.mem.trimEnd(u8, parent, "/\\");
+    const base = if (trimmed.len == 0 or (trimmed.len == 2 and trimmed[1] == ':')) parent else trimmed;
+    return std.fs.path.join(arena, &.{ base, name });
+}
+
 /// Whether a quoted path in the branches (a table, a glob, a join's other table) is in the directory `dir`.
 fn readsFrom(leaves: []const []const u8, dir: []const u8) bool {
     for (leaves) |sql| {
@@ -328,7 +360,8 @@ fn readsFrom(leaves: []const []const u8, dir: []const u8) bool {
             const end = sql_setops.quotedEnd(sql, i);
             const text = sql[i + 1 .. @max(i + 1, end -| 1)];
             i = end;
-            if (std.mem.indexOfScalar(u8, text, '/') == null and !std.mem.endsWith(u8, text, ".parquet") and
+            if (std.mem.indexOfScalar(u8, text, '/') == null and
+                (@import("builtin").os.tag != .windows or std.mem.indexOfScalar(u8, text, '\\') == null) and !std.mem.endsWith(u8, text, ".parquet") and
                 !std.mem.endsWith(u8, text, ".csv") and std.mem.indexOfScalar(u8, text, '*') == null) continue;
             const in_dir = std.fs.path.dirname(text) orelse ".";
             if (local_fs.sameFile(dir, in_dir) catch false) return true;
@@ -350,9 +383,15 @@ pub fn run(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const parent = scratchParent(compound.leaves, dir_hint);
+    const parent = if (@import("builtin").os.tag == .windows)
+        try scratchParentWindows(arena, compound.leaves, dir_hint)
+    else
+        scratchParent(compound.leaves, dir_hint);
     const pid: u32 = if (@import("builtin").os.tag == .windows) std.os.windows.GetCurrentProcessId() else @bitCast(std.posix.system.getpid());
-    const dir = try std.fmt.allocPrint(arena, "{s}/.zpq-setop-{d}", .{ std.mem.trimEnd(u8, parent, "/"), pid });
+    const dir = if (@import("builtin").os.tag == .windows)
+        try windowsScratchJoin(arena, parent, try std.fmt.allocPrint(arena, ".zpq-setop-{d}", .{pid}))
+    else
+        try std.fmt.allocPrint(arena, "{s}/.zpq-setop-{d}", .{ std.mem.trimEnd(u8, parent, "/"), pid });
     // The directory's name goes into queries as a quoted path with a wildcard.
     if (std.mem.indexOfAny(u8, dir, "'*\"") != null) {
         stager.say("sql: set operations keep their scratch files beside the output; its directory name may not contain a quote or a *\n");
@@ -431,4 +470,29 @@ test "scratch files do not go in a directory a branch reads from" {
     // Another directory, or a string that is no path, leaves it where the output is.
     try std.testing.expectEqualStrings(here, scratchParent(&.{"SELECT x FROM 'elsewhere/in.parquet' WHERE s = 'a'"}, here));
     try std.testing.expectEqualStrings("/tmp", scratchParent(&.{"SELECT x FROM 'a.parquet'"}, null));
+}
+
+test "review_windows: scratch uses the Windows temporary directory" {
+    if (comptime @import("builtin").os.tag != .windows) return;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const parent = try scratchParentWindows(arena.allocator(), &.{}, null);
+    try std.testing.expect(!std.mem.eql(u8, parent, "/tmp"));
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fmt.allocPrint(a, ".zig-cache\\tmp\\{s}", .{tmp.sub_path});
+    const sql = try std.fmt.allocPrint(a, "SELECT * FROM '{s}\\no_extension'", .{dir});
+    try std.testing.expect(readsFrom(&.{sql}, dir));
+    try std.testing.expectEqualStrings("\\\\?\\C:\\scratch\\file.parquet", try windowsScratchJoin(a, "\\\\?\\C:\\scratch\\", "file.parquet"));
+    try std.testing.expectEqualStrings("C:\\file.parquet", try windowsScratchJoin(a, "C:\\", "file.parquet"));
+    try std.testing.expectEqualStrings("C:file.parquet", try windowsScratchJoin(a, "C:", "file.parquet"));
+    try std.testing.expectEqualStrings("\\\\server\\share\\file.parquet", try windowsScratchJoin(a, "\\\\server\\share\\", "file.parquet"));
+    var state: Run = .{
+        .arena = a,
+        .dir = "\\\\?\\C:\\scratch\\",
+        .stager = .{ .ptr = undefined, .stage = undefined, .finish = undefined, .say = silent },
+        .leaves = &.{},
+    };
+    try std.testing.expectEqualStrings("\\\\?\\C:\\scratch\\raw1.parquet", try state.path("raw"));
 }

@@ -12,4 +12,4 @@ For example, from the extracted directory:
 .\bin\zpq.exe query .\data.parquet --output .\copy.parquet
 ```
 
-The x86-64 Windows build uses Windows certificate chain policy for HTTPS. UPDATE works on local files. It checks that the input has not changed immediately before replacing it; a non-cooperating writer can still race that check. If a failed replacement cannot be restored, the error names the retained backup.
+The x86-64 Windows build uses Windows certificate chain policy for HTTPS. UPDATE works on local files. It checks the input before replacing it and checks the replaced backup for concurrent changes. If it detects a change, it restores the backup and reports an error. If restoration fails, the error names the retained backup.

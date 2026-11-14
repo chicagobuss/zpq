@@ -122,7 +122,7 @@ pub const QueryArgs = struct {
     /// (`scan.MultiAggArgs.typed_answer`), never read back as rows.
     typed_answer: bool = false,
     /// Consumed synchronously while query inputs, bound output types and the ledger are alive.
-    text_output: ?struct { format: PrintFormat, fd: ?local_fs.fd_t = null, sink: ?*std.Io.Writer = null } = null,
+    text_output: ?struct { format: PrintFormat, fd: if (@import("builtin").os.tag == .windows) ?local_fs.fd_t else local_fs.fd_t = if (@import("builtin").os.tag == .windows) null else 1, sink: ?*std.Io.Writer = null } = null,
     /// Envelope consumers also drain inside the query lifetime; the borrowed answer must not escape the callback.
     aggregate_sink: ?struct {
         ctx: *anyopaque,

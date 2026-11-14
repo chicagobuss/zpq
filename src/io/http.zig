@@ -709,7 +709,7 @@ test "a connection closed before any response byte is told apart from a truncate
 }
 
 test "only a closed or reset connection counts as closed before the response; local read errors propagate" {
-    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // This test uses a POSIX directory descriptor.
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX directory descriptor");
     const posix = test_posix;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

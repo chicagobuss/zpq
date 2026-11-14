@@ -293,9 +293,15 @@ const ReportHook = struct {
         if (h.calls == h.at) switch (h.mode) {
             .fail => return null,
             .touch => {
-                const os = std.posix.system;
-                const later = [2]os.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
-                std.debug.assert(os.utimensat(std.posix.AT.FDCWD, h.path.ptr, &later, 0) == 0);
+                if (@import("builtin").os.tag == .windows) {
+                    const file = std.Io.Dir.cwd().openFile(testing.io, h.path, .{ .mode = .read_write }) catch return null;
+                    defer file.close(testing.io);
+                    file.setTimestamps(testing.io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = std.time.ns_per_s } } }) catch return null;
+                } else {
+                    const os = std.posix.system;
+                    const later = [2]os.timespec{ .{ .sec = 1, .nsec = 0 }, .{ .sec = 1, .nsec = 0 } };
+                    std.debug.assert(os.utimensat(std.posix.AT.FDCWD, h.path.ptr, &later, 0) == 0);
+                }
             },
         };
         return h.base.rawAlloc(len, alignment, ret);

@@ -1014,7 +1014,7 @@ fn expectCutByte(byte: u8) !void {
 }
 
 test "regression: a mapped file truncated under the reader reads zeros past its end and reports it changed" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest; // Windows does not permit truncating a mapped file.
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "Windows does not permit truncating a mapped file");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [256]u8 = undefined;
@@ -1048,7 +1048,7 @@ test "regression: a mapped file truncated under the reader reads zeros past its 
 }
 
 test "regression: a mapped file cut inside its last page or rewritten in place reports it changed; renamed over, not" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest; // Windows does not permit truncating a mapped file.
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "Windows does not permit truncating a mapped file");
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [256]u8 = undefined;
@@ -1114,6 +1114,7 @@ test "regression: a mapped file cut inside its last page or rewritten in place r
 }
 
 test "regression: the SIGBUS handler is in place only while a mapping is, and yields to one installed since" {
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "SIGBUS handler");
     if (posix.Sigaction == void) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1214,7 +1215,7 @@ test "starting writeback preserves the bytes and the write position" {
 }
 
 test "writeback hints leave pipe outputs usable" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest; // This test uses POSIX pipe descriptors.
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "POSIX pipe descriptors");
     var fds: [2]fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return error.PipeFailed;
     defer close(fds[0]);

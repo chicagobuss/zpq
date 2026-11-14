@@ -425,7 +425,11 @@ fn currentPid() u32 {
 /// pages resident, so the span is mapped afresh in place (a failed remap leaves them until `deinit`).
 fn release(span: []align(std.heap.page_size_min) u8) void {
     if (builtin.target.os.tag == .windows) {
-        if (span.len > 0) _ = win.VirtualFree(span.ptr, span.len, 0x4000);
+        if (span.len > 0) {
+            // MEM_RESET keeps the pages accessible but does not promise zeroes; make their old contents zero first.
+            @memset(span, 0);
+            _ = win.VirtualAlloc(span.ptr, span.len, 0x80000, 0x04);
+        }
     } else if (builtin.target.os.tag == .linux) {
         _ = std.os.linux.madvise(span.ptr, span.len, std.os.linux.MADV.DONTNEED);
     } else if (builtin.target.os.tag.isDarwin()) {

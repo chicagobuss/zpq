@@ -93,17 +93,29 @@ const WinSocket = struct {
         const real_start = monoMs();
         var off: usize = 0;
         while (off < buf.len) {
-            const left = msLeft(end, opts.clock_ms) orelse return error.WouldBlock;
-            if (opts.clock_ms != null and monoMs() - real_start > 120_000) return error.Backstop;
+            const left = msLeft(end, opts.clock_ms) orelse {
+                if (opts.clock_ms != null) noteDeadline(.virtual, real_start, .write);
+                return error.WouldBlock;
+            };
+            if (opts.clock_ms != null and monoMs() - real_start > 120_000) {
+                noteDeadline(.backstop, real_start, .write);
+                return error.Backstop;
+            }
             const wait = if (opts.clock_ms == null) left else @min(left, 20);
             if (!timeout(fd, 0x1005, wait)) return error.SendFailed;
             const ready = poll(fd, 0x10, wait);
             if (ready < 0) return error.SendFailed;
-            if (ready == 0) continue;
+            if (ready == 0) {
+                if (opts.clock_ms) |clk| expireBlockedTestWait(clk, end);
+                continue;
+            }
             const n = send(fd, buf[off..].ptr, @intCast(@min(buf.len - off, std.math.maxInt(i32))), 0);
             if (n < 0) {
                 const e = WSAGetLastError();
-                if (e == 10035 or e == 10060) continue;
+                if (e == 10035 or e == 10060) {
+                    if (opts.clock_ms) |clk| expireBlockedTestWait(clk, end);
+                    continue;
+                }
                 return error.SendFailed;
             }
             if (n == 0) return error.SendFailed;
@@ -115,17 +127,29 @@ const WinSocket = struct {
     fn read(fd: usize, buf: []u8, end: u64, opts: *SockTimeouts) ReadError!usize {
         const real_start = monoMs();
         while (true) {
-            const left = msLeft(end, opts.clock_ms) orelse return error.WouldBlock;
-            if (opts.clock_ms != null and monoMs() - real_start > 120_000) return error.Backstop;
+            const left = msLeft(end, opts.clock_ms) orelse {
+                if (opts.clock_ms != null) noteDeadline(.virtual, real_start, .read);
+                return error.WouldBlock;
+            };
+            if (opts.clock_ms != null and monoMs() - real_start > 120_000) {
+                noteDeadline(.backstop, real_start, .read);
+                return error.Backstop;
+            }
             const wait = if (opts.clock_ms == null) left else @min(left, 20);
             if (!timeout(fd, 0x1006, wait)) return error.ReadFailed;
             const ready = poll(fd, 0x100, wait);
             if (ready < 0) return error.ReadFailed;
-            if (ready == 0) continue;
+            if (ready == 0) {
+                if (opts.clock_ms) |clk| expireBlockedTestWait(clk, end);
+                continue;
+            }
             const n = recv(fd, buf.ptr, @intCast(@min(buf.len, std.math.maxInt(i32))), 0);
             if (n >= 0) return @intCast(n);
             const e = WSAGetLastError();
-            if (e == 10035 or e == 10060) continue;
+            if (e == 10035 or e == 10060) {
+                if (opts.clock_ms) |clk| expireBlockedTestWait(clk, end);
+                continue;
+            }
             if (e == 10053 or e == 10054) return error.ConnectionReset;
             return error.ReadFailed;
         }

@@ -1155,6 +1155,7 @@ fn bigPayload(part: usize) ![]u8 {
 }
 
 test "an UploadPart whose body the server stops reading is sent again on a new connection" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "loopback fixture does not force a blocked Winsock send");
     var fake: fake_s3.FakeS3 = undefined;
     try fake.start(testing.allocator);
     defer fake.deinit();

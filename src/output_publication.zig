@@ -212,6 +212,7 @@ test "local publication syncs by default and permits an explicit opt out" {
 }
 
 test "publication reports a post-rename directory sync error and preserves the published target" {
+    if (comptime @import("test_skip.zig").lacks(.posix)) return @import("test_skip.zig").skipNeeding(.posix, "Windows publication has no directory sync operation");
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();

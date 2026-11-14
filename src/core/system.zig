@@ -15,7 +15,7 @@ pub fn deinitWindowsEnv() void {
     }
 }
 
-pub fn winEnvValue(env: std.process.Environ, name: []const u8) ?[]const u8 {
+pub inline fn winEnvValue(env: std.process.Environ, name: []const u8) ?[]const u8 {
     if (@import("builtin").os.tag == .windows) {
         if (env.block.isEmpty()) return null;
         const map = windows_env orelse return null;

@@ -101,6 +101,7 @@ fn diveFrom(out: *usize) void {
 }
 
 test "a walk stops at the stack the thread has, never at a depth chosen in advance" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "thread stack-size hints do not set distinct Windows reservation sizes");
     if (!builtin.link_libc or builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) return error.SkipZigTest;
     // The same walk on a small and a large thread stack: the budget follows the stack, and both end by refusal.
     var small: usize = 0;

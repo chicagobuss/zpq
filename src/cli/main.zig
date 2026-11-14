@@ -1540,7 +1540,7 @@ fn writeJsonString(w: *StdoutWriter, s: []const u8) !void {
 }
 
 const StdoutWriter = struct {
-    fd: ?local_fs.fd_t = null,
+    fd: if (@import("builtin").os.tag == .windows) ?local_fs.fd_t else local_fs.fd_t = if (@import("builtin").os.tag == .windows) null else 1,
     inner: ?engine.StdoutWriter = null,
 
     fn getInner(self: *StdoutWriter) *engine.StdoutWriter {

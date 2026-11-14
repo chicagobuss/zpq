@@ -904,6 +904,7 @@ test "aggregate consumers conflict before input opening or output in every build
 }
 
 test "aggregate drains retain input-change precedence over a later write error" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "Windows disallows truncating a mapped file");
     const a = std.testing.allocator;
     const bytes = try metadata.readFileSlice("ci/fixtures/parquet/full_match.parquet", a);
     defer a.free(bytes);

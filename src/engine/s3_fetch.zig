@@ -843,8 +843,8 @@ pub fn fetchMetaBatch(
 
 /// Fail a GET on `resp`: the one parser maps S3's answer to a named error, and the fetch keeps the details for the
 /// query's diagnostic after the workers join.
-fn refuseGet(sp: *FetchSpec, resp: http.Response) anyerror {
-    const r = s3.refusal(.GetObject, sp.url.bucket, sp.url.key, resp);
+fn refuseGet(sp: *FetchSpec, creds: s3.Credentials, resp: http.Response) anyerror {
+    const r = s3.refusal(.GetObject, sp.url.bucket, sp.url.key, resp, creds);
     sp.failure = r.failure;
     return r.err;
 }
@@ -894,7 +894,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
                 try maybeCacheMeta(t.ctx, sp, cond.header("ETag"));
                 return;
             }
-            return refuseGet(sp, cond);
+            return refuseGet(sp, t.creds, cond);
         }
     };
 
@@ -906,7 +906,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
         .range = s3.Range.suffix(t.probe),
         .prof = t.prof,
     });
-    if (tail_resp.status != 206 and tail_resp.status != 200) return refuseGet(sp, tail_resp);
+    if (tail_resp.status != 206 and tail_resp.status != 200) return refuseGet(sp, t.creds, tail_resp);
     noteFooterRtt(sp, tail_resp);
     sp.noteEtag(tail_resp.header("ETag"));
     try populateFromTailResponse(t, scratch, tail_resp);
@@ -958,7 +958,7 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
             .range = s3.Range.span(footer_actual_start, sp.tail_start - 1),
             .prof = t.prof,
         });
-        if (need.status != 206) return refuseGet(sp, need);
+        if (need.status != 206) return refuseGet(sp, t.creds, need);
         const missing_len: usize = @intCast(sp.tail_start - footer_actual_start);
         if (need.body.len != missing_len) return error.BadResponse;
         // The prefix itself starts at offset 0. Check it here: nothing later re-reads these bytes.

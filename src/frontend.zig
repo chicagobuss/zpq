@@ -43,14 +43,6 @@ pub fn failureMessage(err: anyerror) []const u8 {
         error.NoCredentials => "S3 credentials are missing; set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY,\n" ++
             "  or S3_NO_SIGN_REQUEST=1 for a public bucket",
         error.NoRegion => "the S3 region is missing; set AWS_REGION (or S3_REGION)",
-        error.NoSuchKey => "the object does not exist; check the bucket and key",
-        error.NoSuchBucket => "the bucket does not exist; check its name and region",
-        error.InvalidAccessKeyId => "S3 did not accept the access key; check AWS_ACCESS_KEY_ID (or S3_ACCESS_KEY_ID)",
-        error.SignatureDoesNotMatch => "S3 did not accept the secret key; check AWS_SECRET_ACCESS_KEY (or S3_SECRET_ACCESS_KEY)",
-        error.WrongRegion => "the S3 endpoint is in the wrong region; check AWS_REGION (or S3_REGION)",
-        error.SlowDown => "S3 is throttling the request; try again",
-        error.S3ServerError => "S3 failed; try again",
-        error.S3RequestFailed => "S3 refused the request; check the bucket, key and credentials",
         error.BadRangeResponse => "S3 did not return the requested byte range; check the endpoint and access",
         error.OutOfMemory => "not enough memory; reduce workers with -j 1 or use a host with more memory",
         error.NoSpaceLeft => "output storage is full; free space or choose another output path",
@@ -834,8 +826,9 @@ fn expandS3Glob(
     };
     var client = try s3.Client.init(arena, creds, url.bucket);
     defer client.deinit();
+    client.diag = diag;
 
-    const entries = try s3.listAll(arena, &client, list_prefix, diag);
+    const entries = try s3.listAll(arena, &client, list_prefix);
     if (entries.len == 0) {
         diagnosticPrint("zpq query: s3 glob matched no objects under prefix {s}\n", .{list_prefix});
     }

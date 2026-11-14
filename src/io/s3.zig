@@ -112,6 +112,7 @@ pub const Error = error{
     /// `Diag.detail.s3_request`.
     NoSuchKey,
     NoSuchBucket,
+    NoSuchUpload,
     AccessDenied,
     InvalidAccessKeyId,
     SignatureDoesNotMatch,
@@ -408,6 +409,8 @@ pub const Client = struct {
     host: []u8, // owned, in client_arena
     addrs: []const tls.Ipv4, // owned, in client_arena
     conn: ?tls.Connection,
+    /// Receives a failed LIST's S3 answer; null when the caller has no diagnostic.
+    diag: ?*diag_mod.Diag = null,
 
     pub fn init(
         client_arena: std.mem.Allocator,
@@ -488,22 +491,11 @@ pub const Client = struct {
         prefix: []const u8,
         max_keys: u32,
         continuation_token: ?[]const u8,
-        diag: ?*diag_mod.Diag,
     ) Error!ListPage {
         if (self.conn == null) {
             self.conn = try connect(self.client_arena, self.creds, self.addrs, self.host);
         }
-        return try sendListV2(
-            req_arena,
-            &self.conn.?,
-            self.creds,
-            self.host,
-            self.bucket,
-            prefix,
-            max_keys,
-            continuation_token,
-            diag,
-        );
+        return try sendListV2(req_arena, self, prefix, max_keys, continuation_token);
     }
 };
 
@@ -525,12 +517,11 @@ pub fn listAll(
     req_arena: std.mem.Allocator,
     client: *Client,
     prefix: []const u8,
-    diag: ?*diag_mod.Diag,
 ) Error![]const ListEntry {
     var all: std.ArrayList(ListEntry) = .empty;
     var token: ?[]const u8 = null;
     while (true) {
-        const page = try client.list(req_arena, prefix, 1000, token, diag);
+        const page = try client.list(req_arena, prefix, 1000, token);
         for (page.entries) |e| try all.append(req_arena, e);
         token = page.next_token;
         if (token == null) break;
@@ -998,20 +989,24 @@ pub fn fetchJobs(
     try work_cursor.startWorkers(FetchCtx, &group, io, &shared, n_workers, io, fetchOneTask);
     try group.await(io);
 
-    // 5. Tally + check for failures.
+    // 5. Tally + check for failures. A later named refusal is more useful than an earlier short body.
     var fetched: u64 = 0;
     var failed: ?anyerror = null;
+    var failed_failure: ?S3Failure = null;
     for (ctxs) |ctx| {
         if (ctx.ok) {
             fetched += ctx.target.len;
             continue;
         }
-        if (failed == null) {
+        if (failed == null or (failed_failure == null and ctx.failure != null)) {
             failed = ctx.err orelse error.RangeFetchFailed;
-            if (ctx.failure) |f| diag_mod.setS3Failure(diag, f);
+            failed_failure = ctx.failure;
         }
     }
-    if (failed) |err| return err;
+    if (failed) |err| {
+        if (failed_failure) |f| diag_mod.setS3Failure(diag, f);
+        return err;
+    }
     return fetched;
 }
 
@@ -1092,6 +1087,7 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
         error.Canceled => return error.Canceled,
         else => {
             ctx.err = err;
+            ctx.failure = transportFailure(.GetObject, ctx.bucket, ctx.key, err);
             return;
         },
     };
@@ -1099,7 +1095,7 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
     if (resp.status == 206 or resp.status == 200) {
         ctx.ok = resp.body.len == ctx.target.len;
     } else {
-        const r = refusal(.GetObject, ctx.bucket, ctx.key, resp);
+        const r = refusal(.GetObject, ctx.bucket, ctx.key, resp, ctx.creds);
         ctx.failure = r.failure;
         ctx.err = r.err;
     }
@@ -1157,16 +1153,95 @@ pub const S3Failure = diag_mod.S3Failure;
 pub const Refusal = struct {
     failure: S3Failure,
     err: Error,
-
-    pub fn record(self: Refusal, diag: ?*diag_mod.Diag) void {
-        diag_mod.setS3Failure(diag, self.failure);
-    }
 };
+
+fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return needle.len <= haystack.len and std.ascii.eqlIgnoreCase(haystack[0..needle.len], needle);
+}
+
+fn secretAt(text: []const u8, secret: []const u8) ?usize {
+    if (secret.len == 0 or !std.mem.startsWith(u8, text, secret)) return null;
+    return secret.len;
+}
+
+fn redactDelimiter(ch: u8) bool {
+    return switch (ch) {
+        ' ', '\t', '\r', '\n', '"', '\'', '&', ';', ',', ')', ']', '}', '>' => true,
+        else => false,
+    };
+}
+
+const RedactField = struct { marker: usize, value: usize };
+
+fn redactFieldAt(text: []const u8) ?RedactField {
+    const markers = [_][]const u8{
+        "x-amz-credential=",     "credential=",     "x-amz-signature=", "signature=",
+        "x-amz-security-token=", "security-token=", "awsaccesskeyid=",  "canonicalrequest=",
+        "authorization:",
+    };
+    for (markers) |marker| {
+        if (!startsWithIgnoreCase(text, marker)) continue;
+        var end = marker.len;
+        while (end < text.len and !redactDelimiter(text[end])) end += 1;
+        return .{ .marker = marker.len, .value = end - marker.len };
+    }
+    return null;
+}
+
+fn awsKeyIdAt(text: []const u8) ?usize {
+    const prefixes = [_][]const u8{
+        "AKIA", "ASIA", "AIDA", "AROA", "AIPA", "ANPA", "ANVA", "APKA", "AGPA", "ACCA", "ABIA",
+    };
+    for (prefixes) |prefix| {
+        if (!std.mem.startsWith(u8, text, prefix) or text.len < 20) continue;
+        for (text[prefix.len..20]) |ch| if (!std.ascii.isAlphanumeric(ch)) return null;
+        return 20;
+    }
+    return null;
+}
+
+fn copyRedacted(out: []u8, at: *usize, bytes: []const u8) void {
+    const len = @min(out.len - at.*, bytes.len);
+    @memcpy(out[at.*..][0..len], bytes[0..len]);
+    at.* += len;
+}
+
+/// Copy S3's text with the configured credentials, authorization fields, signatures and AWS key IDs replaced.
+fn redactInto(dst: *diag_mod.Text, text: []const u8, creds: Credentials) void {
+    var out: [256]u8 = undefined;
+    var at: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and at < out.len) {
+        if (secretAt(text[i..], creds.access_key)) |len| {
+            copyRedacted(&out, &at, "[redacted]");
+            i += len;
+        } else if (secretAt(text[i..], creds.secret_key)) |len| {
+            copyRedacted(&out, &at, "[redacted]");
+            i += len;
+        } else if (if (creds.session_token) |token| secretAt(text[i..], token) else null) |len| {
+            copyRedacted(&out, &at, "[redacted]");
+            i += len;
+        } else if (redactFieldAt(text[i..])) |field| {
+            copyRedacted(&out, &at, text[i..][0..field.marker]);
+            copyRedacted(&out, &at, "[redacted]");
+            i += field.marker + field.value;
+        } else if (awsKeyIdAt(text[i..])) |len| {
+            copyRedacted(&out, &at, "[redacted]");
+            i += len;
+        } else {
+            out[at] = text[i];
+            at += 1;
+            i += 1;
+        }
+    }
+    dst.set(out[0..at]);
+}
 
 /// Parse S3's error answer once: status, `<Code>` and `<Message>`, plus `x-amz-bucket-region`, then map the code to a
 /// named error. A HEAD body is empty, so its status and headers are all there is. A redirect or a region complaint is
-/// `WrongRegion`; a 5xx is `SlowDown` when S3 says so and `S3ServerError` otherwise.
-pub fn refusal(op: diag_mod.S3Failure.Op, bucket: []const u8, key: []const u8, resp: http.Response) Refusal {
+/// `WrongRegion`; a 5xx is `SlowDown` when S3 says so and `S3ServerError` otherwise. The code and message are copied
+/// with credentials and signatures redacted.
+pub fn refusal(op: diag_mod.S3Failure.Op, bucket: []const u8, key: []const u8, resp: http.Response, creds: Credentials) Refusal {
     var failure: S3Failure = .{
         .op = op,
         .phase = .response,
@@ -1174,37 +1249,38 @@ pub fn refusal(op: diag_mod.S3Failure.Op, bucket: []const u8, key: []const u8, r
         .bucket = .of(bucket),
         .key = .of(key),
     };
-    if (extractTag(resp.body, "<Code>", "</Code>")) |code| {
-        failure.code.set(std.mem.trim(u8, code, " \t\r\n"));
-    }
-    if (extractTag(resp.body, "<Message>", "</Message>")) |message| {
-        failure.message.set(std.mem.trim(u8, message, " \t\r\n"));
-    }
+    const code_raw = if (extractTag(resp.body, "<Code>", "</Code>")) |code| std.mem.trim(u8, code, " \t\r\n") else "";
+    const message_raw = if (extractTag(resp.body, "<Message>", "</Message>")) |message| std.mem.trim(u8, message, " \t\r\n") else "";
     if (resp.header("x-amz-bucket-region")) |region| failure.region.set(std.mem.trim(u8, region, " \t\r\n"));
 
-    const code = failure.code.get();
     const redirect = resp.status == 301 or resp.status == 307 or resp.status == 308;
-    const err: Error = if (redirect or std.mem.eql(u8, code, "AuthorizationHeaderMalformed") or
-        std.mem.eql(u8, code, "PermanentRedirect") or std.mem.eql(u8, code, "TemporaryRedirect"))
+    const err: Error = if (redirect or std.mem.eql(u8, code_raw, "AuthorizationHeaderMalformed") or
+        std.mem.eql(u8, code_raw, "PermanentRedirect") or std.mem.eql(u8, code_raw, "TemporaryRedirect"))
         error.WrongRegion
-    else if (std.mem.eql(u8, code, "NoSuchKey"))
+    else if (std.mem.eql(u8, code_raw, "NoSuchKey"))
         error.NoSuchKey
-    else if (std.mem.eql(u8, code, "NoSuchBucket"))
+    else if (std.mem.eql(u8, code_raw, "NoSuchBucket"))
         error.NoSuchBucket
-    else if (std.mem.eql(u8, code, "AccessDenied"))
+    else if (std.mem.eql(u8, code_raw, "NoSuchUpload"))
+        error.NoSuchUpload
+    else if (std.mem.eql(u8, code_raw, "AccessDenied"))
         error.AccessDenied
-    else if (std.mem.eql(u8, code, "InvalidAccessKeyId"))
+    else if (std.mem.eql(u8, code_raw, "InvalidAccessKeyId"))
         error.InvalidAccessKeyId
-    else if (std.mem.eql(u8, code, "SignatureDoesNotMatch"))
+    else if (std.mem.eql(u8, code_raw, "SignatureDoesNotMatch"))
         error.SignatureDoesNotMatch
-    else if (std.mem.eql(u8, code, "InvalidToken") or std.mem.eql(u8, code, "ExpiredToken"))
+    else if (std.mem.eql(u8, code_raw, "InvalidToken") or std.mem.eql(u8, code_raw, "ExpiredToken"))
         error.InvalidAccessKeyId
-    else if (std.mem.eql(u8, code, "InvalidRequest") and std.mem.indexOf(u8, failure.message.get(), "region") != null)
+    else if (std.mem.eql(u8, code_raw, "InvalidRequest") and std.mem.indexOf(u8, message_raw, "region") != null)
         error.WrongRegion
-    else if (std.mem.eql(u8, code, "SlowDown") or resp.status == 429)
+    else if (std.mem.eql(u8, code_raw, "SlowDown") or resp.status == 429)
         error.SlowDown
     else if (resp.status == 404)
-        if (op == .GetObject or op == .HeadObject) error.NoSuchKey else error.NoSuchBucket
+        switch (op) {
+            .GetObject, .HeadObject => error.NoSuchKey,
+            .UploadPart, .CompleteMultipartUpload, .AbortMultipartUpload => error.NoSuchUpload,
+            else => error.NoSuchBucket,
+        }
     else if (resp.status == 403)
         error.AccessDenied
     else if (resp.status >= 500)
@@ -1212,10 +1288,14 @@ pub fn refusal(op: diag_mod.S3Failure.Op, bucket: []const u8, key: []const u8, r
     else
         error.S3RequestFailed;
 
+    redactInto(&failure.code, code_raw, creds);
+    redactInto(&failure.message, message_raw, creds);
     if (failure.message.len == 0) failure.message.set(if (err == error.NoSuchKey)
         "the object does not exist"
     else if (err == error.NoSuchBucket)
         "the bucket does not exist"
+    else if (err == error.NoSuchUpload)
+        "the upload does not exist"
     else if (err == error.AccessDenied)
         "access denied"
     else if (err == error.InvalidAccessKeyId)
@@ -1231,6 +1311,21 @@ pub fn refusal(op: diag_mod.S3Failure.Op, bucket: []const u8, key: []const u8, r
     else
         "S3 refused the request");
     return .{ .failure = failure, .err = err };
+}
+
+/// A request that never got an answer: its operation, bucket and key, and what failed.
+pub fn transportFailure(op: diag_mod.S3Failure.Op, bucket: []const u8, key: []const u8, err: anyerror) S3Failure {
+    const before_send = switch (err) {
+        error.DnsFailed, error.ConnectFailed, error.ConnectTimeout, error.HandshakeFailed, error.HandshakeTimeout, error.CertificateRejected, error.SocketFailed, error.NonCanonicalIpEndpoint, error.Ipv6EndpointUnsupported => true,
+        else => false,
+    };
+    return .{
+        .op = op,
+        .phase = if (before_send) .connect else .request,
+        .bucket = .of(bucket),
+        .key = .of(key),
+        .err = err,
+    };
 }
 
 fn buildAndSend(
@@ -1300,15 +1395,14 @@ fn buildAndSend(
 /// driver lives in `listAll`; this is the single-RT primitive.
 fn sendListV2(
     req_arena: std.mem.Allocator,
-    conn: *tls.Connection,
-    creds: Credentials,
-    host: []const u8,
-    bucket: []const u8,
+    client: *Client,
     prefix: []const u8,
     max_keys: u32,
     continuation_token: ?[]const u8,
-    diag: ?*diag_mod.Diag,
 ) Error!ListPage {
+    const creds = client.creds;
+    const host = client.host;
+    const bucket = client.bucket;
     // Path: virtual-hosted is "/"; path-style (R2 / endpoint override /
     // dotted bucket) is "/<bucket>". Same logic as `pathFor` for an empty key.
     const list_path: []const u8 = if (virtualHosted(creds, bucket))
@@ -1349,15 +1443,15 @@ fn sendListV2(
 
     const path_with_query = try std.fmt.allocPrint(req_arena, "{s}?{s}", .{ list_path, query });
 
-    const resp = try http.sendRequest(req_arena, conn, .{
+    const resp = try http.sendRequest(req_arena, &client.conn.?, .{
         .method = .GET,
         .host = host,
         .path = path_with_query,
         .headers = req_headers.items,
     });
     if (resp.status != 200) {
-        const r = refusal(.ListObjectsV2, bucket, prefix, resp);
-        r.record(diag);
+        const r = refusal(.ListObjectsV2, bucket, prefix, resp, creds);
+        diag_mod.setS3Failure(client.diag, r.failure);
         return r.err;
     }
 
@@ -1651,6 +1745,19 @@ test "S3 refusals name the request, status, code and message, and map the code t
             .text = "LIST s3://bkt/prefix: 404 (no S3 error code): the bucket does not exist",
         },
         .{
+            .status = 404,
+            .body = "<Error><Code>NoSuchUpload</Code></Error>",
+            .op = .UploadPart,
+            .want = error.NoSuchUpload,
+            .text = "PUT part s3://bkt/key: 404 NoSuchUpload: the upload does not exist",
+        },
+        .{
+            .status = 404,
+            .op = .UploadPart,
+            .want = error.NoSuchUpload,
+            .text = "PUT part s3://bkt/key: 404 (no S3 error code): the upload does not exist",
+        },
+        .{
             .status = 403,
             .body = "<Error><Code>AccessDenied</Code></Error>",
             .op = .UploadPart,
@@ -1659,11 +1766,42 @@ test "S3 refusals name the request, status, code and message, and map the code t
         },
     };
     for (cases) |case| {
-        const r = refusal(case.op, "bkt", case.key, .{ .status = case.status, .headers = case.headers, .body = case.body });
+        const r = refusal(case.op, "bkt", case.key, .{ .status = case.status, .headers = case.headers, .body = case.body }, .{
+            .access_key = "AKIAIOSFODNN7EXAMPLE",
+            .secret_key = "secretKeyValue1234567890",
+            .region = "us-east-1",
+        });
         try testing.expectEqual(case.want, r.err);
         var buf: [512]u8 = undefined;
         try testing.expectEqualStrings(case.text, try std.fmt.bufPrint(&buf, "{f}", .{r.failure}));
     }
+}
+
+test "S3 refusals redact credentials and key IDs from S3's message" {
+    const creds: Credentials = .{
+        .access_key = "AKIAIOSFODNN7EXAMPLE",
+        .secret_key = "secretKeyValue1234567890",
+        .session_token = "session-token-value",
+        .region = "us-east-1",
+    };
+    const body = try std.fmt.allocPrint(std.testing.allocator, "<Error><Code>AuthorizationHeaderMalformed</Code><Message>The authorization header is mal-formed; " ++
+        "expecting \"{s}/20261114/us-east-1/s3/aws4_request\"; {s}; " ++
+        "X-Amz-Credential={s}%2F20261114%2Fus-east-1%2Fs3%2Faws4_request; " ++
+        "X-Amz-Signature=deadbeef; X-Amz-Security-Token={s}</Message></Error>", .{ creds.access_key, creds.secret_key, creds.access_key, creds.session_token.? });
+    defer std.testing.allocator.free(body);
+    const r = refusal(.GetObject, "bkt", "key", .{ .status = 403, .headers = &.{}, .body = body }, creds);
+    const message = r.failure.message.get();
+    try testing.expect(std.mem.indexOf(u8, message, "AKIAIOSFODNN7EXAMPLE") == null);
+    try testing.expect(std.mem.indexOf(u8, message, "secretKeyValue1234567890") == null);
+    try testing.expect(std.mem.indexOf(u8, message, "session-token-value") == null);
+    try testing.expect(std.mem.indexOf(u8, message, "deadbeef") == null);
+    try testing.expect(std.mem.indexOf(u8, message, "[redacted]") != null);
+}
+
+test "a GET that never got an answer still names its bucket and key" {
+    var buf: [256]u8 = undefined;
+    const f = transportFailure(.GetObject, "bkt", "key", error.ConnectTimeout);
+    try testing.expectEqualStrings("GET s3://bkt/key: failed while connecting: ConnectTimeout", try std.fmt.bufPrint(&buf, "{f}", .{f}));
 }
 
 fn testEnviron(comptime entries: []const [*:0]const u8) std.process.Environ {
@@ -1999,6 +2137,41 @@ test "a response that keeps arriving is not cut off by the idle timeout, however
     try testing.expect(clock.monoNs() - t0 >= 440 * std.time.ns_per_ms);
     try testing.expectEqual(@as(u64, 0), stats.timeout_retries);
     try testing.expectEqual(@as(u64, 0), stats.backoff_retries);
+}
+
+test "a later named refusal is not hidden by an earlier short body" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    try fake.serveBytes("small", &.{});
+    fake.fail = "GET /bkt/bad";
+    fake.fails_left = std.math.maxInt(u32);
+    fake.fail_status = 403;
+    fake.fail_code = "AccessDenied";
+
+    var endpoint_buf: [64]u8 = undefined;
+    const creds: Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "us-east-1",
+        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+        .timeouts = test_timeouts,
+    };
+    var p: Pool(4) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var short: [16]u8 = undefined;
+    var refused: [512]u8 = undefined;
+    const jobs = [_]FetchJob{
+        .{ .bucket = "bkt", .key = "small", .range = .{ .start = 0, .end = 16 }, .target = &short },
+        .{ .bucket = "bkt", .key = "bad", .range = .{ .start = 0, .end = 512 }, .target = &refused },
+    };
+    var diag: diag_mod.Diag = .{};
+    try testing.expectError(error.AccessDenied, fetchJobs(testing.io, &p, testing.allocator, arena_state.allocator(), creds, &jobs, 2, null, null, &diag));
+    try testing.expect(diag.detail == .s3_request);
+    try testing.expectEqualStrings("AccessDenied", diag.detail.s3_request.code.get());
 }
 
 test "regression: a response that trickles in past its attempt's deadline is cut off and fetched again" {

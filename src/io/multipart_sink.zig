@@ -347,7 +347,7 @@ pub const MultipartSink = struct {
     fn recordFailure(self: *MultipartSink, failure: S3Failure, named: anyerror) void {
         self.error_lock.lockUncancelable(self.io);
         defer self.error_lock.unlock(self.io);
-        if (self.first_error == null) self.first_error = @errorName(named);
+        if (self.first_error == null) self.first_error = "S3 refused a part upload";
         if (self.first_failure == null) self.first_failure = failure;
         if (self.first_named == null) self.first_named = named;
     }
@@ -507,7 +507,7 @@ fn partWorker(io: Io, ctx: *PartTaskCtx) Io.Cancelable!void {
         return;
     };
     if (resp.status != 200) {
-        const r = s3.refusal(.UploadPart, ctx.sink.url.bucket, ctx.sink.url.key, resp);
+        const r = s3.refusal(.UploadPart, ctx.sink.url.bucket, ctx.sink.url.key, resp, ctx.sink.creds);
         ctx.sink.recordFailure(r.failure, r.err);
         return;
     }
@@ -562,8 +562,8 @@ fn doUploadPart(ctx: *PartTaskCtx, arena: std.mem.Allocator, conn: *tls.Connecti
 // ============================================================
 
 /// S3's refusal for a control request, keeping the attempts its connection already took.
-fn refused(op: S3Failure.Op, url: s3.Url, resp: http.Response, previous: S3Failure) S3Failure {
-    var failure = s3.refusal(op, url.bucket, url.key, resp).failure;
+fn refused(op: S3Failure.Op, url: s3.Url, resp: http.Response, previous: S3Failure, creds: s3.Credentials) S3Failure {
+    var failure = s3.refusal(op, url.bucket, url.key, resp, creds).failure;
     failure.attempts = previous.attempts;
     return failure;
 }
@@ -605,11 +605,11 @@ fn createMultipartUpload(
         .body = "",
     }, failure);
     if (resp.status != 200) {
-        failure.* = refused(.CreateMultipartUpload, url, resp, failure.*);
+        failure.* = refused(.CreateMultipartUpload, url, resp, failure.*, creds);
         return error.CreateMultipartFailed;
     }
     return s3.extractXml(arena, resp.body, "UploadId") catch |err| {
-        failure.* = refused(.CreateMultipartUpload, url, resp, failure.*);
+        failure.* = refused(.CreateMultipartUpload, url, resp, failure.*, creds);
         failure.err = err;
         return err;
     };
@@ -713,7 +713,7 @@ fn completeMultipartUpload(
     }, failure);
     // S3 can answer 200 and then report an error in the body.
     if (resp.status != 200 or std.mem.indexOf(u8, resp.body, "<Error>") != null) {
-        failure.* = refused(.CompleteMultipartUpload, url, resp, failure.*);
+        failure.* = refused(.CompleteMultipartUpload, url, resp, failure.*, creds);
         return error.CompleteMultipartFailed;
     }
 }
@@ -776,7 +776,7 @@ fn listMultipartUploads(arena: std.mem.Allocator, creds: s3.Credentials, url: s3
         .path = path_with_query,
         .headers = headers.items,
     });
-    if (resp.status != 200) return s3.refusal(.ListMultipartUploads, url.bucket, url.key, resp).err;
+    if (resp.status != 200) return s3.refusal(.ListMultipartUploads, url.bucket, url.key, resp, creds).err;
     return parseListedUploads(arena, resp.body);
 }
 
@@ -947,7 +947,7 @@ fn abortMultipartUpload(
         .body = "",
     }, failure);
     if (resp.status != 204 and resp.status != 200) {
-        failure.* = refused(.AbortMultipartUpload, url, resp, failure.*);
+        failure.* = refused(.AbortMultipartUpload, url, resp, failure.*, creds);
         return error.AbortMultipartFailed;
     }
 }
@@ -971,7 +971,7 @@ fn singlePut(
         return err;
     };
     if (resp.status != 200) {
-        const r = s3.refusal(.PutObject, url.bucket, url.key, resp);
+        const r = s3.refusal(.PutObject, url.bucket, url.key, resp, creds);
         failure.* = r.failure;
         return r.err;
     }
@@ -1590,6 +1590,24 @@ test "an UploadPart refused by S3 fails with the named error and names the part 
     var buf: [256]u8 = undefined;
     const said = try std.fmt.bufPrint(&buf, "{f}", .{diag.detail.s3_request});
     try testing.expectEqualStrings("PUT part s3://bkt/out.parquet: 403 AccessDenied: access denied", said);
+}
+
+test "an UploadPart answered NoSuchUpload names the upload, not a missing bucket" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.fail = "PUT /bkt/out.parquet?partNumber=1&";
+    fake.fail_status = 404;
+    fake.fail_code = "NoSuchUpload";
+    var diag: Diag = .{};
+
+    try testing.expectError(error.NoSuchUpload, writeToPort(fake.port, "out.parquet", &test_payload, .{}, .{
+        .target_part_size = 1024,
+        .diag = &diag,
+    }));
+    var buf: [256]u8 = undefined;
+    const said = try std.fmt.bufPrint(&buf, "{f}", .{diag.detail.s3_request});
+    try testing.expectEqualStrings("PUT part s3://bkt/out.parquet: 404 NoSuchUpload: the upload does not exist", said);
 }
 
 test "regression: a CompleteMultipartUpload that S3 keeps alive for minutes completes, past the request bound" {

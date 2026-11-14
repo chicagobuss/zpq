@@ -1301,7 +1301,10 @@ test "ndv: probe ranges allocate only from the arena they are given" {
     const meta = try metadata.open(state.allocator(), bytes);
     try std.testing.checkAllAllocationFailures(a, struct {
         fn run(gpa: std.mem.Allocator, m: *const schema.FileMetaData) !void {
-            var arena = std.heap.ArenaAllocator.init(gpa);
+            // Arena growth can resize in place depending on allocator layout. Fault every allocation with
+            // resizing disabled so checkAllAllocationFailures sees the same allocation count on every run.
+            var growth = std.testing.FailingAllocator.init(gpa, .{ .resize_fail_index = 0 });
+            var arena = std.heap.ArenaAllocator.init(growth.allocator());
             defer arena.deinit();
             const keys = [_]expr.Expr{.{ .col_ref = .{ .col_idx = 1, .physical_type = .INT64, .expr_type = .i64 } }};
             _ = try probeRanges(arena.allocator(), &.{m.*}, &keys, 512 << 20, true, true, true, null);

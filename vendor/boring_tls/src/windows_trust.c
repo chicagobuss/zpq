@@ -6,12 +6,34 @@
 #include <wincrypt.h>
 #include <stdlib.h>
 
+static int verify_chain(HCERTCHAINENGINE engine, PCCERT_CONTEXT leaf, HCERTSTORE extra, WCHAR *name) {
+    PCCERT_CHAIN_CONTEXT built = NULL;
+    CERT_CHAIN_PARA params = {0};
+    params.cbSize = sizeof(params);
+    LPSTR server_auth[] = {szOID_PKIX_KP_SERVER_AUTH};
+    params.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
+    params.RequestedUsage.Usage.cUsageIdentifier = 1;
+    params.RequestedUsage.Usage.rgpszUsageIdentifier = server_auth;
+    if (!CertGetCertificateChain(engine, leaf, NULL, extra, &params, 0, NULL, &built)) return 0;
+    SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl_policy = {0};
+    ssl_policy.cbSize = sizeof(ssl_policy);
+    ssl_policy.dwAuthType = AUTHTYPE_SERVER;
+    ssl_policy.pwszServerName = name;
+    CERT_CHAIN_POLICY_PARA policy = {0};
+    policy.cbSize = sizeof(policy);
+    policy.pvExtraPolicyPara = &ssl_policy;
+    CERT_CHAIN_POLICY_STATUS status = {0};
+    status.cbSize = sizeof(status);
+    int ok = CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, built, &policy, &status) && status.dwError == 0;
+    CertFreeCertificateChain(built);
+    return ok;
+}
+
 static enum ssl_verify_result_t verify_windows(SSL *ssl, uint8_t *alert) {
     const char *name = SSL_get_ex_data(ssl, 0);
     const STACK_OF(CRYPTO_BUFFER) *chain = SSL_get0_peer_certificates(ssl);
     HCERTSTORE extra = NULL;
     PCCERT_CONTEXT leaf = NULL;
-    PCCERT_CHAIN_CONTEXT built = NULL;
     WCHAR *wide = NULL;
     enum ssl_verify_result_t result = ssl_verify_invalid;
     (void)alert;
@@ -31,26 +53,9 @@ static enum ssl_verify_result_t verify_windows(SSL *ssl, uint8_t *alert) {
                                                (DWORD)len, CERT_STORE_ADD_ALWAYS, &added)) goto done;
         if (i == 0) leaf = added; else CertFreeCertificateContext(added);
     }
-    CERT_CHAIN_PARA params = {0};
-    params.cbSize = sizeof(params);
-    LPSTR server_auth[] = {szOID_PKIX_KP_SERVER_AUTH};
-    params.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
-    params.RequestedUsage.Usage.cUsageIdentifier = 1;
-    params.RequestedUsage.Usage.rgpszUsageIdentifier = server_auth;
-    if (!CertGetCertificateChain(NULL, leaf, NULL, extra, &params, 0, NULL, &built)) goto done;
-    SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl_policy = {0};
-    ssl_policy.cbSize = sizeof(ssl_policy);
-    ssl_policy.dwAuthType = AUTHTYPE_SERVER;
-    ssl_policy.pwszServerName = wide;
-    CERT_CHAIN_POLICY_PARA policy = {0};
-    policy.cbSize = sizeof(policy);
-    policy.pvExtraPolicyPara = &ssl_policy;
-    CERT_CHAIN_POLICY_STATUS status = {0};
-    status.cbSize = sizeof(status);
-    if (CertVerifyCertificateChainPolicy(CERT_CHAIN_POLICY_SSL, built, &policy, &status) && status.dwError == 0)
+    if (verify_chain(NULL, leaf, extra, wide))
         result = ssl_verify_ok;
 done:
-    if (built) CertFreeCertificateChain(built);
     if (leaf) CertFreeCertificateContext(leaf);
     if (extra) CertCloseStore(extra, 0);
     free(wide);

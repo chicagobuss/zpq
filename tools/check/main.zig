@@ -1181,7 +1181,7 @@ fn execute(
     std.Io.Dir.cwd().deleteFile(run.io, out_path) catch {};
     if (c.sql) |sql| {
         // A diagnostic can borrow the plan's input name until executeAt renders it in the same case arena.
-        const pq = try zpq.core.expr.sql_parser.parseSqlPlan(arena, sql);
+        const pq = try parseCaseSql(arena, sql);
         if (c.emit == .values) return valuesOf(gpa, arena, ctx, pq, jobs, diag);
         const inputs = try expandInputs(arena, ctx, pq.table_name);
         var args: engine.QueryArgs = .{
@@ -1364,6 +1364,15 @@ fn expandInputs(arena: std.mem.Allocator, ctx: engine.Context, pattern: []const 
     return zpq.frontend.expandGlob(arena, ctx.io, pattern, ctx.env, null);
 }
 
+fn parseCaseSql(arena: std.mem.Allocator, sql: []const u8) !zpq.core.expr.sql_parser.ParsedQuery {
+    var schemas: engine.join.LocalSchemas = .{ .arena = arena };
+    defer schemas.deinit();
+    return (try zpq.core.expr.sql_parser.parseSqlJoinPlan(arena, sql, .{
+        .ctx = &schemas,
+        .footer = engine.join.LocalSchemas.footer,
+    })) orelse try zpq.core.expr.sql_parser.parseSqlPlan(arena, sql);
+}
+
 /// `{data}` is the external data root; without `--data` a case that needs it fails rather than skips.
 fn dataPath(run: *Run, arena: std.mem.Allocator, raw: []const u8) ![]const u8 {
     if (std.mem.indexOf(u8, raw, "{data}") == null) return raw;
@@ -1418,9 +1427,8 @@ fn runParity(
         const points = try pointsOf(arena, file, c);
         if (points[0].jobs) |j| at.jobs = j;
     }
-    const parsed = try zpq.core.expr.sql_parser.parseSqlPlan(run.gpa, c.sql.?);
+    const parsed = try parseCaseSql(arena, c.sql.?);
     const aggregate = parsed.aggregate_str != null or parsed.group_by_str != null;
-    parsed.deinit(run.gpa);
     var bound: std.ArrayList(forcing.Binding) = .empty;
     defer while (bound.pop()) |binding| {
         var b = binding;

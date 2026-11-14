@@ -551,7 +551,7 @@ def test_arrow_consumers(z):
         except ImportError:
             duckdb = None
         if duckdb is not None:
-            con = duckdb.connect()
+            con = duckdb.connect(config={"memory_limit": "8GB"})
             con.register("t", z.arrow({"sql": sql}))
             rows = con.execute("SELECT s, k FROM t ORDER BY k").fetchall()
             check(rows == [("a", 1), ("b", 2), ("c", 3)], f"DuckDB registers the reader {rows}")

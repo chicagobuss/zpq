@@ -105,7 +105,7 @@ def main():
     checks = 0
     tmp = tempfile.mkdtemp()
     fixture = os.path.join(tmp, "diff_fixture.parquet")
-    corpus.gen_fixture(duckdb.connect(), fixture)
+    corpus.gen_fixture(duckdb.connect(config={"memory_limit": "8GB"}), fixture)
     lam = Lambda()
     z = zpq.Zpq()
 

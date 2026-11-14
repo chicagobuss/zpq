@@ -21,7 +21,7 @@ with tempfile.TemporaryDirectory(prefix='zpq-lib-publication-') as d:
     bad = pa.Array.from_buffers(pa.decimal128(20, 0), 10_000,
                                [None, pa.py_buffer((10**21).to_bytes(16, 'little', signed=True) * 10_000)])
     pq.write_table(pa.table({'d': bad}), bad_src, compression='NONE', use_dictionary=False)
-    con = duckdb.connect()
+    con = duckdb.connect(config={"memory_limit": "8GB"})
     with zpq.Zpq() as z:
         for j in (1, 16):
             for old in (None, b'preserve this result'):

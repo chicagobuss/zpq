@@ -1507,12 +1507,6 @@ fn prepareAggregateWithMetas(
         // `plan` is the scan-count marker. Bill this work to planning without inventing another scan or I/O job.
         split_span.end(.plan_ranges, profile.args(.{}));
     }
-    // Shared optional header memo: charged separately so a declined hint cannot poison decoder flags.
-    var hint_charge: core_memory.Charged = .{ .child = std.heap.page_allocator, .budget = group_budget };
-    var cache_hints: consumer.CacheHints = .{ .allocator = hint_charge.allocator() };
-    defer cache_hints.deinit();
-    if (args.auto_decode_batches and args.decode_batch_rows == 0 and args.expr_batch_rows != 0 and
-        consumer.cacheHintsWanted(agg_calls)) cache_hints.initShards(n_workers) catch {};
     var private_decode: PrivateDecode = .{};
     // Declared before region cleanup: their actual allocations go before their funding returns to the query.
     defer private_decode.release();
@@ -1812,7 +1806,6 @@ fn prepareAggregateWithMetas(
             .expr_batch_rows = args.expr_batch_rows,
             .decode_batch_rows = args.decode_batch_rows,
             .auto_decode_batches = args.auto_decode_batches,
-            .cache_hints = &cache_hints,
             .compaction = args.compaction,
             .scan_workers = n_workers,
             .retire_after_run = args.leave_regions and (args.ledger != null or private_decode.held > 0) and
@@ -1891,7 +1884,6 @@ fn prepareAggregateWithMetas(
     // they go even for a process about to exit, as their charge would sit beside the merge and the answer.
     if (!args.leave_regions or args.ledger != null or private_decode.held > 0) releaseRegionsParallel(workers);
     private_decode.release();
-    cache_hints.deinit();
     if (firstWorkerFailure(workers, args.failure_probe)) |failure| {
         const e = failure.err;
         if (e == error.ExceededMemoryBudget) if (args.taken) |taken| {

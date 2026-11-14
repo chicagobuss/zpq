@@ -156,8 +156,6 @@ const budget_module = @import("consumer/budget.zig");
 pub const DecodeBudget = budget_module.DecodeBudget;
 pub const decodeEstimate = budget_module.decodeEstimate;
 
-pub const CacheHints = workspace_module.CacheHints;
-pub const cacheHintsWanted = workspace_module.cacheHintsWanted;
 const cacheDictionary = workspace_module.cacheDictionary;
 
 const pool_module = @import("consumer/pool.zig");

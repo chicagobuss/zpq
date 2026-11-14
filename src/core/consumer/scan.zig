@@ -41,7 +41,6 @@ const AggTarget = target_module.AggTarget;
 const RecordSink = target_module.RecordSink;
 const workspace_module = @import("workspace.zig");
 const AggWorkspace = workspace_module.AggWorkspace;
-const CacheHints = workspace_module.CacheHints;
 const admitWhole = workspace_module.admitWhole;
 const dropRegion = workspace_module.dropRegion;
 const refusedDraw = workspace_module.refusedDraw;
@@ -493,7 +492,7 @@ pub fn scanRGForAgg(
     if (execution.auto_decode_batches and ws.decode_batch_rows == 0 and ws.expr_batch_rows != 0 and
         (join or target != .grouped or exactTileTarget(in, target) or (decode_options.encoded and
             target.grouped.part == null and target.grouped.records == null)))
-        execution.decode_batch_rows = automaticCacheRowsWithHints(in, target, ws.scan_workers, ws.cache_hints) catch 0;
+        execution.decode_batch_rows = automaticCacheRows(in, target, ws.scan_workers) catch 0;
     if (ws.defer_decode_errors) return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution);
     return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution) catch |err| {
         if (!isDecodeError(err)) return err;
@@ -603,10 +602,6 @@ fn wholeFloatTreeBytes(e: expr_ast.Expr) usize {
 /// Admit only computed fault-free float trees. Decoded inputs, all DAG results, key codes, selection and group
 /// IDs share the stable L2 worker budget; pages/dictionaries use the decoder's separate bounded buffers.
 pub fn automaticCacheRows(in: AggRowGroup, target: AggTarget, workers: usize) !usize {
-    return automaticCacheRowsWithHints(in, target, workers, null);
-}
-
-fn automaticCacheRowsWithHints(in: AggRowGroup, target: AggTarget, workers: usize, hints: ?*CacheHints) !usize {
     const join = join_lookup.inFilter(in.filter);
     if (exactTileTarget(in, target)) return if (join) 0 else exactTileRows(in, target);
     var computed = false;
@@ -646,7 +641,7 @@ fn automaticCacheRowsWithHints(in: AggRowGroup, target: AggTarget, workers: usiz
         if (!SliceReader.supports(in.rg, in.meta, ci)) return 0;
         const cm = in.rg.columns.items[ci].meta_data orelse return 0;
         const n: usize = @intCast(@max(0, cm.num_values));
-        const dictionary = if (hints) |h| h.get(in, ci) else cacheDictionary(in, ci);
+        const dictionary = cacheDictionary(in, ci);
         const lane: usize = if (dictionary != null) 4 else switch (cm.type) {
             .INT32, .FLOAT => 4,
             .BOOLEAN => 1,
@@ -690,7 +685,7 @@ fn automaticCacheRowsWithHints(in: AggRowGroup, target: AggTarget, workers: usiz
     var space: usize = 1;
     // A join's keys are its lookups' codes or slots: no dictionary of the row group's bounds their table.
     if (grouped and !join) for (target.grouped.keys) |key| {
-        const d = (if (hints) |h| h.get(in, key.col_ref.col_idx) else cacheDictionary(in, key.col_ref.col_idx)) orelse return 0;
+        const d = cacheDictionary(in, key.col_ref.col_idx) orelse return 0;
         fixed_keys +|= agg_coded.plainKeyScratchBytes(d.entries) orelse return 0;
         space *|= d.entries +| 1;
     };

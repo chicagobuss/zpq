@@ -120,8 +120,6 @@ const refusedDraw = workspace_module.refusedDraw;
 const budget_module = @import("budget.zig");
 const DecodeBudget = budget_module.DecodeBudget;
 const decodeEstimate = budget_module.decodeEstimate;
-const CacheHints = workspace_module.CacheHints;
-const cacheHintsWanted = workspace_module.cacheHintsWanted;
 const cacheDictionary = workspace_module.cacheDictionary;
 const pool_module = @import("pool.zig");
 const poolOn = pool_module.poolOn;
@@ -2199,23 +2197,6 @@ test "cache decode admission bounds dictionary strings and composite domains fro
         in.src.bytes = bytes;
         columns[1].meta_data.?.total_compressed_size = @intCast(bytes.len);
         const proof = cacheDictionary(in, 1).?;
-        var funding: core_memory.SharedBudget = .{ .limit = 64 << 10 };
-        var charge: core_memory.Charged = .{ .child = testing.allocator, .budget = &funding };
-        var memo: CacheHints = .{ .allocator = charge.allocator() };
-        try memo.initShards(3);
-        try testing.expectEqualDeep(proof, memo.get(in, 1).?);
-        try testing.expectEqualDeep(proof, memo.get(in, 1).?);
-        try testing.expectEqual(@as(usize, 1), memo.count());
-        memo.deinit();
-        try testing.expectEqual(@as(usize, 0), funding.used.load(.monotonic));
-        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-        var uncached: CacheHints = .{ .allocator = failing.allocator() };
-        try testing.expectError(error.OutOfMemory, uncached.initShards(3));
-        try testing.expectEqual(@as(usize, 0), uncached.shards.len);
-        try testing.expectEqualDeep(proof, uncached.get(in, 1).?);
-        try testing.expectEqual(@as(usize, 0), uncached.count());
-        uncached.deinit();
-
         try testing.expectEqual(@as(usize, @intCast(width)), proof.bytes);
         const rows = try automaticCacheRows(in, target, 16);
         if (width == 24) {

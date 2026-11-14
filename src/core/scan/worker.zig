@@ -392,7 +392,6 @@ fn workerRunErr(w: *Worker, prof: ?*profile.Thread, items: *usize) !void {
             .expr_batch_rows = w.expr_batch_rows,
             .decode_batch_rows = w.decode_batch_rows,
             .auto_decode_batches = w.auto_decode_batches,
-            .cache_hints = w.cache_hints,
             .compaction = w.compaction,
             .fold_context = .{ .winner_charge = w.winners, .distinct_pairs = w.pairs },
             .scan_workers = w.scan_workers,

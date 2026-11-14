@@ -43,11 +43,27 @@ pub fn openParent(path: []const u8) !fd_t {
 }
 
 fn syncFd(fd: fd_t, data_only: bool) !void {
+    return syncUsing(fd, data_only, builtin.os.tag == .macos, struct {
+        fn full(f: fd_t) posix.E {
+            return posix.errno(posix.system.fcntl(f, std.c.F.FULLFSYNC, @as(c_int, 0)));
+        }
+        fn sync(f: fd_t, data: bool) posix.E {
+            return posix.errno(if (builtin.os.tag != .macos and data) posix.system.fdatasync(f) else posix.system.fsync(f));
+        }
+    });
+}
+
+fn syncUsing(fd: fd_t, data_only: bool, comptime darwin: bool, comptime Ops: type) !void {
+    var full = darwin;
     while (true) {
-        const rc = if (builtin.target.os.tag == .macos)
-            posix.system.fcntl(fd, std.c.F.FULLFSYNC, @as(c_int, 0))
-        else if (data_only) posix.system.fdatasync(fd) else posix.system.fsync(fd);
-        switch (posix.errno(rc)) {
+        const err = if (darwin and full) Ops.full(fd) else Ops.sync(fd, data_only and !darwin);
+        if (full and (err == .INVAL or err == .NOTTY or err == .OPNOTSUPP or
+            (if (@hasField(posix.E, "NOTSUP")) err == .NOTSUP else false)))
+        {
+            full = false;
+            continue;
+        }
+        switch (err) {
             .SUCCESS => return,
             .INTR => continue,
             .IO => return error.InputOutput,
@@ -55,6 +71,48 @@ fn syncFd(fd: fd_t, data_only: bool) !void {
             else => return error.SyncFailed,
         }
     }
+}
+
+/// A queue fact, including rotational=0. A partition uses its disk's queue; absent sysfs stays unknown.
+pub fn deviceQueue(dev: [2]u32, name: []const u8) ?usize {
+    if (builtin.os.tag != .linux) return null;
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    var data: [64]u8 = undefined;
+    for ([_][]const u8{ "queue", "../queue" }) |dir| {
+        const z = std.fmt.bufPrintSentinel(&path, "/sys/dev/block/{d}:{d}/{s}/{s}", .{ dev[0], dev[1], dir, name }, 0) catch return null;
+        const fd = posix.openat(posix.AT.FDCWD, z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch continue;
+        defer close(fd);
+        const n = posix.read(fd, &data) catch continue;
+        return std.fmt.parseInt(usize, std.mem.trim(u8, data[0..n], " \t\r\n"), 10) catch null;
+    }
+    return null;
+}
+
+test "device sync falls back when Darwin full sync is unsupported for data or directories" {
+    const Fake = struct {
+        var failure: posix.E = .INVAL;
+        var calls: usize = 0;
+        var data_arg: bool = true;
+        fn full(_: fd_t) posix.E {
+            return failure;
+        }
+        fn sync(_: fd_t, data: bool) posix.E {
+            calls += 1;
+            data_arg = data;
+            return .SUCCESS;
+        }
+    };
+    for ([_]posix.E{ .INVAL, .NOTTY, .OPNOTSUPP }) |failure| for ([_]bool{ false, true }) |data| {
+        Fake.failure = failure;
+        Fake.calls = 0;
+        try syncUsing(-1, data, true, Fake);
+        try std.testing.expectEqual(@as(usize, 1), Fake.calls);
+        try std.testing.expect(!Fake.data_arg);
+    };
+    Fake.failure = .IO;
+    Fake.calls = 0;
+    try std.testing.expectError(error.InputOutput, syncUsing(-1, true, true, Fake));
+    try std.testing.expectEqual(@as(usize, 0), Fake.calls);
 }
 
 /// Start Linux writeback without waiting for completion; publication still needs its final data sync.

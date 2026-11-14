@@ -25,6 +25,74 @@ const nowNs = ac.nowNs;
 const residencyFrom = ac.residencyFrom;
 const uring_retry_bound = ac.uring_retry_bound;
 
+test "device Readers with opposite probe order finish before timeout" {
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "device admission");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, @intCast(2 * pageLen()));
+    defer testing.allocator.free(data);
+    @memset(data, 7);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "opposite.bin", data, &path_buf);
+    const a = try Reader.create(testing.allocator, .{ .mode = .pread, .device_admission = true });
+    defer a.destroy();
+    const b = try Reader.create(testing.allocator, .{ .mode = .pread, .device_admission = true });
+    defer b.destroy();
+    var barrier: std.atomic.Value(u32) = .init(0);
+    var faults: [2]Faults = @splat(.{ .first_probe_barrier = &barrier });
+    var inputs: [4]*File = undefined;
+    for ([_]*Reader{ a, b }, 0..) |rd, ri| {
+        rd.faults = &faults[ri];
+        for (0..2) |fi| {
+            const f = try rd.openFile(path, data.len);
+            inputs[ri * 2 + fi] = f;
+            const d = &f.admission.?;
+            d.device = @intCast(11 + (if (ri == 0) fi else 1 - fi));
+            d.serial = true;
+            d.block = pageLen();
+            d.limit = pageLen();
+            var ranges = [_]Range{.{ .start = 0, .end = data.len }};
+            var plans = [_]?[]Range{&ranges};
+            try rd.planFile(f, &plans, 0);
+            try rd.probe(f, 0, 0, pageLen());
+        }
+    }
+    try a.start();
+    try b.start();
+    const deadline = nowNs() + 2 * std.time.ns_per_s;
+    var ready = false;
+    while (nowNs() < deadline) {
+        ready = true;
+        for (inputs) |f| ready = ready and f.rg_ready[0].load(.acquire) == 1;
+        if (ready) break;
+        @import("../clock.zig").sleepNs(std.time.ns_per_ms);
+    }
+    if (!ready) {
+        a.abandon();
+        b.abandon();
+        return error.DeviceAdmissionTimeout;
+    }
+    for (inputs) |f| {
+        try testing.expectEqualSlices(u8, data, f.bytes()[0..data.len]);
+        const gate = f.gate();
+        gate.done(gate.ctx, 0, 1);
+    }
+}
+
+test "device abandon unregisters credits before destroy" {
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "device admission");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const data: [4096]u8 = @splat(7);
+    const path = try testFile(&tmp, "abandon.bin", &data, &path_buf);
+    const rd = try Reader.create(testing.allocator, .{ .device_admission = true });
+    defer rd.destroy();
+    const f = try rd.openFile(path, 4096);
+    rd.abandon();
+    try testing.expect(f.admission == null);
+}
+
 test "device credits resume an admitted row group after submission fallback" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "device admission");
     if (!uringAvailable()) return error.SkipZigTest;

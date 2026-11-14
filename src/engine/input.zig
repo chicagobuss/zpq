@@ -1155,8 +1155,8 @@ fn mappedReadAhead(arena: std.mem.Allocator, args: QueryArgs, opened: OpenedInpu
         };
         if (seen) |d| if (d[0] == dev[0] and d[1] == dev[1]) continue;
         seen = dev;
-        block = @min(block, deviceReadAhead(arena, dev));
-        window = deviceWindow(window, deviceQueueBytes(arena, dev), deviceReadAhead(arena, dev));
+        block = @min(block, deviceReadAhead(dev));
+        window = deviceWindow(window, deviceQueueBytes(dev), deviceReadAhead(dev));
     }
     if (window == 0) return null;
     // Residency and advice through each file's descriptor, where the mapping kept one (`scan_read_ahead.Config.fds`).
@@ -1179,8 +1179,9 @@ fn deviceOf(arena: std.mem.Allocator, path: []const u8) ?[2]u32 {
 }
 
 /// The read-ahead of block device `dev`, in bytes: the most one `WILLNEED` call reads.
-fn deviceReadAhead(arena: std.mem.Allocator, dev: [2]u32) usize {
-    const kb = deviceQueue(arena, dev, "read_ahead_kb") orelse return default_read_ahead;
+fn deviceReadAhead(dev: [2]u32) usize {
+    const kb = local_fs.deviceQueue(dev, "read_ahead_kb") orelse return default_read_ahead;
+    if (kb == 0) return default_read_ahead;
     return kb << 10;
 }
 
@@ -1195,27 +1196,11 @@ pub fn deviceWindow(window: u64, queue: ?u64, read_ahead: u64) u64 {
 
 /// What one hardware queue of block device `dev` holds in flight, in bytes: its requests (`nr_requests`) at their
 /// largest (`max_sectors_kb`). Null where sysfs does not say.
-fn deviceQueueBytes(arena: std.mem.Allocator, dev: [2]u32) ?u64 {
-    const requests = deviceQueue(arena, dev, "nr_requests") orelse return null;
-    const kb = deviceQueue(arena, dev, "max_sectors_kb") orelse return null;
+fn deviceQueueBytes(dev: [2]u32) ?u64 {
+    const requests = local_fs.deviceQueue(dev, "nr_requests") orelse return null;
+    const kb = local_fs.deviceQueue(dev, "max_sectors_kb") orelse return null;
+    if (requests == 0 or kb == 0) return null;
     return std.math.mul(u64, requests, kb << 10) catch null;
-}
-
-/// A positive number from block device `dev`'s sysfs `queue/name`. A partition's queue is its disk's: the parent
-/// directory in sysfs.
-fn deviceQueue(arena: std.mem.Allocator, dev: [2]u32, name: []const u8) ?usize {
-    var buf: [32]u8 = undefined;
-    for ([_][]const u8{ "queue", "../queue" }) |dir| {
-        const file = std.fmt.allocPrintSentinel(arena, "/sys/dev/block/{d}:{d}/{s}/{s}", .{
-            dev[0], dev[1], dir, name,
-        }, 0) catch return null;
-        const fd = std.posix.openat(std.posix.AT.FDCWD, file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch continue;
-        defer _ = std.posix.system.close(fd);
-        const n = std.posix.read(fd, &buf) catch continue;
-        const v = std.fmt.parseInt(usize, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10) catch continue;
-        if (v > 0) return v;
-    }
-    return null;
 }
 
 /// The one choice every local read makes, scan or write: plan the reads (`metas` must be given when

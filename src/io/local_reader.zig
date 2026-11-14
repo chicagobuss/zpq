@@ -514,6 +514,7 @@ pub const Stats = struct {
 pub const Inject = union(enum) { again, busy, intr, submit: u32 };
 
 pub const Faults = struct {
+    first_probe_barrier: ?*std.atomic.Value(u32) = null,
     inject: []const Inject = &.{},
     at: usize = 0,
     cqe_replays: u8 = 0,
@@ -609,7 +610,7 @@ pub const Reader = struct {
     }
 
     fn addFile(self: *Reader, fd: i32, size: u64, borrowed: bool) !*File {
-        const admission = if (self.cfg.device_admission) device_io.Admission.discover(fd, @intFromPtr(self)) else null;
+        const admission = if (self.cfg.device_admission) device_io.Admission.discover(fd) else null;
         // O_DIRECT is a new open of `/proc/self/fd/N`, never F_SETFL on `fd`. The buffered descriptor stays: a read
         // the direct one rejects is pread through it, and a borrowed descriptor is never closed or retargeted.
         // A file system that refuses the open (tmpfs, some FUSE) has no second descriptor and reads buffered.
@@ -743,7 +744,6 @@ pub const Reader = struct {
             try self.units.append(self.gpa, unit);
             off += len;
         }
-        if (file.admission) |*d| d.remaining += n;
         return n;
     }
 
@@ -911,7 +911,10 @@ pub const Reader = struct {
         _ = linux.futex_3arg(&self.rel_gen.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
         for (self.threads.items) |t| t.join();
         self.threads.clearRetainingCapacity();
-        for (self.files.items) |f| if (f.admission) |*d| d.clear();
+        for (self.files.items) |f| {
+            if (f.admission) |*d| d.unregister();
+            f.admission = null;
+        }
         for (self.files.items) |f| _ = linux.madvise(f.buf.ptr, f.buf.len, linux.MADV.DONTNEED);
         self.giveBackLedger();
     }
@@ -968,6 +971,12 @@ pub const Reader = struct {
                 _ = self.rel_gen.fetchAdd(1, .release);
                 _ = linux.futex_3arg(&self.rel_gen.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
             }
+            if (builtin.is_test) if (self.faults) |fault| if (u.file == 0) {
+                if (fault.first_probe_barrier) |barrier| {
+                    _ = barrier.fetchAdd(1, .seq_cst);
+                    while (barrier.load(.seq_cst) < 2 and !self.cancel.load(.acquire)) std.atomic.spinLoopHint();
+                }
+            };
             return;
         }
         if (f.rg_units_left[u.rg].fetchSub(1, .acq_rel) == 1) {
@@ -1026,7 +1035,6 @@ pub const Reader = struct {
     }
 
     fn waitRelease(self: *Reader) void {
-        for (self.files.items) |f| if (f.admission) |*d| d.yieldStream();
         _ = self.stats.window_waits.fetchAdd(1, .monotonic);
         const g = self.rel_gen.load(.acquire);
         const ts: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };

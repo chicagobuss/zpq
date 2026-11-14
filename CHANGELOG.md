@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **zpq-check no longer crashes printing errors in fresh-case runs.**
+- **macOS: CSV reads no longer hit SIGSYS.**
+- **UPDATE reports RollbackFailed and InputChanged correctly.**
+- **A parallel top-k cut that runs out of memory retries on one worker instead of refusing.**
+- **Release archives ship every guide the manual references.**
 - **A WHERE comparing two columns no longer fails when the output is Parquet and either column is dictionary-encoded.**
 - **Fewer memory-map calls in hot loops, so cold scans don't stall behind their own reads.**
 - **Local reads share one admission budget per device, so spinning and unknown storage read in order. Outputs sync their directory after the atomic rename. A failing disk ends a query with a clear error naming the file and offset.**

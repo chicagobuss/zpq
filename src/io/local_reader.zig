@@ -21,6 +21,7 @@ const builtin = @import("builtin");
 const test_skip = @import("../test_skip.zig");
 const core_memory = @import("../core/memory.zig");
 const clock = @import("../clock.zig");
+const diag_mod = @import("../core/diag.zig");
 const linux = std.os.linux;
 const posix = std.posix;
 
@@ -364,6 +365,7 @@ pub const Gate = @import("../core/scan.zig").RowGroupGate;
 
 pub const File = struct {
     reader: *Reader,
+    name: []const u8 = "",
     fd: i32,
     size: u64,
     /// The descriptor opened without `O_DIRECT`, kept when `fd` is direct. -1 when there is only one.
@@ -407,6 +409,18 @@ pub const File = struct {
 
     pub fn bytes(f: *const File) []const u8 {
         return f.buf[0..@intCast(f.size)];
+    }
+
+    fn readFailed(f: *File, op: @FieldType(diag_mod.LocalIoFailure, "op"), offset: u64, errno: u16) error{ReadFailed} {
+        const r = f.reader;
+        if (r.failure_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+            r.failure_path = f.name;
+            r.failure = .{ .op = op, .offset = offset, .errno = errno };
+            r.failure_state.store(2, .release);
+        } else {
+            while (r.failure_state.load(.acquire) == 1) std.atomic.spinLoopHint();
+        }
+        return error.ReadFailed;
     }
 
     pub fn gate(f: *File) Gate {
@@ -539,6 +553,9 @@ pub const Reader = struct {
     admit_next: std.atomic.Value(u32) = .init(0),
     tickets: u32 = 0,
     stats: Stats = .{},
+    failure_state: std.atomic.Value(u8) = .init(0),
+    failure_path: []const u8 = "",
+    failure: diag_mod.LocalIoFailure = undefined,
     /// Reader threads by the backend they actually got: a uring thread whose ring setup failed reads with pread.
     uring_threads: u32 = 0,
     pread_threads: u32 = 0,
@@ -556,6 +573,16 @@ pub const Reader = struct {
         return r;
     }
 
+    /// Only a returned read error may replace its diagnostic; decode/resource error precedence stays unchanged.
+    pub fn reportFailure(self: *Reader, err: anyerror, diag: ?*diag_mod.Diag) void {
+        if (err != error.ReadFailed and err != error.LocalReadFailed) return;
+        const d = diag orelse return;
+        if (self.failure_state.load(.acquire) != 2) return;
+        d.input = self.failure_path;
+        d.cause = error.ReadFailed;
+        d.detail = .{ .local_io = self.failure };
+    }
+
     /// Open `path` for reading into a buffer of `size` bytes.
     pub fn openFile(self: *Reader, path: []const u8, size: u64) !*File {
         var path_z: [std.fs.max_path_bytes]u8 = undefined;
@@ -565,7 +592,9 @@ pub const Reader = struct {
         const rc = linux.open(@ptrCast(&path_z), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         if (linux.errno(rc) != .SUCCESS) return error.OpenFailed;
         const fd: i32 = @intCast(rc);
-        return self.addFile(fd, size, false);
+        const f = try self.addFile(fd, size, false);
+        f.name = path;
+        return f;
     }
 
     /// Read the file open on `fd` into a buffer of `size` bytes: the very file the caller opened, whatever its path
@@ -1005,12 +1034,13 @@ pub const Reader = struct {
 
     /// Read unit `i` with a blocking pread, retrying short reads; the tail of the file reads short by design.
     fn readUnit(self: *Reader, i: usize) !void {
-        if (self.cfg.fail_unit == i) return error.ReadFailed;
+        const u = self.units.items[i];
+        const file = self.files.items[u.file];
+        if (self.cfg.fail_unit == i) return file.readFailed(.pread, u.off, @backingInt(linux.E.IO));
         if (builtin.is_test) if (self.faults) |f| {
             f.preads += 1;
-            if (f.fail_pread) return error.ReadFailed;
+            if (f.fail_pread) return file.readFailed(.pread, u.off, @backingInt(linux.E.IO));
         };
-        const u = self.units.items[i];
         const f = self.files.items[u.file];
         try preadAll(f, u.off, @min(u.off + u.len, f.size));
         // The whole unit went through the buffered descriptor. A direct completion's short tail calls `preadAll`
@@ -1080,8 +1110,8 @@ pub const Reader = struct {
                     break;
                 }
                 pending = null;
-                if (self.cfg.fail_unit == idx) return error.ReadFailed;
                 const f = self.files.items[u.file];
+                if (self.cfg.fail_unit == idx) return f.readFailed(.io_uring, u.off, @backingInt(linux.E.IO));
                 held[nheld] = idx;
                 tries[nheld] = 0;
                 nheld += 1;
@@ -1158,7 +1188,7 @@ pub const Reader = struct {
                 }
                 // `-EIO` and any other failure. Siblings in this batch are already counted; still-submitted reads
                 // are reaped.
-                if (c.res < 0) return error.ReadFailed;
+                if (c.res < 0) return f.readFailed(.io_uring, u.off, @intCast(-@as(i64, c.res)));
                 if (slot) |s| heldRemove(held, tries, &nheld, s);
                 const want = @min(@as(u64, u.len), f.size - u.off);
                 // O_DIRECT reads the file's unaligned tail short; anything else short is finished with pread.
@@ -1168,7 +1198,7 @@ pub const Reader = struct {
                         fault.repaired = true;
                         fault.repair_at = u.off + got;
                         fault.preads += 1;
-                        if (fault.fail_pread) return error.ReadFailed;
+                        if (fault.fail_pread) return f.readFailed(.pread, u.off + got, @backingInt(linux.E.IO));
                     };
                     try preadAll(f, u.off + got, u.off + want);
                 }
@@ -1388,9 +1418,9 @@ fn preadAll(f: *File, lo: u64, hi: u64) !void {
         switch (linux.errno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
-            else => return error.ReadFailed,
+            else => |err| return f.readFailed(.pread, off, @backingInt(err)),
         }
-        if (rc == 0) return error.ReadFailed; // the file shrank under us
+        if (rc == 0) return f.readFailed(.pread, off, 0); // EOF, not a kernel errno
         off += rc;
     }
 }

@@ -1344,6 +1344,7 @@ pub fn planLocalReader(
             if (!std.meta.eql(now, m.stamp)) return error.InputChanged;
             break :blk f;
         };
+        f.name = in.name;
         try rd.planFile(f, per_rg, COALESCE_GAP);
         in.bytes = f.bytes();
         in.gate = f.gate();

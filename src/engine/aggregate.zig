@@ -490,7 +490,10 @@ fn executeAggregateOver(
         scan_args.metas = empty_metas;
     }
     // A group-join's partials draw from the ledger too: their refusal is the ledger's.
-    var r = scan.runMultiAggregate(ctx.gpa, arena, scan_args) catch |err| return if (args.join) |j| j.refusal(err) else err;
+    var r = scan.runMultiAggregate(ctx.gpa, arena, scan_args) catch |err| {
+        if (reader) |rd| rd.reportFailure(err, args.diag);
+        return if (args.join) |j| j.refusal(err) else err;
+    };
     if (args.join) |j| if (try j.takeRows(ctx.gpa)) |rows| {
         // The group-join's answer stands in for the empty one the group tables gave (`GroupJoin.rows`).
         if (r.output.group_rows) |old| {

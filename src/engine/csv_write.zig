@@ -1429,6 +1429,7 @@ pub fn startReader(
     });
     errdefer rd.destroy();
     const f = try rd.borrowFile(fd, mapped.bytes.len);
+    f.name = args.inputs[0];
     source.overhang = source.opts.overhang orelse overhang_bytes;
     source.gate = f.gate();
     source.buf = f.bytes();
@@ -1552,7 +1553,10 @@ fn writeOnce(
     defer w.piece_pool.deinit();
     const t_scan = nowMonoNs();
     // A draw the ledger refused is the budget's refusal, not the host's: named so, as a Parquet write names it.
-    window_mod.runWindowedReencode(&w, sizing.workers, ctx.env) catch |e| return slicing.refusal(memory.refusal(e));
+    window_mod.runWindowedReencode(&w, sizing.workers, ctx.env) catch |e| {
+        if (reader) |rd| rd.reportFailure(e, args.diag);
+        return slicing.refusal(memory.refusal(e));
+    };
     t.decode_wall_ns = @intCast(nowMonoNs() - t_scan);
     t.core.sink_ns += w.sink_ns;
     t.core.encode_ns += w.core.encode_ns;

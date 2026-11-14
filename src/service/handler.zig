@@ -877,6 +877,10 @@ fn engineError(allocator: std.mem.Allocator, err: anyerror, diag: *const Diag) !
         if (diag.cause) |cause| try w.print(",\"cause\":\"{s}\"", .{@errorName(cause)});
     }
     if (diag.detail == .s3_request) try writeS3Failure(w, diag.detail.s3_request);
+    if (diag.detail == .local_io) {
+        const f = diag.detail.local_io;
+        try w.print(",\"local_io\":{{\"op\":\"{s}\",\"errno\":{d},\"offset\":{d}}}", .{ @tagName(f.op), f.errno, f.offset });
+    }
     try w.writeByte('}');
     return aw.toOwnedSlice();
 }
@@ -1469,6 +1473,21 @@ test "sink error details retain the service WriteFailed reason" {
         defer std.testing.allocator.free(response);
         try std.testing.expectEqualStrings("{\"error\":\"engine\",\"reason\":\"WriteFailed\"}", response);
     }
+}
+
+test "local I/O errors keep their tag and escape the input name" {
+    const a = std.testing.allocator;
+    const d: Diag = .{ .input = "file\"name", .detail = .{ .local_io = .{ .op = .pread, .errno = 5, .offset = 123 } } };
+    const response = try engineError(a, error.LocalReadFailed, &d);
+    defer a.free(response);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("LocalReadFailed", obj.get("reason").?.string);
+    try std.testing.expectEqualStrings(d.input.?, obj.get("input").?.string);
+    const local = obj.get("local_io").?.object;
+    try std.testing.expectEqual(@as(i64, 5), local.get("errno").?.integer);
+    try std.testing.expectEqual(@as(i64, 123), local.get("offset").?.integer);
 }
 
 test "parquet version rejects an unknown profile" {

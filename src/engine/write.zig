@@ -414,7 +414,10 @@ fn runWriteOver(
 
     if (args.diag) |diag| diag.execution_started = true;
     const t_scan = nowMonoNs();
-    try rows.run();
+    rows.run() catch |err| {
+        if (reader) |rd| rd.reportFailure(err, args.diag);
+        return err;
+    };
 
     if (args.codec == .ZSTD) {
         var pages: [4]u64 = undefined;

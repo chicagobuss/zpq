@@ -722,7 +722,10 @@ fn foldOnce(
                 .empty => error.CsvEmpty,
             };
         }
-        if (errs[i]) |e| return scratch_charge.refusal(e);
+        if (errs[i]) |e| {
+            if (reader) |rd| rd.reportFailure(e, args.diag);
+            return scratch_charge.refusal(e);
+        }
     }
     // The fold has merged every chunk: what is left is the answer. As past a Parquet scan (`runMultiAggregate`), it
     // may hold the ceiling's slack past the limit (`memory.finalize_allowance`), so an answer of groups the fold

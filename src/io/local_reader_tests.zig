@@ -25,6 +25,39 @@ const nowNs = ac.nowNs;
 const residencyFrom = ac.residencyFrom;
 const uring_retry_bound = ac.uring_retry_bound;
 
+test "local reader preserves the syscall error and location without changing error precedence" {
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "reader errno");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes: [16384]u8 = @splat(3);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "input.bin", &bytes, &path_buf);
+    for ([_]Mode{ .pread, .uring }) |mode| {
+        if (mode == .uring and !uringAvailable()) continue;
+        const rd = try Reader.create(testing.allocator, .{ .mode = mode, .threads = 1 });
+        defer rd.destroy();
+        const f = try rd.openFile(path, bytes.len);
+        _ = linux.close(f.fd);
+        f.owned = false;
+        f.fd = -1;
+        var range = [_]Range{.{ .start = 4096, .end = 8192 }};
+        const plan = [_]?[]Range{&range};
+        try rd.planFile(f, &plan, 0);
+        try rd.start();
+        const gate = f.gate();
+        try testing.expectError(error.LocalReadFailed, gate.wait(gate.ctx, 0));
+        var diag: @import("../core/diag.zig").Diag = .{};
+        rd.reportFailure(error.OutOfMemory, &diag);
+        try testing.expect(diag.detail == .none);
+        rd.reportFailure(error.LocalReadFailed, &diag);
+        try testing.expectEqualStrings(path, diag.input.?);
+        try testing.expectEqual(@as(u16, @backingInt(linux.E.BADF)), diag.detail.local_io.errno);
+        try testing.expectEqual(@as(u64, 4096), diag.detail.local_io.offset);
+        const op: @TypeOf(diag.detail.local_io.op) = if (mode == .pread) .pread else .io_uring;
+        try testing.expectEqual(op, diag.detail.local_io.op);
+    }
+}
+
 fn testFile(tmp: *testing.TmpDir, name: []const u8, data: []const u8, buf: []u8) ![]const u8 {
     var f = try tmp.dir.createFile(testing.io, name, .{});
     defer f.close(testing.io);

@@ -725,6 +725,9 @@ fn printDetail(diag: *const Diag) void {
         ),
         // The upload logged it to stderr when it happened.
         .s3_request => {},
+        .local_io => |f| diagnosticPrint("local I/O: {s}: {s}, offset {d}, errno {d}\n", .{
+            diag.input orelse "(input)", @tagName(f.op), f.offset, f.errno,
+        }),
         // Printed with the error itself (`csvError`).
         .csv => {},
         // `decodeError` prints it whole, for a decode error; any other error's message stands alone.

@@ -97,6 +97,7 @@ pub const Detail = union(enum) {
     },
     /// The S3 request behind the error failed: which one, at what point, and how.
     s3_request: S3Failure,
+    local_io: LocalIoFailure,
     /// A CSV input (`Diag.input`) refused at `line` (from 1, quoted newlines counted) and `byte` (from 0), in
     /// `Diag.column` when a field is at fault: `reason` (static) says why; a record's field counts, or a value and the
     /// type it does not fit.
@@ -112,6 +113,12 @@ pub const Detail = union(enum) {
         /// A type change was refused by `--csv-strict`; otherwise its output could not start again (a pipe).
         strict: bool = false,
     },
+};
+
+pub const LocalIoFailure = struct {
+    op: enum { pread, io_uring },
+    errno: u16,
+    offset: u64,
 };
 
 /// A failed S3 request, as reported to the user: the operation, the bucket and key, the phase it failed in, and the

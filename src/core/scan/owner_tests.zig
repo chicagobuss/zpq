@@ -2708,7 +2708,11 @@ test "filtered shared-string window sizes PLAIN chunks without dictionary-covere
 }
 
 test "shared string top-k cut refusals replay at every budget the old path answers" {
-    const gpa = testing.allocator;
+    // Compare budget peaks with copies on both paths; in-place growth depends on neighboring allocations.
+    var copy_only = testing.allocator.vtable.*;
+    copy_only.resize = std.mem.Allocator.noResize;
+    copy_only.remap = std.mem.Allocator.noRemap;
+    const gpa: std.mem.Allocator = .{ .ptr = testing.allocator.ptr, .vtable = &copy_only };
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2767,7 +2771,12 @@ test "shared string top-k cut refusals replay at every budget the old path answe
                 if (outcome.*) |*r| try r.output.applyResultOrder(gpa, shape.order);
             }
             const want = outcomes[0] orelse continue;
-            const got = outcomes[1] orelse return error.TestExpectedEqual;
+            const got = outcomes[1] orelse {
+                std.debug.print("top-k replay: j={d}, budget={d}, aggregate={s}, limit={?d}, offset={d}\n", .{
+                    j, half_mib << 19, shape.aggregate, shape.order.limit, shape.order.offset,
+                });
+                return error.TestExpectedEqual;
+            };
             try testing.expectEqualDeep(want.output.group_rows, got.output.group_rows);
             answered += 1;
         }

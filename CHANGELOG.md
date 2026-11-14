@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **S3 errors name the operation, bucket and key, report S3's own code and message with credentials redacted, and tell a missing multipart upload apart from a missing bucket.**
 - **q06-style composite GROUP BY with SUM is faster: dense keys sum straight into lanes.**
 - **Joins decode in L2-sized slices, and cold scans no longer stall on memory mapping.**
 - **Faster CSV aggregates.** A CSV aggregate's chunks parse into pooled per-worker arenas, fold without copies and drop their pages behind them, and a one-byte string's dictionary code is its byte.

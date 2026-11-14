@@ -89,7 +89,7 @@ pub const Region = struct {
     }
 
     pub fn deinit(self: *Region) void {
-        if (self.mapping.len > 0) std.posix.munmap(self.mapping);
+        if (builtin.os.tag != .windows) if (self.mapping.len > 0) std.posix.munmap(self.mapping);
         if (self.budget) |b| b.release(self.charged);
         self.* = .{ .child = self.child, .budget = self.budget, .spilled = self.spilled };
     }
@@ -286,7 +286,7 @@ pub const pair_cache = struct {
     var pairs: [256]Region.Pair = undefined;
     var len: usize = 0;
     var cap: usize = 0;
-    var owner_pid: std.posix.pid_t = 0;
+    var owner_pid: u32 = 0;
 
     fn capacity() usize {
         if (cap == 0) cap = @min(pairs.len, std.Thread.getCpuCount() catch 64);
@@ -357,7 +357,7 @@ pub fn retirePair(pair: *Region.Pair) void {
         pair_cache.len += 1;
     }
     pair_cache.lock.unlock(blocking.io);
-    if (!fits) std.posix.munmap(arena.mapping);
+    if (builtin.os.tag != .windows) if (!fits) std.posix.munmap(arena.mapping);
     pair.* = .{ .scratch = .{ .child = std.heap.page_allocator }, .arena = .{ .child = arena.child } };
 }
 
@@ -365,14 +365,15 @@ pub fn retirePair(pair: *Region.Pair) void {
 pub fn drainPairs() void {
     pair_cache.lock.lockUncancelable(blocking.io);
     defer pair_cache.lock.unlock(blocking.io);
-    if (pair_cache.owner_pid == currentPid()) {
+    if (builtin.os.tag != .windows and pair_cache.owner_pid == currentPid()) {
         for (pair_cache.pairs[0..pair_cache.len]) |p| std.posix.munmap(p.arena.mapping);
     }
     pair_cache.len = 0;
 }
 
-fn currentPid() std.posix.pid_t {
-    return if (builtin.target.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
+fn currentPid() u32 {
+    if (builtin.target.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
+    return @intCast(if (builtin.target.os.tag == .linux) std.os.linux.getpid() else std.c.getpid());
 }
 
 /// Drop `span`'s pages now. Linux keeps the mapping; Darwin's MADV_DONTNEED may keep the

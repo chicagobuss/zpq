@@ -1660,6 +1660,12 @@ pub fn inputFormat(path: []const u8, forced: InputFormat) !InputFormat {
 
 /// `PAR1` at both ends. A file that cannot be opened is left to the Parquet path to report as it does.
 fn hasParquetMagic(path: []const u8) !bool {
+    if (@import("builtin").os.tag == .windows) {
+        const map = local_fs.mapFile(path) catch return true;
+        defer map.unmap();
+        if (map.bytes.len < 8) return map.bytes.len == 0;
+        return std.mem.eql(u8, map.bytes[0..4], "PAR1") and std.mem.eql(u8, map.bytes[map.bytes.len - 4 ..], "PAR1");
+    }
     const fd = local_fs.openRead(path) catch return true;
     defer local_fs.close(fd);
     const size = local_fs.fileSize(fd) catch return true;

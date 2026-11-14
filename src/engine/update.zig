@@ -125,6 +125,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, req: Request, problem: *Problem) 
 /// `footers` holds the file's parsed footer, outside the budget as a SELECT's footers are; everything else is
 /// drawn through `gpa`, the charged allocator.
 fn runCharged(footers: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, req: Request, problem: *Problem) !Summary {
+    if (@import("builtin").os.tag == .windows) {
+        problem.set("UPDATE is not supported on Windows", .{});
+        return error.UpdateRefused;
+    }
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();

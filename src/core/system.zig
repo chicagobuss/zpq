@@ -1,4 +1,28 @@
 const std = @import("std");
+
+// Windows exposes a mutable UTF-16 process block. The CLI snapshots it before
+// workers start so all callers can borrow UTF-8 values for the query lifetime.
+var windows_env: ?std.process.Environ.Map = null;
+
+pub fn initWindowsEnv(env: std.process.Environ, allocator: std.mem.Allocator) !void {
+    if (@import("builtin").os.tag == .windows) windows_env = try env.createMap(allocator);
+}
+
+pub fn deinitWindowsEnv() void {
+    if (@import("builtin").os.tag == .windows) {
+        if (windows_env) |*map| map.deinit();
+        windows_env = null;
+    }
+}
+
+pub fn winEnvValue(env: std.process.Environ, name: []const u8) ?[]const u8 {
+    if (@import("builtin").os.tag == .windows) {
+        if (env.block.isEmpty()) return null;
+        const map = windows_env orelse return null;
+        return map.get(name);
+    }
+    return env.getPosix(name);
+}
 const builtin = @import("builtin");
 
 /// Discover available system memory in bytes, returning:
@@ -46,7 +70,7 @@ pub fn resolveParallelism(visible: usize, quota_cpus: ?usize, lambda_mem_mb: ?us
 
 fn lambdaMemoryMb(env: ?std.process.Environ) ?usize {
     const e = env orelse return null;
-    const val_str = e.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE") orelse return null;
+    const val_str = winEnvValue(e, "AWS_LAMBDA_FUNCTION_MEMORY_SIZE") orelse return null;
     return std.fmt.parseInt(usize, val_str, 10) catch null;
 }
 
@@ -157,7 +181,7 @@ test "cgroup quota files parse to whole CPUs, rounded up" {
 /// generously from the owned tier, vs. staying polite on a shared machine.
 pub fn onLambda(env: ?std.process.Environ) bool {
     const e = env orelse return false;
-    return e.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE") != null;
+    return winEnvValue(e, "AWS_LAMBDA_FUNCTION_MEMORY_SIZE") != null;
 }
 
 /// Maximum jobs admitted to a byte-buffering pipeline at once. The byte
@@ -172,7 +196,7 @@ pub fn windowCapacity(inflight_budget: u64, avg_job_bytes: u64, job_count: usize
 
 fn getLambdaMemory(env: ?std.process.Environ) ?usize {
     const e = env orelse return null;
-    if (e.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")) |val_str| {
+    if (winEnvValue(e, "AWS_LAMBDA_FUNCTION_MEMORY_SIZE")) |val_str| {
         if (std.fmt.parseInt(usize, val_str, 10) catch null) |val| {
             // 75% of the memory tier. A size no machine has is ignored, like one that does not parse.
             const bytes = std.math.mul(usize, val, 1024 * 1024) catch return null;

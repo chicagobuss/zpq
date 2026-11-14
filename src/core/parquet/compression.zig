@@ -164,10 +164,13 @@ const ThreadCodecs = struct {
     inflater: ?*c_deflate.libdeflate_decompressor = null,
     window: ?[]align(std.heap.page_size_min) u8 = null,
 
-    var key: std.c.pthread_key_t = undefined;
+    var key: if (builtin.os.tag == .windows) u32 else std.c.pthread_key_t = undefined;
     var key_ready: std.atomic.Value(bool) = .init(false);
     var key_tried = false;
-    var key_lock: std.c.pthread_mutex_t = .{};
+    var key_lock: if (builtin.os.tag == .windows) std.os.windows.SRWLOCK else std.c.pthread_mutex_t = .{};
+    extern "kernel32" fn FlsAlloc(?*const fn (?*anyopaque) callconv(.winapi) void) callconv(.winapi) u32;
+    extern "kernel32" fn FlsGetValue(u32) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn FlsSetValue(u32, ?*anyopaque) callconv(.winapi) std.os.windows.BOOL;
     /// Tests only: parts made and freed, to show reuse and teardown.
     var made: std.atomic.Value(usize) = .init(0);
     var freed: std.atomic.Value(usize) = .init(0);
@@ -176,6 +179,16 @@ const ThreadCodecs = struct {
     /// left), and the caller then uses a set of its own for the one call.
     fn current() ?*ThreadCodecs {
         if (!haveKey()) return null;
+        if (builtin.os.tag == .windows) {
+            if (FlsGetValue(key)) |p| return @ptrCast(@alignCast(p));
+            const state = std.heap.c_allocator.create(ThreadCodecs) catch return null;
+            state.* = .{};
+            if (!FlsSetValue(key, state).toBool()) {
+                std.heap.c_allocator.destroy(state);
+                return null;
+            }
+            return state;
+        }
         if (std.c.pthread_getspecific(key)) |p| return @ptrCast(@alignCast(p));
         const s = std.heap.c_allocator.create(ThreadCodecs) catch return null;
         s.* = .{};
@@ -188,6 +201,16 @@ const ThreadCodecs = struct {
 
     fn haveKey() bool {
         if (key_ready.load(.acquire)) return true;
+        if (builtin.os.tag == .windows) {
+            std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&key_lock);
+            defer std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&key_lock);
+            if (!key_tried) {
+                key_tried = true;
+                key = FlsAlloc(atWindowsThreadExit);
+                if (key != std.math.maxInt(u32)) key_ready.store(true, .release);
+            }
+            return key_ready.load(.monotonic);
+        }
         _ = std.c.pthread_mutex_lock(&key_lock);
         defer _ = std.c.pthread_mutex_unlock(&key_lock);
         if (!key_tried) {
@@ -195,6 +218,14 @@ const ThreadCodecs = struct {
             if (std.c.pthread_key_create(&key, atThreadExit) == .SUCCESS) key_ready.store(true, .release);
         }
         return key_ready.load(.monotonic);
+    }
+
+    fn atWindowsThreadExit(p: ?*anyopaque) callconv(.winapi) void {
+        if (p) |value| {
+            const state: *ThreadCodecs = @ptrCast(@alignCast(value));
+            state.deinit();
+            std.heap.c_allocator.destroy(state);
+        }
     }
 
     fn atThreadExit(p: *anyopaque) callconv(.c) void {
@@ -573,8 +604,11 @@ var gzip_impl: std.atomic.Value(u8) = .init(0);
 fn gzipUsesStd() bool {
     var v = gzip_impl.load(.monotonic);
     if (v == 0) {
-        const e = std.c.getenv("ZPQ_GZIP_STD");
-        const std_flate = if (e) |p| p[0] != 0 and !(p[0] == '0' and p[1] == 0) else false;
+        const e = @import("../system.zig").winEnvValue(if (builtin.os.tag == .windows) .{ .block = .global } else std.process.Environ.empty, "ZPQ_GZIP_STD");
+        const std_flate = if (builtin.os.tag == .windows) (if (e) |p| p.len > 0 and !std.mem.eql(u8, p, "0") else false) else blk: {
+            const p = std.c.getenv("ZPQ_GZIP_STD") orelse break :blk false;
+            break :blk p[0] != 0 and !(p[0] == '0' and p[1] == 0);
+        };
         v = if (std_flate) 2 else 1;
         gzip_impl.store(v, .monotonic);
     }

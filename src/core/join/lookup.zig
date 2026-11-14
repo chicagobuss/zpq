@@ -1005,6 +1005,10 @@ const FillCodes = struct {
 /// survivors, pick the key structure from their verified domain, and lay every payload out by slot.
 fn lap(what: []const u8, since: i64) i64 {
     const now = @import("../../clock.zig").monoNs();
+    if (@import("builtin").os.tag == .windows) {
+        std.debug.print("join build: {s} {d:.1} ms\n", .{ what, @as(f64, @floatFromInt(now - since)) / 1e6 });
+        return now;
+    }
     const ru = std.posix.getrusage(0);
     std.debug.print("join build: {s} {d:.1} ms (minor faults so far {d})\n", .{ what, @as(f64, @floatFromInt(now - since)) / 1e6, ru.minflt });
     return now;

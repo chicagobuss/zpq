@@ -71,6 +71,7 @@ fn stackLow() ?usize {
 /// A walk's bytes where the thread cannot be asked: the process's stack limit, as if the walk starts near the top of a
 /// stack of that size (true of a main thread), else the last resort.
 fn fallbackBytes() usize {
+    if (builtin.os.tag == .windows) return last_resort_bytes;
     const limit = std.posix.getrlimit(.STACK) catch return last_resort_bytes;
     if (limit.cur == std.posix.RLIM.INFINITY or limit.cur == 0) return last_resort_bytes;
     return @intCast(@min(limit.cur / share_den * share_num, std.math.maxInt(usize)));

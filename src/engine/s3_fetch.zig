@@ -1,6 +1,7 @@
 const sbbf = @import("../core/parquet/bloom.zig");
 const AtomicWorkCursor = @import("../io/work_cursor.zig").AtomicWorkCursor;
 const std = @import("std");
+const winEnvValue = @import("../core/system.zig").winEnvValue;
 const s3_window = @import("../io/s3_window.zig");
 const system = @import("../core/system.zig");
 const diag_mod = @import("../core/diag.zig");
@@ -10,7 +11,7 @@ pub const lambda_window_cap: u64 = 128 << 20;
 
 /// A query's S3 fetch window: `ZPQ_S3_WINDOW_KIB` when set, else budget-derived and capped on Lambda.
 pub fn s3FetchWindow(env: ?std.process.Environ, max_memory: usize) u64 {
-    if (env) |e| if (e.getPosix("ZPQ_S3_WINDOW_KIB")) |v| if (std.fmt.parseInt(u64, v, 10)) |k| {
+    if (env) |e| if (winEnvValue(e, "ZPQ_S3_WINDOW_KIB")) |v| if (std.fmt.parseInt(u64, v, 10)) |k| {
         return @max(1, k) << 10;
     } else |_| {};
     const derived = s3_window.windowFor(max_memory);
@@ -49,7 +50,7 @@ const FOOTER_PROBE_MIN: u64 = 64 << 10;
 const FOOTER_PROBE_MAX: u64 = 16 << 20;
 
 pub fn footerProbeBytes(env: std.process.Environ) u64 {
-    const v = env.getPosix("ZPQ_S3_FOOTER_PROBE") orelse return FOOTER_PROBE_DEFAULT;
+    const v = winEnvValue(env, "ZPQ_S3_FOOTER_PROBE") orelse return FOOTER_PROBE_DEFAULT;
     const n = std.fmt.parseInt(u64, v, 10) catch return FOOTER_PROBE_DEFAULT;
     if (n < 8) return 8;
     return @min(n, FOOTER_PROBE_MAX);
@@ -61,7 +62,7 @@ pub fn footerProbeBytes(env: std.process.Environ) u64 {
 pub fn footerProbeFor(env: std.process.Environ, budget: u64, concurrent: usize) u64 {
     const n: u64 = @max(concurrent, 1);
     const derived = std.math.clamp(budget / (2 * n), FOOTER_PROBE_MIN, FOOTER_PROBE_DEFAULT);
-    if (env.getPosix("ZPQ_S3_FOOTER_PROBE") == null) return derived;
+    if (winEnvValue(env, "ZPQ_S3_FOOTER_PROBE") == null) return derived;
     const requested = footerProbeBytes(env);
     if (requested > derived) {
         std.log.warn("ZPQ_S3_FOOTER_PROBE={d} exceeds the memory budget; using {d} bytes", .{ requested, derived });

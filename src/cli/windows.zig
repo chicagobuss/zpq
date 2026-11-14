@@ -21,7 +21,7 @@ pub fn run(
     const arena = arena_state.allocator();
 
     const parent = setops.scratchParent(&.{plan.input_sql}, dir_hint);
-    const pid: u32 = @bitCast(std.posix.system.getpid());
+    const pid: u32 = if (@import("builtin").os.tag == .windows) std.os.windows.GetCurrentProcessId() else @bitCast(std.posix.system.getpid());
     const dir = try std.fmt.allocPrint(arena, "{s}/.zpq-window-{d}", .{ std.mem.trimEnd(u8, parent, "/"), pid });
     // The directory's name goes into queries as a quoted path.
     if (std.mem.indexOfAny(u8, dir, "'*\"") != null) {

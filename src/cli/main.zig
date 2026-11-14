@@ -45,8 +45,9 @@ fn cliLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptim
     if (!machine_diagnostics) std.log.defaultLog(level, scope, fmt, args);
 }
 
-fn wantsJsonSummary(args: std.process.Args) bool {
-    var it = std.process.Args.Iterator.init(args);
+fn wantsJsonSummary(args: std.process.Args, gpa: std.mem.Allocator) !bool {
+    var it = try std.process.Args.Iterator.initAllocator(args, gpa);
+    defer it.deinit();
     _ = it.next();
     const command = it.next() orelse return false;
     if (!std.mem.eql(u8, command, "query")) return false;
@@ -85,7 +86,7 @@ fn diagnosticPrint(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn emitError(err: anyerror) !void {
-    var w: StdoutWriter = .{ .fd = 2 };
+    var w: StdoutWriter = .{ .fd = std.Io.File.stderr().handle };
     try w.writeAll("{\"type\":\"error\",\"ok\":false,\"code\":\"");
     try writeJsonString(&w, @errorName(err));
     try w.writeAll("\",\"message\":\"");
@@ -106,13 +107,16 @@ pub fn main(init: std.process.Init) void {
 fn runMain(init: std.process.Init) !void {
     zpq.cpu_level.require();
     const gpa = zpq.core.memory.processAllocator(init.gpa);
+    try zpq.core.system.initWindowsEnv(init.minimal.environ, gpa);
+    defer zpq.core.system.deinitWindowsEnv();
     local_fs.raiseOpenFileLimit();
     zpq.core.memory.fixHeapThreshold();
-    machine_diagnostics = wantsJsonSummary(init.minimal.args);
+    machine_diagnostics = try wantsJsonSummary(init.minimal.args, gpa);
     // Human diagnostics print unbounded; machine ones are captured into the JSON error.
     if (machine_diagnostics) zpq.frontend.diagnostic_fn = captureSqlDiagnostic;
     defer zpq.frontend.diagnostic_fn = null;
-    var iter = std.process.Args.Iterator.init(init.minimal.args);
+    var iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
+    defer iter.deinit();
     _ = iter.next(); // skip program name
     const cmd = iter.next() orelse {
         var ws: StdoutWriter = .{};
@@ -933,7 +937,7 @@ fn runParsed(
             .csv = csv_opts,
         };
         const ctx: engine.Context = .{ .gpa = gpa, .env = env, .io = io };
-        var ws: StdoutWriter = .{ .fd = 1 };
+        var ws: StdoutWriter = .{};
         defer ws.flush() catch {};
         // A CSV input's aggregate folds during the parse (`csv_agg`): its own plan, not a Parquet scan's.
         if (try engine.csv_write.csvInput(explain_args)) |path| {
@@ -953,12 +957,12 @@ fn runParsed(
         .inputs = inputs,
         .plan_source = plan_source,
         .output = if (fmt == .parquet) engine_output orelse "-" else null,
-        .output_fd = if (fmt == .parquet) (if (to_stdout) 1 else publication.fd) else null,
+        .output_fd = if (fmt == .parquet) (if (to_stdout) std.Io.File.stdout().handle else publication.fd) else null,
         .output_restartable = fmt == .parquet and !to_stdout and publication.fd != null,
         .typed_answer = fmt == .parquet,
         .text_output = if (fmt != .parquet) .{
             .format = fmt,
-            .fd = if (to_stdout) 1 else publication.fd orelse return error.BadOutputUrl,
+            .fd = if (to_stdout) std.Io.File.stdout().handle else publication.fd orelse return error.BadOutputUrl,
         } else null,
         .quiet_diagnostics = machine_diagnostics,
         .empty_scalar = group_by == null and (limit == 0 or result_order.offset > 0),
@@ -1017,7 +1021,7 @@ fn runParsed(
             diagnosticPrint("zpq query: this output format does not support S3 destinations\n", .{});
             return error.BadArgs;
         }
-        const fd: local_fs.fd_t = if (to_stdout) 1 else publication.fd orelse return error.BadOutputUrl;
+        const fd: local_fs.fd_t = if (to_stdout) std.Io.File.stdout().handle else publication.fd orelse return error.BadOutputUrl;
         const printed = try engine.runPrintTo(ctx, query_args, fmt, limit, fd, @intCast(result_order.offset));
         rows = printed.rows;
         output_started_ns = printed.timings.output_started_ns;
@@ -1094,7 +1098,7 @@ fn runUpdate(
     };
     if (!summary) return;
     const elapsed = nowMonoNs() - started;
-    var w: StdoutWriter = .{ .fd = 2 };
+    var w: StdoutWriter = .{ .fd = std.Io.File.stderr().handle };
     try w.writeAll("{\"type\":\"summary\",\"ok\":true,\"statement\":\"update\",\"output\":");
     if (s.unchanged) try w.writeAll("null") else {
         try w.writeByte('"');
@@ -1164,7 +1168,7 @@ fn writeCsvSummary(w: *StdoutWriter, r: *const engine.csv_write.Report) !void {
 }
 
 fn writeSummary(output: ?[]const u8, rows: usize, s: SummaryStats, elapsed: i64) !void {
-    var w: StdoutWriter = .{ .fd = 2 };
+    var w: StdoutWriter = .{ .fd = std.Io.File.stderr().handle };
     try w.print("{{\"type\":\"summary\",\"ok\":true,\"rows\":{d},\"output\":", .{rows});
     if (output) |path| {
         try w.writeByte('"');
@@ -1205,25 +1209,24 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
     if (err == error.BrokenPipe) return 141;
     if (execution_started) return 1;
     const usage = [_][]const u8{
-        "BadArgs",                     "NoInputs",                    "NoMatches",                    "SqlNotCompiledIn",         "UnknownColumn",        "UnknownFunction",
-        "UnknownAggFunc",              "WrongArity",                  "EmptyExpr",                    "EmptyAggregate",           "EmptyColumnList",      "UnexpectedChar",
-        "UnexpectedEnd",               "BadNumber",                   "UnterminatedString",           "TypeMismatch",             "ExpectedLParen",       "ExpectedRParen",
-        "ExpectedIdentifier",          "ExpectedWhere",               "ExpectedAggFunc",              "StarOnlyValidInCount",     "TrailingTokens",       "BadAggArg",
-        "AggregateMutexWithSelect",    "DuplicateOutputColumn",       "AmbiguousOutputColumn",        "AmbiguousColumn",          "ExpressionTooDeep",    "GroupKeyAliasRequired",
-        "SqlParseError",               "OrderByNotSupported",         "LimitNotSupported",            "DistinctNotSupported",     "HavingNotSupported",   "MixedSelectNotSupported",
-        "UnsupportedStatement",        "SubqueryNotSupported",        "WindowNotSupported",           "ColumnMustBeGrouped",      "BadOutputUrl",         "BadOperator",
-        "BadValue",                    "BloomFilterNeedsRows",        "BloomFilterUnsupportedColumn", "Unsigned64Operand",        "NullableNotSupported", "NestedNotSupported",
-        "NestedRowOutputNotSupported", "UnbalancedParentheses",       "FilterTooDeep",                "AggregateInGroupBy",       "HavingTypeMismatch",   "UnsupportedCase",
-        "UnsupportedType",             "DecimalScaleTooLarge",        "MissingOutputOrAggregate", "SelectAliasRequired", "ColumnsNotSupported", "ColumnsNoMatch", "ColumnsExcludeMissing", "WindowFloatAggregate", "WindowArgumentType",     "MultipleStatements",       "CteNotSupported",      "AggregateInWhere",
-        "WindowRangeKey", "WindowRangeCast",
-        "MissingFromClause",           "MissingTableName",            "UnsupportedFromClause",        "UnsupportedAggType",       "UnsupportedCoalesce",  "UnsupportedColumnType",
-        "UnlabelledColumn",            "INT96ReencodeNotSupported",   "NestedReencodeNotSupported",   "NestedFilterNotSupported", "ModuloNotSupported",   "ExpressionInPredicate",
-        "NestedColumnSelected",        "NestedAggregateNotSupported", "NestedGroupKeyNotSupported",   "UnsupportedDatePart",      "InvalidRegex",         "UnsupportedRegex",
-        "RegexTooBig",                 "TypedLiteralColumn",          "BadInterval",                  "IntervalNotSupported",     "TemporalOutOfRange",   "ConstantTooDeep",
-        "IlikePatternNotAscii",        "PostAggNotSupported",         "UpdateWithoutWhere",           "UnparseError",
-        "SetOperationAll",             "SetOperationByName",          "SetOperationOrder",            "SetOperationNesting",      "SetOperationColumns",  "SetOperationTypes",
-        "SetOperationNullability",
-        "GroupingSetsKey",             "GroupingSetsDistinct",        "GroupingSetsNesting",          "GroupingSetsGrouping",     "GroupingSetsTooMany",
+        "BadArgs",                     "NoInputs",              "NoMatches",                    "SqlNotCompiledIn",            "UnknownColumn",              "UnknownFunction",
+        "UnknownAggFunc",              "WrongArity",            "EmptyExpr",                    "EmptyAggregate",              "EmptyColumnList",            "UnexpectedChar",
+        "UnexpectedEnd",               "BadNumber",             "UnterminatedString",           "TypeMismatch",                "ExpectedLParen",             "ExpectedRParen",
+        "ExpectedIdentifier",          "ExpectedWhere",         "ExpectedAggFunc",              "StarOnlyValidInCount",        "TrailingTokens",             "BadAggArg",
+        "AggregateMutexWithSelect",    "DuplicateOutputColumn", "AmbiguousOutputColumn",        "AmbiguousColumn",             "ExpressionTooDeep",          "GroupKeyAliasRequired",
+        "SqlParseError",               "OrderByNotSupported",   "LimitNotSupported",            "DistinctNotSupported",        "HavingNotSupported",         "MixedSelectNotSupported",
+        "UnsupportedStatement",        "SubqueryNotSupported",  "WindowNotSupported",           "ColumnMustBeGrouped",         "BadOutputUrl",               "BadOperator",
+        "BadValue",                    "BloomFilterNeedsRows",  "BloomFilterUnsupportedColumn", "Unsigned64Operand",           "NullableNotSupported",       "NestedNotSupported",
+        "NestedRowOutputNotSupported", "UnbalancedParentheses", "FilterTooDeep",                "AggregateInGroupBy",          "HavingTypeMismatch",         "UnsupportedCase",
+        "UnsupportedType",             "DecimalScaleTooLarge",  "MissingOutputOrAggregate",     "SelectAliasRequired",         "ColumnsNotSupported",        "ColumnsNoMatch",
+        "ColumnsExcludeMissing",       "WindowFloatAggregate",  "WindowArgumentType",           "MultipleStatements",          "CteNotSupported",            "AggregateInWhere",
+        "WindowRangeKey",              "WindowRangeCast",       "MissingFromClause",            "MissingTableName",            "UnsupportedFromClause",      "UnsupportedAggType",
+        "UnsupportedCoalesce",         "UnsupportedColumnType", "UnlabelledColumn",             "INT96ReencodeNotSupported",   "NestedReencodeNotSupported", "NestedFilterNotSupported",
+        "ModuloNotSupported",          "ExpressionInPredicate", "NestedColumnSelected",         "NestedAggregateNotSupported", "NestedGroupKeyNotSupported", "UnsupportedDatePart",
+        "InvalidRegex",                "UnsupportedRegex",      "RegexTooBig",                  "TypedLiteralColumn",          "BadInterval",                "IntervalNotSupported",
+        "TemporalOutOfRange",          "ConstantTooDeep",       "IlikePatternNotAscii",         "PostAggNotSupported",         "UpdateWithoutWhere",         "UnparseError",
+        "SetOperationAll",             "SetOperationByName",    "SetOperationOrder",            "SetOperationNesting",         "SetOperationColumns",        "SetOperationTypes",
+        "SetOperationNullability",     "GroupingSetsKey",       "GroupingSetsDistinct",         "GroupingSetsNesting",         "GroupingSetsGrouping",       "GroupingSetsTooMany",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;
@@ -1262,7 +1265,10 @@ const ProfileOut = struct {
                 return error.BadArgs;
             },
         }
-        const pid: u32 = @bitCast(std.posix.system.getpid());
+        const pid: u32 = if (@import("builtin").os.tag == .windows)
+            std.os.windows.GetCurrentProcessId()
+        else
+            @bitCast(std.posix.system.getpid());
         const tmp = std.fmt.bufPrint(&self.tmp_buf, "{s}.{d}.zpq-tmp", .{ path, pid }) catch {
             diagnosticPrint("zpq query: cannot write profile {s}: NameTooLong\n", .{path});
             return error.BadArgs;
@@ -1322,7 +1328,7 @@ const ProfileOut = struct {
                     try aw.writer.writeByte('\n');
                 },
             }
-            var w: StdoutWriter = .{ .fd = 2 };
+            var w: StdoutWriter = .{ .fd = std.Io.File.stderr().handle };
             defer w.flush() catch {};
             if (machine_diagnostics and fmt == .json) {
                 try w.writeAll("{\"type\":\"profile\",");
@@ -1336,7 +1342,8 @@ const ProfileOut = struct {
 /// The command line as typed, arguments with spaces or quotes single-quoted, for the profile's metadata.
 fn commandLine(arena: std.mem.Allocator, args: std.process.Args) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    var it = std.process.Args.Iterator.init(args);
+    var it = try std.process.Args.Iterator.initAllocator(args, arena);
+    defer it.deinit();
     var first = true;
     while (it.next()) |a| {
         if (!first) try out.append(arena, ' ');
@@ -1533,7 +1540,7 @@ fn writeJsonString(w: *StdoutWriter, s: []const u8) !void {
 }
 
 const StdoutWriter = struct {
-    fd: local_fs.fd_t = 1,
+    fd: ?local_fs.fd_t = null,
     inner: ?engine.StdoutWriter = null,
 
     fn getInner(self: *StdoutWriter) *engine.StdoutWriter {

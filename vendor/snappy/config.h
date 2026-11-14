@@ -10,17 +10,31 @@
 #define HAVE_BUILTIN_CTZ 1
 #define HAVE_BUILTIN_EXPECT 1
 #define HAVE_BUILTIN_PREFETCH 1
+#ifdef _WIN32
+#define HAVE_FUNC_MMAP 0
+#define HAVE_FUNC_SYSCONF 0
+#else
 #define HAVE_FUNC_MMAP 1
 #define HAVE_FUNC_SYSCONF 1
+#endif
 #define HAVE_LIBLZO2 0
 #define HAVE_LIBZ 0
 #define HAVE_LIBLZ4 0
+#ifdef _WIN32
+#define HAVE_SYS_MMAN_H 0
+#define HAVE_SYS_RESOURCE_H 0
+#define HAVE_SYS_TIME_H 0
+#define HAVE_SYS_UIO_H 0
+#define HAVE_UNISTD_H 0
+#define HAVE_WINDOWS_H 1
+#else
 #define HAVE_SYS_MMAN_H 1
 #define HAVE_SYS_RESOURCE_H 1
 #define HAVE_SYS_TIME_H 1
 #define HAVE_SYS_UIO_H 1
 #define HAVE_UNISTD_H 1
 #define HAVE_WINDOWS_H 0
+#endif
 
 // Intrinsic-specific defines. Conditionally enabled based on target CPU features.
 #ifdef __SSSE3__

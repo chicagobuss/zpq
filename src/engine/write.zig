@@ -1097,7 +1097,7 @@ fn inputLocal(arena: std.mem.Allocator, opened: input.OpenedInputs) ![]const boo
 pub const Output = struct {
     path: []const u8,
     sink: streaming.Sink = undefined,
-    fd_sink: FdSink = .{ .fd = 0 },
+    fd_sink: FdSink = .{ .fd = undefined },
     mp_sink: ?multipart_sink.MultipartSink = null,
     owned_pool: ?*s3.Pool(POOL_SIZE) = null,
     owns_fd: bool = false,

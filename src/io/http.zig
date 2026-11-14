@@ -490,6 +490,7 @@ fn parseHeaders(arena: std.mem.Allocator, headers_bytes: []const u8) Error![]con
 // ============================================================
 
 const testing = std.testing;
+const test_posix = if (@import("builtin").os.tag == .windows) @import("win_test_socket.zig") else std.posix;
 
 test "parseStatus extracts 200" {
     try testing.expectEqual(@as(u16, 200), try parseStatus("HTTP/1.1 200 OK"));
@@ -561,34 +562,34 @@ test "buildRequestHead emits headers without copying body" {
 
 /// `drainResponse` over a peer that sends `bytes` and closes, with a body cap of `max_body`.
 fn drainSent(bytes: []const u8, max_body: usize) Error!void {
-    var fds: [2]std.posix.fd_t = undefined;
-    if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+    var fds: [2]test_posix.fd_t = undefined;
+    if (test_posix.errno(test_posix.system.socketpair(test_posix.AF.UNIX, test_posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
         return error.RecvFailed;
-    defer _ = std.posix.system.close(fds[1]);
+    defer _ = test_posix.system.close(fds[1]);
     var conn: tls.Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
     defer conn.deinit();
     // The peer writes from its own thread: a response larger than the socket buffer (8 KiB for AF_UNIX on macOS) would
     // otherwise block the write before anything reads it. A refused response stops the reader early, so the reader's
     // end is shut before the join: the writer's blocked send then fails (no SIGPIPE: MSG_NOSIGNAL, or SO_NOSIGPIPE).
-    if (@hasDecl(std.posix.SO, "NOSIGPIPE")) {
+    if (@hasDecl(test_posix.SO, "NOSIGPIPE")) {
         const one: c_int = 1;
-        _ = std.posix.system.setsockopt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
+        _ = test_posix.system.setsockopt(fds[1], test_posix.SOL.SOCKET, test_posix.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
     }
     const Writer = struct {
-        const flags: u32 = if (@hasDecl(std.posix.MSG, "NOSIGNAL")) std.posix.MSG.NOSIGNAL else 0;
-        fn run(fd: std.posix.fd_t, data: []const u8) void {
+        const flags: u32 = if (@hasDecl(test_posix.MSG, "NOSIGNAL")) test_posix.MSG.NOSIGNAL else 0;
+        fn run(fd: test_posix.fd_t, data: []const u8) void {
             var at: usize = 0;
             while (at < data.len) {
-                const n = std.posix.system.sendto(fd, data[at..].ptr, data.len - at, flags, null, 0);
+                const n = test_posix.system.sendto(fd, data[at..].ptr, data.len - at, flags, null, 0);
                 if (n <= 0) break;
                 at += @intCast(n);
             }
-            _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
+            _ = test_posix.system.shutdown(fd, test_posix.SHUT.WR);
         }
     };
     const writer = std.Thread.spawn(.{}, Writer.run, .{ fds[1], bytes }) catch return error.RecvFailed;
     defer {
-        _ = std.posix.system.shutdown(fds[0], std.posix.SHUT.RDWR);
+        _ = test_posix.system.shutdown(fds[0], test_posix.SHUT.RDWR);
         writer.join();
     }
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -603,21 +604,21 @@ test "a declared body is read into one buffer of its size, and returned in it" {
     defer testing.allocator.free(bytes);
     @memcpy(bytes[0..head.len], head);
     for (bytes[head.len..], 0..) |*b, i| b.* = @truncate(i);
-    var fds: [2]std.posix.fd_t = undefined;
-    const pair = std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds);
-    try testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(pair));
-    defer _ = std.posix.system.close(fds[1]);
+    var fds: [2]test_posix.fd_t = undefined;
+    const pair = test_posix.system.socketpair(test_posix.AF.UNIX, test_posix.SOCK.STREAM, 0, &fds);
+    try testing.expectEqual(test_posix.E.SUCCESS, test_posix.errno(pair));
+    defer _ = test_posix.system.close(fds[1]);
     var conn: tls.Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
     defer conn.deinit();
     const Writer = struct {
-        fn run(fd: std.posix.fd_t, data: []const u8) void {
+        fn run(fd: test_posix.fd_t, data: []const u8) void {
             var at: usize = 0;
             while (at < data.len) {
-                const n = std.posix.system.write(fd, data[at..].ptr, data.len - at);
+                const n = test_posix.system.write(fd, data[at..].ptr, data.len - at);
                 if (n <= 0) return;
                 at += @intCast(n);
             }
-            _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
+            _ = test_posix.system.shutdown(fd, test_posix.SHUT.WR);
         }
     };
     const writer = try std.Thread.spawn(.{}, Writer.run, .{ fds[1], bytes });
@@ -686,10 +687,10 @@ test "a request's body cap is its range plus slack, else the control-plane cap" 
 }
 
 test "a connection closed before any response byte is told apart from a truncated response" {
-    var fds: [2]std.posix.fd_t = undefined;
-    if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+    var fds: [2]test_posix.fd_t = undefined;
+    if (test_posix.errno(test_posix.system.socketpair(test_posix.AF.UNIX, test_posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
         return error.SkipZigTest;
-    defer _ = std.posix.system.close(fds[1]);
+    defer _ = test_posix.system.close(fds[1]);
     var conn: tls.Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
     defer conn.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -698,8 +699,8 @@ test "a connection closed before any response byte is told apart from a truncate
 
     // A response that starts and stops short is truncated...
     const partial = "HTTP/1.1 206 Partial Content\r\nContent-Length: 16\r\n\r\nabc";
-    _ = std.posix.system.write(fds[1], partial.ptr, partial.len);
-    _ = std.posix.system.shutdown(fds[1], std.posix.SHUT.WR);
+    _ = test_posix.system.write(fds[1], partial.ptr, partial.len);
+    _ = test_posix.system.shutdown(fds[1], test_posix.SHUT.WR);
     try testing.expectError(error.BodyTruncated, drainResponseInto(arena.allocator(), &conn, &target, null));
     // ...while EOF with nothing received is a connection the peer had already closed.
     try testing.expectError(error.ClosedBeforeResponse, drainResponseInto(arena.allocator(), &conn, &target, null));
@@ -708,7 +709,8 @@ test "a connection closed before any response byte is told apart from a truncate
 }
 
 test "only a closed or reset connection counts as closed before the response; local read errors propagate" {
-    const posix = std.posix;
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // This test uses a POSIX directory descriptor.
+    const posix = test_posix;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var target: [16]u8 = undefined;
@@ -752,17 +754,17 @@ test "only a closed or reset connection counts as closed before the response; lo
 }
 
 test "a HEAD response ends at its headers whatever Content-Length says" {
-    var fds: [2]std.posix.fd_t = undefined;
-    if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+    var fds: [2]test_posix.fd_t = undefined;
+    if (test_posix.errno(test_posix.system.socketpair(test_posix.AF.UNIX, test_posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
         return error.SkipZigTest;
-    defer _ = std.posix.system.close(fds[1]);
+    defer _ = test_posix.system.close(fds[1]);
     var conn: tls.Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
     defer conn.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     // The peer stays open: reading for the advertised body would block forever.
     const resp = "HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\nETag: \"abc-2\"\r\n\r\n";
-    _ = std.posix.system.write(fds[1], resp.ptr, resp.len);
+    _ = test_posix.system.write(fds[1], resp.ptr, resp.len);
     const r = try sendRequest(arena.allocator(), &conn, .{ .method = .HEAD, .host = "h", .path = "/k", .headers = &.{} });
     try testing.expectEqual(@as(u16, 200), r.status);
     try testing.expectEqualStrings("\"abc-2\"", r.header("etag").?);
@@ -770,10 +772,10 @@ test "a HEAD response ends at its headers whatever Content-Length says" {
 }
 
 test "regression: interim 1xx responses are passed over to the final one, which leaves nothing unread" {
-    var fds: [2]std.posix.fd_t = undefined;
-    if (std.posix.errno(std.posix.system.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
+    var fds: [2]test_posix.fd_t = undefined;
+    if (test_posix.errno(test_posix.system.socketpair(test_posix.AF.UNIX, test_posix.SOCK.STREAM, 0, &fds)) != .SUCCESS)
         return error.SkipZigTest;
-    defer _ = std.posix.system.close(fds[1]);
+    defer _ = test_posix.system.close(fds[1]);
     var conn: tls.Connection = .{ .fd = fds[0], .tls = undefined, .allocator = testing.allocator, .plain = true };
     defer conn.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -781,13 +783,13 @@ test "regression: interim 1xx responses are passed over to the final one, which 
     const interim = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </x>; rel=preload\r\n\r\n";
     const req: Request = .{ .method = .GET, .host = "h", .path = "/k", .headers = &.{} };
     const first = interim ++ "HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\n\r\nabc";
-    _ = std.posix.system.write(fds[1], first.ptr, first.len);
+    _ = test_posix.system.write(fds[1], first.ptr, first.len);
     const r = try sendRequest(arena.allocator(), &conn, req);
     try testing.expectEqual(@as(u16, 206), r.status);
     try testing.expectEqualStrings("abc", r.body);
     // The same over the into-a-buffer path; and the connection holds the next response, not this one's tail.
     const second = interim ++ "HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\n\r\nwxyz";
-    _ = std.posix.system.write(fds[1], second.ptr, second.len);
+    _ = test_posix.system.write(fds[1], second.ptr, second.len);
     var target: [4]u8 = undefined;
     const into = try sendRequestInto(arena.allocator(), &conn, req, &target, null);
     try testing.expectEqual(@as(u16, 206), into.status);

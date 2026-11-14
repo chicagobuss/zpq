@@ -52,7 +52,10 @@ pub const OutputPublication = struct {
             error.FileNotFound => {},
             else => return err,
         }
-        const pid: u32 = @bitCast(std.posix.system.getpid());
+        const pid: u32 = if (@import("builtin").os.tag == .windows)
+            std.os.windows.GetCurrentProcessId()
+        else
+            @bitCast(std.posix.system.getpid());
         const id = next_id.fetchAdd(1, .monotonic);
         const tmp = try std.fmt.bufPrint(&self.buffer, "{s}.{d}.{d}.zpq-tmp", .{ target, pid, id });
         // Retain the exclusive fd: reopening even this empty file with O_TRUNC makes ext4 flush at final close.
@@ -67,7 +70,7 @@ pub const OutputPublication = struct {
     pub fn commit(self: *OutputPublication, io: std.Io) !void {
         const target = self.target orelse return;
         try self.seal(io);
-        const parent = if (self.fsync) try local_fs.openParent(target) else null;
+        const parent = if (@import("builtin").os.tag != .windows and self.fsync) try local_fs.openParent(target) else null;
         defer if (parent) |fd| local_fs.close(fd);
         try local_fs.rename(self.path(), target);
         try self.published(parent);
@@ -82,7 +85,7 @@ pub const OutputPublication = struct {
     pub fn commitReplacing(self: *OutputPublication, io: std.Io, expected: local_fs.Stamp) !void {
         const target = self.target orelse return;
         try self.seal(io);
-        const parent = if (self.fsync) try local_fs.openParent(target) else null;
+        const parent = if (@import("builtin").os.tag != .windows and self.fsync) try local_fs.openParent(target) else null;
         defer if (parent) |fd| local_fs.close(fd);
         local_fs.exchange(self.path(), target) catch |err| switch (err) {
             error.NotFound => return error.InputChanged,

@@ -74,7 +74,7 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(a.cli);
     b.step("cli", "Build the CLI binary (zpq)").dependOn(&b.addInstallArtifact(a.cli, .{}).step);
-    b.installArtifact(a.lambda);
+    if (target.result.os.tag != .windows) b.installArtifact(a.lambda);
     b.step("lambda", "Build the Lambda binary (zpq-lambda)").dependOn(&b.addInstallArtifact(a.lambda, .{}).step);
 
     // A shared library carrying everything it links, and a static archive of zpq's own objects (a static link adds
@@ -117,7 +117,9 @@ pub fn build(b: *std.Build) void {
     // The unit-test executables without running them, to copy to and run on another host. Run them from the repo
     // root (or a bundle mirroring it): fixtures are cwd-relative.
     const test_bin_step = b.step("test-bin", "Install all unit-test executables without running them");
-    for (a.unit_tests) |t| test_bin_step.dependOn(&b.addInstallArtifact(t.exe, .{ .dest_sub_path = t.bin }).step);
+    if (target.result.os.tag != .windows) {
+        for (a.unit_tests) |t| test_bin_step.dependOn(&b.addInstallArtifact(t.exe, .{ .dest_sub_path = t.bin }).step);
+    }
     test_bin_step.dependOn(&b.addInstallArtifact(a.core_tests, .{ .dest_sub_path = "zpq-core-test" }).step);
     // Spawns the built zpq-lambda against an in-process fake runtime API.
     b.step("test-integration", "Run Lambda integration tests").dependOn(&b.addRunArtifact(a.integration_tests).step);
@@ -289,7 +291,7 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
 
     // The core unit tests linked against BoringSSL built from source: the pinned prebuilt archives repeat members,
     // which lld tolerates and the self-hosted linker that incremental builds use does not.
-    const dev_core = addCoreModule(b, libzpq_deps, target, optimize, .{ .sql = true });
+    const dev_core = if (target.result.os.tag == .windows) test_core else addCoreModule(b, libzpq_deps, target, optimize, .{ .sql = true });
 
     // Lambda integration: the built zpq-lambda against an in-process fake runtime API, and the CLI for the S3 paths
     // a Lambda child can't show (in Debug its allocator reports leaks as it exits).
@@ -756,6 +758,7 @@ fn addCoreModule(
         b.addModule(name, module_options)
     else
         b.createModule(module_options);
+    if (target.result.os.tag == .windows) zpq_mod.linkSystemLibrary("ws2_32", .{});
     zpq_mod.linkLibrary(deps.zstd);
     zpq_mod.linkLibrary(deps.libdeflate);
     zpq_mod.linkLibrary(deps.lz4);

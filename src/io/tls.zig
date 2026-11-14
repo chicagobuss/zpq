@@ -18,11 +18,124 @@
 //! its connection open would otherwise block a read forever (and with it the whole query).
 
 const std = @import("std");
+const winEnvValue = @import("../core/system.zig").winEnvValue;
 const builtin = @import("builtin");
 const test_skip = @import("../test_skip.zig");
 const posix = std.posix;
 const boring = @import("boring_tls");
 const clock = @import("../clock.zig");
+
+const socket_t = if (builtin.os.tag == .windows) usize else posix.fd_t;
+const WinSocket = struct {
+    const ws = std.os.windows.ws2_32;
+    const PollFd = extern struct { fd: usize, events: i16, revents: i16 = 0 };
+    extern "ws2_32" fn WSAStartup(u16, *anyopaque) callconv(.winapi) c_int;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+    extern "ws2_32" fn socket(c_int, c_int, c_int) callconv(.winapi) usize;
+    extern "ws2_32" fn closesocket(usize) callconv(.winapi) c_int;
+    extern "ws2_32" fn ioctlsocket(usize, u32, *u32) callconv(.winapi) c_int;
+    extern "ws2_32" fn connect(usize, *const ws.sockaddr.in, c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn getsockopt(usize, c_int, c_int, *anyopaque, *c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn setsockopt(usize, c_int, c_int, *const anyopaque, c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn WSAPoll(*PollFd, u32, c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn send(usize, [*]const u8, c_int, c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn recv(usize, [*]u8, c_int, c_int) callconv(.winapi) c_int;
+    // WSAStartup is process-wide and runs once before any resolver or socket use.
+    var state: std.atomic.Value(u8) = .init(0);
+    fn startup() bool {
+        if (state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
+            var data: [512]u8 align(8) = undefined;
+            const ok = WSAStartup(0x202, &data) == 0;
+            state.store(if (ok) 2 else 3, .release);
+            return ok;
+        }
+        while (state.load(.acquire) == 1) std.atomic.spinLoopHint();
+        return state.load(.acquire) == 2;
+    }
+    fn poll(fd: usize, events: i16, ms: u32) c_int {
+        var p: PollFd = .{ .fd = fd, .events = events };
+        return WSAPoll(&p, 1, @intCast(@min(ms, std.math.maxInt(i32))));
+    }
+    fn open(ip: Ipv4, port: u16, timeout_ms: u32, clock_ms: ?*const fn () u64, deadline_ms: ?u64) Error!usize {
+        if (!startup()) return error.SocketFailed;
+        const fd = socket(2, 1, 6);
+        if (fd == std.math.maxInt(usize)) return error.SocketFailed;
+        errdefer _ = closesocket(fd);
+        var mode: u32 = 1;
+        if (ioctlsocket(fd, 0x8004667e, &mode) != 0) return error.SocketFailed;
+        const addr: ws.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(ip) };
+        if (connect(fd, &addr, @sizeOf(@TypeOf(addr))) != 0) {
+            const e = WSAGetLastError();
+            if (e != 10035 and e != 10036) return error.ConnectFailed;
+            const end = deadline_ms orelse nowMs(clock_ms) + timeout_ms;
+            const real_start = monoMs();
+            while (true) {
+                const left = msLeft(end, clock_ms) orelse return error.ConnectTimeout;
+                if (clock_ms != null and monoMs() - real_start > 120_000) return error.ConnectTimeout;
+                const rc = poll(fd, 0x10, if (clock_ms == null) left else @min(left, 20));
+                if (rc < 0) return error.ConnectFailed;
+                if (rc > 0) break;
+            }
+            var so_err: c_int = 0;
+            var len: c_int = @sizeOf(c_int);
+            if (getsockopt(fd, 0xffff, 0x1007, &so_err, &len) != 0 or so_err != 0) return error.ConnectFailed;
+        }
+        mode = 0;
+        if (ioctlsocket(fd, 0x8004667e, &mode) != 0) return error.SocketFailed;
+        return fd;
+    }
+    fn timeout(fd: usize, opt: c_int, ms: u32) bool {
+        return setsockopt(fd, 0xffff, opt, &ms, @sizeOf(u32)) == 0;
+    }
+    fn write(fd: usize, buf: []const u8, idle_ms: u32, stage: ?u64, opts: *SockTimeouts) WriteError!void {
+        var end = nowMs(opts.clock_ms) + idle_ms;
+        if (stage) |d| end = @min(end, d);
+        const real_start = monoMs();
+        var off: usize = 0;
+        while (off < buf.len) {
+            const left = msLeft(end, opts.clock_ms) orelse return error.WouldBlock;
+            if (opts.clock_ms != null and monoMs() - real_start > 120_000) return error.Backstop;
+            const wait = if (opts.clock_ms == null) left else @min(left, 20);
+            if (!timeout(fd, 0x1005, wait)) return error.SendFailed;
+            const ready = poll(fd, 0x10, wait);
+            if (ready < 0) return error.SendFailed;
+            if (ready == 0) continue;
+            const n = send(fd, buf[off..].ptr, @intCast(@min(buf.len - off, std.math.maxInt(i32))), 0);
+            if (n < 0) {
+                const e = WSAGetLastError();
+                if (e == 10035 or e == 10060) continue;
+                return error.SendFailed;
+            }
+            if (n == 0) return error.SendFailed;
+            off += @intCast(n);
+            end = nowMs(opts.clock_ms) + idle_ms;
+            if (stage) |d| end = @min(end, d);
+        }
+    }
+    fn read(fd: usize, buf: []u8, end: u64, opts: *SockTimeouts) ReadError!usize {
+        const real_start = monoMs();
+        while (true) {
+            const left = msLeft(end, opts.clock_ms) orelse return error.WouldBlock;
+            if (opts.clock_ms != null and monoMs() - real_start > 120_000) return error.Backstop;
+            const wait = if (opts.clock_ms == null) left else @min(left, 20);
+            if (!timeout(fd, 0x1006, wait)) return error.ReadFailed;
+            const ready = poll(fd, 0x100, wait);
+            if (ready < 0) return error.ReadFailed;
+            if (ready == 0) continue;
+            const n = recv(fd, buf.ptr, @intCast(@min(buf.len, std.math.maxInt(i32))), 0);
+            if (n >= 0) return @intCast(n);
+            const e = WSAGetLastError();
+            if (e == 10035 or e == 10060) continue;
+            if (e == 10053 or e == 10054) return error.ConnectionReset;
+            return error.ReadFailed;
+        }
+    }
+};
+
+pub fn ensureWindowsSockets() bool {
+    if (builtin.os.tag == .windows) return WinSocket.startup();
+    return true;
+}
 
 pub const Error = error{
     DnsFailed,
@@ -99,13 +212,13 @@ pub const Timeouts = struct {
             .{ "request_ms", "ZPQ_S3_REQUEST_TIMEOUT_MS" },
             .{ "complete_ms", "ZPQ_S3_COMPLETE_TIMEOUT_MS" },
         }) |f| {
-            if (env.getPosix(f[1])) |v| {
+            if (winEnvValue(env, f[1])) |v| {
                 const n = std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10) catch 0;
                 if (n > 0) @field(t, f[0]) = n;
             }
         }
         // KiB a second; 0 is a value here, not unset.
-        if (env.getPosix("ZPQ_S3_MIN_RATE_KIBS")) |v| {
+        if (winEnvValue(env, "ZPQ_S3_MIN_RATE_KIBS")) |v| {
             if (std.fmt.parseInt(u32, std.mem.trim(u8, v, " "), 10)) |kib| t.min_rate = kib *| 1024 else |_| {}
         }
         return t;
@@ -154,12 +267,14 @@ const LazyContext = struct {
     ready: std.atomic.Value(bool) = .init(false),
     /// Blocking, not a spin: threads racing on a cold start sleep through the first one's build instead of burning
     /// CPU in yield loops. libc is linked anyway (getaddrinfo).
-    lock: std.c.pthread_mutex_t = .{},
+    lock: if (builtin.os.tag == .windows) std.os.windows.SRWLOCK else std.c.pthread_mutex_t = .{},
 
     fn get(self: *LazyContext) Error!*const ClientContext {
         if (self.ready.load(.acquire)) return &self.context;
-        _ = std.c.pthread_mutex_lock(&self.lock);
-        defer _ = std.c.pthread_mutex_unlock(&self.lock);
+        if (builtin.os.tag == .windows) std.os.windows.ntdll.RtlAcquireSRWLockExclusive(&self.lock) else _ = std.c.pthread_mutex_lock(&self.lock);
+        defer if (builtin.os.tag == .windows) std.os.windows.ntdll.RtlReleaseSRWLockExclusive(&self.lock) else {
+            _ = std.c.pthread_mutex_unlock(&self.lock);
+        };
         if (!self.ready.load(.monotonic)) {
             self.context = ClientContext.init(self.options) catch return error.HandshakeFailed;
             self.ready.store(true, .release);
@@ -200,7 +315,7 @@ fn isAwsEndpoint(name: []const u8) bool {
 }
 
 pub const Connection = struct {
-    fd: posix.fd_t,
+    fd: socket_t,
     tls: boring.tls_client.TlsClient,
     allocator: std.mem.Allocator,
     plain: bool = false,
@@ -305,7 +420,7 @@ pub const Connection = struct {
     ///   2. write them to the socket
     ///   3. read from the socket, feed back into TLS
     /// Stop when the client reports handshake complete.
-    fn handshake(fd: posix.fd_t, tls: *boring.tls_client.TlsClient, budget_ms: u32, opts: *SockTimeouts) Error!void {
+    fn handshake(fd: socket_t, tls: *boring.tls_client.TlsClient, budget_ms: u32, opts: *SockTimeouts) Error!void {
         // One deadline for the whole stage: every read and write gets only what is left of it.
         const deadline = monoMs() + budget_ms;
         const initial = tls.startHandshake() catch |err| return handshakeError(err);
@@ -498,7 +613,7 @@ fn handshakeError(err: anyerror) Error {
 // Raw socket helpers
 // ============================================================
 
-fn openTcpAny(peer: Peer) Error!posix.fd_t {
+fn openTcpAny(peer: Peer) Error!socket_t {
     if (peer.addrs.len == 0) return error.DnsFailed;
     var last: Error = error.ConnectFailed;
     for (0..peer.addrs.len) |k| {
@@ -522,7 +637,7 @@ const send_flags: u32 = if (@hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL 
 /// such flag. A peer that reset the connection is `SendFailed`, whatever SIGPIPE disposition the process has: a
 /// libzpq host keeps its own, and one context closing (`std.Io.Threaded` restores the disposition it saved) cannot
 /// leave another's writes to kill the host.
-fn sendNoSignal(fd: posix.fd_t, buf: []const u8) @TypeOf(posix.system.sendto(fd, buf.ptr, buf.len, 0, null, 0)) {
+fn sendNoSignal(fd: socket_t, buf: []const u8) @TypeOf(posix.system.sendto(fd, buf.ptr, buf.len, 0, null, 0)) {
     return posix.system.sendto(fd, buf.ptr, buf.len, send_flags, null, 0);
 }
 
@@ -530,12 +645,13 @@ fn sendNoSignal(fd: posix.fd_t, buf: []const u8) @TypeOf(posix.system.sendto(fd,
 /// established within `timeout_ms`. The connect itself runs non-blocking under `poll`, which bounds it the same way
 /// on Linux and Darwin (Darwin's connect ignores SO_SNDTIMEO). `clock_ms`, when set, is the deadline clock: the
 /// wait polls briefly and gives up when that clock passes, and a wall-clock backstop is a different failure.
-fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32, clock_ms: ?*const fn () u64, deadline_ms: ?u64) Error!posix.fd_t {
+fn openTcp(ip: Ipv4, port: u16, timeout_ms: u32, clock_ms: ?*const fn () u64, deadline_ms: ?u64) Error!socket_t {
+    if (builtin.os.tag == .windows) return WinSocket.open(ip, port, timeout_ms, clock_ms, deadline_ms);
     // Darwin has no SOCK_CLOEXEC; set FD_CLOEXEC right after instead.
     const cloexec_flag = if (builtin.target.os.tag == .linux) posix.SOCK.CLOEXEC else 0;
     const r = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM | cloexec_flag, posix.IPPROTO.TCP);
     if (posix.errno(r) != .SUCCESS) return error.SocketFailed;
-    const fd: posix.fd_t = @intCast(r);
+    const fd: socket_t = @intCast(r);
     errdefer closeFd(fd);
     if (builtin.target.os.tag != .linux) _ = posix.system.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
     // Darwin has no MSG_NOSIGNAL: the socket itself is told not to raise SIGPIPE (see `sendNoSignal`).
@@ -625,8 +741,7 @@ const test_clock = struct {
 
 fn waitTestClock() void {
     while (test_clock.held.cmpxchgWeak(false, true, .acq_rel, .acquire) != null) {
-        var ts: posix.timespec = .{ .sec = 0, .nsec = 1_000_000 };
-        _ = posix.system.nanosleep(&ts, &ts);
+        clock.sleepNs(std.time.ns_per_ms);
     }
 }
 
@@ -705,7 +820,7 @@ fn noteDeadline(cause: DeadlineCause, real_start: u64, wait: DeadlineWait) void 
 
 /// Set SO_RCVTIMEO or SO_SNDTIMEO to `ms` unless it already holds it. A blocking read or write that waits that long
 /// without moving a byte then fails with EAGAIN.
-fn armSockTimeout(fd: posix.fd_t, opt: u32, ms: u32, current: *u32) bool {
+fn armSockTimeout(fd: socket_t, opt: u32, ms: u32, current: *u32) bool {
     if (current.* == ms) return true;
     const tv: posix.timeval = .{ .sec = @intCast(ms / 1000), .usec = @intCast(@as(u32, ms % 1000) * 1000) };
     const r = posix.system.setsockopt(fd, posix.SOL.SOCKET, opt, @ptrCast(&tv), @sizeOf(posix.timeval));
@@ -744,7 +859,11 @@ fn nowMs(clock_ms: ?*const fn () u64) u64 {
     return monoMs();
 }
 
-fn closeFd(fd: posix.fd_t) void {
+fn closeFd(fd: socket_t) void {
+    if (builtin.os.tag == .windows) {
+        _ = WinSocket.closesocket(fd);
+        return;
+    }
     _ = posix.system.close(fd);
 }
 
@@ -754,7 +873,8 @@ const ReadError = error{ ReadFailed, ConnectionReset, WouldBlock, Backstop };
 /// Write all of `buf`. `error.WouldBlock`: `idle_ms` passed with no byte taken, or `stage` (an absolute deadline,
 /// for the handshake) passed. Every byte taken restarts the idle wait; a signal interrupting a wait does not, since
 /// the socket timeout is set to the time left before each write.
-fn writeAllBy(fd: posix.fd_t, buf: []const u8, idle_ms: u32, stage: ?u64, opts: *SockTimeouts) WriteError!void {
+fn writeAllBy(fd: socket_t, buf: []const u8, idle_ms: u32, stage: ?u64, opts: *SockTimeouts) WriteError!void {
+    if (builtin.os.tag == .windows) return WinSocket.write(fd, buf, idle_ms, stage, opts);
     const clock_ms = opts.clock_ms;
     var deadline = nowMs(clock_ms) + idle_ms;
     if (stage) |d| deadline = @min(deadline, d);
@@ -835,7 +955,7 @@ fn sendError(err: WriteError) Error {
 /// why: it is asked without waiting, and a reset is `error.ConnectionReset` (an idle pooled connection S3 dropped is
 /// closed before the response, not a failed read), the end of the stream 0. Elsewhere, and for anything else, the
 /// refusal is a local failure.
-fn readShut(fd: posix.fd_t, buf: []u8) ReadError!usize {
+fn readShut(fd: socket_t, buf: []u8) ReadError!usize {
     if (comptime !builtin.target.os.tag.isDarwin()) return error.ReadFailed;
     const r = posix.system.recvfrom(fd, buf.ptr, buf.len, posix.MSG.DONTWAIT, null, null);
     return switch (posix.errno(r)) {
@@ -847,7 +967,8 @@ fn readShut(fd: posix.fd_t, buf: []u8) ReadError!usize {
 
 /// One read, by `deadline` (absolute, `monoMs`). `error.WouldBlock`: the deadline passed without a byte arriving.
 /// A signal interrupting the wait does not extend it: the socket timeout is set to the time left before each try.
-fn readBy(fd: posix.fd_t, buf: []u8, deadline: u64, opts: *SockTimeouts) ReadError!usize {
+fn readBy(fd: socket_t, buf: []u8, deadline: u64, opts: *SockTimeouts) ReadError!usize {
+    if (builtin.os.tag == .windows) return WinSocket.read(fd, buf, deadline, opts);
     if (opts.clock_ms) |clock_ms| {
         if (!armSockTimeout(fd, posix.SO.RCVTIMEO, 20, &opts.rcv_ms)) return readShut(fd, buf);
         const real_start = monoMs();
@@ -1244,18 +1365,19 @@ test "a TLS response that never starts fails with FirstByteTimeout, and a reques
 }
 
 test "a connect the listener never completes fails within its timeout" {
+    const test_posix = if (builtin.os.tag == .windows) @import("win_test_socket.zig") else std.posix;
     // A listener that never accepts, with the shortest backlog: once its queue is full the kernel drops further SYNs,
     // so a connect waits on retransmissions with no answer, as an unreachable front end looks. macOS queues every
     // connection to it, but drops a SYN to a socket that is bound and not listening: there that is the front end.
-    const lfd_r = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
-    if (posix.errno(lfd_r) != .SUCCESS) return error.SkipZigTest;
-    const lfd: posix.fd_t = @intCast(lfd_r);
+    const lfd_r = test_posix.system.socket(test_posix.AF.INET, test_posix.SOCK.STREAM, test_posix.IPPROTO.TCP);
+    if (test_posix.errno(lfd_r) != .SUCCESS) return error.SkipZigTest;
+    const lfd: socket_t = @intCast(lfd_r);
     defer closeFd(lfd);
-    var addr: posix.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
-    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-    if (posix.errno(posix.system.bind(lfd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
-    if (!builtin.target.os.tag.isDarwin() and posix.errno(posix.system.listen(lfd, 0)) != .SUCCESS) return error.SkipZigTest;
-    if (posix.errno(posix.system.getsockname(lfd, @ptrCast(&addr), &len)) != .SUCCESS) return error.SkipZigTest;
+    var addr: test_posix.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+    var len: test_posix.socklen_t = @sizeOf(test_posix.sockaddr.in);
+    if (test_posix.errno(test_posix.system.bind(lfd, @ptrCast(&addr), len)) != .SUCCESS) return error.SkipZigTest;
+    if (!builtin.target.os.tag.isDarwin() and test_posix.errno(test_posix.system.listen(lfd, 0)) != .SUCCESS) return error.SkipZigTest;
+    if (test_posix.errno(test_posix.system.getsockname(lfd, @ptrCast(&addr), &len)) != .SUCCESS) return error.SkipZigTest;
 
     var peer: Peer = .loopback(std.mem.bigToNative(u16, addr.port));
     peer.timeouts = short;

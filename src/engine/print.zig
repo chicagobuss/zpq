@@ -215,7 +215,7 @@ test "Arrow columnar handoff applies the same row cut as text output" {
 }
 
 pub const StdoutWriter = struct {
-    fd: local_fs.fd_t = 1,
+    fd: ?local_fs.fd_t = null,
     sink: ?*std.Io.Writer = null,
     buf: [4096]u8 = undefined,
     pos: usize = 0,
@@ -235,7 +235,7 @@ pub const StdoutWriter = struct {
         // is one write, not one per buffer's worth.
         if (bytes.len >= self.buf.len) {
             try self.flush();
-            if (self.sink) |sink| try sink.writeAll(bytes) else try local_fs.writeAll(self.fd, bytes);
+            if (self.sink) |sink| try sink.writeAll(bytes) else try local_fs.writeAll(self.fd orelse std.Io.File.stdout().handle, bytes);
             self.bytes_written += bytes.len;
             return;
         }
@@ -262,7 +262,7 @@ pub const StdoutWriter = struct {
         if (self.pos == 0) return;
         const pending = self.buf[0..self.pos];
         self.pos = 0;
-        if (self.sink) |sink| try sink.writeAll(pending) else try local_fs.writeAll(self.fd, pending);
+        if (self.sink) |sink| try sink.writeAll(pending) else try local_fs.writeAll(self.fd orelse std.Io.File.stdout().handle, pending);
         self.bytes_written += pending.len;
     }
 };

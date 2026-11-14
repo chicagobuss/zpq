@@ -1,12 +1,12 @@
 // Generated for ZPQ vendor/snappy from snappy-stubs-public.h.in.
-// We assume Linux with <sys/uio.h> available; SNAPPY_HAVE_SYS_UIO_H = 1.
+// Windows has no POSIX iovec declaration.
 
 #ifndef THIRD_PARTY_SNAPPY_OPENSOURCE_SNAPPY_STUBS_PUBLIC_H_
 #define THIRD_PARTY_SNAPPY_OPENSOURCE_SNAPPY_STUBS_PUBLIC_H_
 
 #include <cstddef>
 
-#if 1
+#ifndef _WIN32
 #include <sys/uio.h>
 #endif
 
@@ -18,7 +18,7 @@
 
 namespace snappy {
 
-#if !1
+#ifdef _WIN32
 struct iovec {
   void* iov_base;
   size_t iov_len;

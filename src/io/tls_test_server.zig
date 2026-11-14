@@ -5,7 +5,8 @@
 //! Test-only: imported from tests, never from the engine.
 
 const std = @import("std");
-const posix = std.posix;
+const posix = if (@import("builtin").os.tag == .windows) @import("win_test_socket.zig") else std.posix;
+const invalid_socket: posix.fd_t = if (@import("builtin").os.tag == .windows) std.math.maxInt(usize) else -1;
 const c = @import("boring_tls").tls.c;
 
 pub const Error = error{TestPki};
@@ -215,9 +216,9 @@ pub const Server = struct {
 
 const State = struct {
     ctx: *c.SSL_CTX = undefined,
-    listen_fd: posix.fd_t = -1,
+    listen_fd: posix.fd_t = invalid_socket,
     /// `finish` writes to `stop[0]`; the server thread polls `stop[1]`, and writes to it once it has stopped.
-    stop: [2]posix.fd_t = .{ -1, -1 },
+    stop: [2]posix.fd_t = .{ invalid_socket, invalid_socket },
     accepts: usize,
     /// `respond.response` is a copy the state owns.
     behavior: Behavior,
@@ -312,7 +313,8 @@ const State = struct {
         }
         const ssl = c.SSL_new(st.ctx) orelse return;
         defer c.SSL_free(ssl);
-        if (c.SSL_set_fd(ssl, fd) != 1) return;
+        const ssl_fd: c_int = std.math.cast(c_int, fd) orelse return;
+        if (c.SSL_set_fd(ssl, ssl_fd) != 1) return;
         const ok = c.SSL_accept(ssl) == 1;
         if (c.SSL_get_servername(ssl, c.TLSEXT_NAMETYPE_host_name)) |name| {
             const s = std.mem.span(name);

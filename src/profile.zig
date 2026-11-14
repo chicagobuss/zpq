@@ -13,6 +13,7 @@
 //! buffer and its spans nest by construction.
 
 const std = @import("std");
+const winEnvValue = @import("core/system.zig").winEnvValue;
 const builtin = @import("builtin");
 const test_skip = @import("test_skip.zig");
 const build_options = @import("build_options");
@@ -471,7 +472,7 @@ pub const Meta = struct {
 
     pub fn discover(env: ?std.process.Environ) Meta {
         const mb: ?usize = if (env) |e|
-            (if (e.getPosix("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")) |s| std.fmt.parseInt(usize, s, 10) catch null else null)
+            (if (winEnvValue(e, "AWS_LAMBDA_FUNCTION_MEMORY_SIZE")) |s| std.fmt.parseInt(usize, s, 10) catch null else null)
         else
             null;
         return .{
@@ -782,14 +783,17 @@ pub const Profiler = struct {
         const t = self.thread(.sampler) orelse return;
         while (self.stop.load(.acquire) == 0) {
             const interval: u64 = self.options.sample_interval_ns << @min(t.decimations, 20);
-            const ts: std.posix.timespec = .{
-                .sec = @intCast(interval / std.time.ns_per_s),
-                .nsec = @intCast(interval % std.time.ns_per_s),
-            };
             if (builtin.target.os.tag == .linux) {
+                const ts: std.posix.timespec = .{
+                    .sec = @intCast(interval / std.time.ns_per_s),
+                    .nsec = @intCast(interval % std.time.ns_per_s),
+                };
                 // Returns early on the wake from `finish` (or spuriously); either way the loop re-checks.
                 _ = std.os.linux.futex_4arg(&self.stop.raw, .{ .cmd = .WAIT, .private = true }, 0, &ts);
+            } else if (builtin.target.os.tag == .windows) {
+                clock.sleepNs(interval);
             } else {
+                const ts: std.posix.timespec = .{ .sec = @intCast(interval / std.time.ns_per_s), .nsec = @intCast(interval % std.time.ns_per_s) };
                 _ = std.posix.system.nanosleep(&ts, null);
             }
             if (self.stop.load(.acquire) != 0) break;

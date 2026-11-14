@@ -1317,6 +1317,7 @@ pub fn planLocalReader(
     cfg: local_reader.Config,
     out: *?*local_reader.Reader,
 ) ![]const scan.Input {
+    if (@import("builtin").os.tag == .windows) return opened.inputs;
     const rd = try local_reader.Reader.create(ctx.gpa, cfg);
     out.* = rd;
     const inputs = try arena.dupe(scan.Input, opened.inputs);
@@ -1376,7 +1377,8 @@ pub const DictProbeSink = struct {
             c.* = if (!allResident(ptr, hi - lo)) .cold else if (seen + 1 == checks) .warm else next;
         }
         // Advice only: a refusal leaves the pages to fault in as they would have.
-        if (c.* == .cold) _ = std.posix.system.madvise(ptr, @intCast(hi - lo), std.posix.MADV.WILLNEED);
+        if (@import("builtin").os.tag != .windows and c.* == .cold)
+            _ = std.posix.system.madvise(ptr, @intCast(hi - lo), std.posix.MADV.WILLNEED);
     }
 
     /// Whether the range's first pages (up to 64) are all in the page cache; false where it cannot tell (off Linux).

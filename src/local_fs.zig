@@ -12,12 +12,74 @@ const posix = std.posix;
 
 pub const fd_t = posix.fd_t;
 
+const win = struct {
+    const w = std.os.windows;
+    const Info = extern struct {
+        attributes: u32,
+        creation: w.FILETIME,
+        access: w.FILETIME,
+        modified: w.FILETIME,
+        volume: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    };
+    extern "kernel32" fn CreateFileW([*:0]const u16, u32, u32, ?*anyopaque, u32, u32, ?w.HANDLE) callconv(.winapi) w.HANDLE;
+    extern "kernel32" fn GetFileInformationByHandle(w.HANDLE, *Info) callconv(.winapi) w.BOOL;
+    extern "kernel32" fn ReadFile(w.HANDLE, [*]u8, u32, *u32, ?*anyopaque) callconv(.winapi) w.BOOL;
+    extern "kernel32" fn WriteFile(w.HANDLE, [*]const u8, u32, *u32, ?*anyopaque) callconv(.winapi) w.BOOL;
+    extern "kernel32" fn FlushFileBuffers(w.HANDLE) callconv(.winapi) w.BOOL;
+    extern "kernel32" fn MoveFileExW([*:0]const u16, [*:0]const u16, u32) callconv(.winapi) w.BOOL;
+    extern "kernel32" fn DeleteFileW([*:0]const u16) callconv(.winapi) w.BOOL;
+    extern "kernel32" fn CreateFileMappingW(w.HANDLE, ?*anyopaque, u32, u32, u32, ?[*:0]const u16) callconv(.winapi) ?w.HANDLE;
+    extern "kernel32" fn MapViewOfFile(w.HANDLE, u32, u32, u32, usize) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn UnmapViewOfFile(*const anyopaque) callconv(.winapi) w.BOOL;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+
+    fn path(s: []const u8) ![:0]u16 {
+        if (s.len >= std.fs.max_path_bytes) return error.NameTooLong;
+        if (std.mem.indexOfScalar(u8, s, 0) != null) return error.InvalidPath;
+        return std.unicode.wtf8ToWtf16LeAllocZ(std.heap.page_allocator, s);
+    }
+    fn open(s: []const u8, access: u32, disposition: u32) !fd_t {
+        const wide = try path(s);
+        defer std.heap.page_allocator.free(wide);
+        const fd = CreateFileW(wide.ptr, access, 7, null, disposition, 0x80, null);
+        if (fd != w.INVALID_HANDLE_VALUE) return fd;
+        return switch (GetLastError()) {
+            2, 3 => error.FileNotFound,
+            80, 183 => error.PathAlreadyExists,
+            else => error.OpenFailed,
+        };
+    }
+    fn info(fd: fd_t) !Info {
+        var result: Info = undefined;
+        if (!GetFileInformationByHandle(fd, &result).toBool()) return error.StatFailed;
+        return result;
+    }
+    fn stamp(fd: fd_t) !Stamp {
+        const st = try info(fd);
+        const ticks = (@as(u64, st.modified.dwHighDateTime) << 32) | st.modified.dwLowDateTime;
+        return .{ .dev = st.volume, .ino = (@as(u64, st.index_high) << 32) | st.index_low, .size = (@as(u64, st.size_high) << 32) | st.size_low, .mtime_sec = @intCast(ticks / 10_000_000), .mtime_nsec = @intCast((ticks % 10_000_000) * 100) };
+    }
+};
+
 pub fn close(fd: fd_t) void {
+    if (builtin.os.tag == .windows) return std.os.windows.CloseHandle(fd);
     _ = posix.system.close(fd);
 }
 
 /// A successful output must surface delayed write failures; never retry close on a reused descriptor.
 pub fn closeChecked(fd: fd_t) !void {
+    if (builtin.os.tag == .windows) {
+        switch (std.os.windows.ntdll.NtClose(fd)) {
+            .SUCCESS => return,
+            .DISK_FULL, .QUOTA_EXCEEDED => return error.NoSpaceLeft,
+            else => return error.CloseFailed,
+        }
+    }
     switch (posix.errno(posix.system.close(fd))) {
         .SUCCESS => {},
         .NOSPC, .DQUOT => return error.NoSpaceLeft,
@@ -27,10 +89,15 @@ pub fn closeChecked(fd: fd_t) !void {
 
 /// Flush data and the metadata needed to read it before publication; Darwin also flushes the drive cache.
 pub fn syncData(fd: fd_t) !void {
+    if (builtin.os.tag == .windows) {
+        if (!win.FlushFileBuffers(fd).toBool()) return error.SyncFailed;
+        return;
+    }
     return syncFd(fd, true);
 }
 
 pub fn syncDirectory(fd: fd_t) !void {
+    if (builtin.os.tag == .windows) return error.Unsupported;
     return syncFd(fd, false);
 }
 
@@ -132,11 +199,21 @@ pub fn startWriteback(fd: fd_t, offset: u64, len: u64) !void {
 }
 
 pub fn openRead(path: []const u8) !fd_t {
+    if (builtin.os.tag == .windows) return win.open(path, 0x80000000, 3);
     return posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
 }
 
 /// Inodes are only unique within a device; follow aliases so hard links are also rejected.
 pub fn sameFile(a: []const u8, b: []const u8) !bool {
+    if (builtin.os.tag == .windows) {
+        const af = try openRead(a);
+        defer close(af);
+        const bf = try openRead(b);
+        defer close(bf);
+        const x = try win.stamp(af);
+        const y = try win.stamp(bf);
+        return x.dev == y.dev and x.ino == y.ino;
+    }
     const az = try posix.toPosixPath(a);
     const bz = try posix.toPosixPath(b);
     if (builtin.target.os.tag == .linux) {
@@ -172,16 +249,26 @@ pub fn deviceOf(fd: ?fd_t, path: []const u8) ?u64 {
 
 /// Create or truncate `path` for writing, mode 0644.
 pub fn createFile(path: []const u8) !fd_t {
+    if (builtin.os.tag == .windows) return win.open(path, 0x40000000, 2);
     return posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o644);
 }
 
 /// Create `path` for writing, mode 0644, failing with `error.PathAlreadyExists` if anything is there.
 pub fn createNewFile(path: []const u8) !fd_t {
+    if (builtin.os.tag == .windows) return win.open(path, 0x40000000, 1);
     return posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o644);
 }
 
 /// Rename `from` to `to`, replacing what `to` names.
 pub fn rename(from: []const u8, to: []const u8) error{ NameTooLong, RenameFailed }!void {
+    if (builtin.os.tag == .windows) {
+        const a = win.path(from) catch return error.RenameFailed;
+        defer std.heap.page_allocator.free(a);
+        const b = win.path(to) catch return error.RenameFailed;
+        defer std.heap.page_allocator.free(b);
+        if (!win.MoveFileExW(a.ptr, b.ptr, 1).toBool()) return error.RenameFailed;
+        return;
+    }
     const from_z = posix.toPosixPath(from) catch return error.NameTooLong;
     const to_z = posix.toPosixPath(to) catch return error.NameTooLong;
     if (posix.errno(posix.system.renameat(posix.AT.FDCWD, &from_z, posix.AT.FDCWD, &to_z)) != .SUCCESS) {
@@ -208,6 +295,12 @@ pub fn exchange(a: []const u8, b: []const u8) error{ NameTooLong, NotFound, Unsu
 
 /// Best-effort unlink.
 pub fn removeFile(path: []const u8) void {
+    if (builtin.os.tag == .windows) {
+        const wide = win.path(path) catch return;
+        defer std.heap.page_allocator.free(wide);
+        _ = win.DeleteFileW(wide.ptr);
+        return;
+    }
     const path_z = posix.toPosixPath(path) catch return;
     _ = posix.system.unlink(&path_z);
 }
@@ -217,6 +310,11 @@ pub fn removeFile(path: []const u8) void {
 /// elsewhere `fstat` does both, since Darwin's `mmap` answers a directory with EINVAL, which `std.posix.mmap` treats
 /// as unreachable.
 pub fn fileSize(fd: fd_t) !usize {
+    if (builtin.target.os.tag == .windows) {
+        const st = try win.info(fd);
+        if (st.attributes & 0x10 != 0) return error.NotAFile;
+        return @intCast((@as(u64, st.size_high) << 32) | st.size_low);
+    }
     if (builtin.target.os.tag == .linux) {
         // A directory "seeks" fine and then fails to map with a confusing error; a FIFO has no size at all.
         const linux = std.os.linux;
@@ -238,6 +336,7 @@ pub fn fileSize(fd: fd_t) !usize {
 
 /// Whether `fd` is a regular file (not a pipe, socket or device): what a range copy can write to.
 pub fn isRegular(fd: fd_t) bool {
+    if (builtin.os.tag == .windows) return false;
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var st = std.mem.zeroes(linux.Statx);
@@ -293,11 +392,36 @@ pub fn copyFileRange(in_fd: fd_t, in_offset: u64, out_fd: fd_t, len: usize) Copy
 
 /// Empty the regular file open at `fd` and write from its start again: a write run again into its unpublished output.
 pub fn truncateToStart(fd: fd_t) error{ TruncateFailed, SeekFailed }!void {
+    if (builtin.os.tag == .windows) {
+        const api = struct {
+            extern "kernel32" fn SetFilePointerEx(fd_t, i64, ?*i64, u32) callconv(.winapi) std.os.windows.BOOL;
+            extern "kernel32" fn SetEndOfFile(fd_t) callconv(.winapi) std.os.windows.BOOL;
+        };
+        if (!api.SetFilePointerEx(fd, 0, null, 0).toBool()) return error.SeekFailed;
+        if (!api.SetEndOfFile(fd).toBool()) return error.TruncateFailed;
+        return;
+    }
     if (posix.errno(posix.system.ftruncate(fd, 0)) != .SUCCESS) return error.TruncateFailed;
     if (posix.errno(posix.system.lseek(fd, 0, posix.SEEK.SET)) != .SUCCESS) return error.SeekFailed;
 }
 
 pub fn writeAll(fd: fd_t, bytes: []const u8) error{ WriteFailed, BrokenPipe, NoSpaceLeft }!void {
+    if (builtin.os.tag == .windows) {
+        var at: usize = 0;
+        while (at < bytes.len) {
+            var n: u32 = 0;
+            if (!win.WriteFile(fd, bytes[at..].ptr, @intCast(@min(bytes.len - at, std.math.maxInt(u32))), &n, null).toBool()) {
+                return switch (win.GetLastError()) {
+                    109, 232 => error.BrokenPipe,
+                    112, 39 => error.NoSpaceLeft,
+                    else => error.WriteFailed,
+                };
+            }
+            if (n == 0) return error.WriteFailed;
+            at += n;
+        }
+        return;
+    }
     var i: usize = 0;
     while (i < bytes.len) {
         const rc = posix.system.write(fd, bytes[i..].ptr, bytes.len - i);
@@ -317,6 +441,10 @@ pub fn writeAll(fd: fd_t, bytes: []const u8) error{ WriteFailed, BrokenPipe, NoS
 /// Write ordered buffers without joining them. A bounded vector stays below Linux and Darwin's IOV_MAX; short
 /// writes may stop inside a buffer, so advance both the vector index and its first remaining base before retrying.
 pub fn writeSegments(fd: fd_t, segments: []const []const u8) error{ WriteFailed, BrokenPipe, NoSpaceLeft }!void {
+    if (builtin.os.tag == .windows) {
+        for (segments) |segment| try writeAll(fd, segment);
+        return;
+    }
     var at: usize = 0;
     while (at < segments.len) {
         var vectors: [64]posix.iovec_const = undefined;
@@ -355,6 +483,20 @@ pub fn writeSegments(fd: fd_t, segments: []const []const u8) error{ WriteFailed,
 /// Read a whole file into an `allocator`-owned buffer. A missing file is `error.FileNotFound`, which fixture-reading
 /// tests turn into a skip.
 pub fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (builtin.os.tag == .windows) {
+        const fd = try openRead(path);
+        defer close(fd);
+        const buf = try allocator.alloc(u8, try fileSize(fd));
+        errdefer allocator.free(buf);
+        var off: usize = 0;
+        while (off < buf.len) {
+            var n: u32 = 0;
+            if (!win.ReadFile(fd, buf[off..].ptr, @intCast(@min(buf.len - off, std.math.maxInt(u32))), &n, null).toBool()) return error.ReadFailed;
+            if (n == 0) return error.ShortRead;
+            off += n;
+        }
+        return buf;
+    }
     // Without blocking, as `mapFile` opens: a FIFO waited for a writer forever (`zpq schema`, `zpq conform`), and
     // `fileSize` refuses it. A regular file's reads ignore the flag.
     const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true }, 0);
@@ -384,6 +526,11 @@ pub const Mapped = struct {
     stamp: Stamp,
 
     pub fn unmap(self: Mapped) void {
+        if (builtin.os.tag == .windows) {
+            _ = win.UnmapViewOfFile(self.bytes.ptr);
+            if (self.fd) |fd| close(fd);
+            return;
+        }
         if (self.slot) |i| guard.leave(i);
         posix.munmap(self.bytes);
         if (self.fd) |fd| close(fd);
@@ -397,6 +544,12 @@ pub const Mapped = struct {
     /// descriptor the file is found by its path, and one that is not there by its device and inode was replaced: not
     /// asked, as it cannot be.
     pub fn intact(self: Mapped, path: []const u8) error{InputChanged}!void {
+        if (builtin.os.tag == .windows) {
+            const now = if (self.fd) |fd| fdStamp(fd) catch return error.InputChanged else pathStamp(path) catch return;
+            if (now.dev != self.stamp.dev or now.ino != self.stamp.ino) return;
+            if (!std.meta.eql(now, self.stamp)) return error.InputChanged;
+            return;
+        }
         if (self.slot) |i| if (guard.faulted[i].load(.acquire)) return error.InputChanged;
         const now = if (self.fd) |fd| fdStamp(fd) catch return error.InputChanged else pathStamp(path) catch return;
         if (now.dev != self.stamp.dev or now.ino != self.stamp.ino) return;
@@ -510,6 +663,7 @@ fn statmPages(i: usize) !usize {
 /// queried (`Mapped.fd`), and a glob of local files would otherwise run short past the soft limit (256 on macOS,
 /// often 1024 elsewhere). For the CLI and the Lambda, whose processes they are; libzpq leaves its host's limits alone.
 pub fn raiseOpenFileLimit() void {
+    if (builtin.os.tag == .windows) return;
     if (posix.rlimit_resource == void) return;
     var lim = posix.getrlimit(.NOFILE) catch return;
     // macOS refuses a soft limit past OPEN_MAX, whatever the hard limit says.
@@ -538,6 +692,7 @@ pub const Stamp = struct {
 };
 
 pub fn fdStamp(fd: fd_t) !Stamp {
+    if (builtin.target.os.tag == .windows) return win.stamp(fd);
     if (builtin.target.os.tag == .linux) return statxStamp(fd, "", std.os.linux.AT.EMPTY_PATH);
     var st: posix.system.Stat = undefined;
     if (posix.errno(posix.system.fstat(fd, &st)) != .SUCCESS) return error.StatFailed;
@@ -546,6 +701,11 @@ pub fn fdStamp(fd: fd_t) !Stamp {
 
 /// `fdStamp` for the file `path` names now.
 pub fn pathStamp(path: []const u8) !Stamp {
+    if (builtin.os.tag == .windows) {
+        const fd = try openRead(path);
+        defer close(fd);
+        return fdStamp(fd);
+    }
     var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
     if (path.len >= path_z.len) return error.NameTooLong;
     @memcpy(path_z[0..path.len], path);
@@ -583,6 +743,19 @@ fn statStamp(st: posix.system.Stat) Stamp {
 
 /// Opens `path` without blocking (a FIFO would wait for a writer forever), checks it is a regular file, and maps it.
 pub fn mapFile(path: []const u8) !Mapped {
+    if (builtin.os.tag == .windows) {
+        const fd = try openRead(path);
+        errdefer close(fd);
+        const size = try fileSize(fd);
+        if (size == 0) return error.EmptyFile;
+        const stamp = try fdStamp(fd);
+        if (stamp.size != size) return error.InputChanged;
+        const mapping = win.CreateFileMappingW(fd, null, 2, 0, 0, null) orelse return error.MapFailed;
+        defer std.os.windows.CloseHandle(mapping);
+        const raw = win.MapViewOfFile(mapping, 4, 0, 0, size) orelse return error.MapFailed;
+        const ptr: [*]align(std.heap.page_size_min) const u8 = @ptrCast(@alignCast(raw));
+        return .{ .bytes = ptr[0..size], .fd = fd, .stamp = stamp };
+    }
     const fd = try posix.openat(posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true }, 0);
     errdefer close(fd);
     const size = try fileSize(fd);
@@ -836,6 +1009,7 @@ fn expectCutByte(byte: u8) !void {
 }
 
 test "regression: a mapped file truncated under the reader reads zeros past its end and reports it changed" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // Windows does not permit truncating a mapped file.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [256]u8 = undefined;
@@ -869,6 +1043,7 @@ test "regression: a mapped file truncated under the reader reads zeros past its 
 }
 
 test "regression: a mapped file cut inside its last page or rewritten in place reports it changed; renamed over, not" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // Windows does not permit truncating a mapped file.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [256]u8 = undefined;
@@ -1034,6 +1209,7 @@ test "starting writeback preserves the bytes and the write position" {
 }
 
 test "writeback hints leave pipe outputs usable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // This test uses POSIX pipe descriptors.
     var fds: [2]fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return error.PipeFailed;
     defer close(fds[0]);

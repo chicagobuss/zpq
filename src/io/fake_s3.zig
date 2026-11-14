@@ -11,7 +11,8 @@
 //! Test-only: imported from tests, never from the engine.
 
 const std = @import("std");
-const posix = std.posix;
+const posix = if (@import("builtin").os.tag == .windows) @import("win_test_socket.zig") else std.posix;
+const invalid_socket: posix.fd_t = if (@import("builtin").os.tag == .windows) std.math.maxInt(usize) else -1;
 const Md5 = std.crypto.hash.Md5;
 
 pub const Upload = struct {
@@ -43,7 +44,7 @@ pub const FakeS3 = struct {
     /// `deinit` writes to `stop[0]`; the accept thread polls `stop[1]`, and writes to it once it has stopped.
     stop: [2]posix.fd_t,
     accept_thread: std.Thread = undefined,
-    conn_fds: [MAX_CONNS]posix.fd_t = @splat(-1),
+    conn_fds: [MAX_CONNS]posix.fd_t = @splat(invalid_socket),
     conn_threads: [MAX_CONNS]?std.Thread = @splat(null),
     conns: usize = 0,
 

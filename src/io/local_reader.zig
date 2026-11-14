@@ -17,6 +17,7 @@
 //! refuses the open, or a finished read that comes back `EINVAL`, uses that descriptor. Nothing else in flight is
 //! retargeted.
 const std = @import("std");
+const winEnvValue = @import("../core/system.zig").winEnvValue;
 const builtin = @import("builtin");
 const test_skip = @import("../test_skip.zig");
 const core_memory = @import("../core/memory.zig");
@@ -73,13 +74,13 @@ pub const Policy = struct {
 
     pub fn fromEnv(env: std.process.Environ) Policy {
         var p: Policy = .{};
-        if (env.getPosix("ZPQ_IO_PROFILE")) |s| p.profile = std.meta.stringToEnum(Profile, s) orelse .auto;
-        if (env.getPosix("ZPQ_IO_WINDOW_MIB")) |s| if (std.fmt.parseInt(u64, s, 10)) |m| {
+        if (winEnvValue(env, "ZPQ_IO_PROFILE")) |s| p.profile = std.meta.stringToEnum(Profile, s) orelse .auto;
+        if (winEnvValue(env, "ZPQ_IO_WINDOW_MIB")) |s| if (std.fmt.parseInt(u64, s, 10)) |m| {
             p.window = @max(1, m) << 20;
         } else |_| {};
-        if (env.getPosix("ZPQ_IO_THREADS")) |s| p.threads = @max(1, std.fmt.parseInt(usize, s, 10) catch p.threads);
+        if (winEnvValue(env, "ZPQ_IO_THREADS")) |s| p.threads = @max(1, std.fmt.parseInt(usize, s, 10) catch p.threads);
         // Lambda's file systems are small and warm, and its sandbox may refuse io_uring: always the mapping there.
-        if (env.getPosix("AWS_LAMBDA_FUNCTION_NAME") != null and p.profile == .auto) p.profile = .mmap;
+        if (winEnvValue(env, "AWS_LAMBDA_FUNCTION_NAME") != null and p.profile == .auto) p.profile = .mmap;
         return p;
     }
 

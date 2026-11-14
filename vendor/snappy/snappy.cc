@@ -68,7 +68,11 @@
 #include <arm_acle.h>
 #endif
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/mman.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -764,7 +768,13 @@ struct ThreadWorkingMemory {
   char* mem = nullptr;
   size_t size = 0;
   void Release() {
-    if (mem != nullptr) munmap(mem, size);
+    if (mem != nullptr) {
+#ifdef _WIN32
+      VirtualFree(mem, 0, MEM_RELEASE);
+#else
+      munmap(mem, size);
+#endif
+    }
     mem = nullptr;
     size = 0;
   }
@@ -782,10 +792,15 @@ WorkingMemory::WorkingMemory(size_t input_size) {
   ThreadWorkingMemory& kept = thread_working_memory;
   if (kept.size < size_) {
     kept.Release();
+#ifdef _WIN32
+    void* p = VirtualAlloc(nullptr, size_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (p == nullptr) std::abort();
+#else
     void* p = mmap(nullptr, size_, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     // As allocate() did, in a build without exceptions.
     if (p == MAP_FAILED) std::abort();
+#endif
     kept.mem = static_cast<char*>(p);
     kept.size = size_;
   }

@@ -23,6 +23,7 @@
 //! follow-up.
 
 const std = @import("std");
+const winEnvValue = @import("../core/system.zig").winEnvValue;
 const builtin = @import("builtin");
 const Io = std.Io;
 const tls = @import("tls.zig");
@@ -63,10 +64,10 @@ pub const S3_IN_FLIGHT_MAX: usize = 64;
 /// `S3_IN_FLIGHT_MAX`), else `S3_IN_FLIGHT` on Lambda and `S3_IN_FLIGHT_MAX` elsewhere.
 pub fn inFlight(env: ?std.process.Environ) usize {
     const e = env orelse return S3_IN_FLIGHT;
-    if (e.getPosix("ZPQ_S3_IN_FLIGHT")) |v| if (std.fmt.parseInt(usize, v, 10)) |n| {
+    if (winEnvValue(e, "ZPQ_S3_IN_FLIGHT")) |v| if (std.fmt.parseInt(usize, v, 10)) |n| {
         if (n > 0) return @min(n, S3_IN_FLIGHT_MAX);
     } else |_| {};
-    return if (e.getPosix("AWS_LAMBDA_FUNCTION_NAME") != null) S3_IN_FLIGHT else S3_IN_FLIGHT_MAX;
+    return if (winEnvValue(e, "AWS_LAMBDA_FUNCTION_NAME") != null) S3_IN_FLIGHT else S3_IN_FLIGHT_MAX;
 }
 /// Data-range requests in flight until this query's first data-range response header, unless `ZPQ_S3_FIRST_WAVE`
 /// says otherwise. Footer, metadata and Bloom requests are not part of that wave and do not raise the cap. After
@@ -77,7 +78,7 @@ pub const S3_FIRST_WAVE: usize = 8;
 /// `S3_FIRST_WAVE`. A value above `S3_IN_FLIGHT` is clamped to it, so 16 starts every data request at the full cap.
 /// On aarch64 the first wave is already the full cap.
 pub fn firstWaveCap(env: ?std.process.Environ) usize {
-    const text = if (env) |e| e.getPosix("ZPQ_S3_FIRST_WAVE") else null;
+    const text = if (env) |e| winEnvValue(e, "ZPQ_S3_FIRST_WAVE") else null;
     return parseFirstWave(text);
 }
 
@@ -174,13 +175,13 @@ pub const Credentials = struct {
         // requests: no keys are read, and the empty access key tells the
         // signer to leave the Authorization header off. Only buckets that
         // allow public access answer these.
-        if (env.getPosix("S3_NO_SIGN_REQUEST")) |v| {
+        if (winEnvValue(env, "S3_NO_SIGN_REQUEST")) |v| {
             if (v.len > 0 and !std.mem.eql(u8, v, "0")) {
                 return .{
                     .access_key = "",
                     .secret_key = "",
-                    .region = env.getPosix("S3_REGION") orelse env.getPosix("AWS_REGION") orelse return error.NoRegion,
-                    .endpoint = env.getPosix("S3_ENDPOINT_URL"),
+                    .region = winEnvValue(env, "S3_REGION") orelse winEnvValue(env, "AWS_REGION") orelse return error.NoRegion,
+                    .endpoint = winEnvValue(env, "S3_ENDPOINT_URL"),
                     .timeouts = .fromEnv(env),
                 };
             }
@@ -196,26 +197,26 @@ pub const Credentials = struct {
         // issued for — never mix S3_* credentials with AWS_SESSION_TOKEN.
         // R2 (and most S3-compat servers) reject `X-Amz-Security-Token`
         // entirely, returning HTTP 400 InvalidArgument.
-        const s3_ak = env.getPosix("S3_ACCESS_KEY_ID");
-        const ak = s3_ak orelse env.getPosix("AWS_ACCESS_KEY_ID") orelse return error.NoCredentials;
+        const s3_ak = winEnvValue(env, "S3_ACCESS_KEY_ID");
+        const ak = s3_ak orelse winEnvValue(env, "AWS_ACCESS_KEY_ID") orelse return error.NoCredentials;
         const sk = if (s3_ak != null)
-            env.getPosix("S3_SECRET_ACCESS_KEY") orelse return error.NoCredentials
+            winEnvValue(env, "S3_SECRET_ACCESS_KEY") orelse return error.NoCredentials
         else
-            env.getPosix("AWS_SECRET_ACCESS_KEY") orelse return error.NoCredentials;
+            winEnvValue(env, "AWS_SECRET_ACCESS_KEY") orelse return error.NoCredentials;
         const region = if (s3_ak != null)
-            env.getPosix("S3_REGION") orelse env.getPosix("AWS_REGION") orelse return error.NoRegion
+            winEnvValue(env, "S3_REGION") orelse winEnvValue(env, "AWS_REGION") orelse return error.NoRegion
         else
-            env.getPosix("AWS_REGION") orelse env.getPosix("S3_REGION") orelse return error.NoRegion;
+            winEnvValue(env, "AWS_REGION") orelse winEnvValue(env, "S3_REGION") orelse return error.NoRegion;
         const session_token = if (s3_ak != null)
-            env.getPosix("S3_SESSION_TOKEN")
+            winEnvValue(env, "S3_SESSION_TOKEN")
         else
-            env.getPosix("AWS_SESSION_TOKEN");
+            winEnvValue(env, "AWS_SESSION_TOKEN");
         return .{
             .access_key = ak,
             .secret_key = sk,
             .session_token = session_token,
             .region = region,
-            .endpoint = env.getPosix("S3_ENDPOINT_URL"),
+            .endpoint = winEnvValue(env, "S3_ENDPOINT_URL"),
             .timeouts = .fromEnv(env),
         };
     }
@@ -306,7 +307,7 @@ pub fn useTls(creds: Credentials) bool {
 /// How many connections to open before the first request. `ZPQ_S3_PRECONNECT`, default 4; 0 opens none.
 /// A value that does not parse is the default.
 pub fn preconnectCount(env: std.process.Environ) usize {
-    const v = env.getPosix("ZPQ_S3_PRECONNECT") orelse return 4;
+    const v = winEnvValue(env, "ZPQ_S3_PRECONNECT") orelse return 4;
     return std.fmt.parseInt(usize, v, 10) catch 4;
 }
 
@@ -1497,6 +1498,45 @@ fn extractTag(haystack: []const u8, open_tag: []const u8, close_tag: []const u8)
 
 // `std.c.addrinfo` follows each OS's layout: Darwin orders `canonname` before `addr`, the reverse of Linux.
 const c = std.c;
+const WinDns = struct {
+    const AddrInfo = extern struct {
+        flags: c_int = 0,
+        family: c_int = 0,
+        socktype: c_int = 0,
+        protocol: c_int = 0,
+        addrlen: usize = 0,
+        canonname: ?[*:0]u8 = null,
+        addr: ?*std.os.windows.ws2_32.sockaddr = null,
+        next: ?*AddrInfo = null,
+    };
+    extern "ws2_32" fn getaddrinfo([*:0]const u8, ?[*:0]const u8, *const AddrInfo, *?*AddrInfo) callconv(.winapi) c_int;
+    extern "ws2_32" fn freeaddrinfo(*AddrInfo) callconv(.winapi) void;
+    fn numeric(host: [:0]const u8) bool {
+        var hints: AddrInfo = .{ .flags = 4, .family = 2, .socktype = 1 };
+        var result: ?*AddrInfo = null;
+        if (getaddrinfo(host, null, &hints, &result) != 0) return false;
+        if (result) |r| freeaddrinfo(r);
+        return true;
+    }
+    fn resolve(arena: std.mem.Allocator, host: [:0]const u8) Error![]const tls.Ipv4 {
+        var hints: AddrInfo = .{ .family = 2, .socktype = 1 };
+        var result: ?*AddrInfo = null;
+        if (getaddrinfo(host, null, &hints, &result) != 0 or result == null) return error.DnsFailed;
+        defer freeaddrinfo(result.?);
+        var addrs: std.ArrayList(tls.Ipv4) = .empty;
+        var it = result;
+        while (it) |ai| : (it = ai.next) {
+            const sa = ai.addr orelse continue;
+            const sin: *align(1) const std.os.windows.ws2_32.sockaddr.in = @ptrCast(sa);
+            const ip: tls.Ipv4 = @bitCast(sin.addr);
+            for (addrs.items) |seen| {
+                if (std.mem.eql(u8, &seen, &ip)) break;
+            } else try addrs.append(arena, ip);
+        }
+        if (addrs.items.len == 0) return error.DnsFailed;
+        return addrs.items;
+    }
+};
 
 /// Refuse a host the resolver would take as an address but the TLS layer would not: an IPv6 literal (connections are
 /// IPv4-only), or IPv4 in a legacy spelling getaddrinfo still accepts (`127.1`, `0x7f.0.0.1`, `2130706433`, `010.0.0.1`
@@ -1506,6 +1546,12 @@ fn checkNumericHost(host_z: [:0]const u8) Error!void {
     if (std.mem.indexOfScalar(u8, host_z, ':') != null) {
         std.log.warn("S3 endpoint host '{s}' is an IPv6 address; IPv6 endpoints are not supported", .{host_z});
         return error.Ipv6EndpointUnsupported;
+    }
+    if (@import("builtin").os.tag == .windows) {
+        if (!tls.ensureWindowsSockets()) return error.DnsFailed;
+        if (!WinDns.numeric(host_z)) return;
+        _ = std.Io.net.Ip4Address.parse(host_z, 0) catch return error.NonCanonicalIpEndpoint;
+        return;
     }
     var hints = std.mem.zeroes(c.addrinfo);
     hints.family = c.AF.INET;
@@ -1552,6 +1598,7 @@ pub fn buildEncodedPath(arena: std.mem.Allocator, key: []const u8) ![]u8 {
 pub fn resolveIpv4(arena: std.mem.Allocator, host: []const u8) Error![]const tls.Ipv4 {
     const host_z = try arena.dupeSentinel(u8, host, 0);
     try checkNumericHost(host_z);
+    if (@import("builtin").os.tag == .windows) return WinDns.resolve(arena, host_z);
 
     var hints = std.mem.zeroes(c.addrinfo);
     hints.family = c.AF.INET;
@@ -1978,6 +2025,50 @@ fn fakeGet(fake: *fake_s3.FakeS3, arena: std.mem.Allocator, stats: *Pool(4).Stat
     const resp = try getViaPool(testing.io, &p, arena, creds, url, Range.span(1000, 1000 + 64 * 1024 - 1));
     if (resp.status != 206) return error.TestUnexpectedResult;
     return try arena.dupe(u8, resp.body);
+}
+
+test "fake S3 serves a Parquet fixture to the Windows CLI" {
+    const a = testing.allocator;
+    const windows = @import("builtin").os.tag == .windows;
+    const fixture = if (windows) "D:\\zpq-win\\nullable_mix.parquet" else "ci/fixtures/parquet/nullable_mix.parquet";
+    const data = try std.Io.Dir.cwd().readFileAlloc(testing.io, fixture, a, .limited(8 << 20));
+    defer a.free(data);
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(a);
+    defer fake.deinit();
+    try fake.serveBytes("obj", data);
+    var endpoint_buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port});
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var pool: Pool(4) = undefined;
+    try pool.init(a);
+    defer pool.deinit();
+    const creds: Credentials = .{ .access_key = "ak", .secret_key = "sk", .region = "us-east-1", .endpoint = endpoint };
+    const response = try getViaPool(testing.io, &pool, arena_state.allocator(), creds, .{ .bucket = "bkt", .key = "obj" }, Range.span(0, data.len - 1));
+    try testing.expectEqual(@as(u16, 206), response.status);
+    try testing.expectEqualSlices(u8, data, response.body);
+
+    if (windows) {
+        var env: std.process.Environ.Map = .{ .allocator = a, .array_hash_map = .empty };
+        defer env.deinit();
+        try env.put("SystemRoot", "C:\\Windows");
+        try env.put("S3_ENDPOINT_URL", endpoint);
+        try env.put("S3_ACCESS_KEY_ID", "ak");
+        try env.put("S3_SECRET_ACCESS_KEY", "sk");
+        try env.put("S3_REGION", "us-east-1");
+        const executable = "D:\\zpq-win\\zpq.exe";
+        const local = try std.process.run(a, testing.io, .{ .argv = &.{ executable, "query", fixture, "-j", "1" }, .environ_map = &env });
+        defer a.free(local.stdout);
+        defer a.free(local.stderr);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, local.term);
+        const remote = try std.process.run(a, testing.io, .{ .argv = &.{ executable, "query", "s3://bkt/obj", "-j", "1" }, .environ_map = &env });
+        defer a.free(remote.stdout);
+        defer a.free(remote.stderr);
+        if (remote.term != .exited or remote.term.exited != 0) std.debug.print("S3 CLI failed: {any} {s}\n", .{ remote.term, remote.stderr });
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, remote.term);
+        try testing.expectEqualSlices(u8, local.stdout, remote.stdout);
+    }
 }
 
 test "a ranged GET that stalls before, inside or after its response headers is sent again and gets the exact bytes" {

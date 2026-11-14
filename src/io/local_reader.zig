@@ -22,6 +22,7 @@ const test_skip = @import("../test_skip.zig");
 const core_memory = @import("../core/memory.zig");
 const clock = @import("../clock.zig");
 const diag_mod = @import("../core/diag.zig");
+const device_io = @import("device_admission.zig");
 const linux = std.os.linux;
 const posix = std.posix;
 
@@ -54,6 +55,8 @@ pub const Config = struct {
     fail_direct_open: bool = false,
     /// io_uring reads with O_DIRECT. The reader opens that descriptor itself.
     direct: bool = false,
+    /// Engine readers coordinate device credits; standalone backend tests retain their requested shape.
+    device_admission: bool = false,
 };
 
 /// How a query reads local files: the mode `ZPQ_IO_PROFILE` names (`mmap`, `pread`, `uring`), or with `auto` (the
@@ -366,6 +369,7 @@ pub const Gate = @import("../core/scan.zig").RowGroupGate;
 pub const File = struct {
     reader: *Reader,
     name: []const u8 = "",
+    admission: ?device_io.Admission = null,
     fd: i32,
     size: u64,
     /// The descriptor opened without `O_DIRECT`, kept when `fd` is direct. -1 when there is only one.
@@ -605,6 +609,7 @@ pub const Reader = struct {
     }
 
     fn addFile(self: *Reader, fd: i32, size: u64, borrowed: bool) !*File {
+        const admission = if (self.cfg.device_admission) device_io.Admission.discover(fd, @intFromPtr(self)) else null;
         // O_DIRECT is a new open of `/proc/self/fd/N`, never F_SETFL on `fd`. The buffered descriptor stays: a read
         // the direct one rejects is pread through it, and a borrowed descriptor is never closed or retargeted.
         // A file system that refuses the open (tmpfs, some FUSE) has no second descriptor and reads buffered.
@@ -617,7 +622,10 @@ pub const Reader = struct {
             if (owned) _ = linux.close(read_fd);
             if (own_buffered) _ = linux.close(buffered_fd);
         }
-        if (self.cfg.direct and !self.cfg.fail_direct_open) {
+        // An ordered stream lets the filesystem perform its own readahead. Small synchronous direct reads
+        // defeat that on rotating/unknown storage (including ZFS's ARC), even when its data is already cached.
+        const ordered = if (admission) |d| d.serial else false;
+        if (self.cfg.direct and !ordered and !self.cfg.fail_direct_open) {
             if (openSibling(fd)) |dfd| {
                 buffered_fd = fd;
                 own_buffered = !borrowed;
@@ -648,6 +656,11 @@ pub const Reader = struct {
             .own_buffered = own_buffered,
             .buf = buf,
         };
+        if (admission) |d| {
+            f.admission = d;
+            f.admission.?.register();
+        }
+        errdefer if (f.admission) |*node| node.unregister();
         try self.files.append(self.gpa, f);
         return f;
     }
@@ -718,16 +731,19 @@ pub const Reader = struct {
 
     /// Append the reads of `[lo, hi)` in blocks.
     fn addUnits(self: *Reader, u: Unit, lo: u64, hi: u64) !u32 {
+        const file = self.files.items[u.file];
+        const block = if (file.admission) |d| d.block else self.cfg.block;
         var off = lo;
         var n: u32 = 0;
         while (off < hi) : (n += 1) {
-            const len = @min(self.cfg.block, hi - off);
+            const len = @min(block, hi - off);
             var unit = u;
             unit.off = off;
             unit.len = @intCast(len);
             try self.units.append(self.gpa, unit);
             off += len;
         }
+        if (file.admission) |*d| d.remaining += n;
         return n;
     }
 
@@ -849,7 +865,12 @@ pub const Reader = struct {
 
     pub fn start(self: *Reader) !void {
         try self.layOut();
-        const n = @max(1, self.cfg.threads);
+        var serial = false;
+        for (self.files.items) |f| if (f.admission) |d| {
+            serial = serial or d.serial;
+        };
+        const n = if (serial) 1 else @max(1, self.cfg.threads);
+        if (serial) self.cfg.qd = 1;
         // Reserved first: a spawned thread missing from the list would never be joined.
         try self.threads.ensureUnusedCapacity(self.gpa, n);
         var entries: u16 = 1;
@@ -885,10 +906,12 @@ pub const Reader = struct {
     /// once no worker waits on a gate. `destroy` still tears down.
     pub fn abandon(self: *Reader) void {
         self.cancel.store(true, .release);
+        device_io.wake();
         _ = self.rel_gen.fetchAdd(1, .release);
         _ = linux.futex_3arg(&self.rel_gen.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
         for (self.threads.items) |t| t.join();
         self.threads.clearRetainingCapacity();
+        for (self.files.items) |f| if (f.admission) |*d| d.clear();
         for (self.files.items) |f| _ = linux.madvise(f.buf.ptr, f.buf.len, linux.MADV.DONTNEED);
         self.giveBackLedger();
     }
@@ -902,11 +925,13 @@ pub const Reader = struct {
     /// Joins the reader threads (abandoning reads not yet made), then unmaps and closes.
     pub fn destroy(self: *Reader) void {
         self.cancel.store(true, .release);
+        device_io.wake();
         _ = self.rel_gen.fetchAdd(1, .release);
         _ = linux.futex_3arg(&self.rel_gen.raw, .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
         for (self.threads.items) |t| t.join();
         self.giveBackLedger();
         for (self.files.items) |f| {
+            if (f.admission) |*d| d.unregister();
             posix.munmap(f.buf);
             if (f.owned) _ = linux.close(f.fd);
             if (f.own_buffered) _ = linux.close(f.buffered_fd);
@@ -931,6 +956,7 @@ pub const Reader = struct {
 
     fn unitDone(self: *Reader, u: Unit) void {
         const f = self.files.items[u.file];
+        if (f.admission) |*d| d.complete(u.len);
         // The file's bytes, not the page padding past its end; the window charge stays page-rounded.
         _ = self.stats.bytes.fetchAdd(@min(u.len, f.size -| u.off), .monotonic);
         if (u.probe) {
@@ -953,6 +979,7 @@ pub const Reader = struct {
     /// A read failed: every row group still waiting fails its workers, and no more reads are made.
     fn failAll(self: *Reader) void {
         self.cancel.store(true, .release);
+        device_io.wake();
         for (self.files.items) |f| {
             for (f.rg_ready) |*r| failReady(r);
             failReady(&f.probe_ready);
@@ -979,6 +1006,7 @@ pub const Reader = struct {
         if (self.probes_out.load(.acquire) != 0) return false;
         const next = self.admit_next.load(.acquire);
         if (u.charge == 0) return next > u.ticket;
+        if (next > u.ticket) return true; // admitted before waiting for device credits
         if (next != u.ticket) return false;
         // Only this admitter adds to `submitted`, and only admitted row groups add to `released`.
         const out = self.submitted.load(.monotonic) -| self.released.load(.acquire);
@@ -998,6 +1026,7 @@ pub const Reader = struct {
     }
 
     fn waitRelease(self: *Reader) void {
+        for (self.files.items) |f| if (f.admission) |*d| d.yieldStream();
         _ = self.stats.window_waits.fetchAdd(1, .monotonic);
         const g = self.rel_gen.load(.acquire);
         const ts: linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
@@ -1052,14 +1081,28 @@ pub const Reader = struct {
         while (!self.cancel.load(.acquire)) {
             const i = self.next_unit.fetchAdd(1, .monotonic);
             if (i >= self.units.items.len) return;
-            const u = self.units.items[i];
-            while (!self.admit(u)) {
-                if (self.cancel.load(.acquire)) return;
-                self.waitRelease();
-            }
-            try self.readUnit(i);
-            self.unitDone(u);
+            try self.readWithIo(i);
         }
+    }
+
+    fn readWithIo(self: *Reader, i: usize) !void {
+        const u = self.units.items[i];
+        while (!self.admit(u)) {
+            if (self.cancel.load(.acquire)) return;
+            self.waitRelease();
+        }
+        var observed: u32 = 0;
+        while (!self.acquireIo(u, &observed)) {
+            if (self.cancel.load(.acquire)) return;
+            device_io.park(observed, &self.cancel);
+        }
+        try self.readUnit(i);
+        self.unitDone(u);
+    }
+
+    fn acquireIo(self: *Reader, u: Unit, observed: *u32) bool {
+        if (self.files.items[u.file].admission) |*d| return d.acquire(u.len, observed);
+        return true;
     }
 
     fn uringRun(self: *Reader, ring_in: linux.IoUring) !void {
@@ -1094,6 +1137,7 @@ pub const Reader = struct {
                 return;
             }
             const cancelled = self.cancel.load(.acquire);
+            var io_blocked: ?u32 = null;
             while (!cancelled and !draining and inflight < self.cfg.qd) {
                 const idx = pending orelse blk: {
                     if (drained) break;
@@ -1109,6 +1153,12 @@ pub const Reader = struct {
                     pending = idx;
                     break;
                 }
+                var observed: u32 = 0;
+                if (!self.acquireIo(u, &observed)) {
+                    pending = idx;
+                    io_blocked = observed;
+                    break;
+                }
                 pending = null;
                 const f = self.files.items[u.file];
                 if (self.cfg.fail_unit == idx) return f.readFailed(.io_uring, u.off, @backingInt(linux.E.IO));
@@ -1121,7 +1171,7 @@ pub const Reader = struct {
             }
             if (inflight == 0) {
                 if ((drained and pending == null) or cancelled) return;
-                self.waitRelease();
+                if (io_blocked) |observed| device_io.park(observed, &self.cancel) else self.waitRelease();
                 continue;
             }
             const n = self.takeCqes(&ring, &cqes) catch |err| switch (err) {
@@ -1210,15 +1260,7 @@ pub const Reader = struct {
     /// The unit claimed but not yet queued, then the shared cursor. A read the kernel accepted is not here:
     /// its buffer stays with the ring until the completion arrives.
     fn finishHeld(self: *Reader, pending: ?usize) !void {
-        if (pending) |i| {
-            const u = self.units.items[i];
-            while (!self.admit(u)) {
-                if (self.cancel.load(.acquire)) return;
-                self.waitRelease();
-            }
-            try self.readUnit(i);
-            self.unitDone(u);
-        }
+        if (pending) |i| try self.readWithIo(i);
         try self.preadRun();
     }
 

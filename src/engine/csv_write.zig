@@ -1426,6 +1426,7 @@ pub fn startReader(
         .window = policy.window orelse @max(8 << 20, args.max_memory / 8),
         .ledger = ledger,
         .direct = choice.directRead(),
+        .device_admission = true,
     });
     errdefer rd.destroy();
     const f = try rd.borrowFile(fd, mapped.bytes.len);

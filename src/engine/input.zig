@@ -1297,6 +1297,7 @@ pub fn localReaderInputs(
         .window = io.policy.window orelse if (window_cap) |cap| @min(default_window, cap) else default_window,
         .ledger = ledger,
         .direct = io.choice.directRead(),
+        .device_admission = true,
     }, out);
 }
 

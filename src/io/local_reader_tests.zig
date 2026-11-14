@@ -25,6 +25,73 @@ const nowNs = ac.nowNs;
 const residencyFrom = ac.residencyFrom;
 const uring_retry_bound = ac.uring_retry_bound;
 
+test "device credits resume an admitted row group after submission fallback" {
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "device admission");
+    if (!uringAvailable()) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const page = pageLen();
+    const data = try testing.allocator.alloc(u8, 2 * page);
+    defer testing.allocator.free(data);
+    @memset(data, 7);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "credits.bin", data, &path_buf);
+    for ([_]bool{ false, true }) |inject| {
+        const rd = try Reader.create(testing.allocator, .{ .mode = .uring, .threads = 1, .qd = 4, .device_admission = true });
+        defer rd.destroy();
+        const again: [uring_retry_bound]Inject = @splat(.again);
+        var fault: Faults = .{ .inject = if (inject) &again else &.{} };
+        rd.faults = &fault;
+        const f = try rd.openFile(path, data.len);
+        f.admission.?.serial = false;
+        f.admission.?.block = page;
+        f.admission.?.limit = page;
+        var ranges = [_][1]Range{ .{.{ .start = 0, .end = page }}, .{.{ .start = page, .end = 2 * page }} };
+        const plan = [_]?[]Range{ &ranges[0], &ranges[1] };
+        try rd.planFile(f, &plan, 0);
+        try rd.start();
+        const gate = f.gate();
+        for (0..2) |rg| {
+            try gate.wait(gate.ctx, rg);
+            try testing.expectEqualSlices(u8, data[rg * page ..][0..page], f.bytes()[rg * page ..][0..page]);
+            gate.done(gate.ctx, rg, 1);
+        }
+        try testing.expectEqual(@as(u64, 0), f.admission.?.held);
+        if (inject) try testing.expect(fault.preads > 0);
+    }
+}
+
+test "device admission returns a failed reader's credits before the next query" {
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "device admission");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data: [16384]u8 = @splat(4);
+    var path_buf: [256]u8 = undefined;
+    const path = try testFile(&tmp, "failure.bin", &data, &path_buf);
+    for ([_]bool{ true, false }) |fail| {
+        const rd = try Reader.create(testing.allocator, .{
+            .mode = .pread,
+            .threads = 2,
+            .fail_unit = if (fail) 0 else null,
+            .device_admission = true,
+        });
+        defer rd.destroy();
+        const f = try rd.openFile(path, data.len);
+        var range = [_]Range{.{ .start = 0, .end = data.len }};
+        const plan = [_]?[]Range{&range};
+        try rd.planFile(f, &plan, 0);
+        try rd.start();
+        const gate = f.gate();
+        if (fail) {
+            try testing.expectError(error.LocalReadFailed, gate.wait(gate.ctx, 0));
+        } else {
+            try gate.wait(gate.ctx, 0);
+            try testing.expectEqualSlices(u8, &data, f.bytes());
+            gate.done(gate.ctx, 0, 1);
+        }
+    }
+}
+
 test "local reader preserves the syscall error and location without changing error precedence" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "reader errno");
     var tmp = testing.tmpDir(.{});

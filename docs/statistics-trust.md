@@ -1,6 +1,6 @@
 # Statistics: trust is opt-in
 
-Moved from the README for 0.5.0: when zpq answers from Parquet statistics, and when it decodes instead.
+When zpq answers from Parquet statistics, and when it decodes instead.
 
 Parquet files carry per-column statistics (min / max / null counts). The spec says they must be accurate, but
 real-world writers ship inaccurate ones: a `parquet-mr 1.8.2` file in the test corpus records a `min` of `2.00` for a

@@ -1,6 +1,6 @@
 # What zpq can do
 
-Moved from the README for 0.5.0: what each part of zpq reads, filters, computes, aggregates and writes.
+What each part of zpq reads, filters, computes, aggregates and writes.
 
 **Read** standard Parquet — V1 + V2 data pages; PLAIN / RLE / RLE_DICTIONARY / DELTA_BINARY_PACKED /
 DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY / BYTE_STREAM_SPLIT encodings; SNAPPY / ZSTD / GZIP / LZ4_RAW / UNCOMPRESSED

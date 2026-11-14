@@ -51,6 +51,8 @@ jobs:
             artifact: zpq-macos-x86_64
           - target: aarch64-macos
             artifact: zpq-macos-arm64
+          - target: x86_64-windows-gnu
+            artifact: zpq-windows-x86_64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -100,6 +102,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: |
             dist/*.tar.gz*
+            dist/*.zip*
             dist/*.deb*
             dist/*.rpm*
             dist/release.json
@@ -111,11 +114,14 @@ jobs:
           name: ${{ matrix.artifact }}
           path: |
             dist/*.tar.gz*
+            dist/*.zip*
             dist/*.deb*
             dist/*.rpm*
             dist/release.json
 
+      # Windows native verification currently runs on raphael; this workflow has no Windows runner.
       - name: Prepare shipped native smoke bundle
+        if: matrix.target != 'x86_64-windows-gnu'
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -131,7 +137,7 @@ jobs:
           (cd $dest/bin && sha256sum $names > SHA256SUMS)
 
       - name: Upload native smoke bundle
-        if: github.server_url == 'https://github.com'
+        if: github.server_url == 'https://github.com' && matrix.target != 'x86_64-windows-gnu'
         uses: actions/upload-artifact@v4
         with:
           name: smoke-${{ matrix.target }}
@@ -142,7 +148,7 @@ jobs:
             dist/${{ matrix.target }}/bin/SHA256SUMS
 
       - name: Upload native smoke bundle (Forgejo)
-        if: github.server_url != 'https://github.com'
+        if: github.server_url != 'https://github.com' && matrix.target != 'x86_64-windows-gnu'
         uses: christopherhx/gitea-upload-artifact@81f940d004763f986ba3582c007fd842dd5cb0d7 # v4
         with:
           name: smoke-${{ matrix.target }}
@@ -299,7 +305,7 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           mkdir -p release
-          find artifacts -type f \( -name "*.tar.gz" -o -name "*.deb" -o -name "*.rpm" -o -name "*.sha256" \) \
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.deb" -o -name "*.rpm" -o -name "*.sha256" \) \
             -exec cp {} release/ \;
           python3 - <<'PY_MERGE'
           import json

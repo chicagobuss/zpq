@@ -127,7 +127,6 @@ pub const TlsClient = struct {
     hostname: []const u8,
     buffers: tls.TlsBuffers = .{},
     verify_certificate: bool = true,
-    windows_name: if (@import("builtin").os.tag == .windows) ?[:0]u8 else void = if (@import("builtin").os.tag == .windows) null else {},
 
     const Self = @This();
 
@@ -136,12 +135,12 @@ pub const TlsClient = struct {
         const ssl = try createSslConnection(context.ctx);
         errdefer c.SSL_free(ssl);
 
-        const windows_name: if (@import("builtin").os.tag == .windows) ?[:0]u8 else void = if (@import("builtin").os.tag == .windows) blk: {
+        const windows_name: ?[:0]u8 = if (@import("builtin").os.tag == .windows) blk: {
             if (!context.verify_certificate) break :blk null;
             const name = try allocator.allocSentinel(u8, hostname.len, 0);
             @memcpy(name, hostname);
             break :blk name;
-        } else {};
+        } else null;
         errdefer if (@import("builtin").os.tag == .windows) {
             if (windows_name) |name| allocator.free(name);
         };
@@ -168,14 +167,18 @@ pub const TlsClient = struct {
             .bio_write = bio_write,
             .hostname = hostname,
             .verify_certificate = context.verify_certificate,
-            .windows_name = windows_name,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.buffers.deinit(self.allocator);
+        if (@import("builtin").os.tag == .windows) {
+            if (c.SSL_get_ex_data(self.ssl, 0)) |raw| {
+                const name: [*:0]u8 = @ptrCast(raw);
+                self.allocator.free(std.mem.span(name));
+            }
+        }
         c.SSL_free(self.ssl);
-        if (@import("builtin").os.tag == .windows) if (self.windows_name) |name| self.allocator.free(name);
     }
 
     pub fn startHandshake(self: *Self) !tls.ProcessResult {

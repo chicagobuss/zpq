@@ -823,28 +823,38 @@ pub fn evalResidual(r: *const ast.Residual, batch: *const Batch, sel: *selection
 
 /// `batch` with each coded DECIMAL column `x` reads given its exact integers row by row, from the dictionary's
 /// (`dict_unscaled`) through the codes: a column decoded for an exact fold carries them only per entry, and the
-/// sides' arithmetic reads them per row (`expr_eval.exactColumn`). The batch itself when no such column is read.
+/// sides' arithmetic reads them per row (`expr_eval.exactColumn`). Codes-only values are materialized as well.
 fn withRowExact(x: ast.ExprCompare, batch: *const Batch, column_lookup: []const ?usize, arena: std.mem.Allocator) Error!Batch {
     var cols: ?[]Batch.Column = null;
     for (column_lookup, 0..) |pos_opt, ci| {
         const pos = pos_opt orelse continue;
         if (!x.readsColumn(ci)) continue;
         switch (batch.cols[pos]) {
-            inline .f64, .i32, .i64 => |c, tag| {
-                if (c.unscaled != null) continue;
-                const du = c.dict_unscaled orelse continue;
+            inline else => |c, tag| {
                 const codes = c.codes orelse continue;
-                const u = try arena.alloc(i128, codes.len);
-                for (u, codes, 0..) |*o, k, r| {
-                    const is_null = if (c.def_levels) |dl| dl[r] < c.max_def else false;
-                    o.* = if (is_null or c.dict.len == 0) 0 else du.at(k);
-                }
-                if (cols == null) cols = try arena.dupe(Batch.Column, batch.cols);
+                if (!c.codesOnly() and (c.unscaled != null or c.dict_unscaled == null)) continue;
                 var out = c;
-                out.unscaled = .{ .i128 = u };
+                // Expression loaders consume row values, including when a writer decoded codes alone.
+                if (c.codesOnly()) {
+                    const T = @TypeOf(c.values[0]);
+                    const values = try arena.alloc(T, codes.len);
+                    for (values, codes, 0..) |*v, k, r| {
+                        const absent = rowIsNull(c.def_levels, c.max_def, r);
+                        v.* = if (absent) std.mem.zeroes(T) else c.dict[k];
+                    }
+                    out.values = values;
+                }
+                if (c.unscaled == null) if (c.dict_unscaled) |du| {
+                    const u = try arena.alloc(i128, codes.len);
+                    for (u, codes, 0..) |*o, k, r| {
+                        const absent = rowIsNull(c.def_levels, c.max_def, r);
+                        o.* = if (absent or c.dict.len == 0) 0 else du.at(k);
+                    }
+                    out.unscaled = .{ .i128 = u };
+                };
+                if (cols == null) cols = try arena.dupe(Batch.Column, batch.cols);
                 cols.?[pos] = @unionInit(Batch.Column, @tagName(tag), out);
             },
-            else => {},
         }
     }
     var out = batch.*;
@@ -1723,4 +1733,27 @@ test "an expression side reads a coded DECIMAL's exact integers row by row, from
     const plain = [_]Batch.Column{.{ .f64 = .{ .values = &view } }};
     const kept = try withRowExact(x, &.{ .cols = &plain, .num_rows = 4 }, &lookup, a);
     try std.testing.expect(kept.cols[0].f64.unscaled == null);
+}
+
+test "column comparisons read independent codes-only string dictionaries" {
+    var state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    const cols = [_]Batch.Column{
+        .{ .string = .{ .values = &.{}, .dict = &.{ "z", "a" }, .codes = &.{ 0, 1, 0, 1, 0 }, .def_levels = &.{ 1, 1, 0, 1, 1 }, .max_def = 1 } },
+        .{ .string = .{ .values = &.{}, .dict = &.{ "a", "z" }, .codes = &.{ 1, 0, 0, 1, 0 }, .def_levels = &.{ 1, 1, 1, 0, 1 }, .max_def = 1 } },
+    };
+    const batch: Batch = .{ .cols = &cols, .num_rows = 5 };
+    var l: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    var r: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = .BYTE_ARRAY, .expr_type = .str } };
+    for ([_]ast.Operator{ .Eq, .NotEq, .Lt, .LtEq, .Gt, .GtEq }) |op| {
+        var sel = try selection.SelectionVector.init(a, 5);
+        try evaluate(.{ .expr = .{ .op = op, .left = &l, .right = &r } }, &batch, &sel, &.{ 0, 1 }, a);
+        for (0..5) |i| {
+            const lv = valueAt(cols[0], i);
+            const rv = valueAt(cols[1], i);
+            const want = if (lv != null and rv != null) ast.applyOpStr(lv.?.str, op, rv.?.str) else false;
+            try std.testing.expectEqual(want, sel.isActive(i));
+        }
+    }
 }

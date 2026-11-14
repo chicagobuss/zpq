@@ -144,7 +144,6 @@ pub const MultipartSink = struct {
 
     // First worker error wins; checked at close.
     error_lock: Io.Mutex = .init,
-    first_error: ?[]const u8 = null,
     first_failure: ?S3Failure = null,
     first_named: ?anyerror = null,
 
@@ -338,16 +337,15 @@ pub const MultipartSink = struct {
         self.bytes_cond.signal(self.io);
     }
 
-    fn recordError(self: *MultipartSink, msg: []const u8) void {
+    fn recordError(self: *MultipartSink, err: anyerror) void {
         self.error_lock.lockUncancelable(self.io);
         defer self.error_lock.unlock(self.io);
-        if (self.first_error == null) self.first_error = msg;
+        if (self.first_named == null) self.first_named = err;
     }
 
     fn recordFailure(self: *MultipartSink, failure: S3Failure, named: anyerror) void {
         self.error_lock.lockUncancelable(self.io);
         defer self.error_lock.unlock(self.io);
-        if (self.first_error == null) self.first_error = "S3 refused a part upload";
         if (self.first_failure == null) self.first_failure = failure;
         if (self.first_named == null) self.first_named = named;
     }
@@ -355,12 +353,11 @@ pub const MultipartSink = struct {
     fn failIfWorkerError(self: *MultipartSink) !void {
         self.error_lock.lockUncancelable(self.io);
         const failure = self.first_failure;
-        const named = self.first_named orelse error.PartUploadFailed;
-        const failed = self.first_error != null;
+        const named = self.first_named;
         self.error_lock.unlock(self.io);
-        if (failed) {
+        if (named) |err| {
             if (failure) |f| self.controlFailed(f);
-            return named;
+            return err;
         }
     }
 
@@ -399,14 +396,14 @@ pub const MultipartSink = struct {
         self.await_ns +%= @intCast(t_await_end - t_await_start);
         profile.record(prof, .upload_wait, t_await_start, t_await_end, profile.args(.{self.next_part_number - 1}));
 
-        if (self.first_error) |msg| {
+        if (self.first_named) |named| {
             // Best-effort abort — we don't expose the abort error
             // separately; the caller already knows there was a
             // failure.
             self.abortOpenUpload();
             if (self.first_failure) |f| self.controlFailed(f);
-            std.log.warn("multipart sink: first worker error: {s}", .{msg});
-            return self.first_named orelse error.PartUploadFailed;
+            std.log.warn("multipart sink: first worker error: {s}", .{@errorName(named)});
+            return named;
         }
 
         const t_complete_start = nowMonoNs();
@@ -503,7 +500,7 @@ fn partWorker(io: Io, ctx: *PartTaskCtx) Io.Cancelable!void {
     const arena = arena_state.allocator();
     const resp = s3.requestViaPool(io, ctx.sink.pool, arena, ctx.sink.criteria, opts, ctx, doUploadPart) catch |err| {
         if (err == error.Canceled) return error.Canceled;
-        ctx.sink.recordError(@errorName(err));
+        ctx.sink.recordError(err);
         return;
     };
     if (resp.status != 200) {
@@ -511,7 +508,7 @@ fn partWorker(io: Io, ctx: *PartTaskCtx) Io.Cancelable!void {
         ctx.sink.recordFailure(r.failure, r.err);
         return;
     }
-    if (!storePartEtag(ctx, resp)) ctx.sink.recordError("part_upload_bad_status");
+    if (!storePartEtag(ctx, resp)) ctx.sink.recordError(error.PartUploadFailed);
 }
 
 /// Record the part's ETag from a successful UploadPart response; false for any other answer.
@@ -1376,10 +1373,8 @@ test "a CreateMultipartUpload answered with a 5xx is not sent again, and the sta
         try testing.expectEqual(@as(u32, 1), fake.creates);
         try testing.expectEqual(@as(u32, 1), fake.failed);
         try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
-        var want: [160]u8 = undefined;
-        try expectFailure(&diag, try std.fmt.bufPrint(&want, "CreateMultipartUpload s3://bkt/out.parquet: {d} {s}: {s}", .{
-            answer[0], answer[1], if (answer[0] == 503) "S3 is throttling the request; try again" else "S3 failed; try again",
-        }));
+        var want: [96]u8 = undefined;
+        try expectFailure(&diag, try std.fmt.bufPrint(&want, "CreateMultipartUpload s3://bkt/out.parquet: {d} {s}", answer));
     }
 }
 
@@ -1399,7 +1394,7 @@ test "a CompleteMultipartUpload answered with an error is not sent again, aborts
     try testing.expectEqual(@as(u32, 1), fake.failed);
     try testing.expect(fake.object("out.parquet") == null);
     try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
-    try expectFailure(&diag, "CompleteMultipartUpload s3://bkt/out.parquet: 500 InternalError: S3 failed; try again");
+    try expectFailure(&diag, "CompleteMultipartUpload s3://bkt/out.parquet: 500 InternalError");
 }
 
 test "a CreateMultipartUpload that connects on its third try and then fails reports three attempts and its own error" {
@@ -1416,7 +1411,7 @@ test "a CreateMultipartUpload that connects on its third try and then fails repo
         const got = writeToPort(fake.port, "out.parquet", &test_payload, .{}, options);
         try testing.expectError(error.CreateMultipartFailed, got);
         try testing.expectEqual(@as(u32, 1), fake.creates);
-        try expectFailure(&diag, "CreateMultipartUpload s3://bkt/out.parquet: 503 SlowDown: S3 is throttling the request; try again (3 attempts)");
+        try expectFailure(&diag, "CreateMultipartUpload s3://bkt/out.parquet: 503 SlowDown (3 attempts)");
     }
     // Unanswered: the response never starts.
     {
@@ -1510,7 +1505,7 @@ test "a CreateMultipartUpload answered 200 without an UploadId is sent once, and
     try testing.expectError(error.CreateMultipartFailed, got);
     try testing.expectEqual(@as(u32, 1), fake.creates);
     try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
-    try expectFailure(&diag, "CreateMultipartUpload s3://bkt/out.parquet: 200 (no S3 error code): S3 refused the request: XmlTagMissing");
+    try expectFailure(&diag, "CreateMultipartUpload s3://bkt/out.parquet: 200 (no S3 error code): XmlTagMissing");
 }
 
 /// A control-plane connect that fails at its `fail_call`th call (1-based: Create, Complete, Abort) and works otherwise.
@@ -1571,43 +1566,31 @@ test "regression: a single-PUT output is retried past a 503 SlowDown, as a part 
     }));
     var buf: [256]u8 = undefined;
     const said = try std.fmt.bufPrint(&buf, "{f}", .{diag.detail.s3_request});
-    try testing.expectEqualStrings("PUT s3://bkt/never.parquet: 403 AccessDenied: access denied", said);
+    try testing.expectEqualStrings("PUT s3://bkt/never.parquet: 403 AccessDenied", said);
 }
 
-test "an UploadPart refused by S3 fails with the named error and names the part request" {
-    var fake: fake_s3.FakeS3 = undefined;
-    try fake.start(testing.allocator);
-    defer fake.deinit();
-    fake.fail = "PUT /bkt/out.parquet?partNumber=1&";
-    fake.fail_status = 403;
-    fake.fail_code = "AccessDenied";
-    var diag: Diag = .{};
+test "an UploadPart refusal keeps its named error and names the part request" {
+    const Case = struct { status: u16, code: []const u8, want: anyerror, text: []const u8 };
+    const cases = [_]Case{
+        .{ .status = 403, .code = "AccessDenied", .want = error.AccessDenied, .text = "PUT part s3://bkt/out.parquet: 403 AccessDenied" },
+        .{ .status = 404, .code = "NoSuchUpload", .want = error.NoSuchUpload, .text = "PUT part s3://bkt/out.parquet: 404 NoSuchUpload" },
+    };
+    for (cases) |case| {
+        var fake: fake_s3.FakeS3 = undefined;
+        try fake.start(testing.allocator);
+        defer fake.deinit();
+        fake.fail = "PUT /bkt/out.parquet?partNumber=1&";
+        fake.fail_status = case.status;
+        fake.fail_code = case.code;
+        var diag: Diag = .{};
 
-    try testing.expectError(error.AccessDenied, writeToPort(fake.port, "out.parquet", &test_payload, .{}, .{
-        .target_part_size = 1024,
-        .diag = &diag,
-    }));
-    var buf: [256]u8 = undefined;
-    const said = try std.fmt.bufPrint(&buf, "{f}", .{diag.detail.s3_request});
-    try testing.expectEqualStrings("PUT part s3://bkt/out.parquet: 403 AccessDenied: access denied", said);
-}
-
-test "an UploadPart answered NoSuchUpload names the upload, not a missing bucket" {
-    var fake: fake_s3.FakeS3 = undefined;
-    try fake.start(testing.allocator);
-    defer fake.deinit();
-    fake.fail = "PUT /bkt/out.parquet?partNumber=1&";
-    fake.fail_status = 404;
-    fake.fail_code = "NoSuchUpload";
-    var diag: Diag = .{};
-
-    try testing.expectError(error.NoSuchUpload, writeToPort(fake.port, "out.parquet", &test_payload, .{}, .{
-        .target_part_size = 1024,
-        .diag = &diag,
-    }));
-    var buf: [256]u8 = undefined;
-    const said = try std.fmt.bufPrint(&buf, "{f}", .{diag.detail.s3_request});
-    try testing.expectEqualStrings("PUT part s3://bkt/out.parquet: 404 NoSuchUpload: the upload does not exist", said);
+        try testing.expectError(case.want, writeToPort(fake.port, "out.parquet", &test_payload, .{}, .{
+            .target_part_size = 1024,
+            .diag = &diag,
+        }));
+        var buf: [256]u8 = undefined;
+        try testing.expectEqualStrings(case.text, try std.fmt.bufPrint(&buf, "{f}", .{diag.detail.s3_request}));
+    }
 }
 
 test "regression: a CompleteMultipartUpload that S3 keeps alive for minutes completes, past the request bound" {

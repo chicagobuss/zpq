@@ -1155,10 +1155,6 @@ pub const Refusal = struct {
     err: Error,
 };
 
-fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return needle.len <= haystack.len and std.ascii.eqlIgnoreCase(haystack[0..needle.len], needle);
-}
-
 fn secretAt(text: []const u8, secret: []const u8) ?usize {
     if (secret.len == 0 or !std.mem.startsWith(u8, text, secret)) return null;
     return secret.len;
@@ -1180,7 +1176,7 @@ fn redactFieldAt(text: []const u8) ?RedactField {
         "authorization:",
     };
     for (markers) |marker| {
-        if (!startsWithIgnoreCase(text, marker)) continue;
+        if (!std.ascii.startsWithIgnoreCase(text, marker)) continue;
         var end = marker.len;
         while (end < text.len and !redactDelimiter(text[end])) end += 1;
         return .{ .marker = marker.len, .value = end - marker.len };
@@ -1290,26 +1286,7 @@ pub fn refusal(op: diag_mod.S3Failure.Op, bucket: []const u8, key: []const u8, r
 
     redactInto(&failure.code, code_raw, creds);
     redactInto(&failure.message, message_raw, creds);
-    if (failure.message.len == 0) failure.message.set(if (err == error.NoSuchKey)
-        "the object does not exist"
-    else if (err == error.NoSuchBucket)
-        "the bucket does not exist"
-    else if (err == error.NoSuchUpload)
-        "the upload does not exist"
-    else if (err == error.AccessDenied)
-        "access denied"
-    else if (err == error.InvalidAccessKeyId)
-        "the access key is not valid"
-    else if (err == error.SignatureDoesNotMatch)
-        "the request signature does not match the secret key"
-    else if (err == error.WrongRegion)
-        "the endpoint is in the wrong region"
-    else if (err == error.SlowDown)
-        "S3 is throttling the request; try again"
-    else if (err == error.S3ServerError)
-        "S3 failed; try again"
-    else
-        "S3 refused the request");
+    if (failure.message.len == 0 and err == error.NoSuchKey) failure.message.set("the object does not exist");
     return .{ .failure = failure, .err = err };
 }
 
@@ -1648,122 +1625,29 @@ test "S3 refusals name the request, status, code and message, and map the code t
     const wrong_region = [_]http.Header{.{ .name = "x-amz-bucket-region", .value = "eu-west-1" }};
     const Case = struct {
         status: u16,
-        body: []const u8 = "",
-        headers: []const http.Header = &.{},
+        body: []const u8,
+        headers: []const http.Header,
         op: diag_mod.S3Failure.Op,
-        key: []const u8 = "key",
+        key: []const u8,
         want: anyerror,
         text: []const u8,
     };
     const cases = [_]Case{
-        .{
-            .status = 404,
-            .body = "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>",
-            .op = .GetObject,
-            .want = error.NoSuchKey,
-            .text = "GET s3://bkt/key: 404 NoSuchKey: The specified key does not exist.",
-        },
-        .{
-            .status = 404,
-            .body = "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>",
-            .op = .GetObject,
-            .want = error.NoSuchBucket,
-            .text = "GET s3://bkt/key: 404 NoSuchBucket: The specified bucket does not exist",
-        },
-        .{
-            .status = 403,
-            .body = "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>",
-            .op = .GetObject,
-            .want = error.AccessDenied,
-            .text = "GET s3://bkt/key: 403 AccessDenied: Access Denied",
-        },
-        .{
-            .status = 403,
-            .body = "<Error><Code>InvalidAccessKeyId</Code><Message>The AWS Access Key Id you provided does not exist.</Message></Error>",
-            .op = .GetObject,
-            .want = error.InvalidAccessKeyId,
-            .text = "GET s3://bkt/key: 403 InvalidAccessKeyId: The AWS Access Key Id you provided does not exist.; " ++
-                "check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)",
-        },
-        .{
-            .status = 403,
-            .body = "<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match.</Message></Error>",
-            .op = .PutObject,
-            .want = error.SignatureDoesNotMatch,
-            .text = "PUT s3://bkt/key: 403 SignatureDoesNotMatch: The request signature we calculated does not match.; " ++
-                "check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)",
-        },
-        .{
-            .status = 301,
-            .headers = &wrong_region,
-            .op = .GetObject,
-            .want = error.WrongRegion,
-            .text = "GET s3://bkt/key: 301 (no S3 error code): the endpoint is in the wrong region; " ++
-                "the bucket is in region eu-west-1",
-        },
-        .{
-            .status = 400,
-            .body = "<Error><Code>AuthorizationHeaderMalformed</Code><Message>The authorization header is malformed; expecting 'eu-west-1'.</Message></Error>",
-            .headers = &wrong_region,
-            .op = .GetObject,
-            .want = error.WrongRegion,
-            .text = "GET s3://bkt/key: 400 AuthorizationHeaderMalformed: The authorization header is malformed; " ++
-                "expecting 'eu-west-1'.; the bucket is in region eu-west-1",
-        },
-        .{
-            .status = 400,
-            .body = "<Error><Code>InvalidRequest</Code><Message>invalid credential region</Message></Error>",
-            .op = .GetObject,
-            .want = error.WrongRegion,
-            .text = "GET s3://bkt/key: 400 InvalidRequest: invalid credential region",
-        },
-        .{
-            .status = 503,
-            .body = "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
-            .op = .GetObject,
-            .want = error.SlowDown,
-            .text = "GET s3://bkt/key: 503 SlowDown: Please reduce your request rate.",
-        },
-        .{
-            .status = 500,
-            .body = "<Error><Code>InternalError</Code></Error>",
-            .op = .GetObject,
-            .want = error.S3ServerError,
-            .text = "GET s3://bkt/key: 500 InternalError: S3 failed; try again",
-        },
-        .{
-            .status = 404,
-            .op = .HeadObject,
-            .want = error.NoSuchKey,
-            .text = "HEAD s3://bkt/key: 404 (no S3 error code): the object does not exist",
-        },
-        .{
-            .status = 404,
-            .op = .ListObjectsV2,
-            .key = "prefix",
-            .want = error.NoSuchBucket,
-            .text = "LIST s3://bkt/prefix: 404 (no S3 error code): the bucket does not exist",
-        },
-        .{
-            .status = 404,
-            .body = "<Error><Code>NoSuchUpload</Code></Error>",
-            .op = .UploadPart,
-            .want = error.NoSuchUpload,
-            .text = "PUT part s3://bkt/key: 404 NoSuchUpload: the upload does not exist",
-        },
-        .{
-            .status = 404,
-            .op = .UploadPart,
-            .want = error.NoSuchUpload,
-            .text = "PUT part s3://bkt/key: 404 (no S3 error code): the upload does not exist",
-        },
-        .{
-            .status = 403,
-            .body = "<Error><Code>AccessDenied</Code></Error>",
-            .op = .UploadPart,
-            .want = error.AccessDenied,
-            .text = "PUT part s3://bkt/key: 403 AccessDenied: access denied",
-        },
+        .{ .status = 404, .body = "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>", .headers = &.{}, .op = .GetObject, .key = "key", .want = error.NoSuchKey, .text = "GET s3://bkt/key: 404 NoSuchKey: The specified key does not exist." },
+        .{ .status = 404, .body = "<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>", .headers = &.{}, .op = .GetObject, .key = "key", .want = error.NoSuchBucket, .text = "GET s3://bkt/key: 404 NoSuchBucket: The specified bucket does not exist" },
+        .{ .status = 403, .body = "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>", .headers = &.{}, .op = .GetObject, .key = "key", .want = error.AccessDenied, .text = "GET s3://bkt/key: 403 AccessDenied: Access Denied" },
+        .{ .status = 403, .body = "<Error><Code>InvalidAccessKeyId</Code><Message>The AWS Access Key Id you provided does not exist.</Message></Error>", .headers = &.{}, .op = .GetObject, .key = "key", .want = error.InvalidAccessKeyId, .text = "GET s3://bkt/key: 403 InvalidAccessKeyId: The AWS Access Key Id you provided does not exist." },
+        .{ .status = 403, .body = "<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match.</Message></Error>", .headers = &.{}, .op = .PutObject, .key = "key", .want = error.SignatureDoesNotMatch, .text = "PUT s3://bkt/key: 403 SignatureDoesNotMatch: The request signature we calculated does not match." },
+        .{ .status = 301, .body = "", .headers = &wrong_region, .op = .GetObject, .key = "key", .want = error.WrongRegion, .text = "GET s3://bkt/key: 301 (no S3 error code); the bucket is in region eu-west-1" },
+        .{ .status = 400, .body = "<Error><Code>AuthorizationHeaderMalformed</Code><Message>The authorization header is malformed; expecting 'eu-west-1'.</Message></Error>", .headers = &wrong_region, .op = .GetObject, .key = "key", .want = error.WrongRegion, .text = "GET s3://bkt/key: 400 AuthorizationHeaderMalformed: The authorization header is malformed; expecting 'eu-west-1'.; the bucket is in region eu-west-1" },
+        .{ .status = 400, .body = "<Error><Code>InvalidRequest</Code><Message>invalid credential region</Message></Error>", .headers = &.{}, .op = .GetObject, .key = "key", .want = error.WrongRegion, .text = "GET s3://bkt/key: 400 InvalidRequest: invalid credential region" },
+        .{ .status = 503, .body = "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>", .headers = &.{}, .op = .GetObject, .key = "key", .want = error.SlowDown, .text = "GET s3://bkt/key: 503 SlowDown: Please reduce your request rate." },
+        .{ .status = 500, .body = "<Error><Code>InternalError</Code></Error>", .headers = &.{}, .op = .GetObject, .key = "key", .want = error.S3ServerError, .text = "GET s3://bkt/key: 500 InternalError" },
+        .{ .status = 404, .body = "", .headers = &.{}, .op = .HeadObject, .key = "key", .want = error.NoSuchKey, .text = "HEAD s3://bkt/key: 404 (no S3 error code): the object does not exist" },
+        .{ .status = 404, .body = "", .headers = &.{}, .op = .ListObjectsV2, .key = "prefix", .want = error.NoSuchBucket, .text = "LIST s3://bkt/prefix: 404 (no S3 error code)" },
+        .{ .status = 404, .body = "<Error><Code>NoSuchUpload</Code></Error>", .headers = &.{}, .op = .UploadPart, .key = "key", .want = error.NoSuchUpload, .text = "PUT part s3://bkt/key: 404 NoSuchUpload" },
+        .{ .status = 404, .body = "", .headers = &.{}, .op = .UploadPart, .key = "key", .want = error.NoSuchUpload, .text = "PUT part s3://bkt/key: 404 (no S3 error code)" },
+        .{ .status = 403, .body = "<Error><Code>AccessDenied</Code></Error>", .headers = &.{}, .op = .UploadPart, .key = "key", .want = error.AccessDenied, .text = "PUT part s3://bkt/key: 403 AccessDenied" },
     };
     for (cases) |case| {
         const r = refusal(case.op, "bkt", case.key, .{ .status = case.status, .headers = case.headers, .body = case.body }, .{
@@ -2172,6 +2056,43 @@ test "a later named refusal is not hidden by an earlier short body" {
     try testing.expectError(error.AccessDenied, fetchJobs(testing.io, &p, testing.allocator, arena_state.allocator(), creds, &jobs, 2, null, null, &diag));
     try testing.expect(diag.detail == .s3_request);
     try testing.expectEqualStrings("AccessDenied", diag.detail.s3_request.code.get());
+}
+
+test "a data GET that never gets a status names its bucket and key" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.stall = "GET /bkt/obj";
+    fake.stall_at = .before_headers;
+    fake.stalls_left = std.math.maxInt(u32);
+
+    var endpoint_buf: [64]u8 = undefined;
+    const creds: Credentials = .{
+        .access_key = "ak",
+        .secret_key = "sk",
+        .region = "us-east-1",
+        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+        .timeouts = .{ .connect_ms = 300, .handshake_ms = 300, .first_byte_ms = 50, .idle_ms = 50, .request_ms = 300 },
+    };
+    var p: Pool(4) = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var target: [16]u8 = undefined;
+    const jobs = [_]FetchJob{.{
+        .bucket = "bkt",
+        .key = "obj",
+        .range = .{ .start = 0, .end = 16 },
+        .target = &target,
+    }};
+    var diag: diag_mod.Diag = .{};
+    try testing.expectError(error.FirstByteTimeout, fetchJobs(testing.io, &p, testing.allocator, arena_state.allocator(), creds, &jobs, 1, null, null, &diag));
+    try testing.expect(diag.detail == .s3_request);
+    try testing.expectEqual(diag_mod.S3Failure.Op.GetObject, diag.detail.s3_request.op);
+    try testing.expectEqualStrings("bkt", diag.detail.s3_request.bucket.get());
+    try testing.expectEqualStrings("obj", diag.detail.s3_request.key.get());
+    try testing.expectEqual(@as(?anyerror, error.FirstByteTimeout), diag.detail.s3_request.err);
 }
 
 test "regression: a response that trickles in past its attempt's deadline is cut off and fetched again" {

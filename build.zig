@@ -278,7 +278,7 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
             .{ .name = "service", .module = test_service },
         },
     }), .filters = filters });
-    const cli_tests = b.addTest(.{ .root_module = cli_zpq.root });
+    const cli_tests = b.addTest(.{ .root_module = cli_zpq.root, .filters = filters });
     const unit_tests = b.allocator.dupe(UnitTest, &.{
         .{ .exe = b.addTest(.{ .root_module = test_core.zpq, .filters = filters }), .bin = "zpq-test", .stage = "units-core" },
         .{ .exe = lambda_tests, .bin = "zpq-lambda-test", .stage = "units-lambda" },

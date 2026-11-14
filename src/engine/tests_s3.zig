@@ -1004,6 +1004,40 @@ test "a recompressing S3 copy whose ranged read stalls writes the same bytes as 
     }
 }
 
+test "a timed-out footer GET names its bucket and key" {
+    const gpa = std.testing.allocator;
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(gpa);
+    defer fake.deinit();
+    fake.stall = "GET /bkt/t/a.parquet";
+    fake.stall_at = .before_headers;
+    fake.stalls_left = std.math.maxInt(u32);
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var lines: std.ArrayList(?[*:0]const u8) = .empty;
+    try lines.append(a, try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0));
+    try lines.appendSlice(a, &.{
+        "AWS_REGION=us-east-1",          "AWS_ACCESS_KEY_ID=ak",            "AWS_SECRET_ACCESS_KEY=sk",
+        "ZPQ_S3_CONNECT_TIMEOUT_MS=300", "ZPQ_S3_HANDSHAKE_TIMEOUT_MS=300", "ZPQ_S3_FIRST_BYTE_TIMEOUT_MS=50",
+        "ZPQ_S3_IDLE_TIMEOUT_MS=50",     "ZPQ_S3_REQUEST_TIMEOUT_MS=300",
+    });
+    const block = try a.allocSentinel(?[*:0]const u8, lines.items.len, null);
+    @memcpy(block, lines.items);
+    const urls = try a.alloc([]const u8, 1);
+    urls[0] = "s3://bkt/t/a.parquet";
+    var diag: Diag = .{};
+    const q: QueryArgs = .{ .inputs = urls, .diag = &diag };
+    const ctx: Context = .{ .gpa = gpa, .env = .{ .block = .{ .slice = block } }, .io = std.testing.io, .diag = &diag };
+    try std.testing.expectError(error.FirstByteTimeout, engine_input.openInputs(ctx, a, q, .{ .limit = 64 << 20 }));
+    try std.testing.expect(diag.detail == .s3_request);
+    try std.testing.expectEqual(s3.S3Failure.Op.GetObject, diag.detail.s3_request.op);
+    try std.testing.expectEqualStrings("bkt", diag.detail.s3_request.bucket.get());
+    try std.testing.expectEqualStrings("t/a.parquet", diag.detail.s3_request.key.get());
+    try std.testing.expectEqual(@as(?anyerror, error.FirstByteTimeout), diag.detail.s3_request.err);
+}
+
 test "a windowed S3 fetch that fails mid-scan fails the query rather than hanging it" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the S3 fetch window (epoll loop)");
     const gpa = std.testing.allocator;

@@ -381,7 +381,10 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
             const arena = arena_state.allocator();
             var diag: Diag = .{};
             var inputs: std.ArrayList([]const u8) = .empty;
-            for (qa.inputs) |pattern| try inputs.appendSlice(arena, try zpq.frontend.expandGlob(arena, io, pattern, env, &diag));
+            for (qa.inputs) |pattern| {
+                const expanded = zpq.frontend.expandGlob(arena, io, pattern, env, &diag) catch |err| return engineError(allocator, err, &diag);
+                try inputs.appendSlice(arena, expanded);
+            }
             qa.inputs = inputs.items;
             var registry = persistentPoolAdapter(pool);
             qa.diag = &diag;

@@ -185,16 +185,7 @@ pub const S3Failure = struct {
         }
         if (self.attempts > 1) try w.print(" ({d} attempts)", .{self.attempts});
         if (self.err) |e| try w.print(": {s}", .{@errorName(e)});
-        const code = self.code.get();
-        if (std.mem.eql(u8, code, "InvalidAccessKeyId") or
-            std.mem.eql(u8, code, "SignatureDoesNotMatch") or
-            std.mem.eql(u8, code, "InvalidToken") or
-            std.mem.eql(u8, code, "ExpiredToken"))
-        {
-            try w.writeAll("; check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)");
-        } else if (self.region.len > 0) {
-            try w.print("; the bucket is in region {s}", .{self.region.get()});
-        }
+        if (self.region.len > 0) try w.print("; the bucket is in region {s}", .{self.region.get()});
     }
 };
 

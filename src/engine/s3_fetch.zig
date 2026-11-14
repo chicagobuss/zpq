@@ -841,6 +841,21 @@ pub fn fetchMetaBatch(
     }
 }
 
+/// A metadata GET that never got an answer keeps its bucket and key on the fetch spec.
+fn getMetaObject(
+    sp: *FetchSpec,
+    io: std.Io,
+    pool: *s3.Pool(POOL_SIZE),
+    scratch: std.mem.Allocator,
+    creds: s3.Credentials,
+    opts: s3.GetOpts,
+) !http.Response {
+    return s3.getViaPoolWithOpts(io, pool, scratch, creds, sp.url, opts) catch |err| {
+        sp.failure = s3.transportFailure(.GetObject, sp.url.bucket, sp.url.key, err);
+        return err;
+    };
+}
+
 /// Fail a GET on `resp`: the one parser maps S3's answer to a named error, and the fetch keeps the details for the
 /// query's diagnostic after the workers join.
 fn refuseGet(sp: *FetchSpec, creds: s3.Credentials, resp: http.Response) anyerror {
@@ -865,7 +880,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
             // Charged before it is asked for: the suffix is at most the probe.
             t.account.add(t.probe);
             defer t.account.sub(t.probe);
-            const cond = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
+            const cond = try getMetaObject(sp, t.ctx.io, t.pool, scratch, t.creds, .{
                 .range = s3.Range.suffix(t.probe),
                 .if_none_match = entry.etag,
                 .prof = t.prof,
@@ -902,7 +917,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
     // populateFromTailResponse.
     t.account.add(t.probe);
     defer t.account.sub(t.probe);
-    const tail_resp = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
+    const tail_resp = try getMetaObject(sp, t.ctx.io, t.pool, scratch, t.creds, .{
         .range = s3.Range.suffix(t.probe),
         .prof = t.prof,
     });
@@ -954,7 +969,7 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
         const need_len: usize = @intCast(sp.tail_start - footer_actual_start);
         t.account.add(need_len);
         defer t.account.sub(need_len);
-        const need = try s3.getViaPoolWithOpts(t.ctx.io, t.pool, scratch, t.creds, sp.url, .{
+        const need = try getMetaObject(sp, t.ctx.io, t.pool, scratch, t.creds, .{
             .range = s3.Range.span(footer_actual_start, sp.tail_start - 1),
             .prof = t.prof,
         });

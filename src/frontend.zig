@@ -125,7 +125,12 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
     if (diag.detail == .decode and zpq.core.consumer.isDecodeError(err)) return decodeError(err, diag);
     if (csvError(err, diag)) return;
     if (diag.detail == .s3_request) {
-        diagnosticPrint("zpq query: {f}\n", .{diag.detail.s3_request});
+        const failure = diag.detail.s3_request;
+        diagnosticPrint("zpq query: {f}\n", .{failure});
+        const code = failure.code.get();
+        if (std.mem.eql(u8, code, "InvalidAccessKeyId") or std.mem.eql(u8, code, "SignatureDoesNotMatch") or
+            std.mem.eql(u8, code, "InvalidToken") or std.mem.eql(u8, code, "ExpiredToken"))
+            diagnosticPrint("  check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY)\n", .{});
         return;
     }
     printDetail(diag);

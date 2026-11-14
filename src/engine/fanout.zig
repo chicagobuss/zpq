@@ -41,6 +41,7 @@ pub fn split(a: A, counts: []const u64, workers: usize) ![]const Split {
 pub const Transport = struct {
     ctx: *anyopaque,
     prepared_v1: ?*bool = null,
+    aligned_v1: ?*bool = null,
     invoke: *const fn (*anyopaque, A, usize, []const u8) anyerror![]const u8,
 };
 
@@ -114,12 +115,26 @@ pub fn partialPayload(a: A, request: V, part: Split) ![]const u8 {
     return std.json.Stringify.valueAlloc(a, top, .{});
 }
 
+fn alignedPayload(a: A, request: V, selection: V) ![]const u8 {
+    // Share the partial envelope; preparation supplies exact physical ranges instead of fractions.
+    const inputs = try array(try member(request, "inputs"));
+    const runs = try a.alloc(Run, inputs.len);
+    for (runs, 0..) |*r, i| r.* = .{ .input = i, .start = 0, .end = 1, .of = 1 };
+    var top = try parse(a, try partialPayload(a, request, .{ .runs = runs }));
+    var partial = try member(top, "partial");
+    try put(a, &partial, "row_groups", try member(selection, "row_groups"));
+    try put(a, &partial, "alignment", try member(selection, "alignment"));
+    try put(a, &top, "partial", partial);
+    try put(a, &top, "operation", text("partial_aligned_join_aggregate"));
+    return std.json.Stringify.valueAlloc(a, top, .{});
+}
+
 fn checkWorker(answer: V) !void {
     if (answer != .object) return error.InvalidWorkerResponse;
     if (answer.object.get("error") == null) return;
     const reason = answer.object.get("reason") orelse return error.WorkerFailed;
     if (reason != .string) return error.WorkerFailed;
-    inline for (.{ error.SchemaMismatch, error.PlanMismatch, error.RowGroupOutOfRange, error.UnmergeableAggregate, error.UnsupportedPlanVersion, error.ConflictingPlanFields, error.PlanTooDeep, error.InvalidBoundPlan, error.JoinNotLocal, error.MemoryLimitExceeded, error.JoinBuildExceedsBudget, error.ReplicatedJoinNeedsS3, error.JoinBuildReadFailed, error.JoinBuildNoSnapshot, error.JoinIncompleteBuild, error.JoinBuildNotUnique, error.DuplicateBuildKey, error.JoinKeyType, error.JoinPayloadType, error.ExceededMemoryBudget }) |err| {
+    inline for (.{ error.SchemaMismatch, error.PlanMismatch, error.RowGroupOutOfRange, error.UnmergeableAggregate, error.UnsupportedPlanVersion, error.ConflictingPlanFields, error.PlanTooDeep, error.InvalidBoundPlan, error.JoinNotLocal, error.MemoryLimitExceeded, error.JoinBuildExceedsBudget, error.ReplicatedJoinNeedsS3, error.JoinBuildReadFailed, error.JoinBuildNoSnapshot, error.JoinIncompleteBuild, error.JoinBuildNotUnique, error.DuplicateBuildKey, error.JoinKeyType, error.JoinPayloadType, error.ExceededMemoryBudget, error.AlignedJoinUnordered, error.AlignedJoinMissingStats, error.AlignedJoinKeyType, error.AlignedJoinNoKeys, error.AlignedJoinNeedsS3, error.AlignedJoinBadRange, error.AlignedJoinSnapshotChanged }) |err| {
         if (std.mem.eql(u8, reason.string, @errorName(err))) return err;
     }
     if (std.mem.eql(u8, reason.string, "MissingField")) return error.WorkerLacksPartialAggregate;
@@ -459,7 +474,49 @@ pub fn run(a: A, backing: A, transport: Transport, request: V, opts: Options) !V
     };
     var payloads: std.ArrayList([]const u8) = .empty;
     var prepared: ?V = null;
-    if (patterned) {
+    const joined = if (request.object.get("join")) |v| v != .null else false;
+    const strategy = if (request.object.get("join_strategy")) |v| try string(v) else "auto";
+    if (!std.mem.eql(u8, strategy, "auto") and !std.mem.eql(u8, strategy, "aligned") and !std.mem.eql(u8, strategy, "replicated")) return error.UnsupportedJoinStrategy;
+    if (!joined and !std.mem.eql(u8, strategy, "auto")) return error.AlignedJoinNeedsJoin;
+    var alignment_prepared = false;
+    var aligned = false;
+    if (joined and !std.mem.eql(u8, strategy, "replicated")) {
+        var supported = if (transport.aligned_v1) |known| known.* else false;
+        if (!supported) {
+            const cap = try parse(a, try transport.invoke(transport.ctx, a, 0, "{\"operation\":\"capabilities\"}"));
+            const version = if (cap == .object) cap.object.get("aligned_join_version") else null;
+            supported = if (version) |v| v == .number_string and std.mem.eql(u8, v.number_string, "1") else false;
+            if (supported) if (transport.aligned_v1) |known| {
+                known.* = true;
+            };
+        }
+        if (!supported and std.mem.eql(u8, strategy, "aligned")) return error.UnsupportedPlanVersion;
+        if (supported) {
+            var prep_request = request;
+            prep_request.object = try request.object.clone(a);
+            try put(a, &prep_request, "operation", text("prepare_aggregate"));
+            try put(a, &prep_request, "plan_version", try number(a, 1));
+            try put(a, &prep_request, "workers", try number(a, opts.workers));
+            const selection = try parse(a, try transport.invoke(transport.ctx, a, 0, try std.json.Stringify.valueAlloc(a, prep_request, .{})));
+            alignment_prepared = true;
+            var usable = true;
+            checkWorker(selection) catch |err| switch (err) {
+                error.AlignedJoinUnordered, error.AlignedJoinMissingStats, error.AlignedJoinKeyType, error.AlignedJoinNoKeys, error.AlignedJoinNeedsS3 => {
+                    if (std.mem.eql(u8, strategy, "aligned")) return err;
+                    usable = false;
+                },
+                else => return err,
+            };
+            if (usable) {
+                const acknowledged = try member(selection, "aligned_join_version");
+                if (acknowledged != .number_string or !std.mem.eql(u8, acknowledged.number_string, "1")) return error.UnsupportedPlanVersion;
+                for (try array(try member(selection, "selections"))) |s| try payloads.append(a, try alignedPayload(a, request, s));
+                if (payloads.items.len == 0) return error.NoWorkerAnswers;
+                aligned = true;
+            }
+        }
+    }
+    if (aligned) {} else if (patterned) {
         if (transport.prepared_v1 == null or !transport.prepared_v1.?.*) {
             const cap = try parse(a, try transport.invoke(transport.ctx, a, 0, "{\"operation\":\"capabilities\"}"));
             const version = try member(cap, "prepare_aggregate_version");
@@ -539,12 +596,12 @@ pub fn run(a: A, backing: A, transport: Transport, request: V, opts: Options) !V
     try put(a, &out, "decode_ms", .{ .float = @as(f64, @floatFromInt(scattered.decode_ns)) / 1e6 });
     try put(a, &out, "scatter_ms", .{ .float = @as(f64, @floatFromInt(scattered_ns - planned_ns)) / 1e6 });
     try put(a, &out, "merge_ms", .{ .float = @as(f64, @floatFromInt(@import("../clock.zig").monoNs() - scattered_ns)) / 1e6 });
-    try put(a, &out, "footer_ms", if (patterned) .null else .{ .integer = 0 });
+    try put(a, &out, "footer_ms", if (patterned or alignment_prepared) .null else .{ .integer = 0 });
     try put(a, &out, "check_ms", .{ .integer = 0 });
     var payload_bytes: u64 = 0;
     for (payloads.items) |payload| payload_bytes += payload.len;
     try put(a, &out, "request_bytes", try number(a, payload_bytes));
-    try put(a, &out, "protocol", text(if (patterned) "plan" else "partial"));
+    try put(a, &out, "protocol", text(if (aligned) "aligned" else if (patterned) "plan" else "partial"));
     var stats = seq(a);
     var response_bytes: usize = 0;
     for (answers, scattered.stats) |answer, stat| {
@@ -717,4 +774,43 @@ test "fanout: empty grouped answers cannot acknowledge an unsupported merge func
     const a = arena.allocator();
     const answer = try parse(a, "{\"partial_version\":1,\"schema_fingerprint\":\"s\",\"plan_digest\":\"p\",\"groups\":[\"k\"],\"aggregates\":[{\"function\":\"median\",\"name\":\"m\"}],\"agg\":[]}");
     try std.testing.expectError(error.UnsupportedMergeFunction, merge(a, &.{answer}));
+}
+
+test "fanout aligned: only explicit version acknowledgement is cached; physical ranges use a guarded operation" {
+    const Mock = struct {
+        caps: usize = 0,
+        plans: usize = 0,
+        bad: bool = false,
+        fn invoke(raw: *anyopaque, a: A, _: usize, bytes: []const u8) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const payload = try parse(a, bytes);
+            const operation = try string(try member(payload, "operation"));
+            if (std.mem.eql(u8, operation, "capabilities")) {
+                self.caps += 1;
+                return a.dupe(u8, if (self.bad) "{\"aligned_join_version\":true}" else "{\"aligned_join_version\":1}");
+            }
+            if (std.mem.eql(u8, operation, "prepare_aggregate")) {
+                self.plans += 1;
+                return a.dupe(u8, "{\"aligned_join_version\":1,\"selections\":[{\"alignment\":{\"low\":1,\"high\":9,\"build\":{\"start\":0,\"end\":1},\"build_snapshot\":{\"etag\":\"e\",\"size\":100},\"probes\":[{\"etag\":\"e\",\"size\":100}]},\"row_groups\":[[0,1]]}]}");
+            }
+            if (!std.mem.eql(u8, operation, "partial_aligned_join_aggregate")) return error.InvalidWorkerResponse;
+            _ = try member(try member(payload, "partial"), "alignment");
+            return a.dupe(u8, "{\"partial_version\":1,\"schema_fingerprint\":\"s\",\"plan_digest\":\"p\",\"aggregates\":[{\"function\":\"count\",\"name\":\"n\"}],\"groups\":[],\"agg\":{\"_a0\":1}}");
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const req = try parse(a, "{\"inputs\":[\"x\"],\"aggregate\":\"count(*) AS n\",\"join_strategy\":\"aligned\",\"join\":{}}");
+    var mock: Mock = .{};
+    var known = false;
+    const transport: Transport = .{ .ctx = &mock, .invoke = Mock.invoke, .aligned_v1 = &known };
+    for (0..3) |_| _ = try run(a, std.heap.smp_allocator, transport, req, .{ .workers = 1 });
+    try std.testing.expectEqual(@as(usize, 1), mock.caps);
+    try std.testing.expectEqual(@as(usize, 3), mock.plans);
+    known = false;
+    mock.bad = true;
+    try std.testing.expectError(error.UnsupportedPlanVersion, run(a, std.heap.smp_allocator, transport, req, .{ .workers = 1 }));
+    try std.testing.expect(!known);
+    try std.testing.expectEqual(@as(usize, 3), mock.plans);
 }

@@ -275,6 +275,7 @@ test "fanout parity: worker refusals, quoted aliases, empty ranges and global or
 }
 
 test "fanout parity: schema disagreement and plan version refusals before I/O" {
+    try std.Io.Dir.cwd().createDirPath(io, "zig-out");
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
@@ -316,6 +317,7 @@ test "fanout parity: schema disagreement and plan version refusals before I/O" {
 }
 
 test "fanout joins: bounded replicated S3 dimensions, inner left semi anti, generation disagreement" {
+    try std.Io.Dir.cwd().createDirPath(io, "zig-out");
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -344,6 +346,7 @@ test "fanout joins: bounded replicated S3 dimensions, inner left semi anti, gene
         const simple = std.mem.eql(u8, kind, "semi") or std.mem.eql(u8, kind, "anti");
         const req = try zpq.engine.fanout.parse(scratch, try std.json.Stringify.valueAlloc(scratch, .{
             .inputs = &.{"s3://test/fact.parquet"},
+            .join_strategy = "replicated",
             .aggregate = "count(*) AS c, sum(amount) AS s, avg(amount) AS a",
             .group_by = if (simple) "fk" else "region",
             .join = .{ .kind = kind, .fk = "fk", .build = .{
@@ -377,6 +380,14 @@ test "fanout joins: bounded replicated S3 dimensions, inner left semi anti, gene
             try std.testing.expect(same(try get(filtered_out, "agg"), try zpq.engine.fanout.parse(scratch, filtered_ref.stdout)));
         }
         if (std.mem.eql(u8, kind, "inner")) {
+            var automatic = req;
+            automatic.object = try req.object.clone(scratch);
+            _ = automatic.object.swapRemove("join_strategy");
+            const automatic_out = try zpq.engine.fanout.run(scratch, a, client.transport(), automatic, .{ .workers = 3, .concurrency = 3 });
+            try std.testing.expectEqualStrings("partial", (try get(automatic_out, "protocol")).string);
+            try std.testing.expect(same(try get(automatic_out, "agg"), try get(out, "agg")));
+            try automatic.object.put(scratch, "join_strategy", .{ .string = "aligned" });
+            try std.testing.expectError(error.AlignedJoinMissingStats, zpq.engine.fanout.run(scratch, a, client.transport(), automatic, .{ .workers = 3 }));
             var compact = req;
             compact.object = try req.object.clone(scratch);
             try compact.object.put(scratch, "aggregate", .{ .string = "count(*) AS c, sum(amount) AS s" });
@@ -419,10 +430,6 @@ test "fanout joins: bounded replicated S3 dimensions, inner left semi anti, gene
                 return error.UnexpectedReplicaBudgetRefusal;
             }
             try std.testing.expectError(error.JoinBuildExceedsBudget, zpq.engine.fanout.run(scratch, a, client.transport(), tiny, .{ .workers = 1, .concurrency = 1 }));
-            store.reported_dimension_size.store((64 << 20) + 1, .release);
-            const oversized = zpq.engine.fanout.run(scratch, a, client.transport(), req, .{ .workers = 1, .concurrency = 1 });
-            store.reported_dimension_size.store(0, .release);
-            try std.testing.expectError(error.JoinBuildExceedsBudget, oversized);
             store.changing_dimension.store(true, .release);
             const changed = zpq.engine.fanout.run(scratch, a, client.transport(), req, .{ .workers = 4, .concurrency = 4 });
             store.changing_dimension.store(false, .release);
@@ -453,4 +460,84 @@ test "fanout joins: bounded replicated S3 dimensions, inner left semi anti, gene
     if (null_ref.term != .exited or null_ref.term.exited != 0) return error.OracleFailed;
     const null_reference = try zpq.engine.fanout.parse(scratch, null_ref.stdout);
     try std.testing.expectEqual(@as(f64, 0), try numeric(try get(null_reference.array.items[0], "n")));
+}
+
+test "fanout aligned joins: boundaries, both sides split, oversized source, small dimensions and snapshot refusal" {
+    try std.Io.Dir.cwd().createDirPath(io, "zig-out");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const fact = "zig-out/fanout-aligned-fact.parquet";
+    const dim = "zig-out/fanout-aligned-build.parquet";
+    defer std.Io.Dir.cwd().deleteFile(io, fact) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, dim) catch {};
+    const made = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-c", "SET memory_limit='1GB'; SET threads=1; COPY (SELECT (i//3-4096)::BIGINT AS fk, i::BIGINT AS amount FROM range(24576) t(i)) TO '" ++ fact ++ "' (FORMAT parquet, ROW_GROUP_SIZE 2048); COPY (SELECT (k-4096)::BIGINT AS dim_key, 'r'||(k%3) AS bucket FROM range(8192) t(k) WHERE k%5<>0) TO '" ++ dim ++ "' (FORMAT parquet, ROW_GROUP_SIZE 2048);" } });
+    if (made.term != .exited or made.term.exited != 0) return error.OracleFailed;
+    const fact_bytes = try fake.paddedParquet(scratch, fact, 2 << 20);
+    const dimension = try fake.paddedParquet(scratch, dim, (64 << 20) + 4096);
+    const small = try std.Io.Dir.cwd().readFileAlloc(io, dim, scratch, .limited(1 << 20));
+    var store: fake.FakeS3 = undefined;
+    try store.startTriple(fact_bytes, dimension, small, 0);
+    defer store.deinit();
+    var fixture: Fixture = undefined;
+    try fixture.startWithEnv(&.{
+        .{ "S3_ENDPOINT_URL", try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}", .{store.port}) },
+        .{ "S3_ACCESS_KEY_ID", "fake" },
+        .{ "S3_SECRET_ACCESS_KEY", "fake" },
+        .{ "S3_REGION", "us-east-1" },
+        .{ "ZPQ_S3_PRECONNECT", "0" },
+    });
+    defer fixture.stop();
+    var client = fixture.client();
+    for ([_][]const u8{ "inner", "left", "semi", "anti" }) |kind| {
+        const simple = std.mem.eql(u8, kind, "semi") or std.mem.eql(u8, kind, "anti");
+        const req = try zpq.engine.fanout.parse(scratch, try std.json.Stringify.valueAlloc(scratch, .{
+            .inputs = &.{"s3://test/fact.parquet"},
+            .join_strategy = "aligned",
+            .aggregate = "count(*) AS c, sum(amount) AS s, avg(amount) AS a",
+            .group_by = if (simple) "fk" else "bucket",
+            .join = .{ .kind = kind, .fk = "fk", .build = .{ .path = "s3://test/dimension.parquet", .key = "dim_key", .columns = if (simple) @as([]const []const u8, &.{}) else @as([]const []const u8, &.{"bucket"}) } },
+        }, .{}));
+        const sql = if (std.mem.eql(u8, kind, "anti"))
+            try std.fmt.allocPrint(scratch, "SELECT fk,count(*) AS c,sum(amount) AS s,avg(amount) AS a FROM '{s}' WHERE fk NOT IN (SELECT dim_key FROM '{s}') GROUP BY ALL", .{ fact, dim })
+        else
+            try std.fmt.allocPrint(scratch, "SELECT {s},count(*) AS c,sum(amount) AS s,avg(amount) AS a FROM '{s}' f {s} JOIN '{s}' d ON f.fk=d.dim_key GROUP BY ALL", .{ if (simple) "fk" else "bucket", fact, kind, dim });
+        const reference = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-json", "-c", try std.fmt.allocPrint(scratch, "SET memory_limit='1GB'; SET threads=1; {s}", .{sql}) } });
+        if (reference.term != .exited or reference.term.exited != 0) return error.OracleFailed;
+        const expected = try zpq.engine.fanout.parse(scratch, reference.stdout);
+        for ([_]usize{ 1, 3, 8 }) |workers| {
+            const out = try zpq.engine.fanout.run(scratch, a, client.transport(), req, .{ .workers = workers, .concurrency = 4, .counts = &.{1} });
+            try std.testing.expectEqualStrings("aligned", (try get(out, "protocol")).string);
+            if (!same(try get(out, "agg"), expected)) {
+                std.debug.print("aligned {s} N{d}: {s}\nexpected: {s}\n", .{ kind, workers, try std.json.Stringify.valueAlloc(scratch, out, .{}), reference.stdout });
+                return error.AlignedAnswerMismatch;
+            }
+        }
+        if (std.mem.eql(u8, kind, "inner")) {
+            var automatic = req;
+            automatic.object = try req.object.clone(scratch);
+            _ = automatic.object.swapRemove("join_strategy");
+            const auto_out = try zpq.engine.fanout.run(scratch, a, client.transport(), automatic, .{ .workers = 3 });
+            try std.testing.expectEqualStrings("aligned", (try get(auto_out, "protocol")).string);
+            try std.testing.expect(same(try get(auto_out, "agg"), expected));
+            var star = req;
+            star.object = try req.object.clone(scratch);
+            var joined = try get(req, "join");
+            joined.object = try joined.object.clone(scratch);
+            try joined.object.put(scratch, "dims", try zpq.engine.fanout.parse(scratch, "[{\"fk\":\"fk\",\"build\":{\"path\":\"s3://test/small.parquet\",\"key\":\"dim_key\",\"columns\":[]}}]"));
+            try star.object.put(scratch, "join", joined);
+            const star_out = try zpq.engine.fanout.run(scratch, a, client.transport(), star, .{ .workers = 3 });
+            try std.testing.expect(same(try get(star_out, "agg"), expected));
+            store.change_on_match.store(true, .release);
+            const changed = zpq.engine.fanout.run(scratch, a, client.transport(), req, .{ .workers = 3 });
+            store.change_on_match.store(false, .release);
+            try std.testing.expectError(error.AlignedJoinSnapshotChanged, changed);
+            var replica = req;
+            replica.object = try req.object.clone(scratch);
+            try replica.object.put(scratch, "join_strategy", .{ .string = "replicated" });
+            const replica_out = try zpq.engine.fanout.run(scratch, a, client.transport(), replica, .{ .workers = 1 });
+            try std.testing.expect(same(try get(replica_out, "agg"), expected));
+        }
+    }
+    try std.testing.expect(store.matched_requests.load(.acquire) > 0);
 }

@@ -391,6 +391,8 @@ pub const FetchSpec = struct {
     /// The object's ETag (quotes stripped), when S3 sent one that fits: what cached Bloom filters are keyed by.
     etag_buf: [96]u8 = undefined,
     etag_len: usize = 0,
+    if_match: ?[]const u8 = null,
+    pin_generation: bool = false,
     /// Time to the first byte of a successful footer request: a cold suffix, a stale 200/206, or a 304. Zero until
     /// one has. That is the latency the coalesce gap uses. A 304 used to record the whole exchange; the body after
     /// the first byte is not latency.
@@ -853,10 +855,16 @@ fn getMetaObject(
     creds: s3.Credentials,
     opts: s3.GetOpts,
 ) !http.Response {
-    return s3.getViaPoolWithOpts(io, pool, scratch, creds, sp.url, opts) catch |err| {
+    var conditional = opts;
+    conditional.if_match = sp.if_match;
+    if (conditional.if_match == null and sp.pin_generation and sp.etag_len > 0 and !std.mem.startsWith(u8, sp.etag(), "W/"))
+        conditional.if_match = try std.fmt.allocPrint(scratch, "\"{s}\"", .{sp.etag()});
+    const response = s3.getViaPoolWithOpts(io, pool, scratch, creds, sp.url, conditional) catch |err| {
         sp.failure = s3.transportFailure(.GetObject, sp.url.bucket, sp.url.key, err);
         return err;
     };
+    if (response.status == 412 and conditional.if_match != null) return error.AlignedJoinSnapshotChanged;
+    return response;
 }
 
 /// Fail a GET on `resp`: the one parser maps S3's answer to a named error, and the fetch keeps the details for the

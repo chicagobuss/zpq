@@ -87,6 +87,7 @@ pub const OpenedInputs = struct {
     gpa: std.mem.Allocator,
     inputs: []const scan.Input,
     metas: []schema.FileMetaData,
+    snapshots: []const ?types.SourceSnapshot = &.{},
     meta_ready: []bool,
     /// `QueryArgs.row_groups`, applied to each footer as it is parsed (`restrictRowGroups`).
     row_groups: ?[]const ?types.RowGroupRange = null,
@@ -269,8 +270,11 @@ pub fn openInputs(
     const prof = profile.threadOf(args.profiler, .main);
     if (args.profiler) |p| p.setFiles(paths);
     if (args.row_groups) |ranges| if (ranges.len != paths.len) return error.RowGroupOutOfRange;
+    if (args.input_snapshots) |snapshots| if (snapshots.len != paths.len) return error.AlignedJoinSnapshotChanged;
     var inputs = try arena.alloc(scan.Input, paths.len);
     const metas = try arena.alloc(schema.FileMetaData, paths.len);
+    const snapshots = try arena.alloc(?types.SourceSnapshot, paths.len);
+    @memset(snapshots, null);
     const meta_ready = try arena.alloc(bool, paths.len);
     @memset(meta_ready, false);
     var mmaps = try arena.alloc(?local_fs.Mapped, paths.len);
@@ -326,6 +330,7 @@ pub fn openInputs(
         .prof = prof,
         .inputs = inputs,
         .metas = metas,
+        .snapshots = snapshots,
         .meta_ready = meta_ready,
         .mmaps = mmaps,
         .s3_indices = s3_indices,
@@ -342,6 +347,7 @@ pub fn openInputs(
         .gpa = ctx.gpa,
         .inputs = inputs,
         .metas = metas,
+        .snapshots = snapshots,
         .meta_ready = meta_ready,
         .has_preparsed_meta = s3_indices.items.len > 0,
         .row_groups = args.row_groups,
@@ -366,6 +372,7 @@ const RemoteInputs = struct {
     prof: ?*profile.Thread,
     inputs: []scan.Input,
     metas: []schema.FileMetaData,
+    snapshots: []?types.SourceSnapshot,
     meta_ready: []bool,
     mmaps: []?local_fs.Mapped,
     s3_indices: std.ArrayList(usize),
@@ -401,7 +408,7 @@ const RemoteInputs = struct {
         // (CLI). Either way, after this we have a `*s3.Pool(POOL_SIZE)`
         // we can drive.
         const pool: *s3.Pool(POOL_SIZE) = if (self.ctx.pool_registry) |reg|
-            try reg.ensure_for_bucket(reg.ctx, self.ctx.gpa, creds, bucket)
+            try reg.ensure_for_bucket(reg.ctx, self.ctx.pool_gpa orelse self.ctx.gpa, creds, bucket)
         else blk: {
             const p = try self.arena.create(s3.Pool(POOL_SIZE));
             try p.init(self.ctx.gpa);
@@ -418,6 +425,13 @@ const RemoteInputs = struct {
             .url = u,
             .file_index = self.s3_indices.items[k],
             .footer_only = self.fetch_window.footer_only,
+            .pin_generation = self.args.pin_input_generation or self.args.input_snapshots != null,
+        };
+        if (self.args.input_snapshots) |expected| for (self.s3_indices.items, specs) |idx, *sp| {
+            const snapshot = expected[idx] orelse return error.AlignedJoinSnapshotChanged;
+            if (snapshot.etag.len == 0 or std.mem.startsWith(u8, snapshot.etag, "W/")) return error.JoinBuildNoSnapshot;
+            for (snapshot.etag) |c| if (std.ascii.isControl(c) or c == '"') return error.JoinBuildNoSnapshot;
+            sp.if_match = try std.fmt.allocPrint(self.arena, "\"{s}\"", .{snapshot.etag});
         };
         // Retained suffixes and in-flight footer bodies share one budget: the caller's max, and never the fetch
         // window's 64 MiB floor when that floor is higher. A suffix that does not fit is dropped and those ranges
@@ -447,6 +461,18 @@ const RemoteInputs = struct {
         };
 
         // A worker's row groups, before anything plans or fetches from the footers.
+        for (self.s3_indices.items, specs) |idx, *sp| {
+            const etag = sp.etag_buf[0..sp.etag_len];
+            const snapshot: types.SourceSnapshot = .{ .etag = try self.arena.dupe(u8, etag), .size = sp.total_size };
+            self.snapshots[idx] = snapshot;
+            if (sp.pin_generation and sp.if_match == null and etag.len > 0 and !std.mem.startsWith(u8, etag, "W/"))
+                sp.if_match = try std.fmt.allocPrint(self.arena, "\"{s}\"", .{etag});
+            if (self.args.input_snapshots) |expected| {
+                const want = expected[idx] orelse return error.AlignedJoinSnapshotChanged;
+                if (etag.len == 0 or std.mem.startsWith(u8, etag, "W/") or
+                    !std.mem.eql(u8, want.etag, etag) or want.size != sp.total_size) return error.AlignedJoinSnapshotChanged;
+            }
+        }
         if (self.args.row_groups) |ranges| for (self.s3_indices.items, specs) |idx, *sp| {
             try restrictRowGroups(self.arena, &sp.meta, ranges[idx], self.args.diag, self.paths[idx]);
         };
@@ -686,6 +712,7 @@ const RemoteInputs = struct {
             .gpa = self.ctx.gpa,
             .inputs = self.inputs,
             .metas = self.metas,
+            .snapshots = self.snapshots,
             .meta_ready = self.meta_ready,
             .has_preparsed_meta = true,
             .mmaps = self.mmaps,
@@ -869,7 +896,10 @@ const RemoteFilePlan = struct {
                     const list = if (self.windowed) &rg_jobs else self.fetch_jobs;
                     const before = list.items.len;
                     try appendSplitFetch(list, self.builder.arena, sp.url.bucket, sp.url.key, r.start, fetch_end, dst[0..@intCast(fetch_end - r.start)]);
-                    for (list.items[before..]) |j| job_bytes += j.target.len;
+                    for (list.items[before..]) |*j| {
+                        job_bytes += j.target.len;
+                        j.if_match = sp.if_match;
+                    }
                 }
 
                 if (r.end > sp.tail_start) {

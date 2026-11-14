@@ -231,9 +231,11 @@ pub const FakeS3 = struct {
     port: u16,
     object: []const u8,
     secondary: ?[]const u8 = null,
+    tertiary: ?[]const u8 = null,
+    change_on_match: std.atomic.Value(bool) = .init(false),
+    matched_requests: std.atomic.Value(u32) = .init(0),
     changing_dimension: std.atomic.Value(bool) = .init(false),
     dimension_generation: std.atomic.Value(u32) = .init(0),
-    reported_dimension_size: std.atomic.Value(u64) = .init(0),
     idle_close_ms: i32,
     accept_thread: std.Thread = undefined,
     conn_fds: [MAX_CONNS]linux.fd_t = @splat(-1),
@@ -247,6 +249,9 @@ pub const FakeS3 = struct {
         return self.startPair(object, null, idle_close_ms);
     }
     pub fn startPair(self: *FakeS3, object: []const u8, secondary: ?[]const u8, idle_close_ms: i32) !void {
+        return self.startTriple(object, secondary, null, idle_close_ms);
+    }
+    pub fn startTriple(self: *FakeS3, object: []const u8, secondary: ?[]const u8, tertiary: ?[]const u8, idle_close_ms: i32) !void {
         const fd = try sysSocket();
         errdefer sysClose(fd);
         const yes: i32 = 1;
@@ -265,6 +270,7 @@ pub const FakeS3 = struct {
             .port = std.mem.bigToNative(u16, bound.port),
             .object = object,
             .secondary = secondary,
+            .tertiary = tertiary,
             .idle_close_ms = idle_close_ms,
         };
         self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
@@ -324,9 +330,9 @@ pub const FakeS3 = struct {
         _ = self.requests.fetchAdd(1, .monotonic);
         const first_line = head[0 .. std.mem.indexOf(u8, head, "\r\n") orelse head.len];
         const dimension = std.mem.indexOf(u8, first_line, "/dimension.parquet") != null;
-        const obj = if (dimension) self.secondary orelse self.object else self.object;
-        const reported = if (dimension) self.reported_dimension_size.load(.acquire) else 0;
-        const total_size = if (reported != 0) reported else obj.len;
+        const small = std.mem.indexOf(u8, first_line, "/small.parquet") != null;
+        const obj = if (dimension) self.secondary orelse self.object else if (small) self.tertiary orelse self.object else self.object;
+        const total_size = obj.len;
         var etag_buffer: [64]u8 = undefined;
         const etag = if (dimension and self.changing_dimension.load(.acquire))
             try std.fmt.bufPrint(&etag_buffer, "generation-{d}", .{self.dimension_generation.fetchAdd(1, .monotonic)})
@@ -334,6 +340,7 @@ pub const FakeS3 = struct {
             ETAG;
         var range: ?[]const u8 = null;
         var if_none_match: ?[]const u8 = null;
+        var if_match: ?[]const u8 = null;
         var lines = std.mem.splitSequence(u8, head, "\r\n");
         _ = lines.next();
         while (lines.next()) |line| {
@@ -341,8 +348,15 @@ pub const FakeS3 = struct {
             const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
             if (std.ascii.eqlIgnoreCase(line[0..colon], "range")) range = value;
             if (std.ascii.eqlIgnoreCase(line[0..colon], "if-none-match")) if_none_match = value;
+            if (std.ascii.eqlIgnoreCase(line[0..colon], "if-match")) if_match = value;
         }
         var hdr_buf: [256]u8 = undefined;
+        if (if_match) |v| {
+            _ = self.matched_requests.fetchAdd(1, .monotonic);
+            const data_range = if (range) |r| !std.mem.startsWith(u8, r, "bytes=-") else false;
+            if ((dimension and data_range and self.change_on_match.load(.acquire)) or !std.mem.eql(u8, std.mem.trim(u8, v, "\""), etag))
+                return writeAllFd(fd, "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\n\r\n");
+        }
         if (if_none_match) |v| if (std.mem.eql(u8, std.mem.trim(u8, v, "\""), etag)) {
             return writeAllFd(fd, try std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 304 Not Modified\r\nETag: \"{s}\"\r\n\r\n", .{etag}));
         };

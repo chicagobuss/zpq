@@ -16,6 +16,8 @@ const Diag = @import("../core/diag.zig").Diag;
 const plans = @import("bound_plan.zig");
 const types = @import("types.zig");
 const s3 = @import("../io/s3.zig");
+const input = @import("input.zig");
+const fanout_plan = @import("fanout_plan.zig");
 
 /// Footers of the local files a join names, for the SQL frontend's binder (`sql_parser.parseSqlJoinPlan`). Each is
 /// read once; the build reads its file again here (`prepare`). The plan the binder returns borrows nothing of them, so
@@ -511,6 +513,10 @@ const Task = struct {
     kind: lookup.Kind,
     arena: std.heap.ArenaAllocator,
     store: Store,
+    aligned_store: Store,
+    aligned: ?types.AlignedJoin = null,
+    opened: std.ArrayList(input.OpenedInputs) = .empty,
+    aligned_source_bytes: usize = 0,
     maps: std.ArrayList(local_fs.Mapped) = .empty,
     charged: usize = 0,
     diag: Diag = .{},
@@ -518,13 +524,15 @@ const Task = struct {
     err: ?anyerror = null,
 
     fn run(t: *Task) void {
-        t.leaf = build(t, t.fk, t.build, t.kind) catch |err| {
+        t.leaf = build(t, t.fk, t.build, t.kind, t.aligned) catch |err| {
             t.err = err;
             return;
         };
     }
 
     fn release(t: *Task) void {
+        for (t.opened.items) |*opened| opened.deinit();
+        t.aligned_store.deinit();
         t.store.deinit();
         for (t.maps.items) |m| m.unmap();
         t.arena.deinit();
@@ -533,28 +541,29 @@ const Task = struct {
 
 /// Read one build side (its own SEMI joins first) into the lookup conjunct on `fk`, charged to the ledger as it is
 /// read.
-fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind) !Leaf {
+fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: ?types.AlignedJoin) !Leaf {
     const arena = t.arena.allocator();
     const p = t.p;
     const diag = &t.diag;
     try t.maps.ensureUnusedCapacity(arena, 1);
-    const file = (if (p.replica_limit != null) openReplica(t, b.path) else open(arena, b.path)) catch |err| {
+    const file = (if (p.replica_limit != null) openRemote(t, b, aligned) else open(arena, b.path)) catch |err| {
         Diag.setInput(diag, b.path, err);
         return err;
     };
     if (file.map) |m| t.maps.appendAssumeCapacity(m);
     const meta = try arena.create(schema.FileMetaData);
     meta.* = file.meta;
-    var filter: ?filter_ast.Filter = if (b.filter) |f| try filters.bindSyntax(arena, f, meta, diag) else null;
+    const filter_syntax = if (aligned) |selection| try fanout_plan.intervalFilter(arena, b.filter, b.key, selection.low, selection.high) else b.filter;
+    var filter: ?filter_ast.Filter = if (filter_syntax) |f| try filters.bindSyntax(arena, f, meta, diag) else null;
     const semis = try arena.alloc(Leaf, b.semis.len);
     for (b.semis, semis) |s, *inner| {
-        inner.* = try build(t, s.fk, s.build, semiKind(s));
+        inner.* = try build(t, s.fk, s.build, semiKind(s), null);
         filter = try withLookup(arena, filter, try leafOf(meta, inner.*, diag));
     }
     // A snowflake's tables under this build: INNER lookups of its filter, whose columns it publishes (`lookup.chain`).
     const dims = try arena.alloc(Leaf, b.dims.len);
     for (b.dims, dims) |d, *inner| {
-        inner.* = try build(t, d.fk, d.build, .inner);
+        inner.* = try build(t, d.fk, d.build, .inner, null);
         filter = try withLookup(arena, filter, try leafOf(meta, inner.*, diag));
     }
     const payload = try arena.alloc(usize, b.columns.len);
@@ -566,8 +575,9 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind) !Leaf {
         Diag.setColumn(diag, b.key);
         return err;
     };
-    const before = t.store.capacity();
-    const j = lookup.build(t.store.allocator(), p.charge.allocator(), file.bytes, meta, .{
+    const store = if (aligned != null) &t.aligned_store else &t.store;
+    const before = store.capacity();
+    const j = lookup.build(store.allocator(), p.charge.allocator(), file.bytes, meta, .{
         .kind = kind,
         .build_name = b.path,
         .key_name = b.key,
@@ -586,7 +596,7 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind) !Leaf {
         const at = for (b.columns, 0..) |name, i| {
             if (std.mem.eql(u8, name, d.fk)) break i;
         } else unreachable;
-        lookup.chain(t.store.allocator(), j, at, inner.join) catch |err| {
+        lookup.chain(store.allocator(), j, at, inner.join) catch |err| {
             Diag.setInput(diag, b.path, null);
             Diag.setColumn(diag, d.fk);
             return if (p.charge.refusal(err) == error.ExceededMemoryBudget) error.JoinBuildExceedsBudget else err;
@@ -597,7 +607,7 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind) !Leaf {
         Diag.setInput(diag, b.path, err);
         return err;
     };
-    j.bytes = t.store.capacity() - before;
+    j.bytes = store.capacity() - before;
     t.charged += j.bytes;
     return .{ .fk = fk, .join = j, .semis = semis, .dims = dims };
 }
@@ -630,13 +640,15 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
         .fk = undefined,
         .build = undefined,
         .kind = undefined,
-        .arena = .init(if (p.replica_limit != null) retained else gpa),
+        .arena = .init(if (args.aligned_join != null) p.charge.allocator() else if (p.replica_limit != null) retained else gpa),
         .store = .init(retained),
+        .aligned_store = .init(p.charge.allocator()),
     };
     // A copy of an arena or a store that has allocated nothing is a fresh one.
     for (tasks) |*t| t.* = task;
     tasks[0].fk = sj.fk;
     tasks[0].build = sj.build;
+    tasks[0].aligned = args.aligned_join;
     tasks[0].kind = switch (sj.kind) {
         inline else => |k| @field(lookup.Kind, @tagName(k)),
     };
@@ -661,7 +673,7 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
             d.detail = t.diag.detail;
         }
         // S3 wraps allocator failures (including signing scratch) as transport errors.
-        if (p.replica_limit != null and p.replica_charge.refused.load(.monotonic)) {
+        if (p.charge.refused.load(.monotonic) or (p.replica_limit != null and p.replica_charge.refused.load(.monotonic))) {
             if (args.diag) |d| d.cause = error.JoinBuildExceedsBudget;
             return error.JoinBuildExceedsBudget;
         }
@@ -669,6 +681,9 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
     };
     for (tasks) |t| p.charged += t.charged;
     if (p.replica_limit != null) p.charged = p.replica_budget.used.load(.monotonic);
+    for (tasks) |t| {
+        p.charged += t.aligned_store.capacity() + t.aligned_source_bytes;
+    }
     p.main = tasks[0].leaf;
     p.main.join.main = true;
     p.main.join.publishes = true;
@@ -719,33 +734,68 @@ test "a build store gives each large array its own allocation and frees it all" 
     try std.testing.expectEqual(@as(u8, @truncate(3 * Store.large_bytes - 1)), list.items[list.items.len - 1]);
 }
 
-/// A single bounded GET holds one immutable dimension generation. Its bytes and lookup share the replica cap.
-fn openReplica(t: *Task, path: []const u8) !Opened {
-    if (!std.mem.startsWith(u8, path, "s3://")) return error.ReplicatedJoinNeedsS3;
-    const limit = t.p.replica_limit.?;
-    if (limit == 0) return error.JoinBuildExceedsBudget;
-    const a = t.store.allocator();
+/// The lookup consumes a compact file too: existing S3 fetch/rebase selects only its columns, without pruning rows
+/// the lookup itself will filter. Nested dimensions retain their own replicated allocator and complete input.
+fn openRemote(t: *Task, b: syntax.Build, aligned: ?types.AlignedJoin) !Opened {
+    if (!std.mem.startsWith(u8, b.path, "s3://")) return error.ReplicatedJoinNeedsS3;
+    if (aligned) |selection| if (selection.build.of != null) return error.AlignedJoinBadRange;
+    var ctx = t.ctx;
+    ctx.pool_gpa = ctx.pool_gpa orelse ctx.gpa;
+    ctx.gpa = if (aligned != null) t.p.charge.allocator() else t.p.replica_charge.allocator();
+    var cache: plans.Cache = .{};
+    const source: plans.Source = .{ .context = &b, .kind = .rows, .bind_fn = buildColumns };
+    const args: types.QueryArgs = .{
+        .inputs = &.{b.path},
+        .plan_source = source,
+        .plan_cache = &cache,
+        .row_groups = if (aligned) |selection| &.{selection.build} else null,
+        .input_snapshots = if (aligned) |selection| &.{selection.build_snapshot} else null,
+        .pin_input_generation = true,
+        .max_memory = if (aligned != null) t.p.ledger.available() else t.p.replica_budget.available(),
+        .parallelism = t.threads,
+        .diag = &t.diag,
+    };
+    var opened = try input.openInputs(ctx, t.arena.allocator(), args, .{ .limit = std.math.maxInt(u64) });
+    errdefer opened.deinit();
+    const metas = try input.materializeMetas(t.arena.allocator(), opened, &t.diag, null);
+    const snapshot = opened.snapshots[0] orelse return error.JoinBuildNoSnapshot;
+    if (snapshot.etag.len == 0 or std.mem.startsWith(u8, snapshot.etag, "W/")) return error.JoinBuildNoSnapshot;
     const creds = try s3.Credentials.fromEnv(t.ctx.env);
-    const response = try s3.get(a, creds, try s3.Url.parse(path), .span(0, limit - 1));
-    if (response.status != 200 and response.status != 206) return error.JoinBuildReadFailed;
-    const size = if (response.status == 206) blk: {
-        const range = response.header("Content-Range") orelse return error.JoinBuildNoSnapshot;
-        const slash = std.mem.lastIndexOfScalar(u8, range, '/') orelse return error.JoinBuildNoSnapshot;
-        break :blk try std.fmt.parseInt(u64, range[slash + 1 ..], 10);
-    } else response.body.len;
-    if (size > limit) return error.JoinBuildExceedsBudget;
-    if (size != response.body.len) return error.JoinIncompleteBuild;
-    const etag = response.header("ETag") orelse return error.JoinBuildNoSnapshot;
-    if (etag.len == 0 or std.mem.startsWith(u8, etag, "W/")) return error.JoinBuildNoSnapshot;
-    const origin = creds.endpoint orelse creds.region;
-    snapshotWord(&t.snapshot, origin.len);
-    t.snapshot.update(origin);
-    snapshotWord(&t.snapshot, path.len);
-    t.snapshot.update(path);
-    snapshotWord(&t.snapshot, etag.len);
-    t.snapshot.update(etag);
-    snapshotWord(&t.snapshot, size);
-    return .{ .map = null, .bytes = response.body, .meta = try metadata.open(t.arena.allocator(), response.body) };
+    snapshotObject(&t.snapshot, creds.endpoint orelse creds.region, b.path, snapshot.etag, snapshot.size);
+    try t.opened.append(t.arena.allocator(), opened);
+    if (aligned != null) for (opened.s3_buffers) |bytes| {
+        t.aligned_source_bytes += bytes.len;
+    };
+    return .{ .map = null, .bytes = opened.inputs[0].bytes, .meta = metas[0] };
+}
+
+fn buildColumns(raw: *const anyopaque, a: std.mem.Allocator, meta: *const schema.FileMetaData, diag: ?*Diag, _: plans.Options) anyerror!plans.Query {
+    const b: *const syntax.Build = @ptrCast(@alignCast(raw));
+    const mask = try a.alloc(bool, metadata.leafCount(meta));
+    @memset(mask, false);
+    mask[try metadata.resolveColumn(meta, b.key)] = true;
+    for (b.columns) |name| mask[try metadata.resolveColumn(meta, name)] = true;
+    for (b.semis) |s| mask[try metadata.resolveColumn(meta, s.fk)] = true;
+    for (b.dims) |d| mask[try metadata.resolveColumn(meta, d.fk)] = true;
+    if (b.filter) |node| {
+        const filter = try filters.bindSyntax(a, node, meta, diag);
+        var cols: std.ArrayList(usize) = .empty;
+        try filter.collectColumns(&cols, a);
+        for (cols.items) |ci| mask[ci] = true;
+    }
+    return .{ .projection = .{ .kept_set = mask } };
+}
+
+fn snapshotObject(hash: *std.crypto.hash.sha2.Sha256, origin: []const u8, path: []const u8, etag: []const u8, size: u64) void {
+    snapshotWord(hash, origin.len);
+    hash.update(origin);
+    snapshotWord(hash, path.len);
+    hash.update(path);
+    // Whole-object and footer ETags have the same canonical representation in agreement.
+    const canonical = std.mem.trim(u8, etag, "\"");
+    snapshotWord(hash, canonical.len);
+    hash.update(canonical);
+    snapshotWord(hash, size);
 }
 fn snapshotWord(hash: *std.crypto.hash.sha2.Sha256, n: u64) void {
     var bytes: [8]u8 = undefined;

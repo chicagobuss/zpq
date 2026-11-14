@@ -16,8 +16,9 @@ pub const Operation = enum {
     prepare_aggregate,
     partial_aggregate,
     partial_join_aggregate,
+    partial_aligned_join_aggregate,
     pub fn isPartial(self: Operation) bool {
-        return self == .partial_aggregate or self == .partial_join_aggregate;
+        return self == .partial_aggregate or self == .partial_join_aggregate or self == .partial_aligned_join_aggregate;
     }
 };
 
@@ -68,16 +69,20 @@ const Wire = struct {
     row_groups: ?std.json.Value = null,
     partial: ?std.json.Value = null,
     join: ?std.json.Value = null,
+    alignment: ?std.json.Value = null,
+    workers: ?std.json.Value = null,
 };
 
 /// The fields `partial_aggregate` takes inside its `partial` object, and only there. A worker that predates the
 /// operation finds no `inputs`, `s3_url` or `sql` at the top level and refuses the request before opening anything.
-const partial_fields = .{ "inputs", "s3_url", "row_groups", "aggregate", "group_by", "filter", "join" };
+const partial_fields = .{ "inputs", "s3_url", "row_groups", "aggregate", "group_by", "filter", "join", "alignment" };
 
 pub const Request = struct {
     operation: Operation = .query,
     plan: ?std.json.Value = null,
     join: ?std.json.Value = null,
+    alignment: ?std.json.Value = null,
+    workers: usize = 0,
     parsed: std.json.Parsed(Wire),
     sql: ?[]const u8 = null,
     parallelism: usize = 0,
@@ -171,7 +176,7 @@ pub const Request = struct {
                 "column_order",   "scan_all",        "trust_stats",       "cache",
                 "ordered",        "max_memory",      "budget_wait_ms",    "max_result_bytes",
                 "profile",        "profile_url",     "bloom_filters",     "bloom_filters_enabled",
-                "row_group_size", "row_group_bytes", "partial",
+                "row_group_size", "row_group_bytes", "partial",           "workers",
             }) |name| {
                 if (@field(inner, name)) |v| if (v != .null) return error.ConflictingPlanFields;
             }
@@ -237,9 +242,18 @@ pub const Request = struct {
         req.aggregate = try q.string("aggregate");
         req.group_by = try q.string("group_by");
         req.join = if (src.join) |v| (if (v == .null) null else v) else null;
-        if (req.operation == .partial_join_aggregate) {
+        if (req.operation == .partial_join_aggregate or req.operation == .partial_aligned_join_aggregate) {
             if (req.join == null or req.join.? != .object) return q.bad("join");
-        } else if (req.join != null) return error.ConflictingPlanFields;
+        } else if (req.join != null and req.operation != .prepare_aggregate) return error.ConflictingPlanFields;
+        req.alignment = if (src.alignment) |v| (if (v == .null) null else v) else null;
+        if (req.operation == .partial_aligned_join_aggregate) {
+            if (req.alignment == null or req.alignment.? != .object) return q.bad("alignment");
+        } else if (req.alignment != null) return error.ConflictingPlanFields;
+        if (req.operation == .prepare_aggregate and req.join != null) {
+            const w = parsed.value.workers orelse return f.bad("workers");
+            if (w != .integer or w.integer <= 0) return f.bad("workers");
+            req.workers = @intCast(w.integer);
+        }
         req.column_order = try f.string("column_order");
         req.scan_all = try f.boolean("scan_all");
         req.trust_stats = try f.boolean("trust_stats");

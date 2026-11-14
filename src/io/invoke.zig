@@ -12,6 +12,7 @@ pub const Pool = struct {
     connections: pool_mod.Pool(256) = undefined,
     capability_key: [32]u8 = @splat(0),
     prepared_v1: bool = false,
+    aligned_v1: bool = false,
     pub fn init(self: *Pool, a: A) !void {
         self.* = .{};
         try self.connections.init(a);
@@ -129,12 +130,13 @@ pub const Client = struct {
                     if (!std.mem.eql(u8, &key, &self.pool.capability_key)) {
                         self.pool.capability_key = key;
                         self.pool.prepared_v1 = false;
+                        self.pool.aligned_v1 = false;
                     }
                     known = &self.pool.prepared_v1;
                 }
             }
         };
-        return .{ .ctx = self, .invoke = invoke, .prepared_v1 = known };
+        return .{ .ctx = self, .invoke = invoke, .prepared_v1 = known, .aligned_v1 = if (known != null) &self.pool.aligned_v1 else null };
     }
     fn invoke(ctx: *anyopaque, a: A, index: usize, body: []const u8) ![]const u8 {
         const self: *Client = @ptrCast(@alignCast(ctx));

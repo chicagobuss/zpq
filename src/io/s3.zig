@@ -596,6 +596,7 @@ pub const GetOpts = struct {
     /// in that case. Used by the metadata cache to skip the
     /// data-page-bearing rounds when an object is unchanged.
     if_none_match: ?[]const u8 = null,
+    if_match: ?[]const u8 = null,
     /// Records the request as an `http_get` span when set.
     prof: ?*profile.Thread = null,
 };
@@ -830,6 +831,8 @@ pub const FetchJob = struct {
     landed: ?Landed = null,
     /// This request overlaps a filter column, so a dispatch sends it before the others.
     urgent: bool = false,
+    /// A footer-derived selection must read only the generation the planner proved.
+    if_match: ?[]const u8 = null,
 };
 
 pub const Landed = struct {
@@ -934,6 +937,7 @@ pub fn fetchJobs(
                     .target = j.target[sub_off_start..sub_off_end],
                     .landed = j.landed,
                     .urgent = j.urgent,
+                    .if_match = j.if_match,
                 });
             }
         } else {
@@ -975,6 +979,7 @@ pub fn fetchJobs(
             .port = hi.port,
             .use_tls = hi.use_tls,
             .range = j.range,
+            .if_match = j.if_match,
             .target = j.target,
             .ok = false,
             .profiler = profiler,
@@ -1058,6 +1063,7 @@ const FetchCtx = struct {
     port: u16,
     use_tls: bool,
     range: Range,
+    if_match: ?[]const u8 = null,
     /// Pre-sized target buffer; `target.len == range.end - range.start`.
     target: []u8,
     ok: bool,
@@ -1103,6 +1109,8 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
     // Any status but a full 200/206 (including a throttle that outlasted the budget) fails this fetch.
     if (resp.status == 206 or resp.status == 200) {
         ctx.ok = resp.body.len == ctx.target.len;
+    } else if (resp.status == 412 and ctx.if_match != null) {
+        ctx.err = error.AlignedJoinSnapshotChanged;
     } else {
         const r = refusal(.GetObject, ctx.bucket, ctx.key, resp, ctx.creds);
         ctx.failure = r.failure;
@@ -1128,6 +1136,7 @@ fn doFetch(ctx: *FetchCtx, arena: std.mem.Allocator, conn: *tls.Connection) !htt
 
     var hdr_in: std.ArrayList(sigv4.SigV4.Header) = .empty;
     try hdr_in.append(arena, .{ .name = "Range", .value = range_header });
+    if (ctx.if_match) |etag| try hdr_in.append(arena, .{ .name = "If-Match", .value = etag });
 
     const signed = try signer.sign(arena, "GET", ctx.host, path, null, hdr_in.items, "", .{ .use_unsigned_payload = true });
 
@@ -1350,6 +1359,7 @@ fn buildAndSend(
         // is to include it.
         try hdr_in.append(req_arena, .{ .name = "If-None-Match", .value = etag });
     }
+    if (opts.if_match) |etag| try hdr_in.append(req_arena, .{ .name = "If-Match", .value = etag });
 
     const signed_headers = signer.sign(
         req_arena,

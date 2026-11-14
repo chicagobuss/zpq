@@ -234,6 +234,7 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
                 .partial_aggregate_version = request.partial_version,
                 .partial_join_aggregate_version = request.partial_version,
                 .replicated_join_max_bytes = @as(usize, 64 << 20),
+                .aligned_join_version = 1,
             }, .{});
 
         const decoded_plan: ?engine.fanout_plan.Query = if (req.plan) |value|
@@ -390,6 +391,17 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
             qa.inputs = inputs.items;
             var registry = persistentPoolAdapter(pool);
             qa.diag = &diag;
+            if (req.join) |value| {
+                const j = engine.fanout_plan.decodeJoin(arena, value) catch |err| return engineError(allocator, err, &diag);
+                return engine.fanout_plan.prepareAligned(.{
+                    .gpa = allocator,
+                    .env = env,
+                    .io = io,
+                    .pool_registry = &registry,
+                    .meta_cache = pool.metaCache(),
+                    .worker_io = pool.worker_io,
+                }, qa, j, req.workers, result_cap.bytes) catch |err| return engineError(allocator, err, &diag);
+            }
             return engine.fanout_plan.prepare(.{
                 .gpa = allocator,
                 .env = env,
@@ -413,13 +425,22 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
             if (req.join) |value| {
                 merged.query.join = engine.fanout_plan.decodeJoin(arena, value) catch |err| return engineError(allocator, err, &Diag{});
             }
+            const common_members = try engine.fanout_plan.partialMembers(arena, merged);
             var pa = qa;
             if (req.join != null) pa.replicated_join_limit = @min(64 << 20, pa.max_memory / 8);
+            if (req.alignment) |value| {
+                const selection = engine.fanout_plan.decodeAlignment(arena, value) catch |err| return engineError(allocator, err, &Diag{});
+                if (selection.probes.len != pa.inputs.len or pa.row_groups == null) return engineError(allocator, error.AlignedJoinBadRange, &Diag{});
+                for (pa.row_groups.?) |r| if (r == null or r.?.of != null) return engineError(allocator, error.AlignedJoinBadRange, &Diag{});
+                pa.aligned_join = selection;
+                pa.input_snapshots = selection.probes;
+                merged.query.filter = try engine.fanout_plan.intervalFilter(arena, merged.query.filter, merged.query.join.?.fk, selection.low, selection.high);
+            }
             pa.plan_source = engine.syntax_plan.source(&merged.query);
             pa.aggregate = null;
             pa.group_by = null;
             pa.filter = null;
-            const response = try runAggregate(io, allocator, env, pool, pa, result_cap, try engine.fanout_plan.partialMembers(arena, merged));
+            const response = try runAggregate(io, allocator, env, pool, pa, result_cap, common_members);
             const prof = profiler orelse return response;
             return attachProfile(io, allocator, env, pool, prof, req.profile_url, budget, response);
         }

@@ -59,26 +59,43 @@ Each response reports planning, scatter, decoding and merge time, transport conn
 per-worker issue offsets, Invoke time and request/response bytes. Worker statistics contain execution metadata;
 partial rows are consumed by the coordinator and omitted from its response.
 
-### Replicated small-side joins
+### Aligned and replicated joins
 
-For fact/dimension queries, each worker can read the small side from S3 and join it against its assigned fact row
-groups. Pass the join description in `--request` (or the coordinator event's `request`):
+Pass a join description in `--request` (or the coordinator event's `request`). By default the coordinator tries
+aligned splits: a worker prepares disjoint key ranges from the fact and build footers, then each worker reads and
+joins the row groups overlapping its range. Both sides filter to that range, so keys shared at row-group boundaries
+belong to one worker. No rows move between workers. This permits ordered fact/fact joins such as PDS-H
+lineitem/orders on orderkey, with replicated small dimensions beside or beneath the aligned build.
 
 ```json
 {"inputs":["s3://bucket/facts.parquet"],"aggregate":"count(*) AS n, sum(amount) AS total","group_by":"region","join":{"kind":"inner","fk":"customer_id","build":{"path":"s3://bucket/customers.parquet","key":"id","columns":["region"]}}}
 ```
 
+Alignment currently takes signed integer keys with complete, non-null footer bounds. Row-group ranges must be
+ordered without strict overlaps; an equal key at adjacent boundaries is supported. The planner derives physical
+selections from real footers rather than count hints. Degenerate repeated keys can yield fewer workers than requested.
+If alignment is unprovable, auto mode falls back to a replicated build. Set `"join_strategy":"aligned"` to require
+alignment and receive `AlignedJoinUnordered`, `AlignedJoinMissingStats`, `AlignedJoinKeyType` or `AlignedJoinNoKeys`.
+Set `"join_strategy":"replicated"` for a known small side, skipping alignment preparation. Queries that prepare
+alignment report `footer_ms:null`; direct replicated and non-join splits retain `footer_ms:0`.
+
 The fact inputs must be explicit S3 paths; joins with glob inputs are refused. Every build input must also be S3.
 Inner and left joins require unique build keys; semi joins test membership, and anti joins use `NOT IN` NULL
 semantics. Keys must use the engine's integer-compatible key types. String and composite keys are not supported.
-The existing join description also accepts small-side stars. Geography, nation/region and similar dimension joins
-qualify when all build sides fit; large fact/fact and self joins require a different execution strategy.
+The existing join description also accepts stars and nested dimensions. Each auxiliary replicated build must fit its
+cap; an aligned main edge does not make an oversized auxiliary dimension eligible. String and composite alignment,
+unsorted large builds and exchange joins require another execution strategy.
 
-The worker caps retained build objects and lookup storage together at the smaller of 64 MiB and one eighth of its
-query memory budget. Oversized builds fail with `JoinBuildExceedsBudget`. Each object needs a strong ETag, and all
-workers must agree on build snapshots as well as the fact schema. A changed build generation fails the query.
-Workers use the versioned `partial_join_aggregate` operation so older workers refuse the request before reading
-inputs. No rows move between workers.
+The worker fetches only the build columns it needs. Replicated source buffers and lookup storage together share the
+smaller of 64 MiB and one eighth of its query memory budget. This cap applies to retained projected bytes, rather
+than the physical object's size. The aligned main slice uses the query budget; all nested replicated dimensions
+still share the smaller cap. A build that does not fit fails with `JoinBuildExceedsBudget`.
+
+Each source needs a strong ETag. Planned generations are checked before column fetching and pinned with `If-Match`
+on ranged reads; a mismatch fails with `AlignedJoinSnapshotChanged`. Workers also agree on build snapshots, fact
+schema and the common query before physical key restrictions. The versioned `partial_join_aggregate` and
+`partial_aligned_join_aggregate` operations make older workers refuse before input I/O. Immutable qualified workers
+cache positive capability acknowledgements. There is no shuffle, exchange pass or separate transport protocol.
 
 S3 access: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION` (on Lambda, the execution
 role's). `S3_`-prefixed variables of the same names, plus `S3_ENDPOINT_URL`, take precedence and target S3-compatible

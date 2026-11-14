@@ -92,6 +92,16 @@ pub const RowGroupRange = struct {
     }
 };
 
+/// Immutable S3 generation used by a footer-derived physical selection (ETag without quotes).
+pub const SourceSnapshot = struct { etag: []const u8, size: u64 };
+pub const AlignedJoin = struct {
+    low: ?i64 = null,
+    high: ?i64 = null,
+    build: RowGroupRange,
+    build_snapshot: SourceSnapshot,
+    probes: []const ?SourceSnapshot,
+};
+
 /// Typed synchronous handoff. Columns borrow the query; a sink must own anything it retains.
 pub const ColumnarSink = struct {
     ctx: *anyopaque,
@@ -208,6 +218,9 @@ pub const QueryArgs = struct {
     /// Per input, parallel to `inputs`: read only that input's `RowGroupRange` of its footer; null (or a null slice)
     /// reads every row group. A coordinator splits one file across workers with it.
     row_groups: ?[]const ?RowGroupRange = null,
+    input_snapshots: ?[]const ?SourceSnapshot = null,
+    pin_input_generation: bool = false,
+    aligned_join: ?AlignedJoin = null,
 
     pub fn kind(self: QueryArgs) bound_plan.Kind {
         if (self.plan_source) |source| return source.kind;
@@ -264,6 +277,8 @@ pub const BloomSpec = struct {
 
 pub const Context = struct {
     gpa: std.mem.Allocator,
+    /// Query-local input bytes can be charged while a registry's allocator must outlive the query.
+    pool_gpa: ?std.mem.Allocator = null,
     env: std.process.Environ,
     io: std.Io,
     /// Optional long-lived pool registry — set by Lambda for warm-

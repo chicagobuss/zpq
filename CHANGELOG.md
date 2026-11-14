@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Local reads share one admission budget per device, so spinning and unknown storage read in order. Outputs sync their directory after the atomic rename. A failing disk ends a query with a clear error naming the file and offset.**
 - **S3 errors name the operation, bucket and key, report S3's own code and message with credentials redacted, and tell a missing multipart upload apart from a missing bucket.**
 - **q06-style composite GROUP BY with SUM is faster: dense keys sum straight into lanes.**
 - **Joins decode in L2-sized slices, and cold scans no longer stall on memory mapping.**

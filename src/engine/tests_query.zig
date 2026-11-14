@@ -760,7 +760,8 @@ test "written files name zpq as their writer once zpq encodes their data, and ke
         .{ .args = .{ .inputs = &.{fixture}, .output = out, .filter = "b >= 3" }, .writer = schema.ZPQ_CREATED_BY },
         .{ .args = .{ .inputs = &.{fixture}, .output = out, .select = "b, s" }, .writer = schema.ZPQ_CREATED_BY },
         // A byte copy, and a recompression that keeps every value and statistic: the source's.
-        .{ .args = .{ .inputs = &.{fixture}, .output = out }, .writer = source },
+        .{ .args = .{ .inputs = &.{fixture}, .output = out }, .writer = schema.ZPQ_CREATED_BY },
+        .{ .args = .{ .inputs = &.{fixture}, .output = out, .row_group = .{ .rows = 1 } }, .writer = source },
         .{ .args = .{ .inputs = &.{fixture}, .output = out, .codec = .ZSTD }, .writer = source },
     };
     for (cases) |c| {

@@ -1283,7 +1283,7 @@ fn tryEncodeDictBytes(arena: std.mem.Allocator, in: ColumnInput, num_values: i64
 /// cap), so a power-of-two table at least twice that never fills and never grows. A slot holds its entry's index + 1
 /// (0 is empty); a multiply-shift hash replaces the general map's per-key hash call. The hash is fixed, so keys can be
 /// chosen to collide: a lookup gives up after `max_probe` slots, and the caller then interns with `MapInterner`.
-fn Interner(comptime K: type) type {
+pub fn Interner(comptime K: type) type {
     return struct {
         keys: []K,
         slots: []u32,
@@ -1291,7 +1291,7 @@ fn Interner(comptime K: type) type {
 
         const Self = @This();
 
-        fn init(arena: std.mem.Allocator, limit: usize) Error!Self {
+        pub fn init(arena: std.mem.Allocator, limit: usize) std.mem.Allocator.Error!Self {
             const bits: u6 = @intCast(std.math.log2_int_ceil(usize, @max(16, 2 * (limit + 1))));
             const n = @as(usize, 1) << bits;
             const slots = try arena.alloc(u32, n);
@@ -1304,7 +1304,7 @@ fn Interner(comptime K: type) type {
 
         /// The slot for `key`: its entry's index + 1, or 0 for the caller to fill (the key is then recorded); null
         /// when `max_probe` slots hold other keys.
-        inline fn find(self: *Self, key: K) ?*u32 {
+        pub inline fn find(self: *Self, key: K) ?*u32 {
             const mask = self.slots.len - 1;
             var h: usize = @intCast((@as(u64, key) *% 0x9E3779B97F4A7C15) >> self.shift);
             for (0..max_probe) |_| {
@@ -1321,20 +1321,20 @@ fn Interner(comptime K: type) type {
 }
 
 /// The general map, with the same interface as `Interner`, for keys that collide in its hash.
-fn MapInterner(comptime K: type) type {
+pub fn MapInterner(comptime K: type) type {
     return struct {
         map: std.AutoHashMapUnmanaged(K, u32) = .empty,
 
         const Self = @This();
 
-        fn init(arena: std.mem.Allocator, limit: usize) Error!Self {
+        pub fn init(arena: std.mem.Allocator, limit: usize) std.mem.Allocator.Error!Self {
             var self: Self = .{};
             // One key past the cap is recorded before the caller sees it is one too many.
             try self.map.ensureTotalCapacity(arena, @intCast(limit + 1));
             return self;
         }
 
-        inline fn find(self: *Self, key: K) ?*u32 {
+        pub inline fn find(self: *Self, key: K) ?*u32 {
             const gop = self.map.getOrPutAssumeCapacity(key);
             if (!gop.found_existing) gop.value_ptr.* = 0;
             return gop.value_ptr;

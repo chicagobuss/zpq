@@ -24,16 +24,32 @@ pub const Source = struct {
     fd: ?std.posix.fd_t = null,
     file_offsets: bool = false,
     pub fn own(s: Source, a: std.mem.Allocator) !Source {
-        const span = try fast.rowGroupByteRange(s.rg, s.bytes.len) orelse return error.InvalidColumnOffsets;
+        return s.ownProjected(a, null);
+    }
+
+    pub fn ownProjected(s: Source, a: std.mem.Allocator, kept: ?[]const bool) !Source {
+        var start: usize = s.bytes.len;
+        var end: usize = 0;
+        for (s.rg.columns.items, 0..) |c, ci| {
+            if (kept) |k| if (!k[ci]) continue;
+            const range = fast.chunkRange(&(c.meta_data orelse return error.InvalidColumnOffsets), s.bytes.len) orelse return error.InvalidColumnOffsets;
+            start = @min(start, range.start);
+            end = @max(end, range.start + range.len);
+        }
+        if (end < start) return error.InvalidColumnOffsets;
         const rg = try a.create(schema.RowGroup);
         rg.* = s.rg.*;
         rg.columns = .empty;
-        for (s.rg.columns.items) |*c| {
-            var moved = fast.rebaseChunk(a, s.bytes, c, -@as(i64, @intCast(span.start)));
+        for (s.rg.columns.items, 0..) |*c, ci| {
+            if (kept) |k| if (!k[ci]) {
+                try rg.columns.append(a, c.*);
+                continue;
+            };
+            var moved = fast.rebaseChunk(a, s.bytes, c, -@as(i64, @intCast(start)));
             moved.bloom_out = try a.dupe(u8, moved.bloom_out);
             try rg.columns.append(a, moved);
         }
-        return .{ .bytes = try a.dupe(u8, s.bytes[span.start..][0..span.len]), .meta = s.meta, .rg = rg };
+        return .{ .bytes = try a.dupe(u8, s.bytes[start..end]), .meta = s.meta, .rg = rg };
     }
 };
 pub const Options = struct {
@@ -86,6 +102,33 @@ pub const Plan = struct {
             @memset(col.maps, &.{});
             var intern: std.StringHashMap(u32) = .init(a);
             defer intern.deinit();
+            // Page headers give exact upper bounds before decompression. Reserve once: growing and rehashing the
+            // dictionary table dominated the sampled CPU time, while retired arena buffers stayed live as well.
+            var entry_bound: usize = 0;
+            var byte_bound: usize = 0;
+            for (sources) |s| {
+                const cm = s.rg.columns.items[ci].meta_data orelse return null;
+                const range = fast.chunkRange(&cm, s.bytes.len) orelse return error.InvalidColumnOffsets;
+                var r = thrift.Reader.init(s.bytes[range.start..][0..range.len]);
+                const h = try schema.PageHeader.read(&r);
+                if (h.type != .DICTIONARY_PAGE) continue;
+                switch (cm.codec) {
+                    .UNCOMPRESSED, .SNAPPY, .GZIP, .ZSTD, .LZ4_RAW => {},
+                    else => return null,
+                }
+                const dh = h.dictionary_page_header orelse return error.BadPageHeader;
+                if (dh.num_values < 0 or h.uncompressed_page_size < 0 or h.compressed_page_size < 0)
+                    return error.BadPageHeader;
+                if (@as(usize, @intCast(h.compressed_page_size)) > range.len - r.pos) return error.TruncatedPage;
+                entry_bound = try std.math.add(usize, entry_bound, @intCast(dh.num_values));
+                byte_bound = try std.math.add(usize, byte_bound, @intCast(h.uncompressed_page_size));
+            }
+            const numeric = cm0.type == .INT32 or cm0.type == .INT64 or cm0.type == .FLOAT or cm0.type == .DOUBLE;
+            var fixed: ?enc.Interner(u64) = null;
+            var general: ?enc.MapInterner(u64) = null;
+            if (numeric and entry_bound > 0) fixed = try enc.Interner(u64).init(a, entry_bound) else try intern.ensureTotalCapacity(std.math.cast(u32, entry_bound) orelse return null);
+            try col.entries.ensureTotalCapacity(a, entry_bound);
+            try col.dictionary.ensureTotalCapacity(a, byte_bound);
             var first_row: u64 = 0;
             var stats_complete = true;
             var filter_bits: ?[]u8 = null;
@@ -95,7 +138,8 @@ pub const Plan = struct {
                 const chunk = &s.rg.columns.items[ci];
                 const cm = chunk.meta_data orelse return null;
                 const se = s.meta.getColumnSchema(cm.path_in_schema.items) orelse return null;
-                if (chunk.encrypted or chunk.file_path != null or s.meta.getColumnLevels(cm.path_in_schema.items).max_rep != 0 or
+                const levels = s.meta.getColumnLevels(cm.path_in_schema.items);
+                if (chunk.encrypted or chunk.file_path != null or levels.max_rep != 0 or
                     cm.num_values != s.rg.num_rows or cm.type != cm0.type or cm.codec != cm0.codec or
                     fast.writerPolicy(chunk, s.meta) != .trust or !compatible(elem, se)) return null;
                 if (cm.statistics) |st| {
@@ -136,15 +180,33 @@ pub const Plan = struct {
                         const plain = try compression.decompress(a, s.bytes[pos + r.pos ..][0 .. len - r.pos], cm.codec, @intCast(h.uncompressed_page_size));
                         const map = try a.alloc(u32, @intCast(dh.num_values));
                         var at: usize = 0;
-                        for (map) |*id| {
+                        for (map) |*mapped| {
                             const entry = try dictionaryEntry(plain, &at, &elem);
-                            const gop = try intern.getOrPut(entry);
-                            if (!gop.found_existing) {
-                                gop.value_ptr.* = std.math.cast(u32, col.entries.items.len) orelse return null;
-                                try col.entries.append(a, entry);
-                                try col.dictionary.appendSlice(a, entry);
+                            var id: u32 = undefined;
+                            var fresh: bool = undefined;
+                            if (fixed) |*lookup| {
+                                const key = numericKey(entry);
+                                const slot = if (general) |*g| g.find(key).? else blk: {
+                                    if (lookup.find(key)) |slot| break :blk slot;
+                                    // The encoder's bounded-probe interner has the same adversarial fallback here.
+                                    general = try enc.MapInterner(u64).init(a, entry_bound);
+                                    for (col.entries.items, 0..) |old, i| general.?.find(numericKey(old)).?.* = @intCast(i + 1);
+                                    break :blk general.?.find(key).?;
+                                };
+                                fresh = slot.* == 0;
+                                if (fresh) slot.* = std.math.cast(u32, col.entries.items.len + 1) orelse return null;
+                                id = slot.* - 1;
+                            } else {
+                                const gop = intern.getOrPutAssumeCapacity(entry);
+                                fresh = !gop.found_existing;
+                                if (fresh) gop.value_ptr.* = std.math.cast(u32, col.entries.items.len) orelse return null;
+                                id = gop.value_ptr.*;
                             }
-                            id.* = gop.value_ptr.*;
+                            if (fresh) {
+                                col.entries.appendAssumeCapacity(entry);
+                                col.dictionary.appendSliceAssumeCapacity(entry);
+                            }
+                            mapped.* = id;
                         }
                         if (at != plain.len) return error.BadPageHeader;
                         col.maps[si] = map;
@@ -155,6 +217,9 @@ pub const Plan = struct {
                         const encoding = if (h.data_page_header) |d| d.encoding else h.data_page_header_v2.?.encoding;
                         const coded = encoding == .RLE_DICTIONARY or encoding == .PLAIN_DICTIONARY;
                         if (coded and !seen_dict) return error.BadPageHeader;
+                        if (coded and levels.max_def > 0) if (h.data_page_header) |dh| {
+                            if (dh.definition_level_encoding != .RLE) return null;
+                        };
                         col.all_dictionary = col.all_dictionary and coded;
                         var st: ?schema.Statistics = null;
                         const fields = try patch.fieldsOf(a, s.bytes[pos..][0..r.pos]);
@@ -348,6 +413,10 @@ fn rebuildFilter(a: std.mem.Allocator, sources: []const Source, ci: usize, fpp: 
     }
     return builder.serialize(a);
 }
+fn numericKey(raw: []const u8) u64 {
+    return if (raw.len == 4) std.mem.readInt(u32, raw[0..4], .little) else std.mem.readInt(u64, raw[0..8], .little);
+}
+
 fn compatible(a: schema.SchemaElement, b: schema.SchemaElement) bool {
     return a.type == b.type and a.type_length == b.type_length and a.scale == b.scale and a.precision == b.precision and
         a.repetition_type == b.repetition_type and a.converted_type == b.converted_type and
@@ -668,4 +737,32 @@ test "coalesce owned window sources retain runtime filters and decode after the 
     _ = try plan.write(a, &out);
     var reader = @import("../parquet/column.zig").ColumnChunkReader(i32).init(sink.buffer.items, .UNCOMPRESSED, .{ .max_def = 0, .max_rep = 0 }, a);
     try std.testing.expectEqualSlices(i32, &.{ 10, 20, 20, 10, 10, 20, 20, 10 }, (try reader.readAll(8)).values);
+}
+
+test "coalesce numeric dictionary collisions preserve IDs when promoting the encoder interner" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var keys: [20]i32 = undefined;
+    var ids: [20]u32 = undefined;
+    const bits = std.math.log2_int_ceil(usize, 2 * (2 * keys.len + 1));
+    const shift: u6 = @intCast(64 - bits);
+    var found: usize = 0;
+    var candidate: u32 = 0;
+    while (found < keys.len) : (candidate += 1) {
+        if ((@as(u64, candidate) *% 0x9E3779B97F4A7C15) >> shift != 0) continue;
+        keys[found] = @intCast(candidate);
+        ids[found] = @intCast(found);
+        found += 1;
+    }
+    const sources = [_]Source{ try testSource(a, &keys, &ids, false, false), try testSource(a, &keys, &ids, true, false) };
+    const p = (try Plan.init(a, &sources, null, .{})).?;
+    const streaming = @import("streaming.zig");
+    var sink: streaming.MemorySink = .{ .arena = a };
+    var out: streaming.SinkOut = .{ .sink = sink.sink() };
+    _ = try p.write(a, &out);
+    var r = @import("../parquet/column.zig").ColumnChunkReader(i32).init(sink.buffer.items, .UNCOMPRESSED, .{ .max_def = 0, .max_rep = 0 }, a);
+    const got = try r.readAll(keys.len * 2);
+    try std.testing.expectEqualSlices(i32, &keys, got.values[0..keys.len]);
+    try std.testing.expectEqualSlices(i32, &keys, got.values[keys.len..]);
 }

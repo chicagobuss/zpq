@@ -403,7 +403,9 @@ boundary reaching the row target or the sum of source chunks' encoded `total_unc
 reaching the byte target. This encoded accounting differs from the reencoder's PLAIN value accounting above; cuts
 may overshoot by one source group. A source group already at target copies whole. Dictionary entries are interned
 and only nonidentity dictionary index streams are remapped; existing PLAIN, DELTA and BYTE_STREAM_SPLIT pages stay
-encoded. Different codecs, unsupported chunk shapes or dictionary-page overflow can end a run early. Compatible
+encoded. The explicit memory limit applies the same one-sixteenth byte cap as reencoding, using encoded bytes here.
+Different codecs, unsupported chunk shapes, dictionary-page overflow or insufficient merge working memory can end
+a run early; the whole-group copy remains available. Compatible
 carried Bloom filters are unioned; otherwise a filter is rebuilt from a complete dictionary or decoded values,
 while the encoded pages remain unchanged. Floating-point and INT96 chunk bounds are omitted conservatively when
 merging; floating-point page indexes retain source bounds with unordered boundaries and unknown NaN counts.

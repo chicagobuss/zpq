@@ -1040,9 +1040,9 @@ test "a byte copy writes every ColumnIndex, then every OffsetIndex, after its ro
     var path_buf: [96]u8 = undefined;
     const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
     const shapes = [_]QueryArgs{
-        .{ .inputs = &.{in}, .output = out },
-        .{ .inputs = &.{in}, .output = out, .columns = &.{ "rid", "k" } },
-        .{ .inputs = &.{ in, in }, .output = out },
+        .{ .inputs = &.{in}, .output = out, .row_group = .{ .rows = 1 } },
+        .{ .inputs = &.{in}, .output = out, .columns = &.{ "rid", "k" }, .row_group = .{ .rows = 1 } },
+        .{ .inputs = &.{ in, in }, .output = out, .row_group = .{ .rows = 1 } },
     };
     for (shapes) |args| {
         var r = try runQuery(ctx, args);
@@ -1125,7 +1125,7 @@ test "a byte-copy concatenation keeps every input's chunks verbatim, aligned, it
         std.Io.Dir.cwd().access(std.testing.io, in, .{}) catch return error.SkipZigTest;
         var path_buf: [96]u8 = undefined;
         const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
-        var r = try runQuery(ctx, .{ .inputs = &.{ in, in, in }, .output = out });
+        var r = try runQuery(ctx, .{ .inputs = &.{ in, in, in }, .output = out, .row_group = .{ .rows = 1 } });
         r.deinit(gpa);
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();

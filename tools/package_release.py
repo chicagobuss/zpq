@@ -27,7 +27,7 @@ SHARED_FILES = {"LICENSE": ROOT / "LICENSE",
                 "share/fish/vendor_completions.d/zpq.fish": ROOT / "packaging/completions/zpq.fish",
                 "share/zpq/tiny.parquet": ROOT / "packaging/fixtures/tiny.parquet",
                 **{"share/doc/zpq/" + n: ROOT / "docs" / n
-                   for n in ("getting-started.md", "output-format.md", "binary-output.md",
+                   for n in ("getting-started.md", "capabilities.md", "statistics-trust.md", "local_io.md", "output-format.md", "binary-output.md",
                              "writer-statistics.md", "decode-errors.md", "hardware-execution.md",
                              "execution_knobs.md", "byte_topk.md", "capabilities.md",
                              "statistics-trust.md", "local_io.md")}}
@@ -62,7 +62,7 @@ def dangling_references(files):
         text = path.read_text().replace("\\-", "-")
         refs = re.findall(r"docs/([\w.-]+)", text) + re.findall(r"\]\((?![a-z]+:)([^)#\s]+)", text)
         missing += [f"{name}: {ref}" for ref in refs if ref.rstrip(".") not in shipped]
-        missing += [f"{name}: README"] if "README" in text else []
+        missing += [f"{name}: README"] if re.search(r"\]\([^)]*README", text) else []
     return missing
 
 

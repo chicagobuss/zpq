@@ -295,20 +295,22 @@ pub const ColRef = struct {
 };
 
 /// How a build column's value follows from another column's (`base`, a leaf of the probe's schema): the join's key
-/// (its build's keys are unique) is looked up and the column read at that build row (`join/lookup.zig`). Only a
-/// value the build holds is read, so dropping the key can hide no per-row error.
+/// (its build's keys are unique) is looked up and the column read at that build row (`join/lookup.zig`).
+/// A deferred payload retains the row locator until the result cut.
 pub const Fetch = struct {
     base: usize,
     ctx: *const anyopaque,
     payload: usize,
     /// The column's value at the build row whose key is `key`; null when no build row has it (a LEFT JOIN's miss).
+    /// The source's charged allocator, for page decode and batch scratch.
     scratch: ?std.mem.Allocator = null,
-    batch: ?*const fn (ctx: *const anyopaque, payload: usize, keys: []const ?i64, scratch: std.mem.Allocator) anyerror![]?FetchValue = null,
+    /// Fetch retained keys together so each selected source page decodes once.
+    batch: ?*const fn (ctx: *const anyopaque, payload: usize, keys: []const ?i64, scratch: std.mem.Allocator, workers: usize) anyerror![]?FetchValue = null,
     value: *const fn (ctx: *const anyopaque, payload: usize, key: i64, scratch: std.mem.Allocator) anyerror!?FetchValue,
 };
 
 /// A fetched value, by its lane: an integer (DECIMAL unscaled, a time in its unit, UINT64 as its bits), a DOUBLE, or
-/// bytes the build owns.
+/// bytes borrowed from the build or the supplied scratch.
 pub const FetchValue = union(enum) { int: i64, float: f64, bytes: []const u8 };
 
 pub const BinOp = struct {

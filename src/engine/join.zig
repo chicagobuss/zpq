@@ -642,7 +642,7 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
         .threads = threads,
         .fk = undefined,
         .build = undefined,
-        .query = if (args.result_order.limit != null and
+        .query = if (!(args.typed_answer and args.output != null) and args.result_order.limit != null and
             !@import("env.zig").envDisables(ctx.env, "ZPQ_GROUP_KEY_FD") and
             !@import("env.zig").envDisables(ctx.env, "ZPQ_LATE_FETCH") and
             !@import("env.zig").envDisables(ctx.env, "ZPQ_JOIN_LATE_PAYLOAD")) deferredSyntax(source) else null,

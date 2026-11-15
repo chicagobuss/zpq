@@ -299,49 +299,12 @@ fn fetchedValue(gpa: std.mem.Allocator, e: expr_ast.Expr, v: expr_ast.FetchValue
 /// Fill the cells a row build left as a fetch's key (`RowSource.defer_fetch`): for each of `rows`' columns that
 /// `fetches` gives a fetch for, its value, as the row build would have fetched it. Strings are the answer's own.
 pub fn fillDeferred(gpa: std.mem.Allocator, rows: []const []const AggValue, fetches: []const ?expr_ast.Expr, workers: usize) !void {
-    const Task = struct {
-        gpa: std.mem.Allocator,
-        rows: []const []const AggValue,
-        fetches: []const ?expr_ast.Expr,
-        cursor: *std.atomic.Value(usize),
-        err: ?anyerror = null,
-        err_col: usize = std.math.maxInt(usize),
-
-        fn run(t: *@This()) void {
-            while (true) {
-                const j = t.cursor.fetchAdd(1, .monotonic);
-                if (j >= t.fetches.len) return;
-                const e = t.fetches[j] orelse continue;
-                fillDeferredColumn(t.gpa, t.rows, e, j) catch |err| {
-                    if (j < t.err_col) {
-                        t.err = err;
-                        t.err_col = j;
-                    }
-                };
-            }
-        }
+    for (fetches, 0..) |maybe, j| if (maybe) |e| {
+        try fillDeferredColumn(gpa, rows, e, j, workers);
     };
-    var batches: usize = 0;
-    for (fetches) |maybe| if (maybe) |e| {
-        batches += @intFromBool(e.col_ref.fetch.?.batch != null);
-    };
-    var storage: [64]Task = undefined;
-    const tasks = storage[0..@max(1, @min(storage.len, workers, batches))];
-    var cursor: std.atomic.Value(usize) = .init(0);
-    for (tasks) |*t| t.* = .{ .gpa = gpa, .rows = rows, .fetches = fetches, .cursor = &cursor };
-    // Each column writes separate cells and owns its decode arena. Failed spawns leave columns on the cursor.
-    if (tasks.len == 1 or !spawn_util.runTree(Task, tasks, .{ .stack_size = WORKER_STACK_SIZE }, Task.run))
-        tasks[0].run();
-    var first: ?anyerror = null;
-    var col: usize = std.math.maxInt(usize);
-    for (tasks) |t| if (t.err_col < col) {
-        col = t.err_col;
-        first = t.err;
-    };
-    if (first) |err| return err;
 }
 
-fn fillDeferredColumn(gpa: std.mem.Allocator, rows: []const []const AggValue, e: expr_ast.Expr, j: usize) !void {
+fn fillDeferredColumn(gpa: std.mem.Allocator, rows: []const []const AggValue, e: expr_ast.Expr, j: usize, workers: usize) !void {
     const f = e.col_ref.fetch.?;
     if (f.batch) |batch| {
         var scratch: std.heap.ArenaAllocator = .init(f.scratch orelse gpa);
@@ -353,7 +316,7 @@ fn fillDeferredColumn(gpa: std.mem.Allocator, rows: []const []const AggValue, e:
             .i => |v| std.math.cast(i64, v),
             else => return error.BadGroupKey,
         };
-        const values = try batch(f.ctx, f.payload, keys, a);
+        const values = try batch(f.ctx, f.payload, keys, a, workers);
         for (rows, values) |row, v| @constCast(row)[j] = if (v) |value|
             try fetchedValue(gpa, e, value, null)
         else

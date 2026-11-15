@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **S3 Express One Zone: directory buckets on zonal endpoints, CreateSession session credentials with one shared refresh, reads, writes and multipart with CRC32, and unsorted directory listings handled.**
 - **Tests honor ZPQ_TEST_PARQUET_DIR: every place zpq's tests write Parquet scratch goes under it.**
 - **Fan-out is native: `zpq fanout` and the Lambda coordinator mode plan, invoke and merge in Zig, replacing the Python coordinator.** Joins fan out too, by aligned key ranges from footer statistics or with a replicated small side. Invoke retries transient failures.
 - **Native Windows x86_64: the CLI, Parquet reads and writes, S3 and TLS with system certificates, Unicode and verbatim (`\\?\`) paths, and a release zip.**

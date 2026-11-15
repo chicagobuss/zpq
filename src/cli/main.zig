@@ -520,8 +520,15 @@ const SetopStager = struct {
     arena: std.mem.Allocator,
     /// The input files of every branch run so far.
     collected: std.ArrayList([]const u8) = .empty,
-    /// The last query reads the user's inputs too (a CTE's), with their input options.
-    finish_reads_inputs: bool = false,
+    /// A CTE's scratch directory. A query that names it reads Parquet scratch files, whatever `--input-format` says;
+    /// one that does not reads the user's inputs, with their input options. Null for a set operation, whose last query
+    /// reads only scratch.
+    cte_dir: ?[]const u8 = null,
+
+    fn readsScratch(self: *const SetopStager, sql: []const u8) bool {
+        const dir = self.cte_dir orelse return true;
+        return std.mem.indexOf(u8, sql, dir) != null;
+    }
 
     fn interface(self: *SetopStager) setops.Stager {
         return .{ .ptr = self, .stage = stage, .finish = finish, .say = say };
@@ -531,6 +538,7 @@ const SetopStager = struct {
         const self: *SetopStager = @ptrCast(@alignCast(ptr));
         var o = stageOptions(self.options.*, sql, out, leaf);
         if (leaf) o.collect_inputs = &self.collected;
+        if (leaf and self.cte_dir != null and self.readsScratch(sql)) parquetInputs(&o);
         try runParsed(self.init, &o, self.diag, self.arena);
     }
 
@@ -538,12 +546,7 @@ const SetopStager = struct {
         const self: *SetopStager = @ptrCast(@alignCast(ptr));
         var o = self.options.*;
         o.query = sql;
-        if (!self.finish_reads_inputs) {
-            o.input_format = .auto;
-            o.csv = .{};
-            o.csv_nulls = .empty;
-            o.csv_types = .empty;
-        }
+        if (self.readsScratch(sql)) parquetInputs(&o);
         o.protect = self.collected.items;
         try runParsed(self.init, &o, self.diag, self.arena);
     }
@@ -571,13 +574,16 @@ fn stageOptions(base: QueryOptions, sql: []const u8, out: []const u8, leaf: bool
     o.collect_inputs = null;
     // A branch may not read the file the user's query will write.
     o.refuse_output = if (leaf) base.output else null;
-    if (!leaf) {
-        o.input_format = .auto;
-        o.csv = .{};
-        o.csv_nulls = .empty;
-        o.csv_types = .empty;
-    }
+    if (!leaf) parquetInputs(&o);
     return o;
+}
+
+/// A query over scratch files: they are Parquet, whatever the user's input options say.
+fn parquetInputs(o: *QueryOptions) void {
+    o.input_format = .auto;
+    o.csv = .{};
+    o.csv_nulls = .empty;
+    o.csv_types = .empty;
 }
 
 test "a set operation's scratch queries release their resources and name the output they must not read" {
@@ -682,7 +688,7 @@ fn runParsed(
             } else null;
             const dir = try cte.scratchDir(arena, clean, out_dir);
             const plan: sql_cte.Plan = (try planCte(arena, clean, dir)).?;
-            var stager: SetopStager = .{ .init = init, .options = options, .diag = diag, .arena = arena, .finish_reads_inputs = true };
+            var stager: SetopStager = .{ .init = init, .options = options, .diag = diag, .arena = arena, .cte_dir = dir };
             return cte.run(gpa, io, plan, dir, stager.interface());
         }
     };

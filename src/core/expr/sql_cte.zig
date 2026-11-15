@@ -83,9 +83,9 @@ const View = struct {
     parent: ?*const View,
 };
 
-/// A filter of one file that a reference reads in place of a stage: `'file'`, its WHERE, and whether it keeps every
-/// column (a `*` over it reads the same columns either way).
-const Inline = struct { file: []const u8, where: ?[]const u8, star: bool };
+/// A filter of one file that a reference reads in place of a stage: `'file'`, its WHERE, and the columns it keeps as
+/// written (`a, "b"`), null for `*`. Inlined, the query sees the file's other columns too, so it may name only these.
+const Inline = struct { file: []const u8, where: ?[]const u8, columns: ?[]const u8 };
 
 /// A reference this level wrote as an inline source's file, at `out[start..end]`.
 const Pending = struct { source: *Source, inline_: Inline, start: usize, end: usize };
@@ -301,7 +301,8 @@ const Planner = struct {
         if (pending.items.len == 0) return out.items;
         // A filter is inlined only into a SELECT whose one table it is: its WHERE joins the query's own.
         const p = pending.items[0];
-        if (pending.items.len == 1 and tables == 1 and selects == 1 and !in_from_start and (p.inline_.star or !stars)) {
+        const sees_kept = if (p.inline_.columns) |kept| !stars and namesOnly(out.items, kept, left.items) else true;
+        if (pending.items.len == 1 and tables == 1 and selects == 1 and !in_from_start and sees_kept) {
             const cond = p.inline_.where orelse return out.items;
             const last = std.mem.trimEnd(u8, out.items, " \t\r\n;").len;
             if (where) |w| {
@@ -356,6 +357,7 @@ fn inlineable(sql: []const u8) ?Inline {
     var w = setops.nextWord(t, 0);
     if (!setops.eql(w.word, "select")) return null;
     var i = skipSpace(t, w.end);
+    const items_start = i;
     var star = false;
     if (i < t.len and t[i] == '*') {
         star = true;
@@ -367,6 +369,7 @@ fn inlineable(sql: []const u8) ?Inline {
         if (i >= t.len or t[i] != ',') break;
         i += 1;
     }
+    const columns: ?[]const u8 = if (star) null else t[items_start..i];
     w = setops.nextWord(t, i);
     if (!setops.eql(w.word, "from")) return null;
     i = skipSpace(t, w.end);
@@ -379,7 +382,7 @@ fn inlineable(sql: []const u8) ?Inline {
         i = (nameAt(t, if (setops.eql(w.word, "as")) w.end else i) orelse return null).end;
     }
     w = setops.nextWord(t, i);
-    if (w.word.len == 0) return if (skipSpace(t, i) == t.len) .{ .file = file, .where = null, .star = star } else null;
+    if (w.word.len == 0) return if (skipSpace(t, i) == t.len) .{ .file = file, .where = null, .columns = columns } else null;
     if (!setops.eql(w.word, "where")) return null;
     const cond = std.mem.trim(u8, t[w.end..], " \t\r\n");
     var depth: usize = 0;
@@ -403,7 +406,86 @@ fn inlineable(sql: []const u8) ?Inline {
         }
         k += 1;
     }
-    return .{ .file = file, .where = cond, .star = star };
+    return .{ .file = file, .where = cond, .columns = columns };
+}
+
+/// Whether every name `query` reads is one of the `kept` columns (`a, "b"`) or a table of its level: an alias of the
+/// SELECT may shadow a column of the file (`SELECT a AS b ... GROUP BY b` groups by the file's `b` first), and any
+/// other name could be a column the filter dropped. A call's name, a qualifier, an alias being named, a cast's type and
+/// a typed literal's keyword read no column; neither does a grammar word, unless the query names an alias so.
+fn namesOnly(query: []const u8, kept: []const u8, tables: []const []const u8) bool {
+    var after_as = false;
+    var i: usize = 0;
+    while (i < query.len) {
+        const ch = query[i];
+        if (ch == '\'') {
+            i = setops.quotedEnd(query, i);
+            continue;
+        }
+        if (ch != '"' and !setops.startsWord(query, i)) {
+            if (!std.ascii.isWhitespace(ch)) after_as = false;
+            i += 1;
+            continue;
+        }
+        const end = if (ch == '"') setops.quotedEnd(query, i) else i + setops.wordAt(query, i).len;
+        const token = query[i..end];
+        const next = skipSpace(query, end);
+        const reads_none = after_as or std.ascii.isDigit(token[0]) or
+            (next < query.len and (query[next] == '(' or query[next] == '\'')) or (end < query.len and query[end] == '.') or
+            (i >= 2 and std.mem.eql(u8, query[i - 2 .. i], "::"));
+        after_as = ch != '"' and setops.eql(token, "as");
+        i = end;
+        if (reads_none or listed(kept, token)) continue;
+        var table = false;
+        for (tables) |t| table = table or sameName(t, token);
+        if (table) continue;
+        if (ch == '"' or !grammar(token) or aliased(query, token)) return false;
+    }
+    return true;
+}
+
+/// Whether the comma-separated names `list` hold `name`.
+fn listed(list: []const u8, name: []const u8) bool {
+    var i: usize = 0;
+    while (nameAt(list, i)) |n| {
+        if (sameName(n.text, name)) return true;
+        i = skipSpace(list, n.end);
+        if (i >= list.len or list[i] != ',') return false;
+        i += 1;
+    }
+    return false;
+}
+
+/// Whether `query` names an alias `name` (`AS name`).
+fn aliased(query: []const u8, name: []const u8) bool {
+    var i: usize = 0;
+    while (i < query.len) {
+        if (query[i] == '\'' or query[i] == '"') {
+            i = setops.quotedEnd(query, i);
+            continue;
+        }
+        if (!setops.startsWord(query, i)) {
+            i += 1;
+            continue;
+        }
+        const w = setops.wordAt(query, i);
+        i += w.len;
+        if (setops.eql(w, "as")) if (nameAt(query, i)) |n| if (sameName(n.text, name)) return true;
+    }
+    return false;
+}
+
+/// The words of the SELECT grammar a query may hold beside its column names.
+fn grammar(word: []const u8) bool {
+    const words = [_][]const u8{
+        "select", "from",   "where",     "group",     "by",     "having", "order",   "asc",     "desc",   "nulls",  "first",
+        "last",   "limit",  "offset",    "and",       "or",     "not",    "is",      "null",    "in",     "between", "like",
+        "ilike",  "as",     "case",      "when",      "then",   "else",   "end",     "distinct", "all",   "true",   "false",
+        "over",   "partition", "rows",   "range",     "unbounded", "preceding", "following", "current", "row", "filter",
+        "qualify", "window", "exists",   "escape",
+    };
+    for (words) |k| if (std.ascii.eqlIgnoreCase(word, k)) return true;
+    return false;
 }
 
 /// Whether the `*` at `i` is a select item (`SELECT *`, `t.*`, `a, *`), not a product or `count(*)`.
@@ -631,6 +713,27 @@ test "a filter of one file is inlined into a query whose one table it is, and st
         "WITH c AS (SELECT a FROM 'f' WHERE a > 1) SELECT a FROM c UNION ALL SELECT a FROM c",
         &.{"SELECT a FROM 'f' WHERE a > 1"},
         "SELECT a FROM 'd/cte0.parquet' AS c UNION ALL SELECT a FROM 'd/cte0.parquet' AS c",
+    );
+    // Inlined, a filter that kept some columns would let the query see the others: an alias named as one of them
+    // (GROUP BY, ORDER BY, HAVING), or any name it did not keep, stages it. Its own names, calls, casts and qualifiers do not.
+    const kept = "WITH c AS (SELECT a FROM 'f' WHERE a > 0) ";
+    for ([_][]const u8{
+        "SELECT a AS b, count(*) AS n FROM c GROUP BY a, b ORDER BY b, n",
+        "SELECT a AS b, count(*) AS n FROM c GROUP BY b",
+        "SELECT a, count(*) AS n FROM c GROUP BY a HAVING n > 1",
+        "SELECT a AS first FROM c ORDER BY first",
+        "SELECT b FROM c",
+        "SELECT a FROM c WHERE \"b\" > 1",
+    }) |q| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const got = (try plan(arena_state.allocator(), try std.mem.concat(arena_state.allocator(), u8, &.{ kept, q }), "d")).?;
+        try testing.expectEqual(@as(usize, 1), got.stages.len);
+    }
+    try expectPlan(
+        kept ++ "SELECT c.a AS x, sum(a::DOUBLE) AS s, count(*) FILTER (WHERE a IS NOT NULL) AS n FROM c WHERE a <> DATE '2024-01-01' GROUP BY c.a ORDER BY 1",
+        &.{},
+        "SELECT c.a AS x, sum(a::DOUBLE) AS s, count(*) FILTER (WHERE a IS NOT NULL) AS n FROM 'f' AS c WHERE (a > 0) AND ( a <> DATE '2024-01-01') GROUP BY c.a ORDER BY 1",
     );
     // Not filters: an expression, DISTINCT, a GROUP BY, an ORDER BY, a subquery in the condition.
     for ([_][]const u8{ "SELECT a + 1 AS b FROM 'f'", "SELECT DISTINCT a FROM 'f'", "SELECT a FROM 'f' WHERE a > 1 GROUP BY a", "SELECT a FROM 'f' ORDER BY a", "SELECT a FROM 'f' WHERE a IN (SELECT k FROM 'g')", "SELECT a FROM 'f', 'g'" }) |body|

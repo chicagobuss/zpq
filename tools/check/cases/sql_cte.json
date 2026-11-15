@@ -1,6 +1,14 @@
 {
  "fixtures": [
   {
+   "name": "f2",
+   "copy": "COPY (SELECT * FROM (VALUES (1, 10), (1, 20), (2, 30), (NULL, 40)) t(a, b)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
+   "name": "cv",
+   "copy": "COPY (SELECT k AS id, k % 4 AS g, k * 3 AS v, 'n' || (k % 3) AS s FROM range(1, 41) t(k)) TO '{path}' (FORMAT CSV, HEADER)"
+  },
+  {
    "name": "cf",
    "copy": "COPY (SELECT k::INTEGER AS id, (k % 10)::INTEGER AS g, (k * 7919 % 1000)::BIGINT AS k2,\n  CASE WHEN k % 13 = 0 THEN NULL ELSE (k * 37 % 1000) / 8.0 END AS v,\n  ((k * 31 % 100000) / 100.0)::DECIMAL(12,2) AS d,\n  CASE WHEN k % 11 = 0 THEN NULL ELSE 's' || (k % 23) END AS s,\n  DATE '2024-01-01' + (k % 400)::INTEGER AS dt\nFROM range(1, 3001) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 700)"
   },
@@ -1480,6 +1488,378 @@
    "oracle": {
     "compare": "written_sql",
     "sql": "WITH c AS (SELECT id, v, d, s, dt FROM '{fixture:cf}' WHERE s = 's3') SELECT id, v, d, s, dt FROM c WHERE id > 100"
+   }
+  },
+  {
+   "id": "sql_cte:shadow:cte:group-alias",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a AS b, count(*) AS n FROM c GROUP BY a, b ORDER BY b, n"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a AS b, count(*) AS n FROM c GROUP BY a, b ORDER BY b, n"
+   }
+  },
+  {
+   "id": "sql_cte:shadow:cte:group-by-alias",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a AS b, count(*) AS n FROM c GROUP BY b ORDER BY b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a AS b, count(*) AS n FROM c GROUP BY b ORDER BY b"
+   }
+  },
+  {
+   "id": "sql_cte:shadow:cte:order-alias",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a AS b FROM c ORDER BY b DESC"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a AS b FROM c ORDER BY b DESC"
+   }
+  },
+  {
+   "id": "sql_cte:shadow:cte:having",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a, count(*) AS n FROM c GROUP BY a HAVING count(*) > 1 ORDER BY a"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a, count(*) AS n FROM c GROUP BY a HAVING count(*) > 1 ORDER BY a"
+   }
+  },
+  {
+   "id": "sql_cte:shadow:cte:qualified-alias",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT c.a AS b, sum(c.a) AS s FROM c GROUP BY c.a ORDER BY b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT c.a AS b, sum(c.a) AS s FROM c GROUP BY c.a ORDER BY b"
+   }
+  },
+  {
+   "id": "sql_cte:shadow:derived:group-alias",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a AS b, count(*) AS n FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) c GROUP BY a, b ORDER BY b, n"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT a AS b, count(*) AS n FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) c GROUP BY a, b ORDER BY b, n"
+   }
+  },
+  {
+   "id": "sql_cte:shadow:derived:group-by-alias",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a AS b, count(*) AS n FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) c GROUP BY b ORDER BY b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT a AS b, count(*) AS n FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) c GROUP BY b ORDER BY b"
+   }
+  },
+  {
+   "id": "sql_cte:shadow:derived:order-alias",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a AS b FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) c ORDER BY b DESC"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT a AS b FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) c ORDER BY b DESC"
+   }
+  },
+  {
+   "id": "sql_cte:shadow:derived:having",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a, count(*) AS n FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) c GROUP BY a HAVING count(*) > 1 ORDER BY a"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT a, count(*) AS n FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) c GROUP BY a HAVING count(*) > 1 ORDER BY a"
+   }
+  },
+  {
+   "id": "sql_cte:shadow:derived:qualified-alias",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT c.a AS b, sum(c.a) AS s FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) c GROUP BY c.a ORDER BY b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT c.a AS b, sum(c.a) AS s FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) c GROUP BY c.a ORDER BY b"
+   }
+  },
+  {
+   "id": "sql_cte:shadow:written",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a AS b, count(*) AS n FROM c GROUP BY a, b",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "WITH c AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a AS b, count(*) AS n FROM c GROUP BY a, b"
+   }
+  },
+  {
+   "id": "sql_cte:csv:staged",
+   "fixture": "cv",
+   "cli": [
+    "query",
+    "--input-format",
+    "csv",
+    "--query",
+    "WITH c AS (SELECT g, count(*) AS n, sum(v) AS s FROM '{fixture:cv}' GROUP BY g) SELECT g, n, s FROM c ORDER BY g"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT g, count(*) AS n, sum(v) AS s FROM read_csv('{fixture:cv}') GROUP BY g) SELECT g, n, s FROM c ORDER BY g"
+   }
+  },
+  {
+   "id": "sql_cte:csv:chain",
+   "fixture": "cv",
+   "cli": [
+    "query",
+    "--input-format",
+    "csv",
+    "--query",
+    "WITH a AS (SELECT g, s, sum(v) AS t FROM '{fixture:cv}' GROUP BY g, s), b AS (SELECT DISTINCT g FROM a WHERE t > 100) SELECT g FROM b ORDER BY g"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH a AS (SELECT g, s, sum(v) AS t FROM read_csv('{fixture:cv}') GROUP BY g, s), b AS (SELECT DISTINCT g FROM a WHERE t > 100) SELECT g FROM b ORDER BY g"
+   }
+  },
+  {
+   "id": "sql_cte:csv:inlined",
+   "fixture": "cv",
+   "cli": [
+    "query",
+    "--input-format",
+    "csv",
+    "--query",
+    "WITH c AS (SELECT g, v FROM '{fixture:cv}' WHERE v > 30) SELECT g, sum(v) AS s, count(*) AS n FROM c GROUP BY g",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "WITH c AS (SELECT g, v FROM read_csv('{fixture:cv}') WHERE v > 30) SELECT g, sum(v) AS s, count(*) AS n FROM c GROUP BY g"
+   }
+  },
+  {
+   "id": "sql_cte:csv:derived",
+   "fixture": "cv",
+   "cli": [
+    "query",
+    "--input-format",
+    "csv",
+    "--query",
+    "SELECT t.g, t.m FROM (SELECT g, max(id) AS m FROM '{fixture:cv}' GROUP BY g) t ORDER BY t.g"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT t.g, t.m FROM (SELECT g, max(id) AS m FROM read_csv('{fixture:cv}') GROUP BY g) t ORDER BY t.g"
    }
   },
   {

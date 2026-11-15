@@ -82,7 +82,10 @@ parentheses in FROM or JOIN, with or without an alias and a column list (`(SELEC
 Names compare without case, quoted or not; a quoted string in FROM is always a file. A column list names the first columns,
 and names past the columns are ignored, as in DuckDB. A filter of one file (`SELECT * | col, ... FROM 'f' [WHERE cond]`, the
 condition qualifying no column) read as the one table of a SELECT is inlined: the SELECT reads the file and ANDs the
-condition into its WHERE, so it costs what the query written without it does. Every other CTE that is read, and every other
+condition into its WHERE, so it costs what the query written without it does. A filter that keeps some columns is inlined
+only into a SELECT that names no other: an alias spelled as a dropped column (`SELECT a AS b ... GROUP BY b`) or any other
+name stages it, so the file's other columns never shadow what the query means. Any query that reads a staged file reads
+it as Parquet, whatever `--input-format` says. Every other CTE that is read, and every other
 subquery in FROM, runs once, before the query, as an ordinary query (a join, a GROUP BY, a set operation, windows) into a
 scratch Parquet file in the directory set operations use, which the query reads where it named it. A CTE read twice is
 computed once and its file read twice: the engine has no plan to splice a body into, and inlining one read twice would scan

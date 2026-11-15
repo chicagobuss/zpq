@@ -350,7 +350,7 @@
     {"id": "cli:contract:bloom-needs-parquet:1", "fixture": "input", "cli": ["query", "{path}", "-o", "{out}", "--bloom-filter", "k", "--format", "json"], "refuse": {"error": "exit 2", "diag": "--bloom-filter"}},
     {"id": "cli:contract:bloom-needs-parquet:2", "fixture": "input", "cli": ["query", "{path}", "-o", "{out}", "--bloom-filter", "k", "--limit", "1"], "refuse": {"error": "exit 2", "diag": "--bloom-filter"}},
     {"id": "cli:contract:sql-refused:0", "fixture": "input", "cli": ["query", "--query", "SELECT * FROM '{path}'; SELECT * FROM '{path}'", "--summary=json"], "refuse": {"error": "MultipleStatements", "exit": 2}},
-    {"id": "cli:contract:sql-refused:1", "fixture": "input", "cli": ["query", "--query", "WITH x AS (SELECT * FROM '{path}') SELECT * FROM x", "--summary=json"], "refuse": {"error": "CteNotSupported", "exit": 2}},
+    {"id": "cli:contract:sql-refused:1", "fixture": "input", "cli": ["query", "--query", "WITH RECURSIVE x AS (SELECT * FROM '{path}') SELECT * FROM x", "--summary=json"], "refuse": {"error": "CteRecursive", "exit": 2}},
     {"id": "cli:contract:sql-refused:2", "fixture": "input", "cli": ["query", "--query", "SELECT * FROM '{path}' WHERE count(*) > 0", "--summary=json"], "refuse": {"error": "AggregateInWhere", "exit": 2}},
     {"id": "cli:contract:schema-without-path", "fixture": "input", "cli": ["schema", "--summary=json"], "refuse": {"error": "exit 2"}},
     {"id": "cli:contract:query-flag-without-sql", "fixture": "input", "cli": ["query", "--query", "--summary=json"], "refuse": {"error": "exit 2"}},

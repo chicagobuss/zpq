@@ -1773,18 +1773,26 @@
    }
   },
   {
-   "id": "sql_windows:refuse:star-over-subquery",
+   "id": "sql_windows:star-over-subquery",
    "fixture": "wn",
    "cli": [
     "query",
     "--query",
     "SELECT * FROM (SELECT id, rank() OVER (ORDER BY id) AS r FROM '{fixture:wn}') t",
-    "--summary=json"
+    "-o",
+    "{out}"
    ],
-   "refuse": {
-    "error": "ColumnsNotSupported",
-    "diag": "needs one local table",
-    "exit": 2
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT * FROM (SELECT id, rank() OVER (ORDER BY id) AS r FROM '{fixture:wn}') t"
    }
   },
   {

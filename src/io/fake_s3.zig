@@ -88,6 +88,12 @@ pub const FakeS3 = struct {
     failed: u32 = 0,
     /// CreateMultipartUpload requests received, whatever became of them.
     creates: u32 = 0,
+    sessions: u32 = 0,
+    session_bad_signature: bool = false,
+    hold_session: bool = false,
+    session_arrived: std.atomic.Value(bool) = .init(false),
+    release_session: std.atomic.Value(bool) = .init(false),
+    require_session: bool = false,
     /// Answer a CreateMultipartUpload 200, having applied it, with a body that carries no UploadId.
     create_unreadable: bool = false,
     /// Set by `deinit`: stalled connection threads stop waiting.
@@ -378,7 +384,32 @@ pub const FakeS3 = struct {
         var extra: []const u8 = "";
         var resp_body: []const u8 = "";
         var advertised_len: ?usize = null;
-        if (std.mem.eql(u8, method, "POST") and param(query, "uploads") != null) {
+        if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, query, "session")) {
+            self.sessions += 1;
+            const auth = header(head, "Authorization") orelse "";
+            const mode = header(head, "x-amz-create-session-mode") orelse "";
+            if (std.mem.indexOf(u8, auth, "/s3express/aws4_request") == null or
+                !(std.mem.eql(u8, mode, "ReadOnly") or std.mem.eql(u8, mode, "ReadWrite"))) self.session_bad_signature = true;
+            const hold = self.hold_session;
+            self.session_arrived.store(true, .release);
+            self.unlock();
+            locked = false;
+            while (hold and !self.release_session.load(.acquire) and !self.stopping.load(.acquire)) sleepMs(1);
+            return self.reply(fd, lose, 200, "", "<CreateSessionResult><Credentials>" ++
+                "<AccessKeyId>session-key</AccessKeyId><SecretAccessKey>session-secret</SecretAccessKey>" ++
+                "<SessionToken>session-token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration>" ++
+                "</Credentials></CreateSessionResult>", null);
+        } else if (self.require_session and (header(head, "x-amz-s3session-token") == null or
+            std.mem.indexOf(u8, header(head, "Authorization") orelse "", "/s3express/aws4_request") == null))
+        {
+            return self.reply(fd, lose, 403, "", "<Error><Code>AccessDenied</Code></Error>", null);
+        } else if (std.mem.eql(u8, method, "GET") and param(query, "list-type") != null) {
+            var out: std.ArrayList(u8) = .empty;
+            try out.appendSlice(a, "<ListBucketResult><IsTruncated>false</IsTruncated>");
+            for (self.objects.items) |o| try out.print(a, "<Contents><Key>{s}</Key><Size>{d}</Size></Contents>", .{ o.key, o.len });
+            try out.appendSlice(a, "</ListBucketResult>");
+            resp_body = out.items;
+        } else if (std.mem.eql(u8, method, "POST") and param(query, "uploads") != null) {
             const id = try self.createUpload(key, realtimeS());
             resp_body = if (self.create_unreadable)
                 "<InitiateMultipartUploadResult/>"

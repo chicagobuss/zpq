@@ -176,6 +176,19 @@ pub const Credentials = struct {
     /// init, before any bucket is known, are the ones the query reuses. The CLI leaves it unset and stays
     /// virtual-hosted.
     path_style: bool = false,
+    /// Set only on credentials returned by CreateSession.
+    express_session: bool = false,
+
+    pub fn signer(self: Credentials) sigv4.SigV4 {
+        return .{
+            .region = self.region,
+            .service = if (self.express_session) "s3express" else "s3",
+            .access_key = self.access_key,
+            .secret_key = self.secret_key,
+            .session_token = self.session_token,
+            .s3express_session = self.express_session,
+        };
+    }
 
     pub fn fromEnv(env: std.process.Environ) Error!Credentials {
         const vars = if (builtin.os.tag == .windows) WindowsEnvironment{ .environ = env } else env;
@@ -415,6 +428,194 @@ pub const Url = struct {
     }
 };
 
+pub const SessionMode = enum { read_only, read_write };
+
+// Entries live for the process lifetime so a detached refresh never borrows a query's arena. The mutex protects both
+// the list and each entry; request credentials are copied into the caller's arena before releasing it.
+const SessionEntry = struct {
+    next: ?*SessionEntry = null,
+    base: Credentials,
+    bucket: []const u8,
+    mode: SessionMode,
+    refreshing: bool = false,
+    done: Io.Condition = .init,
+    session_arena: ?*std.heap.ArenaAllocator = null,
+    session: ?Credentials = null,
+    expires: i64 = 0,
+    failure: Error = error.S3RequestFailed,
+};
+var session_mutex: Io.Mutex = .init;
+var sessions: ?*SessionEntry = null;
+const session_io = @import("../core/blocking.zig").io;
+const session_alloc = std.heap.page_allocator;
+
+fn sameOptional(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn copyCredentials(a: std.mem.Allocator, creds: Credentials) !Credentials {
+    var out = creds;
+    out.access_key = try a.dupe(u8, creds.access_key);
+    out.secret_key = try a.dupe(u8, creds.secret_key);
+    out.region = try a.dupe(u8, creds.region);
+    out.session_token = if (creds.session_token) |v| try a.dupe(u8, v) else null;
+    out.endpoint = if (creds.endpoint) |v| try a.dupe(u8, v) else null;
+    return out;
+}
+
+/// Acquire a bucket-scoped session. The refresh thread is independent of the caller's cancellation and arena.
+pub fn sessionCredentials(arena: std.mem.Allocator, base: Credentials, bucket: []const u8, mode: SessionMode) Error!Credentials {
+    return sessionCredentialsWait(null, arena, base, bucket, mode) catch |err| switch (err) {
+        error.Canceled => unreachable,
+        else => |e| return e,
+    };
+}
+
+pub fn sessionCredentialsWithIo(io: Io, arena: std.mem.Allocator, base: Credentials, bucket: []const u8, mode: SessionMode) (Error || Io.Cancelable)!Credentials {
+    return sessionCredentialsWait(io, arena, base, bucket, mode);
+}
+
+fn sessionCredentialsWait(io: ?Io, arena: std.mem.Allocator, base: Credentials, bucket: []const u8, mode: SessionMode) (Error || Io.Cancelable)!Credentials {
+    if (directoryBucketZone(bucket) == null or base.express_session) return base;
+    if (base.access_key.len == 0) return error.NoCredentials;
+    session_mutex.lockUncancelable(session_io);
+    defer session_mutex.unlock(session_io);
+    var entry = sessions;
+    while (entry) |e| : (entry = e.next) {
+        if (e.mode == mode and std.mem.eql(u8, e.bucket, bucket) and
+            std.mem.eql(u8, e.base.region, base.region) and std.mem.eql(u8, e.base.access_key, base.access_key) and
+            std.mem.eql(u8, e.base.secret_key, base.secret_key) and sameOptional(e.base.session_token, base.session_token) and
+            sameOptional(e.base.endpoint, base.endpoint)) break;
+    }
+    if (entry == null) {
+        const storage = try session_alloc.create(std.heap.ArenaAllocator);
+        storage.* = std.heap.ArenaAllocator.init(session_alloc);
+        errdefer {
+            storage.deinit();
+            session_alloc.destroy(storage);
+        }
+        const a = storage.allocator();
+        const e = try a.create(SessionEntry);
+        e.* = .{ .base = try copyCredentials(a, base), .bucket = try a.dupe(u8, bucket), .mode = mode, .next = sessions };
+        sessions = e;
+        entry = e;
+    }
+    const e = entry.?;
+    const now = clock.realtimeS();
+    if (e.session != null and e.expires > now + 60) return copyCredentials(arena, e.session.?);
+    if (!e.refreshing) {
+        e.refreshing = true;
+        const t = std.Thread.spawn(.{}, refreshSession, .{e}) catch {
+            e.refreshing = false;
+            return error.S3RequestFailed;
+        };
+        t.detach();
+    }
+    if (e.session != null and e.expires > now + 5) return copyCredentials(arena, e.session.?);
+    while (e.refreshing) {
+        if (io) |wait_io| try e.done.wait(wait_io, &session_mutex) else e.done.waitUncancelable(session_io, &session_mutex);
+    }
+    if (e.session) |s| if (e.expires > clock.realtimeS() + 5) return copyCredentials(arena, s);
+    return e.failure;
+}
+
+const SessionResult = struct { creds: Credentials, expires: i64 };
+
+fn refreshSession(e: *SessionEntry) void {
+    const storage = session_alloc.create(std.heap.ArenaAllocator) catch {
+        session_mutex.lockUncancelable(session_io);
+        e.failure = error.OutOfMemory;
+        e.refreshing = false;
+        e.done.broadcast(session_io);
+        session_mutex.unlock(session_io);
+        return;
+    };
+    storage.* = std.heap.ArenaAllocator.init(session_alloc);
+    var scratch = std.heap.ArenaAllocator.init(session_alloc);
+    defer scratch.deinit();
+    const result: Error!SessionResult = blk: {
+        const fresh = createSession(scratch.allocator(), e.base, e.bucket, e.mode) catch |err| break :blk err;
+        const held = copyCredentials(storage.allocator(), fresh.creds) catch |err| break :blk err;
+        break :blk .{ .creds = held, .expires = fresh.expires };
+    };
+    session_mutex.lockUncancelable(session_io);
+    if (result) |s| {
+        if (e.session_arena) |old| {
+            old.deinit();
+            session_alloc.destroy(old);
+        }
+        e.session_arena = storage;
+        e.session = s.creds;
+        e.expires = s.expires;
+    } else |err| {
+        storage.deinit();
+        session_alloc.destroy(storage);
+        e.failure = err;
+    }
+    e.refreshing = false;
+    e.done.broadcast(session_io);
+    session_mutex.unlock(session_io);
+}
+
+fn createSession(arena: std.mem.Allocator, base: Credentials, bucket: []const u8, mode: SessionMode) Error!SessionResult {
+    const host = try hostFor(arena, base, bucket);
+    const connect_host = try connectHostFor(arena, base, bucket);
+    const addrs = try resolveIpv4(arena, connect_host);
+    var conn = try connect(arena, base, addrs, host);
+    defer conn.deinit();
+    const path = try pathFor(arena, base, bucket, "");
+    var signer = base.signer();
+    signer.service = "s3express";
+    const mode_header = if (mode == .read_only) "ReadOnly" else "ReadWrite";
+    const signed = signer.sign(arena, "GET", host, path, "session=", &.{.{ .name = "x-amz-create-session-mode", .value = mode_header }}, "", .{}) catch return error.SignFailed;
+    var headers: std.ArrayList(http.Header) = .empty;
+    for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
+    const target = try std.fmt.allocPrint(arena, "{s}?session", .{path});
+    const resp = try http.sendRequest(arena, &conn, .{ .method = .GET, .host = host, .path = target, .headers = headers.items });
+    if (resp.status != 200) return refusal(.GetObject, bucket, "", resp, base).err;
+    var creds = base;
+    creds.access_key = extractXml(arena, resp.body, "AccessKeyId") catch return error.BadResponse;
+    creds.secret_key = extractXml(arena, resp.body, "SecretAccessKey") catch return error.BadResponse;
+    creds.session_token = extractXml(arena, resp.body, "SessionToken") catch return error.BadResponse;
+    creds.express_session = true;
+    const exp = extractXml(arena, resp.body, "Expiration") catch return error.BadResponse;
+    const expires = parseSessionExpiration(exp) orelse return error.BadResponse;
+    if (expires <= clock.realtimeS() + 5) return error.BadResponse;
+    return .{ .creds = creds, .expires = expires };
+}
+
+fn parseSessionExpiration(s: []const u8) ?i64 {
+    if (s.len < 20 or s[4] != '-' or s[7] != '-' or s[10] != 'T' or s[13] != ':' or s[16] != ':' or s[s.len - 1] != 'Z') return null;
+    const num = struct {
+        fn f(t: []const u8) ?i64 {
+            return std.fmt.parseInt(i64, t, 10) catch null;
+        }
+    }.f;
+    const y = num(s[0..4]) orelse return null;
+    const m = num(s[5..7]) orelse return null;
+    const d = num(s[8..10]) orelse return null;
+    const hh = num(s[11..13]) orelse return null;
+    const mm = num(s[14..16]) orelse return null;
+    const ss = num(s[17..19]) orelse return null;
+    if (m < 1 or m > 12 or d < 1 or d > 31 or hh > 23 or mm > 59 or ss > 59) return null;
+    const yy = if (m <= 2) y - 1 else y;
+    const era = @divFloor(yy, 400);
+    const yoe = yy - era * 400;
+    const mp = @mod(m + 9, 12);
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return (era * 146097 + doe - 719468) * 86400 + hh * 3600 + mm * 60 + ss;
+}
+
+test "S3 Express session expiration and standard credentials" {
+    try std.testing.expectEqual(@as(?i64, 1_791_066_063), parseSessionExpiration("2026-10-03T22:21:03.000Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseSessionExpiration("bad"));
+    const base: Credentials = .{ .access_key = "key", .secret_key = "secret", .region = "us-west-2" };
+    const got = try sessionCredentials(std.testing.allocator, base, "standard-bucket", .read_only);
+    try std.testing.expectEqualStrings(base.access_key, got.access_key);
+}
+
 test "an S3 URL with a bucket that could break a header, or a control byte in its key, is refused" {
     try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt\r\nX-Injected: 1/key"));
     try std.testing.expectError(error.BadS3Url, Url.parse("s3://bkt evil/key"));
@@ -505,18 +706,40 @@ pub const Client = struct {
         key: []const u8,
         range: ?Range,
     ) Error!http.Response {
+        const creds = try sessionCredentials(req_arena, self.creds, self.bucket, .read_only);
         if (self.conn == null) {
             self.conn = try connect(self.client_arena, self.creds, self.addrs, self.host);
         }
         return try buildAndSend(
             req_arena,
             &self.conn.?,
-            self.creds,
+            creds,
             self.host,
             self.bucket,
             key,
             .{ .range = range },
         );
+    }
+
+    pub fn head(self: *Client, arena: std.mem.Allocator, key: []const u8) Error!http.Response {
+        return self.headOnce(arena, key) catch |err| switch (err) {
+            error.ClosedBeforeResponse, error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => blk: {
+                if (self.conn) |*conn| conn.deinit();
+                self.conn = null;
+                break :blk try self.headOnce(arena, key);
+            },
+            else => return err,
+        };
+    }
+
+    fn headOnce(self: *Client, arena: std.mem.Allocator, key: []const u8) Error!http.Response {
+        const creds = try sessionCredentials(arena, self.creds, self.bucket, .read_only);
+        if (self.conn == null) self.conn = try connect(self.client_arena, creds, self.addrs, self.host);
+        const path = try pathFor(arena, creds, self.bucket, key);
+        const signed = creds.signer().sign(arena, "HEAD", self.host, path, null, &.{}, "", .{ .use_unsigned_payload = true }) catch return error.SignFailed;
+        var headers: std.ArrayList(http.Header) = .empty;
+        for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
+        return http.sendRequest(arena, &self.conn.?, .{ .method = .HEAD, .host = self.host, .path = path, .headers = headers.items });
     }
 
     /// One ListObjectsV2 page. Reuses the cached TLS connection.
@@ -639,6 +862,7 @@ pub fn getViaPoolWithOpts(
     url: Url,
     opts: GetOpts,
 ) !http.Response {
+    const request_creds = try sessionCredentialsWithIo(io, arena, creds, url.bucket, .read_only);
     const host = try hostFor(arena, creds, url.bucket);
     const criteria = try poolCriteria(arena, creds, url.bucket);
     const Get = struct {
@@ -661,7 +885,7 @@ pub fn getViaPoolWithOpts(
         .prof = opts.prof,
         .tag = tag,
         .bytes = bytes,
-    }, Get{ .creds = creds, .host = host, .url = url, .opts = opts }, Get.send);
+    }, Get{ .creds = request_creds, .host = host, .url = url, .opts = opts }, Get.send);
 }
 
 pub const RequestOpts = struct {
@@ -1168,18 +1392,14 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
 
 /// Issue one ranged GET on `conn`, streaming the body into `ctx.target`.
 fn doFetch(ctx: *FetchCtx, arena: std.mem.Allocator, conn: *tls.Connection) !http.Response {
-    const path = try pathFor(arena, ctx.creds, ctx.bucket, ctx.key);
+    const creds = try sessionCredentialsWithIo(ctx.io, arena, ctx.creds, ctx.bucket, .read_only);
+    const path = try pathFor(arena, creds, ctx.bucket, ctx.key);
 
     var range_buf: [64]u8 = undefined;
     const inclusive: Range = .{ .start = ctx.range.start, .end = ctx.range.end - 1 };
     const range_header = try inclusive.writeHeader(&range_buf);
 
-    const signer: sigv4.SigV4 = .{
-        .region = ctx.creds.region,
-        .access_key = ctx.creds.access_key,
-        .secret_key = ctx.creds.secret_key,
-        .session_token = ctx.creds.session_token,
-    };
+    const signer = creds.signer();
 
     var hdr_in: std.ArrayList(sigv4.SigV4.Header) = .empty;
     try hdr_in.append(arena, .{ .name = "Range", .value = range_header });
@@ -1387,12 +1607,7 @@ fn buildAndSend(
     else
         null;
 
-    const signer: sigv4.SigV4 = .{
-        .region = creds.region,
-        .access_key = creds.access_key,
-        .secret_key = creds.secret_key,
-        .session_token = creds.session_token,
-    };
+    const signer = creds.signer();
 
     var hdr_in: std.ArrayList(sigv4.SigV4.Header) = .empty;
     defer hdr_in.deinit(req_arena);
@@ -1443,7 +1658,7 @@ fn sendListV2(
     max_keys: u32,
     continuation_token: ?[]const u8,
 ) Error!ListPage {
-    const creds = client.creds;
+    const creds = try sessionCredentials(req_arena, client.creds, client.bucket, .read_only);
     const host = client.host;
     const bucket = client.bucket;
     // Path: virtual-hosted is "/"; path-style (R2 / endpoint override /
@@ -1463,12 +1678,7 @@ fn sendListV2(
         break :blk try std.fmt.allocPrint(req_arena, "continuation-token={s}&list-type=2&max-keys={s}&prefix={s}", .{ enc, max_keys_str, encoded_prefix });
     } else try std.fmt.allocPrint(req_arena, "list-type=2&max-keys={s}&prefix={s}", .{ max_keys_str, encoded_prefix });
 
-    const signer: sigv4.SigV4 = .{
-        .region = creds.region,
-        .access_key = creds.access_key,
-        .secret_key = creds.secret_key,
-        .session_token = creds.session_token,
-    };
+    const signer = creds.signer();
     const signed = signer.sign(
         req_arena,
         "GET",
@@ -2096,6 +2306,72 @@ test "requestViaPool retries a dead reused connection at once only for an idempo
 // ------------------------------------------------------------------ stalled connections (tls.Timeouts)
 
 const fake_s3 = @import("fake_s3.zig");
+
+test "S3 Express session shared by concurrent callers and survives cancellation" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.hold_session = true;
+    fake.require_session = true;
+    defer fake.release_session.store(true, .release);
+    try fake.serveBytes("dir/file", "abcdefgh");
+    var endpoint_buf: [64]u8 = undefined;
+    const creds: Credentials = .{
+        .access_key = "base-key",
+        .secret_key = "base-secret",
+        .region = "us-west-2",
+        .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}),
+    };
+    const bucket = "test--usw2-az1--x-s3";
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Call = struct {
+        fn run(task_io: Io, base: Credentials, b: []const u8) anyerror!void {
+            var arena = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena.deinit();
+            const s = try sessionCredentialsWithIo(task_io, arena.allocator(), base, b, .read_only);
+            try testing.expectEqualStrings("session-key", s.access_key);
+        }
+    };
+    var canceled = try io.concurrent(Call.run, .{ io, creds, bucket });
+    while (!fake.session_arrived.load(.acquire)) clock.sleepNs(std.time.ns_per_ms);
+    var others: [8]Io.Future(anyerror!void) = undefined;
+    for (&others) |*f| f.* = try io.concurrent(Call.run, .{ io, creds, bucket });
+    try testing.expectError(error.Canceled, canceled.cancel(io));
+    fake.release_session.store(true, .release);
+    for (&others) |*f| try f.await(io);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var client = try Client.init(a, creds, bucket);
+    defer client.deinit();
+    const whole = try client.get(a, "dir/file", null);
+    try testing.expectEqualStrings("abcdefgh", whole.body);
+    const part = try client.get(a, "dir/file", Range.span(2, 4));
+    try testing.expectEqualStrings("cde", part.body);
+    const head = try client.head(a, "dir/file");
+    try testing.expectEqual(@as(u16, 200), head.status);
+    try testing.expectEqualStrings("8", head.header("Content-Length").?);
+    const entries = try listAll(a, &client, "dir/");
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqualStrings("dir/file", entries[0].key);
+    session_mutex.lockUncancelable(session_io);
+    var current = sessions.?;
+    while (!std.mem.eql(u8, current.bucket, bucket) or current.mode != .read_only) current = current.next.?;
+    current.expires = clock.realtimeS() + 30;
+    session_mutex.unlock(session_io);
+    _ = try sessionCredentials(a, creds, bucket, .read_only);
+    session_mutex.lockUncancelable(session_io);
+    while (current.refreshing) current.done.waitUncancelable(session_io, &session_mutex);
+    session_mutex.unlock(session_io);
+    _ = try sessionCredentials(a, creds, bucket, .read_write);
+    fake.lock();
+    defer fake.unlock();
+    try testing.expectEqual(@as(u32, 3), fake.sessions);
+    try testing.expect(!fake.session_bad_signature);
+}
 
 /// Per-connection deadlines short enough for tests; production uses `tls.Timeouts` defaults or the environment.
 const test_timeouts: tls.Timeouts = .{ .connect_ms = 300, .handshake_ms = 300, .first_byte_ms = 200, .idle_ms = 200 };

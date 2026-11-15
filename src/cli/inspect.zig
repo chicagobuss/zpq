@@ -17,6 +17,7 @@ const Source = struct {
     arena: std.mem.Allocator,
     mapped: ?fs.Mapped = null,
     client: ?s3.Client = null,
+    whole: ?[]const u8 = null,
     key: []const u8 = "",
     size: usize = 0,
     footer_start: usize = 0,
@@ -32,13 +33,18 @@ const Source = struct {
             const url = try s3.Url.parse(path);
             self.key = url.key;
             self.client = try s3.Client.init(arena, try s3.Credentials.fromEnv(env), url.bucket);
-            const r = try self.client.?.get(arena, self.key, .suffix(8));
-            if (r.status != 206 or r.body.len != 8) return error.BadRangeResponse;
-            const cr = r.header("Content-Range") orelse return error.BadRangeResponse;
-            const slash = std.mem.lastIndexOfScalar(u8, cr, '/') orelse return error.BadRangeResponse;
-            self.size = try std.fmt.parseInt(usize, cr[slash + 1 ..], 10);
+            const r = try self.client.?.head(arena, self.key);
+            if (r.status != 200) return error.BadResponse;
+            self.size = try std.fmt.parseInt(usize, r.header("Content-Length") orelse return error.BadResponse, 10);
             self.requests = 1;
-            self.bytes = 8;
+            // Small files fit the existing detail budget; one GET avoids a separate round trip for each range.
+            if (self.size <= detail_limit) {
+                const whole = try self.client.?.get(arena, self.key, null);
+                if (whole.status != 200 or whole.body.len != self.size) return error.BadResponse;
+                self.whole = whole.body;
+                self.requests += 1;
+                self.bytes = whole.body.len;
+            }
         } else {
             self.mapped = try fs.mapFile(path);
             self.size = self.mapped.?.bytes.len;
@@ -58,9 +64,10 @@ const Source = struct {
             if (len > detail_limit - self.detail_bytes or self.requests >= request_limit) return error.DetailLimit;
             self.detail_bytes += len;
         }
-        self.bytes += len;
         if (self.mapped) |m| return m.bytes[start..][0..len];
+        if (self.whole) |bytes| return bytes[start..][0..len];
         if (len == 0) return "";
+        self.bytes += len;
         self.requests += 1;
         const r = try self.client.?.get(self.arena, self.key, .span(start, start + len - 1));
         if (r.status != 206 or r.body.len != len) return error.BadRangeResponse;

@@ -332,8 +332,12 @@ test "S3 Express session uses its token header and signing scope" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const signer: SigV4 = .{
-        .region = "us-west-2", .service = "s3express", .access_key = "AKIA", .secret_key = "secret",
-        .session_token = "token-xyz", .s3express_session = true,
+        .region = "us-west-2",
+        .service = "s3express",
+        .access_key = "AKIA",
+        .secret_key = "secret",
+        .session_token = "token-xyz",
+        .s3express_session = true,
     };
     const headers = try signer.sign(arena.allocator(), "GET", "bucket.example", "/key", null, &.{}, "", .{ .timestamp = 1369353600 });
     var token = false;

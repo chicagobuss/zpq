@@ -829,7 +829,7 @@ fn deferredPayloads(a: std.mem.Allocator, query: ?*const syntax.Query, b: syntax
     const keys = q.keys orelse return &.{};
     const key_leaf = try metadata.resolveColumn(meta, b.key);
     const key_element = metadata.leafSchemaElement(meta, key_leaf) orelse return &.{};
-    if (lookup.KeyDomain.of(key_element) != .signed) return &.{};
+    if ((lookup.KeyDomain.of(key_element) orelse return &.{}) != .signed) return &.{};
     const determines = for (keys) |k| {
         if (k.expr == .column and std.ascii.eqlIgnoreCase(k.expr.column, fk)) break true;
     } else false;

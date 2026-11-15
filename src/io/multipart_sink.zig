@@ -97,6 +97,7 @@ pub const Control = struct {
 const EtagSlot = struct {
     buf: [512]u8 = undefined,
     len: usize = 0,
+    crc32: [8]u8 = undefined,
 
     fn slice(self: *const EtagSlot) []const u8 {
         return self.buf[0..self.len];
@@ -526,7 +527,7 @@ fn storePartEtag(ctx: *PartTaskCtx, resp: http.Response) bool {
 
 fn doUploadPart(ctx: *PartTaskCtx, arena: std.mem.Allocator, conn: *tls.Connection) !http.Response {
     const url = ctx.sink.url;
-    const creds = ctx.sink.creds;
+    const creds = try s3.sessionCredentialsWithIo(ctx.sink.io, arena, ctx.sink.creds, url.bucket, .read_write);
     const upload_id = ctx.sink.upload_id.?;
 
     const host = try s3.hostFor(arena, creds, url.bucket);
@@ -534,13 +535,15 @@ fn doUploadPart(ctx: *PartTaskCtx, arena: std.mem.Allocator, conn: *tls.Connecti
     const query = try std.fmt.allocPrint(arena, "partNumber={d}&uploadId={s}", .{ ctx.part_number, try uriEncodeQueryValue(arena, upload_id) });
     const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ path, query });
 
-    const signer: sigv4.SigV4 = .{
-        .region = creds.region,
-        .access_key = creds.access_key,
-        .secret_key = creds.secret_key,
-        .session_token = creds.session_token,
-    };
-    const signed = try signer.sign(arena, "PUT", host, path, query, &.{}, ctx.body, .{ .use_unsigned_payload = true });
+    var checksum: [4]u8 = undefined;
+    var extra_buf: [1]sigv4.SigV4.Header = undefined;
+    const extra: []const sigv4.SigV4.Header = if (s3.directoryBucketZone(url.bucket) != null) blk: {
+        std.mem.writeInt(u32, &checksum, std.hash.Crc32.hash(ctx.body), .big);
+        const checksum64 = std.base64.standard.Encoder.encode(&ctx.etag_slot.crc32, &checksum);
+        extra_buf[0] = .{ .name = "x-amz-checksum-crc32", .value = checksum64 };
+        break :blk &extra_buf;
+    } else &.{};
+    const signed = try creds.signer().sign(arena, "PUT", host, path, query, extra, ctx.body, .{ .use_unsigned_payload = true });
 
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
@@ -569,12 +572,13 @@ fn refused(op: S3Failure.Op, url: s3.Url, resp: http.Response, previous: S3Failu
 /// it is never repeated, since the server may have applied it. A failure is described in `failure`.
 fn createMultipartUpload(
     arena: std.mem.Allocator,
-    creds: s3.Credentials,
+    base: s3.Credentials,
     url: s3.Url,
     control: Control,
     io: Io,
     failure: *S3Failure,
 ) ![]const u8 {
+    const creds = try s3.sessionCredentialsWithIo(io, arena, base, url.bucket, .read_write);
     const host = try s3.hostFor(arena, creds, url.bucket);
     const path = try s3.pathFor(arena, creds, url.bucket, url.key);
     const query = "uploads=";
@@ -583,13 +587,11 @@ fn createMultipartUpload(
     var conn = try controlConnect(arena, creds, url, control, io, failure);
     defer conn.deinit();
 
-    const signer: sigv4.SigV4 = .{
-        .region = creds.region,
-        .access_key = creds.access_key,
-        .secret_key = creds.secret_key,
-        .session_token = creds.session_token,
-    };
-    const signed = try signer.sign(arena, "POST", host, path, query, &.{}, "", .{});
+    const extra: []const sigv4.SigV4.Header = if (s3.directoryBucketZone(url.bucket) != null)
+        &.{.{ .name = "x-amz-checksum-algorithm", .value = "CRC32" }}
+    else
+        &.{};
+    const signed = try creds.signer().sign(arena, "POST", host, path, query, extra, "", .{});
 
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
@@ -658,7 +660,7 @@ fn controlSend(arena: std.mem.Allocator, conn: *tls.Connection, req: http.Reques
 
 fn completeMultipartUpload(
     arena: std.mem.Allocator,
-    creds: s3.Credentials,
+    base: s3.Credentials,
     url: s3.Url,
     control: Control,
     io: Io,
@@ -666,6 +668,7 @@ fn completeMultipartUpload(
     etag_slots: []const *EtagSlot,
     failure: *S3Failure,
 ) !void {
+    const creds = try s3.sessionCredentialsWithIo(io, arena, base, url.bucket, .read_write);
     const host = try s3.hostFor(arena, creds, url.bucket);
     const path = try s3.pathFor(arena, creds, url.bucket, url.key);
     const query = try std.fmt.allocPrint(arena, "uploadId={s}", .{try uriEncodeQueryValue(arena, upload_id)});
@@ -674,11 +677,10 @@ fn completeMultipartUpload(
     var body: std.ArrayList(u8) = .empty;
     try body.appendSlice(arena, "<CompleteMultipartUpload>");
     for (etag_slots, 1..) |slot, part_no| {
-        const piece = try std.fmt.allocPrint(
-            arena,
-            "<Part><PartNumber>{d}</PartNumber><ETag>{s}</ETag></Part>",
-            .{ part_no, slot.slice() },
-        );
+        const piece = if (s3.directoryBucketZone(url.bucket) != null)
+            try std.fmt.allocPrint(arena, "<Part><PartNumber>{d}</PartNumber><ETag>{s}</ETag><ChecksumCRC32>{s}</ChecksumCRC32></Part>", .{ part_no, slot.slice(), &slot.crc32 })
+        else
+            try std.fmt.allocPrint(arena, "<Part><PartNumber>{d}</PartNumber><ETag>{s}</ETag></Part>", .{ part_no, slot.slice() });
         try body.appendSlice(arena, piece);
     }
     try body.appendSlice(arena, "</CompleteMultipartUpload>");
@@ -687,13 +689,7 @@ fn completeMultipartUpload(
     var conn = try controlConnect(arena, creds, url, control, io, failure);
     defer conn.deinit();
 
-    const signer: sigv4.SigV4 = .{
-        .region = creds.region,
-        .access_key = creds.access_key,
-        .secret_key = creds.secret_key,
-        .session_token = creds.session_token,
-    };
-    const signed = try signer.sign(arena, "POST", host, path, query, &.{}, body.items, .{});
+    const signed = try creds.signer().sign(arena, "POST", host, path, query, &.{}, body.items, .{});
 
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
@@ -743,13 +739,18 @@ fn abortUploadsStartedSince(
 const ListedUpload = struct { key: []const u8, upload_id: []const u8, initiated: []const u8 };
 
 /// ListMultipartUploads with `prefix` = the key; the first page only (up to 1000 uploads under that prefix).
-fn listMultipartUploads(arena: std.mem.Allocator, creds: s3.Credentials, url: s3.Url) ![]const ListedUpload {
+fn listMultipartUploads(arena: std.mem.Allocator, base: s3.Credentials, url: s3.Url) ![]const ListedUpload {
+    const creds = try s3.sessionCredentials(arena, base, url.bucket, .read_write);
     const host = try s3.hostFor(arena, creds, url.bucket);
     const list_path: []const u8 = if (s3.virtualHosted(creds, url.bucket))
         "/"
     else
         try std.fmt.allocPrint(arena, "/{s}", .{url.bucket});
-    const query = try std.fmt.allocPrint(arena, "prefix={s}&uploads=", .{try uriEncodeQueryValue(arena, url.key)});
+    const prefix = if (s3.directoryBucketZone(url.bucket) != null)
+        if (std.mem.lastIndexOfScalar(u8, url.key, '/')) |i| url.key[0 .. i + 1] else ""
+    else
+        url.key;
+    const query = try std.fmt.allocPrint(arena, "prefix={s}&uploads=", .{try uriEncodeQueryValue(arena, prefix)});
     const path_with_query = try std.fmt.allocPrint(arena, "{s}?{s}", .{ list_path, query });
 
     const connect_host = try s3.connectHostFor(arena, creds, url.bucket);
@@ -757,13 +758,7 @@ fn listMultipartUploads(arena: std.mem.Allocator, creds: s3.Credentials, url: s3
     var conn = try s3.connect(arena, creds, addrs, host);
     defer conn.deinit();
 
-    const signer: sigv4.SigV4 = .{
-        .region = creds.region,
-        .access_key = creds.access_key,
-        .secret_key = creds.secret_key,
-        .session_token = creds.session_token,
-    };
-    const signed = try signer.sign(arena, "GET", host, list_path, query, &.{}, "", .{ .use_unsigned_payload = true });
+    const signed = try creds.signer().sign(arena, "GET", host, list_path, query, &.{}, "", .{ .use_unsigned_payload = true });
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
 
@@ -864,6 +859,7 @@ fn multipartEtag(arena: std.mem.Allocator, parts: []const *EtagSlot) !?[]const u
 /// After a CompleteMultipartUpload whose answer was lost: whether `url` now holds the object those parts complete to,
 /// by HEAD and ETag. Any doubt (a request failing, an unpredictable ETag) answers no.
 fn completedObjectMatches(arena: std.mem.Allocator, creds: s3.Credentials, url: s3.Url, parts: []const *EtagSlot) bool {
+    if (s3.directoryBucketZone(url.bucket) != null) return false;
     const want = (multipartEtag(arena, parts) catch return false) orelse return false;
     const resp = headObject(arena, creds, url) catch return false;
     if (resp.status != 200) return false;
@@ -911,12 +907,13 @@ fn abortLogged(
 
 fn abortMultipartUpload(
     arena: std.mem.Allocator,
-    creds: s3.Credentials,
+    base: s3.Credentials,
     url: s3.Url,
     control: Control,
     upload_id: []const u8,
     failure: *S3Failure,
 ) !void {
+    const creds = try s3.sessionCredentials(arena, base, url.bucket, .read_write);
     const host = try s3.hostFor(arena, creds, url.bucket);
     const path = try s3.pathFor(arena, creds, url.bucket, url.key);
     const query = try std.fmt.allocPrint(arena, "uploadId={s}", .{try uriEncodeQueryValue(arena, upload_id)});
@@ -925,13 +922,7 @@ fn abortMultipartUpload(
     var conn = try controlConnect(arena, creds, url, control, null, failure);
     defer conn.deinit();
 
-    const signer: sigv4.SigV4 = .{
-        .region = creds.region,
-        .access_key = creds.access_key,
-        .secret_key = creds.secret_key,
-        .session_token = creds.session_token,
-    };
-    const signed = try signer.sign(arena, "DELETE", host, path, query, &.{}, "", .{});
+    const signed = try creds.signer().sign(arena, "DELETE", host, path, query, &.{}, "", .{});
 
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
@@ -998,6 +989,10 @@ fn writeThroughSinkWith(
 
 /// Push `payload` through a sink with `options` to bucket `bkt` of the S3 endpoint on local `port`, then close it.
 fn writeToPort(port: u16, key: []const u8, payload: []const u8, timeouts: tls.Timeouts, options: Options) !void {
+    return writeToBucket(port, "bkt", key, payload, timeouts, options);
+}
+
+fn writeToBucket(port: u16, bucket: []const u8, key: []const u8, payload: []const u8, timeouts: tls.Timeouts, options: Options) !void {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -1013,7 +1008,7 @@ fn writeToPort(port: u16, key: []const u8, payload: []const u8, timeouts: tls.Ti
         .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{port}),
         .timeouts = timeouts,
     };
-    const url: s3.Url = .{ .bucket = "bkt", .key = key };
+    const url: s3.Url = .{ .bucket = bucket, .key = key };
     var pool: s3.Pool(4) = undefined;
     try pool.init(testing.allocator);
     defer pool.deinit();
@@ -1034,6 +1029,19 @@ const test_payload: [2500]u8 = blk: {
     for (&b, 0..) |*c, i| c.* = @truncate(i *% 31 +% 7);
     break :blk b;
 };
+
+test "S3 Express multipart sends CRC32 for every part" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.require_session = true;
+    const bucket = "test--usw2-az1--x-s3";
+    try writeToBucket(fake.port, bucket, "dir/out.parquet", &test_payload, .{}, .{ .target_part_size = 1024 });
+    try testing.expect(fake.object("dir/out.parquet") != null);
+    try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("dir/out.parquet"));
+    try writeToBucket(fake.port, bucket, "dir/small.parquet", "small", .{}, .{});
+    try testing.expect(fake.object("dir/small.parquet") != null);
+}
 
 test "a CreateMultipartUpload whose response is lost leaves no upload of ours behind" {
     var fake: fake_s3.FakeS3 = undefined;

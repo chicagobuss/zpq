@@ -22,7 +22,7 @@ pub const Upload = struct {
     parts: std.ArrayList(Part) = .empty,
 };
 
-pub const Part = struct { number: u32, md5: [Md5.digest_length]u8 };
+pub const Part = struct { number: u32, md5: [Md5.digest_length]u8, crc32: [8]u8 };
 
 pub const Object = struct {
     key: []u8,
@@ -94,6 +94,9 @@ pub const FakeS3 = struct {
     session_arrived: std.atomic.Value(bool) = .init(false),
     release_session: std.atomic.Value(bool) = .init(false),
     require_session: bool = false,
+    redirect_status: u16 = 0,
+    redirect_location: []const u8 = "",
+    requests_seen: std.atomic.Value(u32) = .init(0),
     /// Answer a CreateMultipartUpload 200, having applied it, with a body that carries no UploadId.
     create_unreadable: bool = false,
     /// Set by `deinit`: stalled connection threads stop waiting.
@@ -328,6 +331,7 @@ pub const FakeS3 = struct {
 
     /// Apply one request and answer it; false when the connection is to be dropped instead.
     fn handle(self: *FakeS3, fd: posix.fd_t, head: []const u8, body: []const u8) !bool {
+        _ = self.requests_seen.fetchAdd(1, .monotonic);
         const line_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
         const line = head[0..line_end];
         const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return false;
@@ -399,10 +403,13 @@ pub const FakeS3 = struct {
                 "<AccessKeyId>session-key</AccessKeyId><SecretAccessKey>session-secret</SecretAccessKey>" ++
                 "<SessionToken>session-token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration>" ++
                 "</Credentials></CreateSessionResult>", null);
-        } else if (self.require_session and (header(head, "x-amz-s3session-token") == null or
+        } else if (self.require_session and (header(head, "Content-MD5") != null or header(head, "x-amz-s3session-token") == null or
             std.mem.indexOf(u8, header(head, "Authorization") orelse "", "/s3express/aws4_request") == null))
         {
             return self.reply(fd, lose, 403, "", "<Error><Code>AccessDenied</Code></Error>", null);
+        } else if (self.redirect_status != 0) {
+            const location = try std.fmt.allocPrint(a, "Location: {s}\r\n", .{self.redirect_location});
+            return self.reply(fd, lose, self.redirect_status, location, "", null);
         } else if (std.mem.eql(u8, method, "GET") and param(query, "list-type") != null) {
             var out: std.ArrayList(u8) = .empty;
             try out.appendSlice(a, "<ListBucketResult><IsTruncated>false</IsTruncated>");
@@ -410,6 +417,8 @@ pub const FakeS3 = struct {
             try out.appendSlice(a, "</ListBucketResult>");
             resp_body = out.items;
         } else if (std.mem.eql(u8, method, "POST") and param(query, "uploads") != null) {
+            if (self.require_session and !std.mem.eql(u8, header(head, "x-amz-checksum-algorithm") orelse "", "CRC32"))
+                return self.reply(fd, lose, 400, "", "<Error><Code>InvalidRequest</Code></Error>", null);
             const id = try self.createUpload(key, realtimeS());
             resp_body = if (self.create_unreadable)
                 "<InitiateMultipartUploadResult/>"
@@ -420,17 +429,28 @@ pub const FakeS3 = struct {
             const u = self.findUpload(param(query, "uploadId").?) orelse return self.reply(fd, lose, 404, "", "<Error><Code>NoSuchUpload</Code></Error>", null);
             var md5: [Md5.digest_length]u8 = undefined;
             Md5.hash(body, &md5, .{});
+            var crc: [4]u8 = undefined;
+            var crc64: [8]u8 = undefined;
+            std.mem.writeInt(u32, &crc, std.hash.Crc32.hash(body), .big);
+            const crc_text = std.base64.standard.Encoder.encode(&crc64, &crc);
+            if (self.require_session and !std.mem.eql(u8, header(head, "x-amz-checksum-crc32") orelse "", crc_text))
+                return self.reply(fd, lose, 400, "", "<Error><Code>BadDigest</Code></Error>", null);
             const number = try std.fmt.parseInt(u32, param(query, "partNumber") orelse "0", 10);
             // As S3: a part sent again replaces the one with its number.
             for (u.parts.items, 0..) |p, i| if (p.number == number) {
                 _ = u.parts.orderedRemove(i);
                 break;
             };
-            try u.parts.append(self.allocator, .{ .number = number, .md5 = md5 });
+            try u.parts.append(self.allocator, .{ .number = number, .md5 = md5, .crc32 = crc64 });
             extra = try std.fmt.allocPrint(a, "ETag: \"{x}\"\r\n", .{md5});
         } else if (std.mem.eql(u8, method, "POST") and param(query, "uploadId") != null) {
             const id = param(query, "uploadId").?;
             const u = self.findUpload(id) orelse return self.reply(fd, lose, 404, "", "<Error><Code>NoSuchUpload</Code></Error>", null);
+            if (self.require_session) for (u.parts.items) |p| {
+                const checksum_element = try std.fmt.allocPrint(a, "<ChecksumCRC32>{s}</ChecksumCRC32>", .{&p.crc32});
+                if (std.mem.indexOf(u8, body, checksum_element) == null)
+                    return self.reply(fd, lose, 400, "", "<Error><Code>InvalidPart</Code></Error>", null);
+            };
             std.mem.sort(Part, u.parts.items, {}, struct {
                 fn lt(_: void, x: Part, y: Part) bool {
                     return x.number < y.number;

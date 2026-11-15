@@ -128,6 +128,7 @@ pub const Error = error{
     SlowDown,
     S3ServerError,
     S3RequestFailed,
+    DirectoryBucketInvalidPrefix,
 } || tls.Error || http.Error || std.mem.Allocator.Error;
 
 pub const Range = struct {
@@ -754,6 +755,10 @@ pub const Client = struct {
         max_keys: u32,
         continuation_token: ?[]const u8,
     ) Error!ListPage {
+        if (directoryBucketZone(self.bucket) != null and prefix.len != 0 and !std.mem.endsWith(u8, prefix, "/")) {
+            diag_mod.setS3Failure(self.diag, transportFailure(.ListObjectsV2, self.bucket, prefix, error.DirectoryBucketInvalidPrefix));
+            return error.DirectoryBucketInvalidPrefix;
+        }
         if (self.conn == null) {
             self.conn = try connect(self.client_arena, self.creds, self.addrs, self.host);
         }
@@ -788,6 +793,13 @@ pub fn listAll(
         token = page.next_token;
         if (token == null) break;
     }
+    if (directoryBucketZone(client.bucket) != null) {
+        std.sort.pdq(ListEntry, all.items, {}, struct {
+            fn less(_: void, a: ListEntry, b: ListEntry) bool {
+                return std.mem.lessThan(u8, a.key, b.key);
+            }
+        }.less);
+    }
     return all.items;
 }
 
@@ -817,12 +829,13 @@ pub fn put(
     url: Url,
     body: []const u8,
 ) Error!http.Response {
+    const request_creds = try sessionCredentials(arena, creds, url.bucket, .read_write);
     const host = try hostFor(arena, creds, url.bucket);
     const connect_host = try connectHostFor(arena, creds, url.bucket);
     const addrs = try resolveIpv4(arena, connect_host);
     var conn = try connect(arena, creds, addrs, host);
     defer conn.deinit();
-    return try sendPut(arena, &conn, creds, host, url.bucket, url.key, body);
+    return try sendPut(arena, &conn, request_creds, host, url.bucket, url.key, body);
 }
 
 /// Same as `get`, but acquires a connection from the supplied pool
@@ -1028,6 +1041,7 @@ pub fn putViaPool(
     url: Url,
     body: []const u8,
 ) !http.Response {
+    const request_creds = try sessionCredentialsWithIo(io, arena, creds, url.bucket, .read_write);
     const host = try hostFor(arena, creds, url.bucket);
     const criteria = try poolCriteria(arena, creds, url.bucket);
     const Put = struct {
@@ -1039,7 +1053,7 @@ pub fn putViaPool(
             return sendPut(a, conn, self.creds, self.host, self.url.bucket, self.url.key, self.body);
         }
     };
-    return requestViaPool(io, p, arena, criteria, .{ .idempotent = true }, Put{ .creds = creds, .host = host, .url = url, .body = body }, Put.send);
+    return requestViaPool(io, p, arena, criteria, .{ .idempotent = true }, Put{ .creds = request_creds, .host = host, .url = url, .body = body }, Put.send);
 }
 
 fn sendPut(
@@ -1053,12 +1067,7 @@ fn sendPut(
 ) Error!http.Response {
     const path = try pathFor(arena, creds, bucket, key);
 
-    const signer: sigv4.SigV4 = .{
-        .region = creds.region,
-        .access_key = creds.access_key,
-        .secret_key = creds.secret_key,
-        .session_token = creds.session_token,
-    };
+    const signer = creds.signer();
 
     const signed_headers = signer.sign(
         arena,
@@ -2367,10 +2376,67 @@ test "S3 Express session shared by concurrent callers and survives cancellation"
     while (current.refreshing) current.done.waitUncancelable(session_io, &session_mutex);
     session_mutex.unlock(session_io);
     _ = try sessionCredentials(a, creds, bucket, .read_write);
+    const response = try put(a, creds, .{ .bucket = bucket, .key = "dir/new" }, "data");
+    try testing.expectEqual(@as(u16, 200), response.status);
     fake.lock();
     defer fake.unlock();
     try testing.expectEqual(@as(u32, 3), fake.sessions);
     try testing.expect(!fake.session_bad_signature);
+}
+
+test "S3 Express listing sorts keys and rejects a non-directory prefix" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    fake.require_session = true;
+    try fake.serveBytes("dir/z", "z");
+    try fake.serveBytes("dir/a", "a");
+    var endpoint_buf: [64]u8 = undefined;
+    const creds: Credentials = .{ .access_key = "ak", .secret_key = "sk", .region = "us-west-2", .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{fake.port}) };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var client = try Client.init(arena.allocator(), creds, "test--usw2-az1--x-s3");
+    defer client.deinit();
+    try testing.expectError(error.DirectoryBucketInvalidPrefix, client.list(arena.allocator(), "dir/prefix", 100, null));
+    const entries = try listAll(arena.allocator(), &client, "dir/");
+    try testing.expectEqualStrings("dir/a", entries[0].key);
+    try testing.expectEqualStrings("dir/z", entries[1].key);
+}
+
+test "S3 redirects never forward credentials to another host or scheme" {
+    var origin: fake_s3.FakeS3 = undefined;
+    try origin.start(testing.allocator);
+    defer origin.deinit();
+    var destination: fake_s3.FakeS3 = undefined;
+    try destination.start(testing.allocator);
+    defer destination.deinit();
+    var endpoint_buf: [64]u8 = undefined;
+    var redirect_buf: [128]u8 = undefined;
+    const creds: Credentials = .{ .access_key = "base-key", .secret_key = "base-secret", .session_token = "base-token", .region = "us-west-2", .endpoint = try std.fmt.bufPrint(&endpoint_buf, "http://127.0.0.1:{d}", .{origin.port}) };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{ "ordinary", "test--usw2-az1--x-s3" }) |bucket| {
+        origin.lock();
+        origin.require_session = directoryBucketZone(bucket) != null;
+        origin.unlock();
+        var client = try Client.init(arena.allocator(), creds, bucket);
+        defer client.deinit();
+        for ([_]u16{ 301, 302, 303, 307, 308 }) |status| {
+            origin.lock();
+            origin.redirect_status = status;
+            origin.redirect_location = try std.fmt.bufPrint(&redirect_buf, "http://localhost:{d}/key", .{destination.port});
+            origin.unlock();
+            const response = try client.get(arena.allocator(), "key", null);
+            try testing.expectEqual(status, response.status);
+        }
+        origin.lock();
+        origin.redirect_status = 307;
+        origin.redirect_location = try std.fmt.bufPrint(&redirect_buf, "https://127.0.0.1:{d}/key", .{destination.port});
+        origin.unlock();
+        const response = try client.get(arena.allocator(), "key", null);
+        try testing.expectEqual(@as(u16, 307), response.status);
+    }
+    try testing.expectEqual(@as(u32, 0), destination.requests_seen.load(.monotonic));
 }
 
 /// Per-connection deadlines short enough for tests; production uses `tls.Timeouts` defaults or the environment.

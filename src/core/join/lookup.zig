@@ -421,7 +421,7 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
             if (gate.count() == 0) continue;
             const cm = rg.columns.items[d.leaf].meta_data orelse return error.ColumnMetaMissing;
             const levels = d.meta.getColumnLevels(cm.path_in_schema.items);
-            const opts = column_mod.chunkOptions(.{ .row_gate = &gate }, d.meta, cm);
+            const opts = column_mod.chunkOptions(.{ .fast_levels = true, .row_gate = &gate }, d.meta, cm);
             const decoded = try @import("../consumer/column.zig").decodeColumnTWithOptions([]const u8, sa, try chunkOf(d.bytes, cm), cm.codec, levels, gate.len, opts);
             kept = sel.iterator();
             while (kept.next()) |r| {
@@ -1311,7 +1311,7 @@ pub fn fetch(ctx: *const anyopaque, p: usize, key: i64, a: std.mem.Allocator) an
         gate.set(loc.row, true);
         const cm = rg.columns.items[d.leaf].meta_data orelse return error.ColumnMetaMissing;
         const levels = d.meta.getColumnLevels(cm.path_in_schema.items);
-        const options = column_mod.chunkOptions(.{ .row_gate = &gate }, d.meta, cm);
+        const options = column_mod.chunkOptions(.{ .fast_levels = true, .row_gate = &gate }, d.meta, cm);
         const col = try @import("../consumer/column.zig").decodeColumnTWithOptions([]const u8, sa, try chunkOf(d.bytes, cm), cm.codec, levels, gate.len, options);
         return .{ .bytes = try a.dupe(u8, col.values[loc.row]) };
     }

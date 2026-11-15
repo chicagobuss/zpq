@@ -290,7 +290,7 @@ fn fetchBeforeCut(gpa: std.mem.Allocator, out: *scan.AggOutput, program: ResultP
         if (d != null and program.readsScanColumn(raw)) break true;
     } else false;
     if (!needed) return true;
-    try scan_rows.fillDeferred(gpa, rows, deferred);
+    try scan_rows.fillDeferred(gpa, rows, deferred, program.workers);
     gpa.free(deferred);
     out.deferred_fetch = &.{};
     return false;
@@ -308,7 +308,7 @@ fn fetchAfterCut(gpa: std.mem.Allocator, out: *scan.AggOutput, program: ResultPr
     const fetches = try gpa.alloc(?@import("../core/expr/ast.zig").Expr, shown);
     defer gpa.free(fetches);
     for (fetches, 0..) |*f, j| f.* = if (program.scanColumn(j)) |raw| (if (raw < deferred.len) deferred[raw] else null) else null;
-    try scan_rows.fillDeferred(gpa, rows, fetches);
+    try scan_rows.fillDeferred(gpa, rows, fetches, program.workers);
 }
 
 /// `changed`: set on an error when a local input changed under the query (`OpenedInputs.whole`).

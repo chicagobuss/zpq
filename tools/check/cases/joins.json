@@ -6720,7 +6720,7 @@
    "cli": [
     "query",
     "--query",
-    "SELECT f.fk, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' d WHERE f.fk = d.pk GROUP BY f.fk, uname, ukind ORDER BY s DESC, f.fk LIMIT 7"
+    "SELECT d.w, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_dim}' p WHERE f.fk = d.pk AND d.w = p.pk GROUP BY d.w, uname, ukind ORDER BY s DESC, d.w LIMIT 7"
    ],
    "axes": [
     {
@@ -6744,7 +6744,7 @@
    ],
    "oracle": {
     "compare": "ordered",
-    "sql": "SELECT f.fk, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' d WHERE f.fk = d.pk GROUP BY f.fk, uname, ukind ORDER BY s DESC, f.fk LIMIT 7"
+    "sql": "SELECT d.w, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_dim}' p WHERE f.fk = d.pk AND d.w = p.pk GROUP BY d.w, uname, ukind ORDER BY s DESC, d.w LIMIT 7"
    }
   },
   {
@@ -6753,7 +6753,7 @@
    "cli": [
     "query",
     "--query",
-    "SELECT f.fk, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' d WHERE f.fk = d.pk GROUP BY f.fk, uname, ukind ORDER BY uname DESC, f.fk LIMIT 7"
+    "SELECT d.w, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_dim}' p WHERE f.fk = d.pk AND d.w = p.pk GROUP BY d.w, uname, ukind ORDER BY uname DESC, d.w LIMIT 7"
    ],
    "axes": [
     {
@@ -6777,7 +6777,7 @@
    ],
    "oracle": {
     "compare": "ordered",
-    "sql": "SELECT f.fk, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' d WHERE f.fk = d.pk GROUP BY f.fk, uname, ukind ORDER BY uname DESC, f.fk LIMIT 7"
+    "sql": "SELECT d.w, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_dim}' p WHERE f.fk = d.pk AND d.w = p.pk GROUP BY d.w, uname, ukind ORDER BY uname DESC, d.w LIMIT 7"
    }
   }
  ]

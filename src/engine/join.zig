@@ -282,9 +282,9 @@ pub const Prepared = struct {
             if (!lane_ok) continue;
             const via = j.payloads[q].via;
             const f: expr_ast.Fetch = if (via != null and isKey(keys, j.virtual_base + via.?.fk))
-                .{ .base = j.virtual_base + via.?.fk, .ctx = via.?.inner, .payload = via.?.p, .value = lookup.fetch, .batch = lookup.fetchBatch }
+                fetchOf(j.virtual_base + via.?.fk, via.?.inner, via.?.p)
             else if (j.domain == .signed and isKey(keys, j.fk_leaf))
-                .{ .base = j.fk_leaf, .ctx = j, .payload = q, .value = lookup.fetch, .batch = lookup.fetchBatch }
+                fetchOf(j.fk_leaf, j, q)
             else
                 continue;
             if (out == null) out = try arena.dupe(expr_ast.Expr, keys);
@@ -645,7 +645,7 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
         .query = if (args.result_order.limit != null and
             !@import("env.zig").envDisables(ctx.env, "ZPQ_GROUP_KEY_FD") and
             !@import("env.zig").envDisables(ctx.env, "ZPQ_LATE_FETCH") and
-            !@import("env.zig").envDisables(ctx.env, "ZPQ_JOIN_LATE_PAYLOAD")) @import("syntax_plan.zig").syntaxOf(source) else null,
+            !@import("env.zig").envDisables(ctx.env, "ZPQ_JOIN_LATE_PAYLOAD")) deferredSyntax(source) else null,
         .kind = undefined,
         .arena = .init(if (args.aligned_join != null) p.charge.allocator() else if (p.replica_limit != null) retained else gpa),
         .store = .init(retained),
@@ -890,4 +890,19 @@ fn predicateReads(f: syntax.Predicate, name: []const u8) bool {
         .boolean => |n| std.ascii.eqlIgnoreCase(n, name),
         .expr_compare => |x| exprReads(x.left.*, name) or exprReads(x.right.*, name),
     };
+}
+
+fn fetchOf(base: usize, j: *const lookup.Join, p: usize) expr_ast.Fetch {
+    const deferred = j.payloads[p].deferred;
+    return .{ .base = base, .ctx = j, .payload = p, .value = lookup.fetch, .batch = if (deferred != null) lookup.fetchBatch else null, .scratch = if (deferred) |d| d.scratch else null };
+}
+
+fn deferredSyntax(source: plans.Source) ?*const syntax.Query {
+    const q = @import("syntax_plan.zig").syntaxOf(source) orelse return null;
+    const keys = q.keys orelse return null;
+    const j = source.join orelse return null;
+    // Keep the compact group-join when the main FK is a key. Replacing its slot arrays with
+    // general grouping tables can turn an admitted bounded-memory query into a refusal.
+    for (keys) |k| if (k.expr == .column and std.ascii.eqlIgnoreCase(k.expr.column, j.fk)) return null;
+    return q;
 }

@@ -302,6 +302,7 @@ pub const Fetch = struct {
     ctx: *const anyopaque,
     payload: usize,
     /// The column's value at the build row whose key is `key`; null when no build row has it (a LEFT JOIN's miss).
+    scratch: ?std.mem.Allocator = null,
     batch: ?*const fn (ctx: *const anyopaque, payload: usize, keys: []const ?i64, scratch: std.mem.Allocator) anyerror![]?FetchValue = null,
     value: *const fn (ctx: *const anyopaque, payload: usize, key: i64, scratch: std.mem.Allocator) anyerror!?FetchValue,
 };

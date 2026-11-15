@@ -6,7 +6,7 @@
 
 - **Zig 0.17.1: the pins name it.** `build.zig.zon`'s minimum, `.zig-version`, the CI and release workflows, `just bootstrap` and the docs move from 0.17.0, and bootstrap now checks the tarball against ziglang.org's published sha256 before unpacking it. Still any 0.17.x release, not only 0.17.1.
 
-- **SQL: non-recursive `WITH` CTEs and subqueries in FROM (derived tables), with column lists, nesting and joins.** Each one read runs once into a scratch Parquet file; `WITH RECURSIVE`, `LATERAL` and circular or duplicate CTEs are refused by name.
+- **SQL: non-recursive `WITH` CTEs and subqueries in FROM (derived tables), with column lists, nesting and joins.** A filter of one file is inlined into the query that reads it; anything else read runs once into a scratch Parquet file. `WITH RECURSIVE`, `LATERAL` and circular or duplicate CTEs are refused by name.
 - **Fixed: a query whose rows are the answer (no aggregate or GROUP BY) with a join or an `IN (SELECT ...)` ignored the join and returned every probe row.** It is now refused (`JoinRowsNotSupported`) until row output of a join lands.
 - **S3 Express One Zone: directory buckets on zonal endpoints, CreateSession session credentials with one shared refresh, reads, writes and multipart with CRC32, and unsorted directory listings handled.**
 - **Tests honor ZPQ_TEST_PARQUET_DIR: every place zpq's tests write Parquet scratch goes under it.**

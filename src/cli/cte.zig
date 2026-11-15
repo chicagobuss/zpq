@@ -18,6 +18,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, plan: sql_cte.Plan, dir: []const 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    // Every CTE inlined: nothing to stage.
+    if (plan.stages.len == 0) return stager.finish(stager.ptr, plan.sql);
     // The directory's name goes into queries as a quoted path.
     if (std.mem.indexOfAny(u8, dir, "'*\"") != null) {
         stager.say("sql: CTEs and subqueries in FROM keep their scratch files beside the output; its directory name may not contain a quote or a *\n");

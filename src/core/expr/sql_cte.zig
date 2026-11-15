@@ -52,12 +52,26 @@ pub fn plan(arena: std.mem.Allocator, sql: []const u8, dir: []const u8) Error!?P
     return .{ .stages = p.stages.items, .sql = text };
 }
 
+/// A CTE's or a derived table's query, as the text that reads it will: inlined into it, or a stage's file.
+const Source = struct {
+    /// Its query, naming no CTE and no derived table.
+    sql: []const u8,
+    columns: []const []const u8,
+    /// Its stage's file, once staged.
+    out: ?[]const u8 = null,
+
+    fn file(self: *Source, p: *Planner) Error![]const u8 {
+        if (self.out == null) self.out = try p.stage(self.sql, self.columns);
+        return self.out.?;
+    }
+};
+
 const Cte = struct {
     name: []const u8,
     columns: []const []const u8,
     body: []const u8,
-    /// Its file once staged.
-    out: ?[]const u8 = null,
+    /// Planned the first time it is read.
+    source: ?*Source = null,
     /// Its body is being planned: a reference to it now is circular.
     defining: bool = false,
 };
@@ -68,6 +82,13 @@ const View = struct {
     len: usize,
     parent: ?*const View,
 };
+
+/// A filter of one file that a reference reads in place of a stage: `'file'`, its WHERE, and whether it keeps every
+/// column (a `*` over it reads the same columns either way).
+const Inline = struct { file: []const u8, where: ?[]const u8, star: bool };
+
+/// A reference this level wrote as an inline source's file, at `out[start..end]`.
+const Pending = struct { source: *Source, inline_: Inline, start: usize, end: usize };
 
 const Planner = struct {
     arena: std.mem.Allocator,
@@ -116,8 +137,8 @@ const Planner = struct {
         return self.body(all, text[i..], false);
     }
 
-    /// The file the CTE `name` is in, staging it first; null when `view` has no CTE of that name.
-    fn lookup(self: *Planner, view: ?*const View, name: []const u8) Error!?[]const u8 {
+    /// The CTE `name`, planned the first time; null when `view` has no CTE of that name.
+    fn lookup(self: *Planner, view: ?*const View, name: []const u8) Error!?*Source {
         var v = view;
         while (v) |at| : (v = at.parent) {
             var k = at.len;
@@ -125,26 +146,42 @@ const Planner = struct {
                 k -= 1;
                 const c = &at.ctes[k];
                 if (!sameName(c.name, name)) continue;
-                if (c.out) |out| return out;
+                if (c.source) |s| return s;
                 if (c.defining) return error.CteCircular;
                 // The body sees the CTEs before it in its list, and itself (to name a circular reference).
                 c.defining = true;
                 const inner: View = .{ .ctes = at.ctes, .len = k + 1, .parent = at.parent };
                 const sql = try self.query(&inner, c.body);
                 c.defining = false;
-                c.out = try self.stage(sql, c.columns);
-                return c.out;
+                c.source = try self.source(sql, c.columns);
+                return c.source;
             }
         }
         return null;
+    }
+
+    fn source(self: *Planner, sql: []const u8, columns: []const []const u8) Error!*Source {
+        const s = try self.arena.create(Source);
+        s.* = .{ .sql = sql, .columns = columns };
+        self.changed = true;
+        return s;
     }
 
     fn stage(self: *Planner, sql: []const u8, columns: []const []const u8) Error![]const u8 {
         const file = try std.fmt.allocPrint(self.arena, "cte{d}.parquet", .{self.stages.items.len});
         const out = try std.fs.path.join(self.arena, &.{ self.dir, file });
         try self.stages.append(self.arena, .{ .sql = sql, .out = out, .columns = columns });
-        self.changed = true;
         return out;
+    }
+
+    /// Writes the reference to `s` called `name`: the filtered file itself when it may be inlined (`pending`
+    /// decides at the level's end), else its stage's file.
+    fn reference(self: *Planner, out: *std.ArrayList(u8), pending: *std.ArrayList(Pending), s: *Source, name: ?[]const u8) Error!void {
+        const start = out.items.len;
+        const in_place = if (s.columns.len == 0 and s.out == null) inlineable(s.sql) else null;
+        if (in_place) |inl| try out.appendSlice(self.arena, inl.file) else try out.print(self.arena, "'{s}'", .{try s.file(self)});
+        if (in_place) |inl| try pending.append(self.arena, .{ .source = s, .inline_ = inl, .start = start, .end = out.items.len });
+        if (name) |n| try out.print(self.arena, " AS {s}", .{n});
     }
 
     /// `text` with its table references resolved. A FROM counts only at a level that is a query (it has a SELECT): the
@@ -156,6 +193,14 @@ const Planner = struct {
         var expect_table = in_from_start;
         // The names of the tables before a derived table in its FROM, which it may not read (an implicit LATERAL).
         var left: std.ArrayList([]const u8) = .empty;
+        // What inlining a filter needs of this level: one table, one SELECT, its WHERE's span in `out`, and whether a
+        // `*` or COLUMNS(...) would see the file's columns where the filter kept fewer.
+        var pending: std.ArrayList(Pending) = .empty;
+        var tables: usize = 0;
+        var selects: usize = 0;
+        var stars = false;
+        var where: ?struct { start: usize, end: ?usize } = null;
+        var from_end: ?usize = null;
         var i: usize = 0;
         while (i < text.len) {
             const ch = text[i];
@@ -165,6 +210,7 @@ const Planner = struct {
                 if (expect_table) {
                     const base = std.fs.path.basename(text[i + 1 .. end - 1]);
                     try left.append(self.arena, aliasAt(text, end) orelse base[0 .. std.mem.indexOfScalar(u8, base, '.') orelse base.len]);
+                    tables += 1;
                 }
                 expect_table = false;
                 i = end;
@@ -175,14 +221,14 @@ const Planner = struct {
                 const token = text[i..end];
                 if (expect_table) {
                     expect_table = false;
+                    tables += 1;
                     if (ch != '"' and setops.eql(token, "lateral")) return error.LateralNotSupported;
                     try left.append(self.arena, aliasAt(text, end) orelse token);
                     const next = skipSpace(text, end);
                     // A table function (`read_parquet(...)`) or a qualified name is no CTE.
                     const plain = next >= text.len or (text[next] != '(' and text[next] != '.');
-                    if (plain) if (try self.lookup(view, token)) |file| {
-                        try out.print(self.arena, "'{s}'", .{file});
-                        if (!aliasFollows(text, end)) try out.print(self.arena, " AS {s}", .{token});
+                    if (plain) if (try self.lookup(view, token)) |s| {
+                        try self.reference(&out, &pending, s, if (aliasFollows(text, end)) null else token);
                         i = end;
                         continue;
                     };
@@ -194,6 +240,7 @@ const Planner = struct {
                     if (setops.eql(token, "select")) {
                         is_query = true;
                         in_from = false;
+                        selects += 1;
                     } else if (is_query and setops.eql(token, "from")) {
                         in_from = true;
                         expect_table = true;
@@ -202,6 +249,18 @@ const Planner = struct {
                         expect_table = true;
                     } else if (in_from and endsFrom(token)) {
                         in_from = false;
+                        from_end = std.mem.trimEnd(u8, out.items, " \t\r\n").len;
+                    } else if (setops.eql(token, "columns") and skipSpace(text, end) < text.len and text[skipSpace(text, end)] == '(') {
+                        stars = true;
+                    }
+                    if (where) |*w| if (w.end == null and endsFrom(token)) {
+                        w.end = std.mem.trimEnd(u8, out.items, " \t\r\n").len;
+                    };
+                    if (is_query and !in_from_start and setops.eql(token, "where") and where == null) {
+                        try out.appendSlice(self.arena, token);
+                        where = .{ .start = out.items.len, .end = null };
+                        i = end;
+                        continue;
                     }
                 }
                 try out.appendSlice(self.arena, token);
@@ -209,6 +268,7 @@ const Planner = struct {
                 continue;
             }
             if (ch == ',' and in_from) expect_table = true;
+            if (ch == '*' and starItem(text, i)) stars = true;
             if (ch == '(') {
                 const close = closing(text, i) orelse {
                     try out.appendSlice(self.arena, text[i..]);
@@ -217,11 +277,13 @@ const Planner = struct {
                 const inner = text[i + 1 .. close - 1];
                 if (expect_table) {
                     expect_table = false;
+                    tables += 1;
                     if (isQuery(inner)) {
                         if (reads(inner, left.items)) return error.LateralNotSupported;
-                        if (aliasAt(text, close)) |name| try left.append(self.arena, name);
-                        const file = try self.stage(try self.query(view, inner), &.{});
-                        i = try self.derivedAlias(text, close, &out, file);
+                        const alias = try self.derivedAlias(text, close);
+                        if (alias.name) |name| try left.append(self.arena, name);
+                        try self.reference(&out, &pending, try self.source(try self.query(view, inner), alias.columns), alias.name);
+                        i = alias.end;
                         continue;
                     }
                     try out.print(self.arena, "({s})", .{try self.body(view, inner, true)});
@@ -236,27 +298,39 @@ const Planner = struct {
             try out.append(self.arena, ch);
             i += 1;
         }
+        if (pending.items.len == 0) return out.items;
+        // A filter is inlined only into a SELECT whose one table it is: its WHERE joins the query's own.
+        const p = pending.items[0];
+        if (pending.items.len == 1 and tables == 1 and selects == 1 and !in_from_start and (p.inline_.star or !stars)) {
+            const cond = p.inline_.where orelse return out.items;
+            const last = std.mem.trimEnd(u8, out.items, " \t\r\n;").len;
+            if (where) |w| {
+                try out.insertSlice(self.arena, w.end orelse last, ")");
+                try out.insertSlice(self.arena, w.start, try std.fmt.allocPrint(self.arena, " ({s}) AND (", .{cond}));
+            } else try out.insertSlice(self.arena, from_end orelse last, try std.fmt.allocPrint(self.arena, " WHERE {s}", .{cond}));
+            return out.items;
+        }
+        // Otherwise each is staged: its file stands where the filtered file was written.
+        var k = pending.items.len;
+        while (k > 0) {
+            k -= 1;
+            const q = pending.items[k];
+            try out.replaceRange(self.arena, q.start, q.end - q.start, try std.fmt.allocPrint(self.arena, "'{s}'", .{try q.source.file(self)}));
+        }
         return out.items;
     }
 
-    /// Writes the derived table's file and its alias, which may name its columns (`AS t(a, b)`): those become the stage's
-    /// `columns`, as the grammar after it has no column list. Returns where the text goes on.
-    fn derivedAlias(self: *Planner, text: []const u8, from: usize, out: *std.ArrayList(u8), file: []const u8) Error!usize {
-        try out.print(self.arena, "'{s}'", .{file});
-        if (!aliasFollows(text, from)) return from;
-        var i = from;
-        const w = setops.nextWord(text, i);
-        if (setops.eql(w.word, "as")) i = w.end;
-        const name = nameAt(text, i) orelse return error.SqlParseError;
-        try out.print(self.arena, " AS {s}", .{name.text});
-        i = name.end;
-        const next = skipSpace(text, i);
+    /// The alias after a derived table, which may name its columns (`AS t(a, b)`).
+    fn derivedAlias(self: *Planner, text: []const u8, from: usize) Error!struct { name: ?[]const u8, columns: []const []const u8, end: usize } {
+        if (!aliasFollows(text, from)) return .{ .name = null, .columns = &.{}, .end = from };
+        const w = setops.nextWord(text, from);
+        const name = nameAt(text, if (setops.eql(w.word, "as")) w.end else from) orelse return error.SqlParseError;
+        const next = skipSpace(text, name.end);
         if (next < text.len and text[next] == '(') {
             const close = closing(text, next) orelse return error.SqlParseError;
-            self.stages.items[self.stages.items.len - 1].columns = try self.names(text[next + 1 .. close - 1]);
-            return close;
+            return .{ .name = name.text, .columns = try self.names(text[next + 1 .. close - 1]), .end = close };
         }
-        return i;
+        return .{ .name = name.text, .columns = &.{}, .end = name.end };
     }
 
     /// `a, "b c", d` as names.
@@ -274,6 +348,75 @@ const Planner = struct {
         return out.items;
     }
 };
+
+/// `sql` as a filter of one file, when it is one: `SELECT * | col, ... FROM 'file' [[AS] alias] [WHERE cond]`, with
+/// plain columns and a condition that qualifies nothing (the alias is gone once inlined) and holds no query.
+fn inlineable(sql: []const u8) ?Inline {
+    const t = std.mem.trim(u8, sql, " \t\r\n");
+    var w = setops.nextWord(t, 0);
+    if (!setops.eql(w.word, "select")) return null;
+    var i = skipSpace(t, w.end);
+    var star = false;
+    if (i < t.len and t[i] == '*') {
+        star = true;
+        i += 1;
+    } else while (true) {
+        const name = nameAt(t, i) orelse return null;
+        if (setops.eql(name.text, "distinct") or setops.eql(name.text, "all") or std.ascii.isDigit(name.text[0])) return null;
+        i = skipSpace(t, name.end);
+        if (i >= t.len or t[i] != ',') break;
+        i += 1;
+    }
+    w = setops.nextWord(t, i);
+    if (!setops.eql(w.word, "from")) return null;
+    i = skipSpace(t, w.end);
+    if (i >= t.len or t[i] != '\'') return null;
+    const file_end = setops.quotedEnd(t, i);
+    const file = t[i..file_end];
+    i = file_end;
+    if (aliasAt(t, i)) |_| {
+        w = setops.nextWord(t, i);
+        i = (nameAt(t, if (setops.eql(w.word, "as")) w.end else i) orelse return null).end;
+    }
+    w = setops.nextWord(t, i);
+    if (w.word.len == 0) return if (skipSpace(t, i) == t.len) .{ .file = file, .where = null, .star = star } else null;
+    if (!setops.eql(w.word, "where")) return null;
+    const cond = std.mem.trim(u8, t[w.end..], " \t\r\n");
+    var depth: usize = 0;
+    var k: usize = 0;
+    while (k < cond.len) {
+        const ch = cond[k];
+        if (ch == '\'') {
+            k = setops.quotedEnd(cond, k);
+            continue;
+        }
+        if (ch == '(') depth += 1;
+        if (ch == ')') depth -|= 1;
+        if (ch == '"' or setops.startsWord(cond, k)) {
+            const end = if (ch == '"') setops.quotedEnd(cond, k) else k + setops.wordAt(cond, k).len;
+            const token = cond[k..end];
+            if (ch != '"' and setops.eql(token, "select")) return null;
+            if (depth == 0 and ch != '"' and endsFrom(token)) return null;
+            if (end < cond.len and cond[end] == '.' and !std.ascii.isDigit(token[0])) return null;
+            k = end;
+            continue;
+        }
+        k += 1;
+    }
+    return .{ .file = file, .where = cond, .star = star };
+}
+
+/// Whether the `*` at `i` is a select item (`SELECT *`, `t.*`, `a, *`), not a product or `count(*)`.
+fn starItem(text: []const u8, i: usize) bool {
+    var k = i;
+    while (k > 0 and std.ascii.isWhitespace(text[k - 1])) k -= 1;
+    if (k == 0) return false;
+    if (text[k - 1] == ',' or text[k - 1] == '.') return true;
+    var s = k;
+    while (s > 0 and setops.isWord(text[s - 1])) s -= 1;
+    const w = text[s..k];
+    return setops.eql(w, "select") or setops.eql(w, "distinct") or setops.eql(w, "all");
+}
 
 /// The alias after a table reference that ends at `from`.
 fn aliasAt(text: []const u8, from: usize) ?[]const u8 {
@@ -408,11 +551,11 @@ test "a CTE is staged once, where it is first read, and every read names its fil
         &.{"SELECT g, sum(v) AS s FROM 't.parquet' GROUP BY g"},
         "SELECT * FROM 'd/cte0.parquet' AS c WHERE s > (SELECT avg(s) FROM 'd/cte0.parquet' AS c)",
     );
-    // A later CTE reads an earlier one; the earlier one is staged first. An unread CTE is never staged.
+    // A later CTE reads an earlier one, here inlined as the filter it is. An unread CTE is never planned.
     try expectPlan(
         "with a as (select x from 't'), unused as (select 1/0 from 't'), b(y) as (select x + 1 AS z from a) select y from b x",
-        &.{ "select x from 't'", "select x + 1 AS z from 'd/cte0.parquet' AS a" },
-        "select y from 'd/cte1.parquet' x",
+        &.{"select x + 1 AS z from 't' AS a"},
+        "select y from 'd/cte0.parquet' x",
     );
     // A join of two CTEs, an alias with AS, and a name in another case or quoted.
     try expectPlan(
@@ -427,12 +570,12 @@ test "a derived table is a stage, nested ones first, and its column list names t
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const p = (try plan(a, "SELECT t.a FROM (SELECT x, y FROM (SELECT x, y FROM 'f' WHERE x > 1) AS i) AS t(a, b) JOIN 'g' ON t.a = k", "d")).?;
-    try testing.expectEqual(@as(usize, 2), p.stages.len);
-    try testing.expectEqualStrings("SELECT x, y FROM 'f' WHERE x > 1", p.stages[0].sql);
-    try testing.expectEqualStrings("SELECT x, y FROM 'd/cte0.parquet' AS i", p.stages[1].sql);
-    try testing.expectEqual(@as(usize, 2), p.stages[1].columns.len);
-    try testing.expectEqualStrings("b", p.stages[1].columns[1]);
-    try testing.expectEqualStrings("SELECT t.a FROM 'd/cte1.parquet' AS t JOIN 'g' ON t.a = k", p.sql);
+    // The innermost is a filter, inlined into the one that reads it; that one names its columns, so it is staged.
+    try testing.expectEqual(@as(usize, 1), p.stages.len);
+    try testing.expectEqualStrings("SELECT x, y FROM 'f' AS i WHERE x > 1", p.stages[0].sql);
+    try testing.expectEqual(@as(usize, 2), p.stages[0].columns.len);
+    try testing.expectEqualStrings("b", p.stages[0].columns[1]);
+    try testing.expectEqualStrings("SELECT t.a FROM 'd/cte0.parquet' AS t JOIN 'g' ON t.a = k", p.sql);
     // No alias, a comma join, and a set operation inside.
     try expectPlan(
         "SELECT * FROM 'f', ((SELECT 1 AS x FROM 'g') UNION ALL (SELECT 2 FROM 'g')) WHERE 1 = 1",
@@ -454,9 +597,44 @@ test "a FROM inside a function, a quoted file and a table function are no table 
     // An inner WITH shadows an outer CTE of the same name, inside its own query only.
     try expectPlan(
         "WITH c AS (SELECT 1 AS x FROM 't') SELECT * FROM (WITH c AS (SELECT 2 AS x FROM 't') SELECT * FROM c) s, c",
-        &.{ "SELECT 2 AS x FROM 't'", "SELECT * FROM 'd/cte0.parquet' AS c", "SELECT 1 AS x FROM 't'" },
-        "SELECT * FROM 'd/cte1.parquet' AS s, 'd/cte2.parquet' AS c",
+        &.{ "SELECT 2 AS x FROM 't'", "SELECT 1 AS x FROM 't'", "SELECT * FROM 'd/cte0.parquet' AS c" },
+        "SELECT * FROM 'd/cte2.parquet' AS s, 'd/cte1.parquet' AS c",
     );
+}
+
+test "a filter of one file is inlined into a query whose one table it is, and staged anywhere else" {
+    try expectPlan(
+        "WITH l AS (SELECT a, b FROM 'f' WHERE a > 1 OR a IS NULL) SELECT b, count(*) AS n FROM l WHERE b < 3 OR b > 7 GROUP BY b",
+        &.{},
+        "SELECT b, count(*) AS n FROM 'f' AS l WHERE (a > 1 OR a IS NULL) AND ( b < 3 OR b > 7) GROUP BY b",
+    );
+    try expectPlan("SELECT x.b FROM (SELECT b FROM 'f' WHERE b IS NULL) x ORDER BY 1;", &.{}, "SELECT x.b FROM 'f' AS x WHERE b IS NULL ORDER BY 1;");
+    try expectPlan("WITH c AS (SELECT * FROM 'f' WHERE g = 1) SELECT count(*) AS n FROM c t", &.{}, "SELECT count(*) AS n FROM 'f' t WHERE g = 1");
+    try expectPlan("WITH c AS (SELECT * FROM 'f' AS z) SELECT *, 2 * g AS h FROM c", &.{}, "SELECT *, 2 * g AS h FROM 'f' AS c");
+    // Read in a subquery and in the query, each inlined where it is read.
+    try expectPlan(
+        "WITH c AS (SELECT a FROM 'f' WHERE a > 1) SELECT sum(a) AS s FROM c WHERE a IN (SELECT a FROM c WHERE a < 9)",
+        &.{},
+        "SELECT sum(a) AS s FROM 'f' AS c WHERE (a > 1) AND ( a IN (SELECT a FROM 'f' AS c WHERE (a > 1) AND ( a < 9)))",
+    );
+    // A `*` would read the columns the filter dropped; a join's other table could own a column of the condition; a
+    // qualified condition names an alias that is gone; a set operation has two SELECTs: all staged, once.
+    try expectPlan("WITH c AS (SELECT a FROM 'f' WHERE a > 1) SELECT * FROM c", &.{"SELECT a FROM 'f' WHERE a > 1"}, "SELECT * FROM 'd/cte0.parquet' AS c");
+    try expectPlan("WITH c AS (SELECT a FROM 'f' WHERE a > 1) SELECT COLUMNS('a') FROM c", &.{"SELECT a FROM 'f' WHERE a > 1"}, "SELECT COLUMNS('a') FROM 'd/cte0.parquet' AS c");
+    try expectPlan(
+        "WITH c AS (SELECT a FROM 'f' WHERE a > 1) SELECT count(*) AS n FROM c, 'g' WHERE a = k",
+        &.{"SELECT a FROM 'f' WHERE a > 1"},
+        "SELECT count(*) AS n FROM 'd/cte0.parquet' AS c, 'g' WHERE a = k",
+    );
+    try expectPlan("WITH c AS (SELECT a FROM 'f' x WHERE x.a > 1.5) SELECT sum(a) AS s FROM c", &.{"SELECT a FROM 'f' x WHERE x.a > 1.5"}, "SELECT sum(a) AS s FROM 'd/cte0.parquet' AS c");
+    try expectPlan(
+        "WITH c AS (SELECT a FROM 'f' WHERE a > 1) SELECT a FROM c UNION ALL SELECT a FROM c",
+        &.{"SELECT a FROM 'f' WHERE a > 1"},
+        "SELECT a FROM 'd/cte0.parquet' AS c UNION ALL SELECT a FROM 'd/cte0.parquet' AS c",
+    );
+    // Not filters: an expression, DISTINCT, a GROUP BY, an ORDER BY, a subquery in the condition.
+    for ([_][]const u8{ "SELECT a + 1 AS b FROM 'f'", "SELECT DISTINCT a FROM 'f'", "SELECT a FROM 'f' WHERE a > 1 GROUP BY a", "SELECT a FROM 'f' ORDER BY a", "SELECT a FROM 'f' WHERE a IN (SELECT k FROM 'g')", "SELECT a FROM 'f', 'g'" }) |body|
+        try testing.expect(inlineable(body) == null);
 }
 
 test "recursive, circular and duplicate CTEs and LATERAL are refused by name" {

@@ -80,18 +80,20 @@ row); `count(a)` and the like keep reading the column.
 one, `[NOT] MATERIALIZED` is accepted), `WITH` inside any subquery (an inner name shadows an outer one), and a SELECT in
 parentheses in FROM or JOIN, with or without an alias and a column list (`(SELECT ...) AS t(x, y)`), nested to any depth.
 Names compare without case, quoted or not; a quoted string in FROM is always a file. A column list names the first columns,
-and names past the columns are ignored, as in DuckDB. Each CTE that is read, and each subquery in FROM, runs once, before the
-query, as an ordinary query (a join, a GROUP BY, a set operation, windows) into a scratch Parquet file in the directory set
-operations use, which the query then reads where it named it; a CTE read twice is read from its file twice, never computed
-twice, and a CTE nothing reads is not computed. The engine has no plan to inline a body into, and inlining one read twice would
-scan its inputs twice. Two consequences: the body's every column is computed, so a CAST that fails in a column the outer query
-never reads is still an error (DuckDB, which inlines, skips it), and an outer filter does not prune the body's scan. Refused by
-name: `WITH RECURSIVE` (`CteRecursive`), two CTEs of one name (`CteDuplicate`), a CTE that reads itself (`CteCircular`), `LATERAL`
-and a subquery in FROM that qualifies a column of a table to its left, which DuckDB runs as LATERAL (`LateralNotSupported`), and a
-WITH list or alias that does not parse (`SqlParseError`). A join over CTEs is a join of files, under its rules (a join must
-aggregate in this release: one whose rows would be the answer, or a projection with an `IN (SELECT ...)`, is
-`JoinRowsNotSupported`). `--explain` is not available, the in-process SQL requests do not carry them yet, a refusal of the
-query after its CTEs ran exits 1, and `--summary=json` describes the last query.
+and names past the columns are ignored, as in DuckDB. A filter of one file (`SELECT * | col, ... FROM 'f' [WHERE cond]`, the
+condition qualifying no column) read as the one table of a SELECT is inlined: the SELECT reads the file and ANDs the
+condition into its WHERE, so it costs what the query written without it does. Every other CTE that is read, and every other
+subquery in FROM, runs once, before the query, as an ordinary query (a join, a GROUP BY, a set operation, windows) into a
+scratch Parquet file in the directory set operations use, which the query reads where it named it. A CTE read twice is
+computed once and its file read twice: the engine has no plan to splice a body into, and inlining one read twice would scan
+its inputs twice. A CTE nothing reads is not computed. A staged body computes its every column, so a CAST that fails in a
+column the outer query never reads is still an error (DuckDB skips it), and an outer filter does not prune its scan. Refused
+by name: `WITH RECURSIVE` (`CteRecursive`), two CTEs of one name (`CteDuplicate`), a CTE that reads itself (`CteCircular`),
+`LATERAL` and a subquery in FROM that qualifies a column of a table to its left, which DuckDB runs as LATERAL
+(`LateralNotSupported`), and a WITH list or alias that does not parse (`SqlParseError`). A join over CTEs is a join of files,
+under its rules (a join must aggregate in this release: one whose rows would be the answer, or a projection with an
+`IN (SELECT ...)`, is `JoinRowsNotSupported`). `--explain` is not available, the in-process SQL requests do not carry them
+yet, a refusal of the query after its CTEs ran exits 1, and `--summary=json` describes the last query.
 
 **More scalar functions.** A column of the query's one table may be written `t.g` (its alias, else the file's own name).
 `epoch(t)` (also `date_part('epoch', t)` and `EXTRACT(epoch FROM t)`) is a DATE's or TIMESTAMP's seconds since the epoch as a

@@ -1191,6 +1191,298 @@
    }
   },
   {
+   "id": "sql_cte:inline:where-precedence",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT id, g, v FROM '{fixture:cf}' WHERE g = 1 OR g = 2) SELECT id, v FROM c WHERE v > 100 OR v IS NULL ORDER BY id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT id, g, v FROM '{fixture:cf}' WHERE g = 1 OR g = 2) SELECT id, v FROM c WHERE v > 100 OR v IS NULL ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_cte:inline:no-outer-where",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT x.id, x.s FROM (SELECT id, s FROM '{fixture:cf}' WHERE id % 500 = 7) x ORDER BY x.id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT x.id, x.s FROM (SELECT id, s FROM '{fixture:cf}' WHERE id % 500 = 7) x ORDER BY x.id"
+   }
+  },
+  {
+   "id": "sql_cte:inline:alias-group-having",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT g, d FROM '{fixture:cf}' WHERE d > 200) SELECT t.g, sum(t.d) AS sd, count(*) AS n FROM c t GROUP BY t.g HAVING count(*) > 120 ORDER BY t.g"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT g, d FROM '{fixture:cf}' WHERE d > 200) SELECT t.g, sum(t.d) AS sd, count(*) AS n FROM c t GROUP BY t.g HAVING count(*) > 120 ORDER BY t.g"
+   }
+  },
+  {
+   "id": "sql_cte:inline:star",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT * FROM '{fixture:cf}' WHERE dt < DATE '2024-01-05') SELECT * FROM c ORDER BY id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT * FROM '{fixture:cf}' WHERE dt < DATE '2024-01-05') SELECT * FROM c ORDER BY id",
+    "epoch": true
+   }
+  },
+  {
+   "id": "sql_cte:inline:subset-under-star",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT id, s FROM '{fixture:cf}' WHERE id < 6) SELECT * FROM c ORDER BY id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT id, s FROM '{fixture:cf}' WHERE id < 6) SELECT * FROM c ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_cte:inline:chain",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "WITH a AS (SELECT id, g, v FROM '{fixture:cf}' WHERE g < 5), b AS (SELECT id, v FROM a WHERE id % 2 = 0) SELECT count(*) AS n, sum(v) AS sv FROM b WHERE v > 50"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH a AS (SELECT id, g, v FROM '{fixture:cf}' WHERE g < 5), b AS (SELECT id, v FROM a WHERE id % 2 = 0) SELECT count(*) AS n, sum(v) AS sv FROM b WHERE v > 50"
+   }
+  },
+  {
+   "id": "sql_cte:inline:in-subquery",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT pk, w FROM '{fixture:cd}' WHERE w > 6) SELECT g, count(*) AS n FROM '{fixture:cf}' WHERE g IN (SELECT pk FROM c WHERE w < 20) GROUP BY g ORDER BY g"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT pk, w FROM '{fixture:cd}' WHERE w > 6) SELECT g, count(*) AS n FROM '{fixture:cf}' WHERE g IN (SELECT pk FROM c WHERE w < 20) GROUP BY g ORDER BY g"
+   }
+  },
+  {
+   "id": "sql_cte:inline:window-outer",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, row_number() OVER (ORDER BY id DESC) AS rn FROM (SELECT id FROM '{fixture:cf}' WHERE g = 7 AND id < 200) t ORDER BY id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, row_number() OVER (ORDER BY id DESC) AS rn FROM (SELECT id FROM '{fixture:cf}' WHERE g = 7 AND id < 200) t ORDER BY id"
+   }
+  },
+  {
+   "id": "sql_cte:inline:join-stages",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT g, v FROM '{fixture:cf}' WHERE v > 100) SELECT name, count(*) AS n FROM c JOIN '{fixture:cd}' ON g = pk GROUP BY name ORDER BY name"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT g, v FROM '{fixture:cf}' WHERE v > 100) SELECT name, count(*) AS n FROM c JOIN '{fixture:cd}' ON g = pk GROUP BY name ORDER BY name"
+   }
+  },
+  {
+   "id": "sql_cte:inline:limit-outer",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT id, k2 FROM '{fixture:cf}' WHERE k2 > 900) SELECT id, k2 FROM c ORDER BY k2 DESC, id LIMIT 7"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT id, k2 FROM '{fixture:cf}' WHERE k2 > 900) SELECT id, k2 FROM c ORDER BY k2 DESC, id LIMIT 7"
+   }
+  },
+  {
+   "id": "sql_cte:inline:typed-literal",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT id, dt FROM '{fixture:cf}' WHERE dt BETWEEN DATE '2024-03-01' AND DATE '2024-03-03') SELECT dt, count(*) AS n FROM c GROUP BY dt ORDER BY dt"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT id, dt FROM '{fixture:cf}' WHERE dt BETWEEN DATE '2024-03-01' AND DATE '2024-03-03') SELECT dt, count(*) AS n FROM c GROUP BY dt ORDER BY dt",
+    "epoch": true
+   }
+  },
+  {
+   "id": "sql_cte:inline:written",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT id, v, d, s, dt FROM '{fixture:cf}' WHERE s = 's3') SELECT id, v, d, s, dt FROM c WHERE id > 100",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "WITH c AS (SELECT id, v, d, s, dt FROM '{fixture:cf}' WHERE s = 's3') SELECT id, v, d, s, dt FROM c WHERE id > 100"
+   }
+  },
+  {
    "id": "sql_cte:derived:basic",
    "fixture": "cf",
    "cli": [

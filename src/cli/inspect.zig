@@ -64,7 +64,10 @@ const Source = struct {
             if (len > detail_limit - self.detail_bytes or self.requests >= request_limit) return error.DetailLimit;
             self.detail_bytes += len;
         }
-        if (self.mapped) |m| return m.bytes[start..][0..len];
+        if (self.mapped) |m| {
+            self.bytes += len;
+            return m.bytes[start..][0..len];
+        }
         if (self.whole) |bytes| return bytes[start..][0..len];
         if (len == 0) return "";
         self.bytes += len;

@@ -80,11 +80,11 @@ row); `count(a)` and the like keep reading the column.
 one, `[NOT] MATERIALIZED` is accepted), `WITH` inside any subquery (an inner name shadows an outer one), and a SELECT in
 parentheses in FROM or JOIN, with or without an alias and a column list (`(SELECT ...) AS t(x, y)`), nested to any depth.
 Names compare without case, quoted or not; a quoted string in FROM is always a file. A column list names the first columns,
-and names past the columns are ignored, as in DuckDB. A filter of one file (`SELECT * | col, ... FROM 'f' [WHERE cond]`, the
-condition qualifying no column) read as the one table of a SELECT is inlined: the SELECT reads the file and ANDs the
-condition into its WHERE, so it costs what the query written without it does. A filter that keeps some columns is inlined
-only into a SELECT that names no other: an alias spelled as a dropped column (`SELECT a AS b ... GROUP BY b`) or any other
-name stages it, so the file's other columns never shadow what the query means. Any query that reads a staged file reads
+and names past the columns are ignored, as in DuckDB. A filter of one file (`SELECT * FROM 'f' [WHERE cond]`, the condition
+qualifying no column) read as the one table of a SELECT is inlined: the SELECT reads the file and ANDs the condition into
+its WHERE, so it costs what the query written without it does, and the scan reads only the columns the query names. A
+body that names its columns is staged: inlined, the query would see the file's other columns, which could shadow the
+names it gives the CTE or its aliases. Any query that reads a staged file reads
 it as Parquet, whatever `--input-format` says. Every other CTE that is read, and every other
 subquery in FROM, runs once, before the query, as an ordinary query (a join, a GROUP BY, a set operation, windows) into a
 scratch Parquet file in the directory set operations use, which the query reads where it named it. A CTE read twice is

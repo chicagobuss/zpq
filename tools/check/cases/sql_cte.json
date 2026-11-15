@@ -5,6 +5,10 @@
    "copy": "COPY (SELECT * FROM (VALUES (1, 10), (1, 20), (2, 30), (NULL, 40)) t(a, b)) TO '{path}' (FORMAT PARQUET)"
   },
   {
+   "name": "fkw",
+   "copy": "COPY (SELECT * FROM (VALUES (1, 10, 5), (1, 20, 6), (2, 30, 7)) t(a, \"first\", \"value\")) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
    "name": "cv",
    "copy": "COPY (SELECT k AS id, k % 4 AS g, k * 3 AS v, 'n' || (k % 3) AS s FROM range(1, 41) t(k)) TO '{path}' (FORMAT CSV, HEADER)"
   },
@@ -1728,6 +1732,198 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT c.a AS b, sum(c.a) AS s FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) c GROUP BY c.a ORDER BY b"
+   }
+  },
+  {
+   "id": "sql_cte:collide:cte:group-alias-named-as-table",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "WITH b AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a AS b, count(*) AS n FROM b GROUP BY a, b ORDER BY b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH b AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a AS b, count(*) AS n FROM b GROUP BY a, b ORDER BY b"
+   }
+  },
+  {
+   "id": "sql_cte:refuse:collide:cte:where-table-name",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "WITH b AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a FROM b WHERE b > 10",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "UnknownColumn",
+    "diag": "unknown column",
+    "exit": 1,
+    "binder_sql": "WITH b AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT a FROM b WHERE b > 10"
+   }
+  },
+  {
+   "id": "sql_cte:refuse:collide:cte:arith-table-name",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "WITH b AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT b + 1 AS x FROM b",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "UnknownColumn",
+    "diag": "unknown column",
+    "exit": 1,
+    "binder_sql": "WITH b AS (SELECT a FROM '{fixture:f2}' WHERE a > 0) SELECT b + 1 AS x FROM b"
+   }
+  },
+  {
+   "id": "sql_cte:collide:cte:keyword-alias",
+   "fixture": "fkw",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT a FROM '{fixture:fkw}' WHERE a > 0) SELECT a first, count(*) AS n FROM c GROUP BY a, first ORDER BY first"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH c AS (SELECT a FROM '{fixture:fkw}' WHERE a > 0) SELECT a first, count(*) AS n FROM c GROUP BY a, first ORDER BY first"
+   }
+  },
+  {
+   "id": "sql_cte:refuse:collide:cte:keyword-column",
+   "fixture": "fkw",
+   "cli": [
+    "query",
+    "--query",
+    "WITH c AS (SELECT a FROM '{fixture:fkw}' WHERE a > 0) SELECT first FROM c",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "UnknownColumn",
+    "diag": "unknown column",
+    "exit": 1,
+    "binder_sql": "WITH c AS (SELECT a FROM '{fixture:fkw}' WHERE a > 0) SELECT first FROM c"
+   }
+  },
+  {
+   "id": "sql_cte:collide:derived:group-alias-named-as-table",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a AS b, count(*) AS n FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) b GROUP BY a, b ORDER BY b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT a AS b, count(*) AS n FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) b GROUP BY a, b ORDER BY b"
+   }
+  },
+  {
+   "id": "sql_cte:refuse:collide:derived:where-table-name",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) b WHERE b > 10",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "UnknownColumn",
+    "diag": "unknown column",
+    "exit": 1,
+    "binder_sql": "SELECT a FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) b WHERE b > 10"
+   }
+  },
+  {
+   "id": "sql_cte:refuse:collide:derived:arith-table-name",
+   "fixture": "f2",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT b + 1 AS x FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) b",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "UnknownColumn",
+    "diag": "unknown column",
+    "exit": 1,
+    "binder_sql": "SELECT b + 1 AS x FROM (SELECT a FROM '{fixture:f2}' WHERE a > 0) b"
+   }
+  },
+  {
+   "id": "sql_cte:collide:derived:keyword-alias",
+   "fixture": "fkw",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a first, count(*) AS n FROM (SELECT a FROM '{fixture:fkw}' WHERE a > 0) c GROUP BY a, first ORDER BY first"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT a first, count(*) AS n FROM (SELECT a FROM '{fixture:fkw}' WHERE a > 0) c GROUP BY a, first ORDER BY first"
+   }
+  },
+  {
+   "id": "sql_cte:refuse:collide:derived:keyword-column",
+   "fixture": "fkw",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT first FROM (SELECT a FROM '{fixture:fkw}' WHERE a > 0) c",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "UnknownColumn",
+    "diag": "unknown column",
+    "exit": 1,
+    "binder_sql": "SELECT first FROM (SELECT a FROM '{fixture:fkw}' WHERE a > 0) c"
    }
   },
   {

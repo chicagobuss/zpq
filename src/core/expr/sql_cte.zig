@@ -83,9 +83,9 @@ const View = struct {
     parent: ?*const View,
 };
 
-/// A filter of one file that a reference reads in place of a stage: `'file'`, its WHERE, and the columns it keeps as
-/// written (`a, "b"`), null for `*`. Inlined, the query sees the file's other columns too, so it may name only these.
-const Inline = struct { file: []const u8, where: ?[]const u8, columns: ?[]const u8 };
+/// A filter of one file that a reference reads in place of a stage: `'file'` and its WHERE. It keeps every column, so
+/// the query sees the same columns either way; the scan reads only the ones the query names.
+const Inline = struct { file: []const u8, where: ?[]const u8 };
 
 /// A reference this level wrote as an inline source's file, at `out[start..end]`.
 const Pending = struct { source: *Source, inline_: Inline, start: usize, end: usize };
@@ -193,12 +193,10 @@ const Planner = struct {
         var expect_table = in_from_start;
         // The names of the tables before a derived table in its FROM, which it may not read (an implicit LATERAL).
         var left: std.ArrayList([]const u8) = .empty;
-        // What inlining a filter needs of this level: one table, one SELECT, its WHERE's span in `out`, and whether a
-        // `*` or COLUMNS(...) would see the file's columns where the filter kept fewer.
+        // What inlining a filter needs of this level: one table, one SELECT, and its WHERE's span in `out`.
         var pending: std.ArrayList(Pending) = .empty;
         var tables: usize = 0;
         var selects: usize = 0;
-        var stars = false;
         var where: ?struct { start: usize, end: ?usize } = null;
         var from_end: ?usize = null;
         var i: usize = 0;
@@ -250,8 +248,6 @@ const Planner = struct {
                     } else if (in_from and endsFrom(token)) {
                         in_from = false;
                         from_end = std.mem.trimEnd(u8, out.items, " \t\r\n").len;
-                    } else if (setops.eql(token, "columns") and skipSpace(text, end) < text.len and text[skipSpace(text, end)] == '(') {
-                        stars = true;
                     }
                     if (where) |*w| if (w.end == null and endsFrom(token)) {
                         w.end = std.mem.trimEnd(u8, out.items, " \t\r\n").len;
@@ -268,7 +264,6 @@ const Planner = struct {
                 continue;
             }
             if (ch == ',' and in_from) expect_table = true;
-            if (ch == '*' and starItem(text, i)) stars = true;
             if (ch == '(') {
                 const close = closing(text, i) orelse {
                     try out.appendSlice(self.arena, text[i..]);
@@ -301,8 +296,7 @@ const Planner = struct {
         if (pending.items.len == 0) return out.items;
         // A filter is inlined only into a SELECT whose one table it is: its WHERE joins the query's own.
         const p = pending.items[0];
-        const sees_kept = if (p.inline_.columns) |kept| !stars and namesOnly(out.items, kept, left.items) else true;
-        if (pending.items.len == 1 and tables == 1 and selects == 1 and !in_from_start and sees_kept) {
+        if (pending.items.len == 1 and tables == 1 and selects == 1 and !in_from_start) {
             const cond = p.inline_.where orelse return out.items;
             const last = std.mem.trimEnd(u8, out.items, " \t\r\n;").len;
             if (where) |w| {
@@ -350,27 +344,17 @@ const Planner = struct {
     }
 };
 
-/// `sql` as a filter of one file, when it is one: `SELECT * | col, ... FROM 'file' [[AS] alias] [WHERE cond]`, with
-/// plain columns and a condition that qualifies nothing (the alias is gone once inlined) and holds no query.
+/// `sql` as a filter of one file, when it is one: `SELECT * FROM 'file' [[AS] alias] [WHERE cond]`, with a condition that
+/// qualifies nothing (the alias is gone once inlined) and holds no query. A body that keeps fewer columns is staged:
+/// inlined, the query would see the file's others, and a name meant for the body's alias or the CTE (`SELECT a AS b ...
+/// GROUP BY b` over a file with a `b`) would read the file's column instead.
 fn inlineable(sql: []const u8) ?Inline {
     const t = std.mem.trim(u8, sql, " \t\r\n");
     var w = setops.nextWord(t, 0);
     if (!setops.eql(w.word, "select")) return null;
     var i = skipSpace(t, w.end);
-    const items_start = i;
-    var star = false;
-    if (i < t.len and t[i] == '*') {
-        star = true;
-        i += 1;
-    } else while (true) {
-        const name = nameAt(t, i) orelse return null;
-        if (setops.eql(name.text, "distinct") or setops.eql(name.text, "all") or std.ascii.isDigit(name.text[0])) return null;
-        i = skipSpace(t, name.end);
-        if (i >= t.len or t[i] != ',') break;
-        i += 1;
-    }
-    const columns: ?[]const u8 = if (star) null else t[items_start..i];
-    w = setops.nextWord(t, i);
+    if (i >= t.len or t[i] != '*') return null;
+    w = setops.nextWord(t, i + 1);
     if (!setops.eql(w.word, "from")) return null;
     i = skipSpace(t, w.end);
     if (i >= t.len or t[i] != '\'') return null;
@@ -382,7 +366,7 @@ fn inlineable(sql: []const u8) ?Inline {
         i = (nameAt(t, if (setops.eql(w.word, "as")) w.end else i) orelse return null).end;
     }
     w = setops.nextWord(t, i);
-    if (w.word.len == 0) return if (skipSpace(t, i) == t.len) .{ .file = file, .where = null, .columns = columns } else null;
+    if (w.word.len == 0) return if (skipSpace(t, i) == t.len) .{ .file = file, .where = null } else null;
     if (!setops.eql(w.word, "where")) return null;
     const cond = std.mem.trim(u8, t[w.end..], " \t\r\n");
     var depth: usize = 0;
@@ -406,98 +390,7 @@ fn inlineable(sql: []const u8) ?Inline {
         }
         k += 1;
     }
-    return .{ .file = file, .where = cond, .columns = columns };
-}
-
-/// Whether every name `query` reads is one of the `kept` columns (`a, "b"`) or a table of its level: an alias of the
-/// SELECT may shadow a column of the file (`SELECT a AS b ... GROUP BY b` groups by the file's `b` first), and any
-/// other name could be a column the filter dropped. A call's name, a qualifier, an alias being named, a cast's type and
-/// a typed literal's keyword read no column; neither does a grammar word, unless the query names an alias so.
-fn namesOnly(query: []const u8, kept: []const u8, tables: []const []const u8) bool {
-    var after_as = false;
-    var i: usize = 0;
-    while (i < query.len) {
-        const ch = query[i];
-        if (ch == '\'') {
-            i = setops.quotedEnd(query, i);
-            continue;
-        }
-        if (ch != '"' and !setops.startsWord(query, i)) {
-            if (!std.ascii.isWhitespace(ch)) after_as = false;
-            i += 1;
-            continue;
-        }
-        const end = if (ch == '"') setops.quotedEnd(query, i) else i + setops.wordAt(query, i).len;
-        const token = query[i..end];
-        const next = skipSpace(query, end);
-        const reads_none = after_as or std.ascii.isDigit(token[0]) or
-            (next < query.len and (query[next] == '(' or query[next] == '\'')) or (end < query.len and query[end] == '.') or
-            (i >= 2 and std.mem.eql(u8, query[i - 2 .. i], "::"));
-        after_as = ch != '"' and setops.eql(token, "as");
-        i = end;
-        if (reads_none or listed(kept, token)) continue;
-        var table = false;
-        for (tables) |t| table = table or sameName(t, token);
-        if (table) continue;
-        if (ch == '"' or !grammar(token) or aliased(query, token)) return false;
-    }
-    return true;
-}
-
-/// Whether the comma-separated names `list` hold `name`.
-fn listed(list: []const u8, name: []const u8) bool {
-    var i: usize = 0;
-    while (nameAt(list, i)) |n| {
-        if (sameName(n.text, name)) return true;
-        i = skipSpace(list, n.end);
-        if (i >= list.len or list[i] != ',') return false;
-        i += 1;
-    }
-    return false;
-}
-
-/// Whether `query` names an alias `name` (`AS name`).
-fn aliased(query: []const u8, name: []const u8) bool {
-    var i: usize = 0;
-    while (i < query.len) {
-        if (query[i] == '\'' or query[i] == '"') {
-            i = setops.quotedEnd(query, i);
-            continue;
-        }
-        if (!setops.startsWord(query, i)) {
-            i += 1;
-            continue;
-        }
-        const w = setops.wordAt(query, i);
-        i += w.len;
-        if (setops.eql(w, "as")) if (nameAt(query, i)) |n| if (sameName(n.text, name)) return true;
-    }
-    return false;
-}
-
-/// The words of the SELECT grammar a query may hold beside its column names.
-fn grammar(word: []const u8) bool {
-    const words = [_][]const u8{
-        "select", "from",   "where",     "group",     "by",     "having", "order",   "asc",     "desc",   "nulls",  "first",
-        "last",   "limit",  "offset",    "and",       "or",     "not",    "is",      "null",    "in",     "between", "like",
-        "ilike",  "as",     "case",      "when",      "then",   "else",   "end",     "distinct", "all",   "true",   "false",
-        "over",   "partition", "rows",   "range",     "unbounded", "preceding", "following", "current", "row", "filter",
-        "qualify", "window", "exists",   "escape",
-    };
-    for (words) |k| if (std.ascii.eqlIgnoreCase(word, k)) return true;
-    return false;
-}
-
-/// Whether the `*` at `i` is a select item (`SELECT *`, `t.*`, `a, *`), not a product or `count(*)`.
-fn starItem(text: []const u8, i: usize) bool {
-    var k = i;
-    while (k > 0 and std.ascii.isWhitespace(text[k - 1])) k -= 1;
-    if (k == 0) return false;
-    if (text[k - 1] == ',' or text[k - 1] == '.') return true;
-    var s = k;
-    while (s > 0 and setops.isWord(text[s - 1])) s -= 1;
-    const w = text[s..k];
-    return setops.eql(w, "select") or setops.eql(w, "distinct") or setops.eql(w, "all");
+    return .{ .file = file, .where = cond };
 }
 
 /// The alias after a table reference that ends at `from`.
@@ -633,11 +526,11 @@ test "a CTE is staged once, where it is first read, and every read names its fil
         &.{"SELECT g, sum(v) AS s FROM 't.parquet' GROUP BY g"},
         "SELECT * FROM 'd/cte0.parquet' AS c WHERE s > (SELECT avg(s) FROM 'd/cte0.parquet' AS c)",
     );
-    // A later CTE reads an earlier one, here inlined as the filter it is. An unread CTE is never planned.
+    // A later CTE reads an earlier one; the earlier one is staged first. An unread CTE is never planned.
     try expectPlan(
         "with a as (select x from 't'), unused as (select 1/0 from 't'), b(y) as (select x + 1 AS z from a) select y from b x",
-        &.{"select x + 1 AS z from 't' AS a"},
-        "select y from 'd/cte0.parquet' x",
+        &.{ "select x from 't'", "select x + 1 AS z from 'd/cte0.parquet' AS a" },
+        "select y from 'd/cte1.parquet' x",
     );
     // A join of two CTEs, an alias with AS, and a name in another case or quoted.
     try expectPlan(
@@ -652,12 +545,12 @@ test "a derived table is a stage, nested ones first, and its column list names t
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const p = (try plan(a, "SELECT t.a FROM (SELECT x, y FROM (SELECT x, y FROM 'f' WHERE x > 1) AS i) AS t(a, b) JOIN 'g' ON t.a = k", "d")).?;
-    // The innermost is a filter, inlined into the one that reads it; that one names its columns, so it is staged.
-    try testing.expectEqual(@as(usize, 1), p.stages.len);
-    try testing.expectEqualStrings("SELECT x, y FROM 'f' AS i WHERE x > 1", p.stages[0].sql);
-    try testing.expectEqual(@as(usize, 2), p.stages[0].columns.len);
-    try testing.expectEqualStrings("b", p.stages[0].columns[1]);
-    try testing.expectEqualStrings("SELECT t.a FROM 'd/cte0.parquet' AS t JOIN 'g' ON t.a = k", p.sql);
+    try testing.expectEqual(@as(usize, 2), p.stages.len);
+    try testing.expectEqualStrings("SELECT x, y FROM 'f' WHERE x > 1", p.stages[0].sql);
+    try testing.expectEqualStrings("SELECT x, y FROM 'd/cte0.parquet' AS i", p.stages[1].sql);
+    try testing.expectEqual(@as(usize, 2), p.stages[1].columns.len);
+    try testing.expectEqualStrings("b", p.stages[1].columns[1]);
+    try testing.expectEqualStrings("SELECT t.a FROM 'd/cte1.parquet' AS t JOIN 'g' ON t.a = k", p.sql);
     // No alias, a comma join, and a set operation inside.
     try expectPlan(
         "SELECT * FROM 'f', ((SELECT 1 AS x FROM 'g') UNION ALL (SELECT 2 FROM 'g')) WHERE 1 = 1",
@@ -686,57 +579,41 @@ test "a FROM inside a function, a quoted file and a table function are no table 
 
 test "a filter of one file is inlined into a query whose one table it is, and staged anywhere else" {
     try expectPlan(
-        "WITH l AS (SELECT a, b FROM 'f' WHERE a > 1 OR a IS NULL) SELECT b, count(*) AS n FROM l WHERE b < 3 OR b > 7 GROUP BY b",
+        "WITH l AS (SELECT * FROM 'f' WHERE a > 1 OR a IS NULL) SELECT b, count(*) AS n FROM l WHERE b < 3 OR b > 7 GROUP BY b",
         &.{},
         "SELECT b, count(*) AS n FROM 'f' AS l WHERE (a > 1 OR a IS NULL) AND ( b < 3 OR b > 7) GROUP BY b",
     );
-    try expectPlan("SELECT x.b FROM (SELECT b FROM 'f' WHERE b IS NULL) x ORDER BY 1;", &.{}, "SELECT x.b FROM 'f' AS x WHERE b IS NULL ORDER BY 1;");
+    try expectPlan("SELECT x.b FROM (SELECT * FROM 'f' WHERE b IS NULL) x ORDER BY 1;", &.{}, "SELECT x.b FROM 'f' AS x WHERE b IS NULL ORDER BY 1;");
     try expectPlan("WITH c AS (SELECT * FROM 'f' WHERE g = 1) SELECT count(*) AS n FROM c t", &.{}, "SELECT count(*) AS n FROM 'f' t WHERE g = 1");
     try expectPlan("WITH c AS (SELECT * FROM 'f' AS z) SELECT *, 2 * g AS h FROM c", &.{}, "SELECT *, 2 * g AS h FROM 'f' AS c");
     // Read in a subquery and in the query, each inlined where it is read.
     try expectPlan(
-        "WITH c AS (SELECT a FROM 'f' WHERE a > 1) SELECT sum(a) AS s FROM c WHERE a IN (SELECT a FROM c WHERE a < 9)",
+        "WITH c AS (SELECT * FROM 'f' WHERE a > 1) SELECT sum(a) AS s FROM c WHERE a IN (SELECT a FROM c WHERE a < 9)",
         &.{},
         "SELECT sum(a) AS s FROM 'f' AS c WHERE (a > 1) AND ( a IN (SELECT a FROM 'f' AS c WHERE (a > 1) AND ( a < 9)))",
     );
-    // A `*` would read the columns the filter dropped; a join's other table could own a column of the condition; a
-    // qualified condition names an alias that is gone; a set operation has two SELECTs: all staged, once.
-    try expectPlan("WITH c AS (SELECT a FROM 'f' WHERE a > 1) SELECT * FROM c", &.{"SELECT a FROM 'f' WHERE a > 1"}, "SELECT * FROM 'd/cte0.parquet' AS c");
-    try expectPlan("WITH c AS (SELECT a FROM 'f' WHERE a > 1) SELECT COLUMNS('a') FROM c", &.{"SELECT a FROM 'f' WHERE a > 1"}, "SELECT COLUMNS('a') FROM 'd/cte0.parquet' AS c");
+    // A join's other table could own a column of the condition; a qualified condition names an alias that is gone; a
+    // set operation has two SELECTs: all staged, once.
     try expectPlan(
-        "WITH c AS (SELECT a FROM 'f' WHERE a > 1) SELECT count(*) AS n FROM c, 'g' WHERE a = k",
-        &.{"SELECT a FROM 'f' WHERE a > 1"},
+        "WITH c AS (SELECT * FROM 'f' WHERE a > 1) SELECT count(*) AS n FROM c, 'g' WHERE a = k",
+        &.{"SELECT * FROM 'f' WHERE a > 1"},
         "SELECT count(*) AS n FROM 'd/cte0.parquet' AS c, 'g' WHERE a = k",
     );
-    try expectPlan("WITH c AS (SELECT a FROM 'f' x WHERE x.a > 1.5) SELECT sum(a) AS s FROM c", &.{"SELECT a FROM 'f' x WHERE x.a > 1.5"}, "SELECT sum(a) AS s FROM 'd/cte0.parquet' AS c");
+    try expectPlan("WITH c AS (SELECT * FROM 'f' x WHERE x.a > 1.5) SELECT sum(a) AS s FROM c", &.{"SELECT * FROM 'f' x WHERE x.a > 1.5"}, "SELECT sum(a) AS s FROM 'd/cte0.parquet' AS c");
     try expectPlan(
-        "WITH c AS (SELECT a FROM 'f' WHERE a > 1) SELECT a FROM c UNION ALL SELECT a FROM c",
-        &.{"SELECT a FROM 'f' WHERE a > 1"},
+        "WITH c AS (SELECT * FROM 'f' WHERE a > 1) SELECT a FROM c UNION ALL SELECT a FROM c",
+        &.{"SELECT * FROM 'f' WHERE a > 1"},
         "SELECT a FROM 'd/cte0.parquet' AS c UNION ALL SELECT a FROM 'd/cte0.parquet' AS c",
     );
-    // Inlined, a filter that kept some columns would let the query see the others: an alias named as one of them
-    // (GROUP BY, ORDER BY, HAVING), or any name it did not keep, stages it. Its own names, calls, casts and qualifiers do not.
-    const kept = "WITH c AS (SELECT a FROM 'f' WHERE a > 0) ";
-    for ([_][]const u8{
-        "SELECT a AS b, count(*) AS n FROM c GROUP BY a, b ORDER BY b, n",
-        "SELECT a AS b, count(*) AS n FROM c GROUP BY b",
-        "SELECT a, count(*) AS n FROM c GROUP BY a HAVING n > 1",
-        "SELECT a AS first FROM c ORDER BY first",
-        "SELECT b FROM c",
-        "SELECT a FROM c WHERE \"b\" > 1",
-    }) |q| {
-        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-        defer arena_state.deinit();
-        const got = (try plan(arena_state.allocator(), try std.mem.concat(arena_state.allocator(), u8, &.{ kept, q }), "d")).?;
-        try testing.expectEqual(@as(usize, 1), got.stages.len);
-    }
+    // A body that keeps fewer columns is staged: inlined, the query would see the file's others under the names it
+    // gives the CTE and its aliases (`b` here, a column of 'f' the body dropped).
     try expectPlan(
-        kept ++ "SELECT c.a AS x, sum(a::DOUBLE) AS s, count(*) FILTER (WHERE a IS NOT NULL) AS n FROM c WHERE a <> DATE '2024-01-01' GROUP BY c.a ORDER BY 1",
-        &.{},
-        "SELECT c.a AS x, sum(a::DOUBLE) AS s, count(*) FILTER (WHERE a IS NOT NULL) AS n FROM 'f' AS c WHERE (a > 0) AND ( a <> DATE '2024-01-01') GROUP BY c.a ORDER BY 1",
+        "WITH b AS (SELECT a FROM 'f' WHERE a > 0) SELECT a AS b, count(*) AS n FROM b GROUP BY a, b",
+        &.{"SELECT a FROM 'f' WHERE a > 0"},
+        "SELECT a AS b, count(*) AS n FROM 'd/cte0.parquet' AS b GROUP BY a, b",
     );
-    // Not filters: an expression, DISTINCT, a GROUP BY, an ORDER BY, a subquery in the condition.
-    for ([_][]const u8{ "SELECT a + 1 AS b FROM 'f'", "SELECT DISTINCT a FROM 'f'", "SELECT a FROM 'f' WHERE a > 1 GROUP BY a", "SELECT a FROM 'f' ORDER BY a", "SELECT a FROM 'f' WHERE a IN (SELECT k FROM 'g')", "SELECT a FROM 'f', 'g'" }) |body|
+    // Not filters: a column list, an expression, DISTINCT, a GROUP BY, an ORDER BY, a subquery in the condition, a join.
+    for ([_][]const u8{ "SELECT a FROM 'f' WHERE a > 0", "SELECT a + 1 AS b FROM 'f'", "SELECT DISTINCT * FROM 'f'", "SELECT * FROM 'f' WHERE a > 1 GROUP BY a", "SELECT * FROM 'f' ORDER BY a", "SELECT * FROM 'f' WHERE a IN (SELECT k FROM 'g')", "SELECT * FROM 'f', 'g'", "SELECT *, 1 AS one FROM 'f'" }) |body|
         try testing.expect(inlineable(body) == null);
 }
 

@@ -336,13 +336,8 @@ fn slotsOf(j: *const Join, comptime T: type, c: filter_eval.ColumnT(T), sel: *co
         }
         return;
     }
-    // A batch uses one layout: specialize its loop instead of dispatching the map for every selected key.
-    switch (j.keys) {
-        inline else => |map| {
-            var it = sel.iterator();
-            while (it.next()) |r| out[r] = if (keyAt(T, c, r)) |k| map.slot(k) orelse EMPTY else EMPTY;
-        },
-    }
+    var it = sel.iterator();
+    while (it.next()) |r| out[r] = if (keyAt(T, c, r)) |k| j.slot(k) orelse EMPTY else EMPTY;
 }
 
 fn slotsOfColumn(j: *const Join, fk: filter_eval.Batch.Column, sel: *const selection.SelectionVector, out: []u32, a: std.mem.Allocator) filter_eval.Error!void {

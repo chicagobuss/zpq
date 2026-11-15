@@ -79,6 +79,48 @@ test "device Readers with opposite probe order finish before timeout" {
     }
 }
 
+test "device admission preserves reader blocks on nonrotating queues and ordered units on serial queues" {
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "device admission");
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
+    defer tmp.cleanup();
+    const page = pageLen();
+    const data = try testing.allocator.alloc(u8, @intCast(8 * page));
+    defer testing.allocator.free(data);
+    @memset(data, 7);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try testFile(&tmp, "device-blocks.bin", data, &path_buf);
+    for ([_]struct { serial: bool, credit_pages: u64, units: usize, partial_page: bool = false }{
+        .{ .serial = false, .credit_pages = 8, .units = 2 },
+        .{ .serial = false, .credit_pages = 2, .units = 4, .partial_page = true },
+        .{ .serial = true, .credit_pages = 8, .units = 8 },
+    }) |case| {
+        const rd = try Reader.create(testing.allocator, .{
+            .mode = .pread,
+            .threads = 1,
+            .block = 4 * page,
+            .device_admission = true,
+        });
+        defer rd.destroy();
+        const f = try rd.openFile(path, data.len);
+        f.admission.?.serial = case.serial;
+        f.admission.?.block = page;
+        f.admission.?.limit = case.credit_pages * page + if (case.partial_page) page / 2 else @as(u64, 0);
+        var ranges = [_]Range{.{ .start = 0, .end = data.len }};
+        const plan = [_]?[]Range{&ranges};
+        try rd.planFile(f, &plan, 0);
+        try rd.start();
+        try testing.expectEqual(case.units, rd.units.items.len);
+        for (rd.units.items) |unit| {
+            try testing.expectEqual(@as(u64, 0), unit.off % page);
+            try testing.expectEqual(@as(u64, 0), unit.len % page);
+        }
+        const gate = f.gate();
+        try gate.wait(gate.ctx, 0);
+        try testing.expectEqualSlices(u8, data, f.bytes()[0..data.len]);
+        gate.done(gate.ctx, 0, 1);
+    }
+}
+
 test "device abandon unregisters credits before destroy" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "device admission");
     var tmp = @import("../test_scratch.zig").tmpDir(.{});

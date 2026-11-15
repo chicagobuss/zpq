@@ -734,7 +734,12 @@ pub const Reader = struct {
     /// Append the reads of `[lo, hi)` in blocks.
     fn addUnits(self: *Reader, u: Unit, lo: u64, hi: u64) !u32 {
         const file = self.files.items[u.file];
-        const block = if (file.admission) |d| d.block else self.cfg.block;
+        // Queue request sizes constrain credits, not userspace reads: the kernel splits a larger read itself.
+        // Only ordered streams need the device's readahead quantum; keep nonrotating reads within their credits.
+        const block = if (file.admission) |d|
+            (if (d.serial) d.block else @min(self.cfg.block, std.mem.alignBackward(u64, d.limit, pageLen())))
+        else
+            self.cfg.block;
         var off = lo;
         var n: u32 = 0;
         while (off < hi) : (n += 1) {

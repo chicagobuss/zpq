@@ -548,13 +548,13 @@ fn doUploadPart(ctx: *PartTaskCtx, arena: std.mem.Allocator, conn: *tls.Connecti
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
 
-    return http.sendRequest(arena, conn, .{
+    return s3.withRequestSecrets(try http.sendRequest(arena, conn, .{
         .method = .PUT,
         .host = host,
         .path = path_with_query,
         .headers = headers.items,
         .body = ctx.body,
-    });
+    }), creds);
 }
 
 // ============================================================

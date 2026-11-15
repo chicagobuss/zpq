@@ -65,9 +65,16 @@ pub const Request = struct {
 };
 
 pub const Response = struct {
+    pub const RequestSecrets = struct {
+        access_key: []const u8,
+        secret_key: []const u8,
+        session_token: ?[]const u8,
+    };
     status: u16,
     headers: []const Header,
     body: []const u8,
+    /// Borrowed from the request arena; used only to redact an error response.
+    request_secrets: ?RequestSecrets = null,
     /// `clock.monoNs` when the first response byte arrived (0 when not read off a connection): splits a request's
     /// time to first byte from its body transfer.
     first_byte_ns: i64 = 0,

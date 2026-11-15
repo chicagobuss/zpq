@@ -740,7 +740,7 @@ pub const Client = struct {
         const signed = creds.signer().sign(arena, "HEAD", self.host, path, null, &.{}, "", .{ .use_unsigned_payload = true }) catch return error.SignFailed;
         var headers: std.ArrayList(http.Header) = .empty;
         for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
-        return http.sendRequest(arena, &self.conn.?, .{ .method = .HEAD, .host = self.host, .path = path, .headers = headers.items });
+        return withRequestSecrets(try http.sendRequest(arena, &self.conn.?, .{ .method = .HEAD, .host = self.host, .path = path, .headers = headers.items }), creds);
     }
 
     /// One ListObjectsV2 page. Reuses the cached TLS connection.
@@ -892,13 +892,14 @@ pub fn getViaPoolWithOpts(
     const is_suffix = r != null and r.?.start == std.math.maxInt(u64);
     const bytes: u64 = if (r) |rr| (if (is_suffix) rr.end else rr.end - rr.start + 1) else 0;
     const tag: [2]u64 = if (r) |rr| (if (is_suffix) .{ 0, rr.end } else .{ rr.start, rr.end + 1 }) else .{ 0, 0 };
-    return requestViaPool(io, p, arena, criteria, .{
+    const response = try requestViaPool(io, p, arena, criteria, .{
         .idempotent = true,
         .method = .GET,
         .prof = opts.prof,
         .tag = tag,
         .bytes = bytes,
     }, Get{ .creds = request_creds, .host = host, .url = url, .opts = opts }, Get.send);
+    return withRequestSecrets(response, request_creds);
 }
 
 pub const RequestOpts = struct {
@@ -1086,13 +1087,13 @@ fn sendPut(
         try req_headers.append(arena, .{ .name = h.name, .value = h.value });
     }
 
-    return try http.sendRequest(arena, conn, .{
+    return withRequestSecrets(try http.sendRequest(arena, conn, .{
         .method = .PUT,
         .host = host,
         .path = path,
         .headers = req_headers.items,
         .body = body,
-    });
+    }), creds);
 }
 
 /// One unit of work for `fetchJobs` — fetch the bytes of `range` from
@@ -1419,12 +1420,12 @@ fn doFetch(ctx: *FetchCtx, arena: std.mem.Allocator, conn: *tls.Connection) !htt
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
 
-    return http.sendRequestInto(arena, conn, .{
+    return withRequestSecrets(try http.sendRequestInto(arena, conn, .{
         .method = .GET,
         .host = ctx.host,
         .path = path,
         .headers = headers.items,
-    }, ctx.target, if (ctx.wave != null) .{ .ctx = ctx, .f = noteDataHeader } else null);
+    }, ctx.target, if (ctx.wave != null) .{ .ctx = ctx, .f = noteDataHeader } else null), creds);
 }
 
 fn noteDataHeader(ctx: *anyopaque) void {
@@ -1449,6 +1450,17 @@ pub const Refusal = struct {
     err: Error,
 };
 
+/// Keep the credentials used for this request until its error is mapped; a refresh may replace the cached session.
+pub fn withRequestSecrets(response: http.Response, creds: Credentials) http.Response {
+    var result = response;
+    if (creds.express_session) result.request_secrets = .{
+        .access_key = creds.access_key,
+        .secret_key = creds.secret_key,
+        .session_token = creds.session_token,
+    };
+    return result;
+}
+
 fn secretAt(text: []const u8, secret: []const u8) ?usize {
     if (secret.len == 0 or !std.mem.startsWith(u8, text, secret)) return null;
     return secret.len;
@@ -1465,9 +1477,9 @@ const RedactField = struct { marker: usize, value: usize };
 
 fn redactFieldAt(text: []const u8) ?RedactField {
     const markers = [_][]const u8{
-        "x-amz-credential=",     "credential=",     "x-amz-signature=", "signature=",
-        "x-amz-security-token=", "security-token=", "awsaccesskeyid=",  "canonicalrequest=",
-        "authorization:",
+        "x-amz-credential=",     "credential=",            "x-amz-signature=", "signature=",
+        "x-amz-security-token=", "x-amz-s3session-token=", "security-token=",  "awsaccesskeyid=",
+        "canonicalrequest=",     "authorization:",
     };
     for (markers) |marker| {
         if (!std.ascii.startsWithIgnoreCase(text, marker)) continue;
@@ -1497,7 +1509,7 @@ fn copyRedacted(out: []u8, at: *usize, bytes: []const u8) void {
 }
 
 /// Copy S3's text with the configured credentials, authorization fields, signatures and AWS key IDs replaced.
-fn redactInto(dst: *diag_mod.Text, text: []const u8, creds: Credentials) void {
+fn redactInto(dst: *diag_mod.Text, text: []const u8, creds: Credentials, secrets: ?http.Response.RequestSecrets) void {
     var out: [256]u8 = undefined;
     var at: usize = 0;
     var i: usize = 0;
@@ -1509,6 +1521,9 @@ fn redactInto(dst: *diag_mod.Text, text: []const u8, creds: Credentials) void {
             copyRedacted(&out, &at, "[redacted]");
             i += len;
         } else if (if (creds.session_token) |token| secretAt(text[i..], token) else null) |len| {
+            copyRedacted(&out, &at, "[redacted]");
+            i += len;
+        } else if (if (secrets) |s| secretAt(text[i..], s.access_key) orelse secretAt(text[i..], s.secret_key) orelse (if (s.session_token) |token| secretAt(text[i..], token) else null) else null) |len| {
             copyRedacted(&out, &at, "[redacted]");
             i += len;
         } else if (redactFieldAt(text[i..])) |field| {
@@ -1578,8 +1593,8 @@ pub fn refusal(op: diag_mod.S3Failure.Op, bucket: []const u8, key: []const u8, r
     else
         error.S3RequestFailed;
 
-    redactInto(&failure.code, code_raw, creds);
-    redactInto(&failure.message, message_raw, creds);
+    redactInto(&failure.code, code_raw, creds, resp.request_secrets);
+    redactInto(&failure.message, message_raw, creds, resp.request_secrets);
     if (failure.message.len == 0 and err == error.NoSuchKey) failure.message.set("the object does not exist");
     return .{ .failure = failure, .err = err };
 }
@@ -1649,12 +1664,12 @@ fn buildAndSend(
         try req_headers.append(req_arena, .{ .name = h.name, .value = h.value });
     }
 
-    return try http.sendRequest(req_arena, conn, .{
+    return withRequestSecrets(try http.sendRequest(req_arena, conn, .{
         .method = .GET,
         .host = host,
         .path = path,
         .headers = req_headers.items,
-    });
+    }), creds);
 }
 
 /// Issue a ListObjectsV2 request and parse one page of `<Contents>`
@@ -2401,6 +2416,16 @@ test "S3 Express listing sorts keys and rejects a non-directory prefix" {
     const entries = try listAll(arena.allocator(), &client, "dir/");
     try testing.expectEqualStrings("dir/a", entries[0].key);
     try testing.expectEqualStrings("dir/z", entries[1].key);
+}
+
+test "S3 Express errors redact the session used by the request" {
+    const base: Credentials = .{ .access_key = "base-key", .secret_key = "base-secret", .region = "us-west-2" };
+    const session: Credentials = .{ .access_key = "session-key", .secret_key = "session-secret", .session_token = "session-token", .region = "us-west-2", .express_session = true };
+    const response = withRequestSecrets(.{ .status = 403, .headers = &.{}, .body = "<Error><Code>AccessDenied</Code><Message>session-key session-secret session-token</Message></Error>" }, session);
+    const result = refusal(.GetObject, "test--usw2-az1--x-s3", "file", response, base);
+    try testing.expectEqual(error.AccessDenied, result.err);
+    try testing.expectEqualStrings("[redacted] [redacted] [redacted]", result.failure.message.get());
+    try testing.expectEqualStrings("AccessDenied", result.failure.code.get());
 }
 
 test "S3 redirects never forward credentials to another host or scheme" {

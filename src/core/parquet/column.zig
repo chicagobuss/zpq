@@ -25,6 +25,7 @@
 //! max_def == 0 (REQUIRED columns only) so callers can't silently alias nulls.
 
 const std = @import("std");
+const hw = @import("../hw.zig");
 const builtin = @import("builtin");
 const nowNs = @import("../../clock.zig").monoNs;
 const schema = @import("../schema.zig");
@@ -963,7 +964,10 @@ pub fn ColumnChunkReader(comptime T: type) type {
             var n_dict: usize = 0;
             // Interleaved counter tables per entry: a run of rows on one entry would otherwise serialize on one
             // counter's store-to-load chain. Four only where they fit what the chunk's decode is charged (a
-            // dictionary of at most num_leaves / 8 entries, against 8 bytes a leaf).
+            // dictionary of at most num_leaves / 8 entries, against 8 bytes a leaf) and a worker's L2: past it,
+            // the extra misses of a larger table cost more than the chain (a 100k-entry key, 3.2 MB in four).
+            // Tables under 256 KiB fit every L2 zpq runs on (hw's smallest default) and skip asking: the first
+            // ask discovers the topology, ~1 ms the scan's other workers wait out.
             var lanes: usize = 1;
             var first_leaf: ?[]u32 = null;
             // Entries with no first leaf yet; once none is left, the rest of the chunk only counts.
@@ -993,7 +997,9 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     } else {
                         dict_ptr = d.ptr;
                         n_dict = d.len;
-                        if (n_dict <= num_leaves / 8) lanes = 4;
+                        const tables = n_dict * 4 * @sizeOf(u64);
+                        if (n_dict <= num_leaves / 8 and (tables <= 256 << 10 or tables <= hw.l2BytesPerWorker()))
+                            lanes = 4;
                         hist = try self.arena.alloc(u64, n_dict * lanes);
                         @memset(hist, 0);
                         if (track_first) {

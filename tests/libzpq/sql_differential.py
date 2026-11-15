@@ -66,7 +66,7 @@ def rss():
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix="zpq-sql-") as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR"), prefix="zpq-sql-") as d:
         path = str(Path(d) / 'study.parquet')
         con = duckdb.connect(config={"memory_limit": "8GB"})
         con.execute("""COPY (SELECT i AS id, i % 31 AS k, (i % 101 - 50)::DOUBLE / 4 AS v,

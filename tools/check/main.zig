@@ -238,7 +238,12 @@ pub fn main(init: std.process.Init) !void {
     var case_files: std.ArrayList([]const u8) = .empty;
     var duckdb: []const u8 = "";
     var python: []const u8 = ".venv/bin/python";
-    var work: []const u8 = "zig-out/check-work";
+    var work: []const u8 = if (init.minimal.environ.getAlloc(arena, "ZPQ_TEST_PARQUET_DIR")) |dir|
+        try std.fs.path.join(arena, &.{ dir, "check-work" })
+    else |err| switch (err) {
+        error.EnvironmentVariableMissing => "zig-out/check-work",
+        else => return err,
+    };
     var zpq_bin: []const u8 = "zig-out/bin/zpq";
     var data_root: ?[]const u8 = null;
     var bless = false;
@@ -869,6 +874,7 @@ fn checkCase(
         .gpa = run.gpa,
         .oracle = run.oracle,
         .python = run.python,
+        .work = run.work,
         .fixture = fixture,
         .text = switch (base) {
             .ok => |bytes| if (file_out) "" else bytes,

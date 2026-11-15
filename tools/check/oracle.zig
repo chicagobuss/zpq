@@ -438,13 +438,13 @@ fn calls(io: std.Io, arena: std.mem.Allocator, dir: []const u8) !usize {
 }
 
 const Sandbox = struct {
-    tmp: std.testing.TmpDir,
+    tmp: @import("zpq").test_scratch.TmpDir,
     arena_state: std.heap.ArenaAllocator,
     root: []const u8 = "",
 
     fn init() !Sandbox {
-        var b: Sandbox = .{ .tmp = testing.tmpDir(.{}), .arena_state = .init(testing.allocator) };
-        b.root = try std.fmt.allocPrint(b.arena_state.allocator(), ".zig-cache/tmp/{s}", .{&b.tmp.sub_path});
+        var b: Sandbox = .{ .tmp = @import("zpq").test_scratch.tmpDir(.{}), .arena_state = .init(testing.allocator) };
+        b.root = try std.fmt.allocPrint(b.arena_state.allocator(), "{s}", .{b.tmp.path});
         return b;
     }
     fn deinit(b: *Sandbox) void {

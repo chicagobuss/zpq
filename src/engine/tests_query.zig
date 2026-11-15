@@ -354,10 +354,10 @@ test "the parallel plain-row Top-N prints what reading every row group in order 
     if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
     std.Io.Dir.cwd().access(std.testing.io, topn_gather_inputs[1], .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.jsonl", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/out.jsonl", .{tmp.path});
     const serial_block = try gpa.allocSentinel(?[*:0]const u8, 1, null);
     defer gpa.free(serial_block);
     serial_block[0] = "ZPQ_TOPN_GATHER=0";
@@ -529,10 +529,10 @@ test "the parallel plain-row Top-N answers within the memory budget wherever rea
     const wide = "ci/fixtures/parquet/topn_budget_12k.parquet";
     std.Io.Dir.cwd().access(std.testing.io, wide, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.jsonl", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/out.jsonl", .{tmp.path});
     const serial_block = try gpa.allocSentinel(?[*:0]const u8, 1, null);
     defer gpa.free(serial_block);
     serial_block[0] = "ZPQ_TOPN_GATHER=0";
@@ -571,12 +571,12 @@ test "row output and writes report the row groups pruning skipped, as aggregates
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
-    var text_buf: [96]u8 = undefined;
-    const text = try std.fmt.bufPrint(&text_buf, ".zig-cache/tmp/{s}/out.jsonl", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
+    var text_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buf, "{s}/out.jsonl", .{tmp.path});
     // Eight row groups, `b` 2i..2i+1 in row group i: only row group 6 can match.
     const filter = "b >= 12 AND b <= 13";
 
@@ -615,12 +615,12 @@ test "summary row counters: every input row, the rows read, and the rows the fil
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
-    var text_buf: [96]u8 = undefined;
-    const text = try std.fmt.bufPrint(&text_buf, ".zig-cache/tmp/{s}/out.jsonl", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
+    var text_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buf, "{s}/out.jsonl", .{tmp.path});
     // 8 row groups of 200 rows, `b` 2i and 2i+1 100 times each in row group i: the filter rules out row groups 0
     // and 7 on statistics, reads 1..6 (1200 rows) and keeps b = 3..12 (1000 rows). Without it every row counts.
     const Want = struct { filter: ?[]const u8, scanned: i64, matched: i64 };
@@ -696,12 +696,12 @@ test "a page that fails to decode is named by file, row group, column and page, 
     std.Io.Dir.cwd().access(std.testing.io, bad, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
-    var text_buf: [96]u8 = undefined;
-    const text = try std.fmt.bufPrint(&text_buf, ".zig-cache/tmp/{s}/out.jsonl", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
+    var text_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const text = try std.fmt.bufPrint(&text_buf, "{s}/out.jsonl", .{tmp.path});
     const inputs = [_][]const u8{ good, bad };
     const Check = struct {
         fn site(diag: *const Diag) !void {
@@ -755,10 +755,10 @@ test "written files name zpq as their writer once zpq encodes their data, and ke
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
     const source = "parquet-cpp-arrow version 25.0.1";
     const Case = struct { args: QueryArgs, writer: []const u8 };
     const cases = [_]Case{
@@ -787,10 +787,10 @@ test "a borrowed worker runtime survives repeated writes and a sink failure" {
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
     var runtime = std.Io.Threaded.init(std.testing.allocator, .{});
     defer runtime.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/borrowed.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/borrowed.parquet", .{tmp.path});
     var expected: ?[]u8 = null;
     defer if (expected) |bytes| std.testing.allocator.free(bytes);
     for (0..3) |i| {
@@ -849,10 +849,10 @@ test "M1 DISTINCT writes identical canonical Parquet with sixteen actual produce
     const gpa = std.testing.allocator;
     const bytes = try metadata.readFileSlice(fixture, gpa);
     defer gpa.free(bytes);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/m1.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/m1.parquet", .{tmp.path});
     const Case = struct { grouped: bool, filter: ?[]const u8 = null, top: bool = false };
     for ([_]Case{
         .{ .grouped = true },
@@ -938,10 +938,10 @@ test "M1 first-H finishes materialize only the original first keys at j1 and six
     const a = std.testing.allocator;
     const bytes = try metadata.readFileSlice(fixture, a);
     defer a.free(bytes);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/first.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/first.parquet", .{tmp.path});
     var expected: ?[]u8 = null;
     defer if (expected) |b| a.free(b);
     for ([_]usize{ 1, 16 }) |workers| for ([_]usize{ 0, 64 }) |window| {
@@ -1162,10 +1162,10 @@ const OomSweep = struct {
 
     fn sweep(case: Case) !void {
         if (std.c.getenv("ZPQ_OOM_SWEEP") == null) return;
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = @import("../test_scratch.zig").tmpDir(.{});
         defer tmp.cleanup();
-        var path_buf: [256]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/answer.parquet", .{tmp.sub_path});
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/answer.parquet", .{tmp.path});
         if (case == .group4) {
             const wide = "ci/fixtures/parquet/census_widefilter.parquet";
             var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1328,10 +1328,10 @@ test "DISTINCT second passes survive cold auto pread and uring readers on a larg
     var held = std.heap.ArenaAllocator.init(gpa);
     defer held.deinit();
     const a = held.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [160]u8 = undefined;
-    const path = try std.fmt.bufPrintSentinel(&path_buf, ".zig-cache/tmp/{s}/distinct-readers.parquet", .{tmp.sub_path}, 0);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/distinct-readers.parquet", .{tmp.path}, 0);
     const fd = try local_fs.createFile(path);
     defer local_fs.close(fd);
     const FileSink = struct {
@@ -1411,10 +1411,10 @@ test "cold mapped passes read ahead of their workers and answer as the faulting 
     var held = std.heap.ArenaAllocator.init(gpa);
     defer held.deinit();
     const a = held.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [160]u8 = undefined;
-    const path = try std.fmt.bufPrintSentinel(&path_buf, ".zig-cache/tmp/{s}/read-ahead.parquet", .{tmp.sub_path}, 0);
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/read-ahead.parquet", .{tmp.path}, 0);
     const fd = try local_fs.createFile(path);
     defer local_fs.close(fd);
     const FileSink = struct {

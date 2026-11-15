@@ -67,6 +67,7 @@ pub const Inputs = struct {
     gpa: Allocator,
     oracle: *oracle_mod.Oracle,
     python: []const u8,
+    work: []const u8 = "zig-out",
     fixture: []const u8,
     /// zpq's output: JSON or JSONL text, or a written Parquet file.
     text: []const u8 = "",
@@ -1702,7 +1703,7 @@ fn produced(in: Inputs) ![]const u8 {
         if (!std.mem.startsWith(u8, head, "PAR1")) return head;
     } else {
         if (!std.mem.startsWith(u8, in.text, "PAR1")) return in.text;
-        file = try std.fmt.allocPrint(in.arena, "zig-out/check-stdout-{d}.parquet", .{std.c.getpid()});
+        file = try std.fmt.allocPrint(in.arena, "{s}/check-stdout-{d}.parquet", .{ in.work, std.c.getpid() });
         try std.Io.Dir.cwd().writeFile(in.io, .{ .sub_path = file, .data = in.text });
     }
     var argv: std.ArrayList([]const u8) = .empty;

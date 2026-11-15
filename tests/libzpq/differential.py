@@ -103,7 +103,7 @@ class Lambda:
 def main():
     failures = []
     checks = 0
-    tmp = tempfile.mkdtemp()
+    tmp = tempfile.mkdtemp(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR"))
     fixture = os.path.join(tmp, "diff_fixture.parquet")
     corpus.gen_fixture(duckdb.connect(config={"memory_limit": "8GB"}), fixture)
     lam = Lambda()

@@ -120,3 +120,5 @@ test {
     // The test-bearing files under this root, listed by build.zig (tests.gen.zig).
     _ = @import("tests.gen.zig");
 }
+
+pub const test_scratch = @import("test_scratch.zig");

@@ -91,6 +91,8 @@ line, `{"fixture", "answer", "parquet", "spec"}` with `spec` a case's oracle exp
 DuckDB N threads (part of every cache key). `text_numbers` in a spec reads a JSON string in a numeric column as
 its number: DuckDB prints HUGEINT that way; zpq never may.
 
+Set `ZPQ_TEST_PARQUET_DIR` to put Parquet test scratch on another disk while keeping builds and compiler caches in their usual locations.
+
 ## Tiers
 
 The gates are build.zig steps; CI and the justfile call them.

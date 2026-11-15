@@ -37,7 +37,7 @@ def main():
     if sys.platform != 'linux' or platform.libc_ver()[0] != 'glibc':
         print('Final allocation fault check requires glibc Linux; skipped')
         return
-    with tempfile.TemporaryDirectory(prefix='zpq-finalize-') as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR"), prefix='zpq-finalize-') as d:
         root = Path(d)
         shim = root / 'fail_finalize.so'
         source = Path(__file__).with_name('fail_finalize.c')

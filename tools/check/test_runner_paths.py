@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class RunnerPaths(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir=ROOT / "zig-out")
+        self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR", ROOT / "zig-out"))
         self.addCleanup(self.tmp.cleanup)
         self.cwd = Path(self.tmp.name)
         (self.cwd / "bin").mkdir()

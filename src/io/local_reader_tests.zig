@@ -27,12 +27,12 @@ const uring_retry_bound = ac.uring_retry_bound;
 
 test "device Readers with opposite probe order finish before timeout" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "device admission");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, @intCast(2 * pageLen()));
     defer testing.allocator.free(data);
     @memset(data, 7);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "opposite.bin", data, &path_buf);
     const a = try Reader.create(testing.allocator, .{ .mode = .pread, .device_admission = true });
     defer a.destroy();
@@ -81,9 +81,9 @@ test "device Readers with opposite probe order finish before timeout" {
 
 test "device abandon unregisters credits before destroy" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "device admission");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const data: [4096]u8 = @splat(7);
     const path = try testFile(&tmp, "abandon.bin", &data, &path_buf);
     const rd = try Reader.create(testing.allocator, .{ .device_admission = true });
@@ -96,13 +96,13 @@ test "device abandon unregisters credits before destroy" {
 test "device credits resume an admitted row group after submission fallback" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "device admission");
     if (!uringAvailable()) return error.SkipZigTest;
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const page = pageLen();
     const data = try testing.allocator.alloc(u8, 2 * page);
     defer testing.allocator.free(data);
     @memset(data, 7);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "credits.bin", data, &path_buf);
     for ([_]bool{ false, true }) |inject| {
         const rd = try Reader.create(testing.allocator, .{ .mode = .uring, .threads = 1, .qd = 4, .device_admission = true });
@@ -131,10 +131,10 @@ test "device credits resume an admitted row group after submission fallback" {
 
 test "device admission returns a failed reader's credits before the next query" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "device admission");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data: [16384]u8 = @splat(4);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "failure.bin", &data, &path_buf);
     for ([_]bool{ true, false }) |fail| {
         const rd = try Reader.create(testing.allocator, .{
@@ -162,10 +162,10 @@ test "device admission returns a failed reader's credits before the next query" 
 
 test "local reader preserves the syscall error and location without changing error precedence" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "reader errno");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const bytes: [16384]u8 = @splat(3);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "input.bin", &bytes, &path_buf);
     for ([_]Mode{ .pread, .uring }) |mode| {
         if (mode == .uring and !uringAvailable()) continue;
@@ -193,16 +193,16 @@ test "local reader preserves the syscall error and location without changing err
     }
 }
 
-fn testFile(tmp: *testing.TmpDir, name: []const u8, data: []const u8, buf: []u8) ![]const u8 {
+fn testFile(tmp: *@import("../test_scratch.zig").TmpDir, name: []const u8, data: []const u8, buf: []u8) ![]const u8 {
     var f = try tmp.dir.createFile(testing.io, name, .{});
     defer f.close(testing.io);
     try f.writeStreamingAll(testing.io, data);
-    return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ tmp.path, name });
 }
 
 test "every backend reads exactly the planned bytes, row group by row group, within any window" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     var prng = std.Random.DefaultPrng.init(0x10ad);
     const r = prng.random();
@@ -210,7 +210,7 @@ test "every backend reads exactly the planned bytes, row group by row group, wit
     const data = try testing.allocator.alloc(u8, size);
     defer testing.allocator.free(data);
     r.bytes(data);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
 
     for ([_]Mode{ .pread, .uring }) |mode| for ([_]u64{ 1 << 30, 4096 }) |window| {
@@ -257,14 +257,14 @@ test "every backend reads exactly the planned bytes, row group by row group, wit
 
 test "probed ranges are read first, once, and given back with their row groups" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     var prng = std.Random.DefaultPrng.init(0x9e0b);
     const size: usize = (2 << 20) + 777;
     const data = try testing.allocator.alloc(u8, size);
     defer testing.allocator.free(data);
     prng.random().bytes(data);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     const page = pageLen();
     for ([_]Mode{ .pread, .uring }) |mode| for ([_]u64{ 1 << 30, 4096 }) |window| {
@@ -322,12 +322,12 @@ test "probed ranges are read first, once, and given back with their row groups" 
 
 test "an abandoned reader stops, gives its pages back, and still tears down" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 1 << 20);
     defer testing.allocator.free(data);
     @memset(data, 9);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     for ([_]Mode{ .pread, .uring }) |mode| {
         if (mode == .uring and !uringAvailable()) continue;
@@ -356,12 +356,12 @@ test "an abandoned reader stops, gives its pages back, and still tears down" {
 
 test "a failed probe fails planning's wait and every row group's" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 1 << 20);
     defer testing.allocator.free(data);
     @memset(data, 3);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     for ([_]Mode{ .pread, .uring }) |mode| {
         if (mode == .uring and !uringAvailable()) continue;
@@ -386,12 +386,12 @@ test "a failed probe fails planning's wait and every row group's" {
 
 test "a failed read fails the row groups waiting on it, and teardown neither hangs nor leaks" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 1 << 20);
     defer testing.allocator.free(data);
     @memset(data, 7);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     for ([_]Mode{ .pread, .uring }) |mode| {
         if (mode == .uring and !uringAvailable()) continue;
@@ -421,14 +421,14 @@ test "a failed read fails the row groups waiting on it, and teardown neither han
 
 test "a row group's release keeps pages other row groups' ranges still cover" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     var prng = std.Random.DefaultPrng.init(0x1d8);
     const size: usize = 2 << 20;
     const data = try testing.allocator.alloc(u8, size);
     defer testing.allocator.free(data);
     prng.random().bytes(data);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
 
     // Arrow's layout: each row group's data, then every row group's column indexes, then every offset index. With a
@@ -476,12 +476,12 @@ test "a row group's release keeps pages other row groups' ranges still cover" {
 
 test "an allocation failing anywhere in open, plan or start leaks nothing and leaves no thread behind" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 256 << 10);
     defer testing.allocator.free(data);
     @memset(data, 3);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     try testing.checkAllAllocationFailures(testing.allocator, struct {
         fn run(gpa: std.mem.Allocator, p: []const u8, size: usize) !void {
@@ -504,13 +504,13 @@ test "an allocation failing anywhere in open, plan or start leaks nothing and le
 test "threads whose ring fails to set up read with pread, and say so" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
     if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     var prng = std.Random.DefaultPrng.init(0xf1);
     const data = try testing.allocator.alloc(u8, 1 << 20);
     defer testing.allocator.free(data);
     prng.random().bytes(data);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     for ([_]struct { fail: u64, uring: u32 }{ .{ .fail = 0b101, .uring = 1 }, .{ .fail = 0b111, .uring = 0 } }) |c| {
         const rd = try Reader.create(testing.allocator, .{
@@ -548,12 +548,12 @@ test "threads whose ring fails to set up read with pread, and say so" {
 test "a direct file whose rings never start is counted through the page cache" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
     if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 128 << 10);
     defer testing.allocator.free(data);
     @memset(data, 4);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "norings.bin", data, &path_buf);
     const rd = try Reader.create(testing.allocator, .{
         .mode = .uring,
@@ -603,9 +603,9 @@ fn virtualBytesForTest() !u64 {
 
 test "failed reader open returns its anonymous mapping too" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", "x", &path_buf);
     const rd = try Reader.create(testing.allocator, .{ .mode = .pread });
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
@@ -622,12 +622,12 @@ test "failed reader open returns its anonymous mapping too" {
 
 test "failed row group gates do not release bytes never admitted" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 256 << 10);
     defer testing.allocator.free(data);
     @memset(data, 3);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     const rd = try Reader.create(testing.allocator, .{ .mode = .pread, .threads = 3, .window = 4096, .fail_unit = 0 });
     defer rd.destroy();
@@ -647,12 +647,12 @@ test "failed row group gates do not release bytes never admitted" {
 
 test "continuation reads wait until their row group is admitted" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 8 << 20);
     defer testing.allocator.free(data);
     @memset(data, 7);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     for ([_]Mode{ .pread, .uring }) |mode| {
         if (mode == .uring and !uringAvailable()) continue;
@@ -688,9 +688,9 @@ fn continuationsWaitFor(mode: Mode, path: []const u8, size: usize) !void {
 
 test "local read bytes exclude EOF padding without shrinking the window charge" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", "x", &path_buf);
     for ([_]Mode{ .pread, .uring }) |mode| {
         if (mode == .uring and !uringAvailable()) continue;
@@ -847,12 +847,12 @@ test "residency follows the planned ranges, not the rest of the file" {
     const page = std.heap.pageSize();
     const pages: usize = 512;
     const size = page * pages;
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, size);
     defer testing.allocator.free(data);
     @memset(data, 7);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "ranges.bin", data, &path_buf);
     try forgetFile(path, size);
     var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
@@ -896,13 +896,13 @@ fn readWhole(path: []const u8, data: []const u8, cfg: Config) !void {
 
 test "pread, buffered io_uring and direct io_uring read the same bytes" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     var prng = std.Random.DefaultPrng.init(0x10);
     const data = try testing.allocator.alloc(u8, 1 << 20);
     defer testing.allocator.free(data);
     prng.random().bytes(data);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     try readWhole(path, data, .{ .mode = .pread, .threads = 2, .block = 64 << 10 });
     if (!uringAvailable()) return;
@@ -913,12 +913,12 @@ test "pread, buffered io_uring and direct io_uring read the same bytes" {
 test "io_uring retries a refused enter and resubmits an EAGAIN completion" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
     if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
     defer testing.allocator.free(data);
     @memset(data, 3);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "retry.bin", data, &path_buf);
     const inject = [_]Inject{ .intr, .intr, .again, .busy };
     var faults: Faults = .{ .inject = &inject, .cqe_replays = 1 };
@@ -956,12 +956,12 @@ fn readFaulted(path: []const u8, data: []const u8, faults: *Faults) !void {
 test "io_uring past the retry bound finishes the unit with pread" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
     if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
     defer testing.allocator.free(data);
     @memset(data, 5);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "bound.bin", data, &path_buf);
     var again: [16]Inject = undefined;
     for (&again) |*step| step.* = .again;
@@ -979,7 +979,7 @@ test "io_uring past the retry bound finishes the unit with pread" {
     const wide_data = try testing.allocator.alloc(u8, 192 << 10);
     defer testing.allocator.free(wide_data);
     @memset(wide_data, 5);
-    var wide_buf: [256]u8 = undefined;
+    var wide_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const wide = try testFile(&tmp, "partial.bin", wide_data, &wide_buf);
     const partial_inject = [_]Inject{
         .{ .submit = 1 }, .again, .again, .again, .again, .again, .again, .again, .again,
@@ -992,12 +992,12 @@ test "io_uring past the retry bound finishes the unit with pread" {
 test "a short repair pread failure reaps the rest of its completion batch" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
     if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 128 << 10);
     defer testing.allocator.free(data);
     @memset(data, 7);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "batch.bin", data, &path_buf);
     var faults: Faults = .{ .hold_batch = 2, .short_first = true, .fail_pread = true };
     try readFaulted(path, data, &faults);
@@ -1008,12 +1008,12 @@ test "a short repair pread failure reaps the rest of its completion batch" {
 test "a submitted io_uring read is not published while its wait is interrupted" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
     if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 192 << 10);
     defer testing.allocator.free(data);
     @memset(data, 6);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "inflight.bin", data, &path_buf);
     const rd = try Reader.create(testing.allocator, .{
         .mode = .uring,
@@ -1041,12 +1041,12 @@ test "a submitted io_uring read is not published while its wait is interrupted" 
 test "a file that cannot open O_DIRECT is still read through the page cache" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
     if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
     defer testing.allocator.free(data);
     @memset(data, 5);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "nodirect.bin", data, &path_buf);
     var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
     @memcpy(path_z[0..path.len], path);
@@ -1084,12 +1084,12 @@ test "a file that cannot open O_DIRECT is still read through the page cache" {
 test "a finished direct read of EINVAL is pread, and the direct fd stays open" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
     if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 128 << 10);
     defer testing.allocator.free(data);
     @memset(data, 4);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "reject.bin", data, &path_buf);
     var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
     @memcpy(path_z[0..path.len], path);
@@ -1133,12 +1133,12 @@ test "a finished direct read of EINVAL is pread, and the direct fd stays open" {
 test "an unaligned direct tail is read through the buffered fd and stays direct" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
     if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, (64 << 10) + 100);
     defer testing.allocator.free(data);
     @memset(data, 8);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "tail.bin", data, &path_buf);
     const rd = try Reader.create(testing.allocator, .{
         .mode = .uring,
@@ -1166,12 +1166,12 @@ test "an unaligned direct tail is read through the buffered fd and stays direct"
 test "a positive short completion repairs from an unaligned offset and stays direct" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
     if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
     defer testing.allocator.free(data);
     @memset(data, 2);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "short.bin", data, &path_buf);
     const rd = try Reader.create(testing.allocator, .{
         .mode = .uring,
@@ -1204,12 +1204,12 @@ test "a positive short completion repairs from an unaligned offset and stays dir
 test "direct io opens its own fd and does not change a borrowed one" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
     if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const data = try testing.allocator.alloc(u8, 64 << 10);
     defer testing.allocator.free(data);
     @memset(data, 9);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     var path_z: [std.fs.max_path_bytes:0]u8 = undefined;
     @memcpy(path_z[0..path.len], path);
@@ -1278,14 +1278,14 @@ fn forgetFile(path: []const u8, size: usize) !void {
 test "a buffered read of a cold file leaves it cached for the next choice" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "io_uring");
     if (!uringAvailable()) return test_skip.skipNeeding(.io_uring, "ring setup");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const page = std.heap.pageSize();
     const size = page * 128;
     const data = try testing.allocator.alloc(u8, size);
     defer testing.allocator.free(data);
     @memset(data, 4);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     try forgetFile(path, size);
     const cold = try fileResidency(path, size);
@@ -1307,13 +1307,13 @@ test "a buffered read of a cold file leaves it cached for the next choice" {
 
 test "row groups draw their bytes from the query's ledger as they are admitted, and give them back as released" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "the local reader's backends");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const size: usize = 1 << 20;
     const data = try testing.allocator.alloc(u8, size);
     defer testing.allocator.free(data);
     @memset(data, 7);
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try testFile(&tmp, "data.bin", data, &path_buf);
     for ([_]Mode{ .pread, .uring }) |mode| for ([_]bool{ false, true }) |abandon| {
         if (mode == .uring and !uringAvailable()) continue;

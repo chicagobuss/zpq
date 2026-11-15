@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'python'))
 import zpq
 
-with tempfile.TemporaryDirectory(prefix='zpq-lib-publication-') as d:
+with tempfile.TemporaryDirectory(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR"), prefix='zpq-lib-publication-') as d:
     root = Path(d)
     src, bad_src, dst = (root / n for n in ('input.parquet', 'bad.parquet', 'out"quoted.parquet'))
     table = pa.table({'k': [1, 2, 1], 'v': [3, 4, 5]})

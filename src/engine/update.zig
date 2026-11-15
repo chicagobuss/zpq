@@ -1136,11 +1136,11 @@ test "UPDATE rewrites only the pages it changes, keeps every other byte at its o
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const src_bytes = try local_fs.readFile(a, fixture);
-    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/t.parquet", .{tmp.sub_path});
-    const again = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/again.parquet", .{tmp.sub_path});
+    const target = try std.fmt.allocPrint(a, "{s}/t.parquet", .{tmp.path});
+    const again = try std.fmt.allocPrint(a, "{s}/again.parquet", .{tmp.path});
     const fd = try local_fs.createFile(target);
     try local_fs.writeAll(fd, src_bytes);
     local_fs.close(fd);
@@ -1257,10 +1257,10 @@ test "UPDATE refuses a target replaced or removed while it ran, even after its s
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const src_bytes = try local_fs.readFile(a, fixture);
-    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/t.parquet", .{tmp.sub_path});
+    const target = try std.fmt.allocPrint(a, "{s}/t.parquet", .{tmp.path});
     const sets = [_]Set{.{ .column = "f", .assignment = try filter_parser.parseSyntax(a, "f = 42") }};
     const req: Request = .{ .target = target, .where = try filter_parser.parseSyntax(a, "rid = 100"), .sets = &sets };
     const Hooks = struct {
@@ -1296,7 +1296,7 @@ test "UPDATE refuses a target replaced or removed while it ran, even after its s
             try std.testing.expectEqualStrings(Hooks.replacement, try local_fs.readFile(a, target));
         } else try std.testing.expectError(error.FileNotFound, local_fs.openRead(target));
         // Nor is the staged result left behind.
-        const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        const dir = try std.fmt.allocPrint(a, "{s}", .{tmp.path});
         for (try local_fs.listFiles(a, io, dir)) |name| try std.testing.expect(std.mem.indexOf(u8, name, "zpq-tmp") == null);
     };
     before_publish = null;
@@ -1326,10 +1326,10 @@ test "UPDATE that grows a page moves only its chunk, at its offset modulo the bl
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const src_bytes = try local_fs.readFile(a, fixture);
-    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/t.parquet", .{tmp.sub_path});
+    const target = try std.fmt.allocPrint(a, "{s}/t.parquet", .{tmp.path});
     const fd = try local_fs.createFile(target);
     try local_fs.writeAll(fd, src_bytes);
     local_fs.close(fd);
@@ -1389,11 +1389,11 @@ test "UPDATE keeps a replaced target when putting it back fails, and says where 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const src_bytes = try local_fs.readFile(a, fixture);
-    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/t.parquet", .{tmp.sub_path});
-    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const target = try std.fmt.allocPrint(a, "{s}/t.parquet", .{tmp.path});
+    const dir = try std.fmt.allocPrint(a, "{s}", .{tmp.path});
     const sets = [_]Set{.{ .column = "f", .assignment = try filter_parser.parseSyntax(a, "f = 42") }};
     const req: Request = .{ .target = target, .where = try filter_parser.parseSyntax(a, "rid = 100"), .sets = &sets };
     const Hooks = struct {

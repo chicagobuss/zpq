@@ -531,12 +531,12 @@ test "through a file's descriptor: resident pages are left alone, and the rest a
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "page-cache advice (madvise, mincore)");
     const local_fs = @import("../../local_fs.zig");
     const page = std.heap.pageSize();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/chunks.bin", .{tmp.sub_path});
+    const path = try std.fmt.allocPrint(a, "{s}/chunks.bin", .{tmp.path});
     const fd = try local_fs.createFile(path);
     const body = try a.alloc(u8, 8 * page);
     @memset(body, 1);
@@ -629,9 +629,9 @@ test "a gated column's kept pages are advised within the window and the ledger, 
     @memset(body, 0);
     @memcpy(body[0..h.len], h);
     @memcpy(body[one_len..][0..h.len], h);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/gated.bin", .{tmp.sub_path});
+    const path = try std.fmt.allocPrint(a, "{s}/gated.bin", .{tmp.path});
     const fd = try local_fs.createFile(path);
     try local_fs.writeAll(fd, body);
     local_fs.close(fd);

@@ -910,9 +910,9 @@ test "review_windows: local glob handles backslashes" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(arena, ".zig-cache\\tmp\\{s}", .{tmp.sub_path});
+    const dir = try std.fmt.allocPrint(arena, "{s}", .{tmp.path});
     const file = try std.fmt.allocPrint(arena, "{s}\\one.parquet", .{dir});
     const fd = try local_fs.createFile(file);
     local_fs.close(fd);

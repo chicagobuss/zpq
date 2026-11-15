@@ -153,11 +153,11 @@ fn replaceWindowsUsing(from: []const u8, to: []const u8, expected: ?Stamp, compt
 test "Windows UPDATE restores or retains the backup when replacement fails midway" {
     if (comptime builtin.os.tag != .windows) return;
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/target", .{tmp.sub_path});
+    const target = try std.fmt.allocPrint(a, "{s}/target", .{tmp.path});
     defer a.free(target);
-    const staged = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/staged", .{tmp.sub_path});
+    const staged = try std.fmt.allocPrint(a, "{s}/staged", .{tmp.path});
     defer a.free(staged);
     const backup = try std.fmt.allocPrint(a, "{s}.backup", .{staged});
     defer a.free(backup);
@@ -213,11 +213,11 @@ test "Windows UPDATE restores or retains the backup when replacement fails midwa
 test "Windows UPDATE locks and replacement preserve open targets and backup ownership" {
     if (comptime builtin.os.tag != .windows) return;
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/target", .{tmp.sub_path});
+    const target = try std.fmt.allocPrint(a, "{s}/target", .{tmp.path});
     defer a.free(target);
-    const staged = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/staged", .{tmp.sub_path});
+    const staged = try std.fmt.allocPrint(a, "{s}/staged", .{tmp.path});
     defer a.free(staged);
     const backup = try std.fmt.allocPrint(a, "{s}.backup", .{staged});
     defer a.free(backup);
@@ -1110,12 +1110,12 @@ pub fn listFiles(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![]
 const testing = std.testing;
 
 test "createFile / writeAll / readFile / mapFile / listFiles round-trip" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const dir_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const dir_path = try std.fmt.allocPrint(arena, "{s}", .{tmp.path});
     const file_path = try std.fs.path.join(arena, &.{ dir_path, "a.bin" });
 
     const fd = try createFile(file_path);
@@ -1141,12 +1141,12 @@ test "createFile / writeAll / readFile / mapFile / listFiles round-trip" {
 }
 
 test "createNewFile refuses an existing path; rename replaces its target" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var a_buf: [256]u8 = undefined;
-    var b_buf: [256]u8 = undefined;
-    const a = try std.fmt.bufPrint(&a_buf, ".zig-cache/tmp/{s}/a", .{tmp.sub_path});
-    const b = try std.fmt.bufPrint(&b_buf, ".zig-cache/tmp/{s}/b", .{tmp.sub_path});
+    var a_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const a = try std.fmt.bufPrint(&a_buf, "{s}/a", .{tmp.path});
+    const b = try std.fmt.bufPrint(&b_buf, "{s}/b", .{tmp.path});
     var fd = try createNewFile(a);
     try writeAll(fd, "new");
     close(fd);
@@ -1164,12 +1164,12 @@ test "createNewFile refuses an existing path; rename replaces its target" {
 
 test "releaseLeft drops a left mapping's pages from the resident set and leaves its bytes readable" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "mincore residency");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const file_path = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/big.bin", .{tmp.sub_path});
+    const file_path = try std.fmt.allocPrint(arena, "{s}/big.bin", .{tmp.path});
     const data = try arena.alloc(u8, 40 << 20);
     for (data, 0..) |*b, i| b.* = @truncate((i *% 2654435761) >> 7);
     const fd = try createFile(file_path);
@@ -1189,10 +1189,10 @@ test "releaseLeft drops a left mapping's pages from the resident set and leaves 
 }
 
 test "mapFile rejects an empty file" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/empty", .{tmp.sub_path});
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/empty", .{tmp.path});
     close(try createFile(path));
     try testing.expectError(error.EmptyFile, mapFile(path));
 }
@@ -1207,10 +1207,10 @@ fn expectCutByte(byte: u8) !void {
 
 test "regression: a mapped file truncated under the reader reads zeros past its end and reports it changed" {
     if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "Windows does not permit truncating a mapped file");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/shrinks", .{tmp.sub_path});
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/shrinks", .{tmp.path});
     const page = std.heap.pageSize();
     const fd = try createFile(path);
     const data = try testing.allocator.alloc(u8, 3 * page);
@@ -1241,12 +1241,12 @@ test "regression: a mapped file truncated under the reader reads zeros past its 
 
 test "regression: a mapped file cut inside its last page or rewritten in place reports it changed; renamed over, not" {
     if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "Windows does not permit truncating a mapped file");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/f", .{tmp.sub_path});
-    var nbuf: [256]u8 = undefined;
-    const other = try std.fmt.bufPrintSentinel(&nbuf, ".zig-cache/tmp/{s}/g", .{tmp.sub_path}, 0);
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/f", .{tmp.path});
+    var nbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const other = try std.fmt.bufPrintSentinel(&nbuf, "{s}/g", .{tmp.path}, 0);
     var data: [1000]u8 = undefined;
     const write = struct {
         fn at(p: []const u8, bytes: []const u8) !void {
@@ -1308,10 +1308,10 @@ test "regression: a mapped file cut inside its last page or rewritten in place r
 test "regression: the SIGBUS handler is in place only while a mapping is, and yields to one installed since" {
     if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "SIGBUS handler");
     if (posix.Sigaction == void) return error.SkipZigTest;
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/m", .{tmp.sub_path});
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "{s}/m", .{tmp.path});
     const fd = try createFile(path);
     try writeAll(fd, "abc");
     close(fd);
@@ -1340,13 +1340,13 @@ test "regression: the SIGBUS handler is in place only while a mapping is, and yi
 
 test "regression: mapFile and readFile refuse a directory and a FIFO instead of misreporting or blocking" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "FIFO and directory mapping");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [256]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "{s}", .{tmp.path});
     try testing.expectError(error.NotAFile, mapFile(dir));
-    var fbuf: [256]u8 = undefined;
-    const fifo = try std.fmt.bufPrintSentinel(&fbuf, ".zig-cache/tmp/{s}/pipe", .{tmp.sub_path}, 0);
+    var fbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fbuf, "{s}/pipe", .{tmp.path}, 0);
     const linux = std.os.linux;
     const made = linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(made));
@@ -1368,11 +1368,11 @@ test "writeAll distinguishes a full device from a broken pipe" {
 
 test "parallel mapping release keeps bytes intact and falls back when concurrency is unavailable" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "madvise release");
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const path = try std.fmt.allocPrint(arena.allocator(), ".zig-cache/tmp/{s}/release.bin", .{tmp.sub_path});
+    const path = try std.fmt.allocPrint(arena.allocator(), "{s}/release.bin", .{tmp.path});
     const data = try arena.allocator().alloc(u8, 65 << 20);
     for (data, 0..) |*b, i| b.* = @truncate((i *% 2654435761) >> 7);
     const fd = try createFile(path);
@@ -1391,10 +1391,10 @@ test "parallel mapping release keeps bytes intact and falls back when concurrenc
 
 test "starting writeback preserves the bytes and the write position" {
     const t = std.testing;
-    var tmp = t.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/writeback", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/writeback", .{tmp.path});
     const fd = try createNewFile(path);
     defer close(fd);
     try writeAll(fd, "before");
@@ -1420,12 +1420,12 @@ test "writeback hints leave pipe outputs usable" {
 }
 
 test "ordered segment writes preserve empty buffers and vector batch boundaries and surface sink errors" {
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/vectors", .{tmp.sub_path});
+    const path = try std.fmt.allocPrint(a, "{s}/vectors", .{tmp.path});
     var segments: [193][]const u8 = undefined;
     for (&segments, 0..) |*s, i| s.* = if (i % 7 == 0) "" else try std.fmt.allocPrint(a, "{d};", .{i});
     const fd = try createFile(path);
@@ -1448,11 +1448,11 @@ test "ordered segment writes preserve empty buffers and vector batch boundaries 
 test "review_windows: UPDATE preserves a writer arriving immediately before replacement" {
     if (comptime builtin.os.tag != .windows) return;
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    const target = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/target", .{tmp.sub_path});
+    const target = try std.fmt.allocPrint(a, "{s}/target", .{tmp.path});
     defer a.free(target);
-    const staged = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/staged", .{tmp.sub_path});
+    const staged = try std.fmt.allocPrint(a, "{s}/staged", .{tmp.path});
     defer a.free(staged);
     const backup = try std.fmt.allocPrint(a, "{s}.backup", .{staged});
     defer a.free(backup);

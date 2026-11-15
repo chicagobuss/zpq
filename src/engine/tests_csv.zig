@@ -13,8 +13,8 @@ const runQuery = @import("aggregate.zig").runQuery;
 const testing = std.testing;
 const Context = engine_types.Context;
 
-fn tmpPath(buf: []u8, tmp: *const std.testing.TmpDir, name: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+fn tmpPath(buf: []u8, tmp: *const @import("../test_scratch.zig").TmpDir, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ tmp.path, name });
 }
 
 fn writeFile(path: []const u8, data: []const u8) !void {
@@ -70,10 +70,10 @@ test "csv write: the same bytes at every -j and chunk size, typed exactly, NULL 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const in = try tmpPath(&b1, &tmp, "in.csv");
     const out = try tmpPath(&b2, &tmp, "out.parquet");
     const rows = 30_000;
@@ -130,11 +130,11 @@ test "csv write: a late value widens its column and the write restarts, to the b
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
-    var b3: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b3: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const in = try tmpPath(&b1, &tmp, "late.csv");
     const out = try tmpPath(&b2, &tmp, "late.parquet");
     const whole = try tmpPath(&b3, &tmp, "whole.parquet");
@@ -166,10 +166,10 @@ test "csv write: a late value widens its column and the write restarts, to the b
 }
 
 test "csv write: malformed input is refused at its line, byte and column" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const in = try tmpPath(&b1, &tmp, "bad.csv");
     const out = try tmpPath(&b2, &tmp, "bad.parquet");
     const cases = [_]struct { csv: []const u8, err: anyerror, line: u64, offset: u64, column: ?usize }{
@@ -195,10 +195,10 @@ test "csv write: the local reader writes the mapping's bytes, records longer tha
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const in = try tmpPath(&b1, &tmp, "read.csv");
     const out = try tmpPath(&b2, &tmp, "read.parquet");
     // Records of every kind, then one whose quoted field spans many chunks and far more than a read's overhang.
@@ -238,11 +238,11 @@ test "csv write: a small budget cuts smaller row groups and writes the same rows
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
-    var b3: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b3: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const in = try tmpPath(&b1, &tmp, "budget.csv");
     const big = try tmpPath(&b2, &tmp, "big.parquet");
     const small = try tmpPath(&b3, &tmp, "small.parquet");
@@ -312,10 +312,10 @@ test "csv write: a failure after the write leaves no output: an input changed un
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const in = try a.dupeSentinel(u8, try tmpPath(&b1, &tmp, "pub.csv"), 0);
     const out = try tmpPath(&b2, &tmp, "pub.parquet");
     const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
@@ -375,10 +375,10 @@ test "csv write: a chunk whose read failed stops the chunks after it, never stra
 
     // Through the whole write: one producer fails mid-file, through the reader or the mapping, at any -j; the write
     // stops with that error, every reader unit goes back, and nothing is left behind.
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const in = try tmpPath(&b1, &tmp, "fault.csv");
     const out = try tmpPath(&b2, &tmp, "fault.parquet");
     try writeFile(in, try sampleCsv(a, 20_000, null));
@@ -397,12 +397,12 @@ test "csv query: inputs are told apart by content, then by name, and a CSV is wr
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
-    var b3: [128]u8 = undefined;
-    var b4: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b3: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b4: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const csv = try tmpPath(&b1, &tmp, "data.CSV");
     const bin = try tmpPath(&b2, &tmp, "data.bin");
     const out = try tmpPath(&b3, &tmp, "data.parquet");
@@ -448,10 +448,10 @@ test "csv query: a column projection writes the columns named, in order, and fra
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const csv = try tmpPath(&b1, &tmp, "p.csv");
     const out = try tmpPath(&b2, &tmp, "p.parquet");
     // `c` turns to text late; written without it, nothing widens and nothing restarts.
@@ -516,10 +516,10 @@ test "csv query: SQL over a CSV is a column list, a filter, expressions or an ag
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const csv = try tmpPath(&b1, &tmp, "s.csv");
     const out = try tmpPath(&b2, &tmp, "s.parquet");
     try writeFile(csv, "a,b,c\n1,x,1.5\n2,y,2.5\n");
@@ -592,11 +592,11 @@ test "csv query: a late value restarts into the caller's own output file, and re
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
-    var b3: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b3: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const csv = try tmpPath(&b1, &tmp, "late.csv");
     const by_path = try tmpPath(&b2, &tmp, "path.parquet");
     const by_fd = try tmpPath(&b3, &tmp, "fd.parquet");
@@ -641,10 +641,10 @@ test "csv write: the report's DECIMAL precision is the data's, as the footer wri
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const in = try tmpPath(&b1, &tmp, "prec.csv");
     const out = try tmpPath(&b2, &tmp, "prec.parquet");
     // The sample sees 1.50; a later -10000.25 needs two more integer digits, which only the footer's precision shows.
@@ -664,10 +664,10 @@ test "csv write: the report's DECIMAL precision is the data's, as the footer wri
 }
 
 test "csv write: a record with too many fields is counted to its own end, not into the next" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const csv = try tmpPath(&b1, &tmp, "long.csv");
     const out = try tmpPath(&b2, &tmp, "long.parquet");
     const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
@@ -692,10 +692,10 @@ test "csv write: a pinned DECIMAL keeps its declared precision, and a value wide
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const in = try tmpPath(&b1, &tmp, "pin.csv");
     const out = try tmpPath(&b2, &tmp, "pin.parquet");
     const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
@@ -731,11 +731,11 @@ test "csv write: strings parsed into dictionary codes write the bytes values wri
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
-    var b3: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b3: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const in = try tmpPath(&b1, &tmp, "dict.csv");
     const plain = try tmpPath(&b2, &tmp, "plain.parquet");
     const coded = try tmpPath(&b3, &tmp, "coded.parquet");
@@ -773,10 +773,10 @@ test "csv write: per-chunk state is charged in full, and a budget too small for 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const in = try tmpPath(&b1, &tmp, "many.csv");
     const out = try tmpPath(&b2, &tmp, "many.parquet");
     // 64 columns over 1-KiB chunks: thousands of chunks, each with state per column, which the ledger must hold.
@@ -812,10 +812,10 @@ test "csv write: per-chunk state is charged in full, and a budget too small for 
 }
 
 test "csv query: a DECIMAL past 18 digits filters, passes through and computes without narrowing (review CSVF-1)" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const csv = try tmpPath(&b1, &tmp, "wide.csv");
     const out = try tmpPath(&b2, &tmp, "wide.parquet");
     try writeFile(csv, "id,d\n0,123456789012345678.25\n1,\n2,-123456789012345678.25\n");
@@ -836,9 +836,9 @@ test "csv aggregate: a group count past --max-memory is refused by name, and ans
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const csv = try tmpPath(&b1, &tmp, "g.csv");
     // Every row its own group, each key a string: the merged table and its answer grow with the row count.
     var text: std.ArrayList(u8) = .empty;
@@ -862,9 +862,9 @@ test "csv aggregate: --explain plans the fold, the fields each chunk parses and 
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const csv = try tmpPath(&b1, &tmp, "e.csv");
     try writeFile(csv, "a,b,c\n1,x,1.5\n2,y,2.5\n");
     const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
@@ -888,10 +888,10 @@ test "csv aggregate: a scalar count(DISTINCT) and string min/max winners draw fr
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const distinct = try tmpPath(&b1, &tmp, "d.csv");
     const winners = try tmpPath(&b2, &tmp, "w.csv");
     // 200,000 distinct 40-byte strings: a set of them is past a 4 MiB budget, one chunk's parse is not.
@@ -931,10 +931,10 @@ test "csv aggregate: a scalar count(DISTINCT) and string min/max winners draw fr
 test "csv aggregate: avg of a DECIMAL past 18 digits keeps the digits the data's precision gives, as over its Parquet (review P2)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
-    var b2: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var b2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const csv = try tmpPath(&b1, &tmp, "a.csv");
     const pq = try tmpPath(&b2, &tmp, "a.parquet");
     try writeFile(csv, "d\n10000000000000000.00\n10000000000000000.00\n10000000000000000.01\n");
@@ -958,9 +958,9 @@ test "csv aggregate: a GROUP BY whose fold fits the budget answers, its answer w
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const csv = try tmpPath(&b1, &tmp, "k.csv");
     var text: std.ArrayList(u8) = .empty;
     try text.appendSlice(a, "k\n");
@@ -998,9 +998,9 @@ test "csv aggregate: a GROUP BY whose fold fits the budget answers, its answer w
 }
 
 test "csv framing: unread fields are skipped off the structural bits, and every record still frames and refuses as when read" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var b1: [128]u8 = undefined;
+    var b1: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const csv = try tmpPath(&b1, &tmp, "f.csv");
     const ctx: Context = .{ .gpa = testing.allocator, .env = .empty, .io = testing.io };
     // Unread fields with quotes, delimiters and newlines inside them, CRLF and LF, and a blank line: only `b` is read.

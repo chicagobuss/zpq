@@ -671,8 +671,12 @@ fn expectResponses(tag: []const u8, events: []const struct { body: []const u8, w
 test "lambda returns a bounded profile summary inline when asked" {
     const esc = "ci/fixtures/parquet/json_escape.parquet";
     const agg = "{\"inputs\":[\"" ++ esc ++ "\"],\"aggregate\":\"count(*) AS n, sum(x) AS sx\",\"profile\":true";
-    const out = "zig-out/lambda_profile_out.parquet";
-    defer _ = linux.unlink(out);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const out = try @import("test_scratch").filePath(scratch, "zig-out/lambda_profile_out.parquet");
+    const quoted_out = try std.json.Stringify.valueAlloc(scratch, out, .{});
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, out) catch {};
     // The request is echoed cut to 512 bytes; put an `é` across that byte. The cut must fall before it.
     // This process has a region and no keys, so pre-connect skips and those fields follow the cut query.
     const note = agg ++ ",\"note\":\"";
@@ -692,8 +696,7 @@ test "lambda returns a bounded profile summary inline when asked" {
             .want = "\"profile_trace\":{\"url\":\"nope\",\"error\":\"BadProfileUrl\"}",
         },
         .{
-            .body = "{\"inputs\":[\"" ++ esc ++ "\"],\"columns\":[\"s\"],\"output_url\":\"" ++ out ++
-                "\",\"profile\":true}",
+            .body = try std.fmt.allocPrint(scratch, "{{\"inputs\":[\"{s}\"],\"columns\":[\"s\"],\"output_url\":{s},\"profile\":true}}", .{ esc, quoted_out }),
             .want = "\"phases\":{",
         },
     });
@@ -701,12 +704,15 @@ test "lambda returns a bounded profile summary inline when asked" {
 
 test "lambda write response escapes an output name holding a quote and a backslash" {
     const esc = "ci/fixtures/parquet/json_escape.parquet";
-    const out = "zig-out/lambda \"q\" \\ out.parquet";
-    defer _ = linux.unlink(out);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const out = try @import("test_scratch").filePath(scratch, "zig-out/lambda \"q\" \\ out.parquet");
+    const quoted_out = try std.json.Stringify.valueAlloc(scratch, out, .{});
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, out) catch {};
     try expectResponses("lambda write escape", &.{.{
-        .body = "{\"inputs\":[\"" ++ esc ++ "\"],\"columns\":[\"s\"]," ++
-            "\"output_url\":\"zig-out/lambda \\\"q\\\" \\\\ out.parquet\"}",
-        .want = "{\"ok\":true,\"output\":\"zig-out/lambda \\\"q\\\" \\\\ out.parquet\",\"files_in\":1,",
+        .body = try std.fmt.allocPrint(scratch, "{{\"inputs\":[\"{s}\"],\"columns\":[\"s\"],\"output_url\":{s}}}", .{ esc, quoted_out }),
+        .want = try std.fmt.allocPrint(scratch, "{{\"ok\":true,\"output\":{s},\"files_in\":1,", .{quoted_out}),
     }});
 }
 

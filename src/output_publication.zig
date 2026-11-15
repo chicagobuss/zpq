@@ -160,10 +160,10 @@ pub const OutputPublication = struct {
 
 test "publication abort preserves target; concurrent preparations retain separate exclusive descriptors" {
     const t = std.testing;
-    var tmp = t.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [256]u8 = undefined;
-    const target = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/answer", .{tmp.sub_path});
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const target = try std.fmt.bufPrint(&buf, "{s}/answer", .{tmp.path});
     const old = try local_fs.createFile(target);
     try local_fs.writeAll(old, "old");
     local_fs.close(old);
@@ -193,10 +193,10 @@ test "publication abort preserves target; concurrent preparations retain separat
 
 test "publication owns its target after the caller releases the request string" {
     const t = std.testing;
-    var tmp = t.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var source_buf: [256]u8 = undefined;
-    const source = try std.fmt.bufPrint(&source_buf, ".zig-cache/tmp/{s}/answer", .{tmp.sub_path});
+    var source_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const source = try std.fmt.bufPrint(&source_buf, "{s}/answer", .{tmp.path});
     var expected_buf: [256]u8 = undefined;
     @memcpy(expected_buf[0..source.len], source);
     const expected = expected_buf[0..source.len];
@@ -221,10 +221,10 @@ test "local publication syncs by default and permits an explicit opt out" {
 test "publication reports a post-rename directory sync error and preserves the published target" {
     if (comptime @import("test_skip.zig").lacks(.posix)) return @import("test_skip.zig").skipNeeding(.posix, "Windows publication has no directory sync operation");
     const t = std.testing;
-    var tmp = t.tmpDir(.{});
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [256]u8 = undefined;
-    const target = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/answer", .{tmp.sub_path});
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const target = try std.fmt.bufPrint(&buf, "{s}/answer", .{tmp.path});
     for ([_]bool{ false, true }) |replacing| {
         const old = try local_fs.createFile(target);
         try local_fs.writeAll(old, "old");

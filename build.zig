@@ -139,7 +139,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = strip,
-            .imports = &.{.{ .name = "integration_opts", .module = opts.createModule() }},
+            .imports = &.{
+                .{ .name = "integration_opts", .module = opts.createModule() },
+                .{ .name = "test_scratch", .module = b.createModule(.{ .root_source_file = srcFile(b, "test_scratch.zig"), .target = target }) },
+            },
         }) });
         b.step("integration-bin", "Install the Lambda integration harness for shipped binaries (zpq-integration)")
             .dependOn(&b.addInstallArtifact(harness, .{ .dest_sub_path = "zpq-integration" }).step);
@@ -309,7 +312,10 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
             .root_source_file = b.path("tests/lambda_integration.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "integration_opts", .module = integration_opts.createModule() }},
+            .imports = &.{
+                .{ .name = "integration_opts", .module = integration_opts.createModule() },
+                .{ .name = "test_scratch", .module = b.createModule(.{ .root_source_file = srcFile(b, "test_scratch.zig"), .target = target }) },
+            },
         }),
         .filters = filters,
     });
@@ -370,6 +376,7 @@ fn addTiers(b: *std.Build, cfg: Config) void {
     const fast = artifacts(b, cfg, .ReleaseFast);
     const runner = safe.check;
     const dir = "zig-out/receipts";
+    const parquet_dir = b.graph.environ_map.get("ZPQ_TEST_PARQUET_DIR") orelse "zig-out";
     const tier_name = @tagName(tier);
 
     const Stage = struct { name: []const u8, run: *std.Build.Step.Run };
@@ -421,7 +428,7 @@ fn addTiers(b: *std.Build, cfg: Config) void {
     if (tier != .edit) if (add(b, &stages, wanted, runner, dir, tier_name, "check-self", "plain", 900)) |r| {
         r.addArg("--");
         r.addArtifactArg(runner);
-        r.addArgs(&.{ "--self-test", "--no-cache", "--duckdb", duckdb, "--python", python, "--work", "zig-out/check-self", "--zpq" });
+        r.addArgs(&.{ "--self-test", "--no-cache", "--duckdb", duckdb, "--python", python, "--work", b.pathJoin(&.{ parquet_dir, "check-self" }), "--zpq" });
         r.addArtifactArg(fast.cli);
     };
     // The scorecard's rules decide what a timing counts for (stalls, quarantine, the denominator): a gate too.
@@ -448,7 +455,7 @@ fn addTiers(b: *std.Build, cfg: Config) void {
         r.addArg("--");
         r.addArtifactArg(runner);
         for (c.files) |f| r.addArgs(&.{ "--cases", f });
-        r.addArgs(&.{ "--duckdb", duckdb, "--python", python, "--work", b.fmt("zig-out/check-work-{s}", .{c.name}) });
+        r.addArgs(&.{ "--duckdb", duckdb, "--python", python, "--work", b.pathJoin(&.{ parquet_dir, b.fmt("check-work-{s}", .{c.name}) }) });
         if (oracle_cache) |path| r.addArgs(&.{ "--cache", path });
         if (c.fresh) r.addArg("--no-cache");
         if (std.mem.eql(u8, c.name, "corpus-odd")) r.addArgs(&.{ "--force", "ZPQ_DECODE_BATCH_ROWS=97" });
@@ -458,7 +465,7 @@ fn addTiers(b: *std.Build, cfg: Config) void {
     };
     if (tier == .full) {
         if (add(b, &stages, wanted, runner, dir, tier_name, "path-parity", "plain", 1800)) |r| {
-            r.addArgs(&.{ "--", python, "tools/check/path_parity.py", "--duckdb", duckdb, "--out", "zig-out/path-parity", "--check" });
+            r.addArgs(&.{ "--", python, "tools/check/path_parity.py", "--duckdb", duckdb, "--out", b.pathJoin(&.{ parquet_dir, "path-parity" }), "--check" });
             r.addArtifactArg(runner);
         }
         // Hardware choices must preserve output bytes: the same cases, answers only, through native-CPU and
@@ -471,16 +478,17 @@ fn addTiers(b: *std.Build, cfg: Config) void {
             var script: std.ArrayList(u8) = .empty;
             script.appendSlice(b.allocator, "set -e; c=\"") catch @panic("OOM");
             for (commit_cases) |f| script.print(b.allocator, " --cases {s}", .{f}) catch @panic("OOM");
-            script.appendSlice(b.allocator, "\"; w=zig-out/check-work-cpu; " ++
-                "\"$1\" $c --zpq \"$2\" --work $w --python \"$5\" --answers-only --manifest $w-native.txt >/dev/null; " ++
-                "\"$3\" $c --zpq \"$4\" --work $w --answers-only --reuse-fixtures --manifest $w-baseline.txt " ++
-                ">/dev/null; \"$1\" manifest-diff $w-native.txt $w-baseline.txt") catch @panic("OOM");
+            script.appendSlice(b.allocator, "\"; w=\"$6\"; " ++
+                "\"$1\" $c --zpq \"$2\" --work \"$w\" --python \"$5\" --answers-only --manifest \"$w-native.txt\" >/dev/null; " ++
+                "\"$3\" $c --zpq \"$4\" --work \"$w\" --answers-only --reuse-fixtures --manifest \"$w-baseline.txt\" " ++
+                ">/dev/null; \"$1\" manifest-diff \"$w-native.txt\" \"$w-baseline.txt\"") catch @panic("OOM");
             r.addArgs(&.{ "--", "sh", "-c", script.items, "cpu-parity" });
             r.addArtifactArg(runner);
             r.addArtifactArg(fast.cli);
             r.addArtifactArg(base_check);
             r.addArtifactArg(base_cli);
             r.addArg(python);
+            r.addArg(b.pathJoin(&.{ parquet_dir, "check-work-cpu" }));
         }
         if (add(b, &stages, wanted, runner, dir, tier_name, "contracts", "contracts", 1200)) |r| {
             r.addArgs(&.{ "--", python, "tools/check/contracts.py" });

@@ -51,7 +51,7 @@ def test_binding(z):
         check(e.response.get("reason") == "OpenFailed", f"error response {e.response}")
     r3 = z.run({"inputs": [FIX]}, check=False)
     check(r3.get("reason") == "NoOperation", f"check=False {r3}")
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR")) as d:
         out = os.path.join(d, "o.parquet")
         w = z.run({"inputs": [FIX], "output_url": out, "select": "a * 2 AS x, b", "filter": "a < 10"})
         check(w["rows_matched"] == 10 and w["rows_scanned"] >= 10, f"write {w}")
@@ -63,7 +63,7 @@ def test_boolean_answers(z):
     # A BOOLEAN key and min/max of a BOOLEAN print true/false in every JSON surface, as its rows do.
     import pyarrow as pa
     import pyarrow.parquet as pq
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR")) as d:
         src = os.path.join(d, "b.parquet")
         pq.write_table(pa.table({"b": pa.array([True, False, True, None], pa.bool_())}), src)
         rows = z.query_raw(f"SELECT b, count(*) AS n FROM '{src}' GROUP BY b")
@@ -87,7 +87,7 @@ def test_decimal_exact(z):
     import pyarrow as pa
     import pyarrow.parquet as pq
     from decimal import Decimal
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR")) as d:
         src = os.path.join(d, "dec.parquet")
         pq.write_table(pa.table({
             "p": pa.array([Decimal("83332533333.00"), Decimal("0.10"), None], pa.decimal128(18, 2)),
@@ -444,7 +444,7 @@ def test_bloom_options(z):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR")) as d:
         src = os.path.join(d, "src.parquet")
         low = [(i % 64) * 2 for i in range(4000)]
         pq.write_table(pa.table({"low": pa.array(low, pa.int32()), "high": pa.array(range(4000), pa.int64())}), src,
@@ -471,7 +471,7 @@ def test_binary_text(z):
     import pyarrow.parquet as pq
 
     cli = os.environ.get("ZPQ_BIN", "zig-out/bin/zpq")
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR")) as d:
         blob, uuids, invalid = (os.path.join(d, n) for n in ("blob.parquet", "uuid.parquet", "invalid.parquet"))
         pq.write_table(pa.table({"v": [b"\xff", b"\xfe", b"ASCII", b"", None, b"\x00", b"/w==", "\u00e9".encode(),
                                        bytes(range(256)) * 13]}), blob)
@@ -496,7 +496,7 @@ def test_arrow_types(z):
     date32, its JSON still the stored days DATE columns print."""
     import pyarrow as pa
     import pyarrow.parquet as pq
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR")) as d:
         src = os.path.join(d, "t.parquet")
         pq.write_table(pa.table({"s": pa.array(["http://www.a.com/x", "https://b.org/y", None, "h\u00e9"]),
                                  "b": pa.array([b"http://c.net/z", b"x", None, b"y"]),
@@ -540,7 +540,7 @@ def test_arrow_consumers(z):
     consumer's EOF or release ends the context call."""
     import pyarrow as pa
     import pyarrow.parquet as pq
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR")) as d:
         src = os.path.join(d, "t.parquet")
         pq.write_table(pa.table({"k": pa.array([3, 1, 2], pa.int64()), "s": ["c", "a", "b"]}), src)
         sql = f"SELECT k, s FROM '{src}' ORDER BY k"

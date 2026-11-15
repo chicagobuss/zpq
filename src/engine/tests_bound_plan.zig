@@ -525,7 +525,7 @@ fn denseCountFixture(a: std.mem.Allocator, sub_path: []const u8) ![]const u8 {
         c.* = @intCast((i * 7) % entries.len);
         v.* = @intCast(i % 1000);
     }
-    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/dense.parquet", .{sub_path});
+    const path = try std.fmt.allocPrint(a, "{s}/dense.parquet", .{sub_path});
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = try denseDictionaryFile(a, entries, codes, f) });
     return path;
 }
@@ -540,9 +540,9 @@ test "regression: SQL syntax hands a filtered integer COUNT top-H the plan its t
     const fa = arena_state.allocator();
     // Owned syntax once handed on no WHERE (8c4e96aa), so the scan costed this filtered cut as unfiltered: 4.6x slower
     // over 458 row groups like these.
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    const path = try denseCountFixture(fa, &tmp.sub_path);
+    const path = try denseCountFixture(fa, tmp.path);
     const text = try std.fmt.allocPrint(fa, "SELECT k, count(*) AS c FROM '{s}' WHERE f < 10 GROUP BY k ORDER BY c DESC LIMIT 10", .{path});
     const original = try sql.parseSqlQuery(a, text);
     defer original.deinit(a);
@@ -582,9 +582,9 @@ test "regression: a structured fanout plan of a filtered integer COUNT plans as 
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const fa = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    const path = try denseCountFixture(fa, &tmp.sub_path);
+    const path = try denseCountFixture(fa, tmp.path);
     const lines = [_:null]?[*:0]const u8{"ZPQ_IO_PROFILE=mmap"};
     const ctx: types.Context = .{ .gpa = a, .io = std.testing.io, .env = .{ .block = .{ .slice = &lines } } };
     const fanout = @import("fanout_plan.zig");
@@ -641,9 +641,9 @@ test "regression: a structured plan without text fragments answers a grouped DIS
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
     const fa = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    const path = try denseCountFixture(fa, &tmp.sub_path);
+    const path = try denseCountFixture(fa, tmp.path);
     const text = try std.fmt.allocPrint(fa, "SELECT k, count(DISTINCT f) AS d FROM '{s}' GROUP BY k", .{path});
     const parsed = try sql.parseSqlPlan(a, text);
     defer parsed.deinit(a);

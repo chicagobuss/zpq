@@ -636,7 +636,7 @@ def main():
         return lib_sync_worker(args.lib_sync_worker)
     ZPQ = str(Path(args.zpq).resolve())
     passed, skipped, failed = 0, [], []
-    with tempfile.TemporaryDirectory(prefix="zpq-contracts-") as d:
+    with tempfile.TemporaryDirectory(dir=os.environ.get("ZPQ_TEST_PARQUET_DIR"), prefix="zpq-contracts-") as d:
         base = Path(d)
         shared = fixtures(base)
         for fn in CONTRACTS:

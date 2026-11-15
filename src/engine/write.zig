@@ -1336,13 +1336,13 @@ test "FdSink segments keep one contiguous writeback range across page and vector
 test "FdSink range copies write the input's bytes whether the kernel copies all, part or none of them" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "FdSink copy_file_range faults");
     const t = std.testing;
-    var tmp = t.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const block = fastpath.share_block;
     var src_bytes: [3 * block + 123]u8 = undefined;
     for (&src_bytes, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
-    const src_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/src", .{tmp.sub_path});
+    const src_path = try std.fmt.bufPrint(&path_buf, "{s}/src", .{tmp.path});
     const src_w = try local_fs.createFile(src_path);
     try local_fs.writeAll(src_w, &src_bytes);
     local_fs.close(src_w);
@@ -1370,8 +1370,8 @@ test "FdSink range copies write the input's bytes whether the kernel copies all,
     };
     for (copiers, 0..) |copier, k| {
         Fake.budget = 1000;
-        var out_buf: [256]u8 = undefined;
-        const out_path = try std.fmt.bufPrint(&out_buf, ".zig-cache/tmp/{s}/out{d}", .{ tmp.sub_path, k });
+        var out_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const out_path = try std.fmt.bufPrint(&out_buf, "{s}/out{d}", .{ tmp.path, k });
         const fd = try local_fs.createFile(out_path);
         var fd_sink: FdSink = .{ .fd = fd, .copy = copier, .share = true };
         var out: streaming.SinkOut = .{ .sink = fd_sink.sink() };

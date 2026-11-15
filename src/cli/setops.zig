@@ -457,10 +457,10 @@ test "a column name is quoted as an identifier" {
 }
 
 test "scratch files do not go in a directory a branch reads from" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("zpq").test_scratch.tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [256]u8 = undefined;
-    const here = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const here = try std.fmt.bufPrint(&buf, "{s}", .{tmp.path});
     var q1: [320]u8 = undefined;
     const reads_here = try std.fmt.bufPrint(&q1, "SELECT x FROM '{s}/in.parquet' WHERE y > 1", .{here});
     try std.testing.expectEqualStrings("/tmp", scratchParent(&.{reads_here}, here));
@@ -479,9 +479,9 @@ test "review_windows: scratch uses the Windows temporary directory" {
     const parent = try scratchParentWindows(arena.allocator(), &.{}, null);
     try std.testing.expect(!std.mem.eql(u8, parent, "/tmp"));
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("zpq").test_scratch.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try std.fmt.allocPrint(a, ".zig-cache\\tmp\\{s}", .{tmp.sub_path});
+    const dir = try std.fmt.allocPrint(a, "{s}", .{tmp.path});
     const sql = try std.fmt.allocPrint(a, "SELECT * FROM '{s}\\no_extension'", .{dir});
     try std.testing.expect(readsFrom(&.{sql}, dir));
     try std.testing.expectEqualStrings("\\\\?\\C:\\scratch\\file.parquet", try windowsScratchJoin(a, "\\\\?\\C:\\scratch\\", "file.parquet"));

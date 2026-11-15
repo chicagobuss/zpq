@@ -157,7 +157,8 @@ static void test_round_trip(zpq_ctx *c) {
 
 static void test_write(zpq_ctx *c) {
     char path[4096];
-    const char *scratch = getenv("TMPDIR");
+    const char *scratch = getenv("ZPQ_TEST_PARQUET_DIR");
+    if (!scratch) scratch = getenv("TMPDIR");
     int length = snprintf(path, sizeof path, "%s/libzpq-test-XXXXXX", scratch && *scratch ? scratch : "/tmp");
     CHECK(length > 0 && (size_t)length < sizeof path, "temporary path too long");
     int fd = mkstemp(path);

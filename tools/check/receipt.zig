@@ -441,12 +441,12 @@ fn writeReceipt(io: std.Io, a: Allocator, dir: []const u8, r: Receipt, log: []co
 
 test "a receipt passes only as evidence of a clean, complete, skip-free run of this SHA" {
     const io = testing.io;
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("zpq").test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var state = std.heap.ArenaAllocator.init(testing.allocator);
     defer state.deinit();
     const a = state.allocator();
-    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const dir = try std.fmt.allocPrint(a, "{s}", .{tmp.path});
     const sha = "1111111111111111111111111111111111111111";
     const good: Receipt = .{
         .header = .{ .sha = sha, .tree_clean = true, .host = "h", .kernel = "k", .zig = "z", .duckdb_sha256 = "d", .artifacts = &.{}, .cases_sha256 = "c", .fixtures = "f" },
@@ -529,12 +529,12 @@ test "a receipt passes only as evidence of a clean, complete, skip-free run of t
 
 test "a macOS unit run passes by the needs its tests named, and the same log fails on Linux" {
     const io = testing.io;
-    var tmp = testing.tmpDir(.{});
+    var tmp = @import("zpq").test_scratch.tmpDir(.{});
     defer tmp.cleanup();
     var state = std.heap.ArenaAllocator.init(testing.allocator);
     defer state.deinit();
     const a = state.allocator();
-    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const dir = try std.fmt.allocPrint(a, "{s}", .{tmp.path});
     const sha = "1111111111111111111111111111111111111111";
     // The lines Zig's runner prints when it is not on a terminal: a test's number and name, what the test printed, then
     // OK or SKIP. These skips come from `test_skip.skipNeeding`, so the marker is the helper's own text.

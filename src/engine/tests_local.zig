@@ -282,10 +282,10 @@ test "windowed re-encode writes the same bytes at every parallelism" {
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
 
     // "ts >= 500" prunes two row groups, filters one and byte-copies the rest; "x > 0" re-encodes all eight.
     for ([_][]const u8{ "ts >= 500", "x > 0" }) |filter| {
@@ -311,12 +311,12 @@ test "windowed re-encode writes the same bytes at every parallelism" {
 test "a single-turn re-encode keeps its output window within max-memory" {
     const fixture = "ci/fixtures/parquet/repeat_keys.parquet";
     const gpa = std.heap.smp_allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
-    var input_buf: [96]u8 = undefined;
-    const delta = try std.fmt.bufPrint(&input_buf, ".zig-cache/tmp/{s}/delta.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
+    var input_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const delta = try std.fmt.bufPrint(&input_buf, "{s}/delta.parquet", .{tmp.path});
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
     var prepared = try runQuery(ctx, .{
         .inputs = &.{fixture},
@@ -365,20 +365,20 @@ test "a row query prints the same bytes at every parallelism, in every text form
 
     // One 1600-row row group beside 1-row ones: a budget that runs producers over the small ones leaves the big one to
     // the writer, which prints it a slice at a time, as -j1 does.
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var big_buf: [96]u8 = undefined;
-    var small_buf: [96]u8 = undefined;
-    const big = try std.fmt.bufPrint(&big_buf, ".zig-cache/tmp/{s}/big.parquet", .{tmp.sub_path});
-    const small = try std.fmt.bufPrint(&small_buf, ".zig-cache/tmp/{s}/small.parquet", .{tmp.sub_path});
+    var big_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var small_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const big = try std.fmt.bufPrint(&big_buf, "{s}/big.parquet", .{tmp.path});
+    const small = try std.fmt.bufPrint(&small_buf, "{s}/small.parquet", .{tmp.path});
     for ([_]struct { []const u8, ?[]const u8, usize }{ .{ big, null, 1600 }, .{ small, "ts < 12", 1 } }) |w| {
         var r = try runQuery(ctx, .{ .inputs = &.{full}, .output = w[0], .filter = w[1], .row_group = .{ .rows = w[2] } });
         r.deinit(gpa);
     }
     // A STRING value that is not UTF-8 fails as it prints, after the bytes before it: the first `next` is a value
     // of the uncompressed column `s`, its first byte made one no UTF-8 has.
-    var bad_buf: [96]u8 = undefined;
-    const bad = try std.fmt.bufPrint(&bad_buf, ".zig-cache/tmp/{s}/bad_utf8.parquet", .{tmp.sub_path});
+    var bad_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const bad = try std.fmt.bufPrint(&bad_buf, "{s}/bad_utf8.parquet", .{tmp.path});
     {
         const bytes = try metadata.readFileSlice(escape, gpa);
         defer gpa.free(bytes);
@@ -459,10 +459,10 @@ test "a recompressing copy writes the same bytes at every parallelism and reads 
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
     const agg = "count(*) AS n, sum(x) AS sx, max(s) AS ms, sum(ts) AS st";
 
     var want = try runQuery(ctx, .{ .inputs = &.{fixture}, .aggregate = agg });
@@ -542,13 +542,13 @@ test "a recompressing copy drops page-index offsets that are not its chunk's, in
     try file.appendSlice(a, &len_le);
     try file.appendSlice(a, "PAR1");
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var in_buf: [96]u8 = undefined;
-    const in = try std.fmt.bufPrint(&in_buf, ".zig-cache/tmp/{s}/in.parquet", .{tmp.sub_path});
+    var in_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const in = try std.fmt.bufPrint(&in_buf, "{s}/in.parquet", .{tmp.path});
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = in, .data = file.items });
-    var out_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&out_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var out_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&out_buf, "{s}/out.parquet", .{tmp.path});
 
     var r = try runQuery(ctx, .{ .inputs = &.{in}, .output = out, .codec = .ZSTD });
     r.deinit(gpa);
@@ -626,10 +626,10 @@ test "a select output naming one column twice is rejected and named, like aggreg
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
 
     const Case = struct { select: []const u8, column: []const u8 };
     const cases = [_]Case{
@@ -837,10 +837,10 @@ test "a profiled write records encode and sink spans and reconciles with its tim
     const fixture = "ci/fixtures/parquet/full_match.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
 
     for ([_][]const u8{ "x > 0", "ts >= 500" }) |filter| {
         const p = try profile.Profiler.create(gpa, .{ .sample_interval_ns = 0 }, .{});
@@ -903,10 +903,10 @@ test "a write builds the Bloom filters asked for, in re-encoded and copied row g
     const fixture = "ci/fixtures/parquet/bloom_keys.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
 
     // `id >= 2` re-encodes row group 0 (it holds id 0) and copies the rest, which carry `id` and `s` filters of their
     // own; `cat` and `x` have none anywhere. The bytes must not depend on parallelism.
@@ -977,10 +977,10 @@ test "regression: an input with no row groups first keeps the re-encode guards o
     std.Io.Dir.cwd().access(std.testing.io, dir ++ "empty_first.parquet", .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
 
     // A LIST column re-encoded drops its repetition levels: refused, as it is for the second input alone.
     try std.testing.expectError(error.NestedReencodeNotSupported, runQuery(ctx, .{
@@ -1011,10 +1011,10 @@ test "regression: inputs whose legacy DECIMAL scales differ are refused on every
     std.Io.Dir.cwd().access(std.testing.io, dir ++ "legacy_decimal_s2.parquet", .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
     const inputs: []const []const u8 = &.{ dir ++ "legacy_decimal_s2.parquet", dir ++ "legacy_decimal_s4.parquet" };
 
     const refused = [_]QueryArgs{
@@ -1034,12 +1034,12 @@ test "a byte copy writes every ColumnIndex, then every OffsetIndex, after its ro
     const dir = "ci/fixtures/parquet/";
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     const in = dir ++ "filtered_records_ordered.parquet";
     std.Io.Dir.cwd().access(std.testing.io, in, .{}) catch return error.SkipZigTest;
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
     const shapes = [_]QueryArgs{
         .{ .inputs = &.{in}, .output = out, .row_group = .{ .rows = 1 } },
         .{ .inputs = &.{in}, .output = out, .columns = &.{ "rid", "k" }, .row_group = .{ .rows = 1 } },
@@ -1095,10 +1095,10 @@ test "a byte-copy concatenation names the input and column whose schema differs"
     std.Io.Dir.cwd().access(std.testing.io, dir ++ "legacy_decimal_s2.parquet", .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
     const inputs: []const []const u8 = &.{
         dir ++ "legacy_decimal_s2.parquet",
         dir ++ "legacy_decimal_s2.parquet",
@@ -1118,14 +1118,14 @@ test "a byte-copy concatenation keeps every input's chunks verbatim, aligned, it
     const dir = "ci/fixtures/parquet/";
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     for ([_][]const u8{ "filtered_records_ordered.parquet", "bloom_keys.parquet" }) |name| {
         var in_buf: [96]u8 = undefined;
         const in = try std.fmt.bufPrint(&in_buf, "{s}{s}", .{ dir, name });
         std.Io.Dir.cwd().access(std.testing.io, in, .{}) catch return error.SkipZigTest;
-        var path_buf: [96]u8 = undefined;
-        const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const out = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ tmp.path, name });
         var r = try runQuery(ctx, .{ .inputs = &.{ in, in, in }, .output = out, .row_group = .{ .rows = 1 } });
         r.deinit(gpa);
         var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -1310,10 +1310,10 @@ test "regression: an INT96 past what 64-bit nanoseconds hold reads, compares and
         }
     }
     // Written out, an INT96 key stays an INT64 TIMESTAMP(NANOS) where 64 bits hold it, and is refused where not.
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var obuf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&obuf, ".zig-cache/tmp/{s}/keys.parquet", .{tmp.sub_path});
+    var obuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&obuf, "{s}/keys.parquet", .{tmp.path});
     const y1: []const []const u8 = &.{dir ++ "int96_year1.parquet"};
     try std.testing.expectError(error.Int96OutOfRange, runQuery(ctx, .{
         .inputs = y1,
@@ -1343,10 +1343,10 @@ test "regression: aggregate output writes a computed string key or min/max as ST
     std.Io.Dir.cwd().access(std.testing.io, escape, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var obuf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&obuf, ".zig-cache/tmp/{s}/answer.parquet", .{tmp.sub_path});
+    var obuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&obuf, "{s}/answer.parquet", .{tmp.path});
     const Want = enum { text, bytes };
     const Leaf = struct { []const u8, Want };
     // Grouped (as rows, and as the CLI's typed answer) and one-row answers: the computed strings `k` and `m` were
@@ -1511,12 +1511,12 @@ test "regression: a DELTA_BYTE_ARRAY value of another length than its FIXED_LEN_
 test "regression: the local reader reads the file mapped, even once another is renamed over its path" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "mapped local reads");
     const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrintSentinel(&buf, ".zig-cache/tmp/{s}/f.parquet", .{tmp.sub_path}, 0);
-    var obuf: [256]u8 = undefined;
-    const other = try std.fmt.bufPrintSentinel(&obuf, ".zig-cache/tmp/{s}/g.parquet", .{tmp.sub_path}, 0);
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&buf, "{s}/f.parquet", .{tmp.path}, 0);
+    var obuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const other = try std.fmt.bufPrintSentinel(&obuf, "{s}/g.parquet", .{tmp.path}, 0);
     const first = "PAR1 the file mapped PAR1";
     for ([_]local_reader.Mode{ .pread, .uring }) |mode| {
         for ([_][:0]const u8{ path, other }, [_][]const u8{ first, "PAR1 its replacement PAR1" }) |p, text| {
@@ -1568,7 +1568,7 @@ test "regression: more local inputs than the open-file limit allows still answer
     const gpa = std.testing.allocator;
     const bytes = try metadata.readFileSlice(fixture, gpa);
     defer gpa.free(bytes);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1576,7 +1576,7 @@ test "regression: more local inputs than the open-file limit allows still answer
     const n = 300;
     const paths = try arena.alloc([]const u8, n);
     for (paths, 0..) |*p, i| {
-        p.* = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/f{d}.parquet", .{ tmp.sub_path, i });
+        p.* = try std.fmt.allocPrint(arena, "{s}/f{d}.parquet", .{ tmp.path, i });
         const fd = try local_fs.createFile(p.*);
         defer local_fs.close(fd);
         try local_fs.writeAll(fd, bytes);
@@ -1700,10 +1700,10 @@ test "regression: a write recompressing a page past its chunk refuses it, as a r
     std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var buf: [256]u8 = undefined;
-    const out = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&buf, "{s}/out.parquet", .{tmp.path});
     // Its one page claims 1 GiB in a chunk the footer gives 32 KiB: the byte copy decompressed it whole to recompress
     // it, at any budget, serially or a page per worker.
     for ([_]schema.CompressionCodec{ .SNAPPY, .UNCOMPRESSED }) |codec| for ([_]usize{ 1, 3 }) |j| {
@@ -1748,10 +1748,10 @@ test "every write path records a row group's uncompressed bytes as its total_byt
     const fixture = "ci/fixtures/parquet/bloom_keys.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
     const gpa = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
     const Case = struct {
         filter: ?[]const u8 = null,
         columns: ?[]const []const u8 = null,
@@ -1795,11 +1795,11 @@ test "a join whose group-join the budget refuses frees what it allocated, reques
     const gpa = std.testing.allocator;
     const sql_parser = @import("../core/expr/sql_parser.zig");
     const engine_join = @import("join.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     try std.Io.Dir.cwd().copyFile(fact, tmp.dir, "dim.parquet", std.testing.io, .{});
-    var path_buf: [96]u8 = undefined;
-    const dim = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/dim.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dim = try std.fmt.bufPrint(&path_buf, "{s}/dim.parquet", .{tmp.path});
     // 100 sums over 1600 slots: the build fits half a megabyte, the group-join's slots do not.
     var sql: std.ArrayList(u8) = .empty;
     defer sql.deinit(gpa);
@@ -1840,13 +1840,13 @@ test "concurrent builds the budget refuses at any point free what they allocated
     const gpa = std.testing.allocator;
     const sql_parser = @import("../core/expr/sql_parser.zig");
     const engine_join = @import("join.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     try std.Io.Dir.cwd().copyFile(dim_src, tmp.dir, "dim.parquet", std.testing.io, .{});
     try std.Io.Dir.cwd().copyFile(dim_src, tmp.dir, "dim2.parquet", std.testing.io, .{});
-    var path_buf: [2][96]u8 = undefined;
-    const dim = try std.fmt.bufPrint(&path_buf[0], ".zig-cache/tmp/{s}/dim.parquet", .{tmp.sub_path});
-    const dim2 = try std.fmt.bufPrint(&path_buf[1], ".zig-cache/tmp/{s}/dim2.parquet", .{tmp.sub_path});
+    var path_buf: [2][std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dim = try std.fmt.bufPrint(&path_buf[0], "{s}/dim.parquet", .{tmp.path});
+    const dim2 = try std.fmt.bufPrint(&path_buf[1], "{s}/dim2.parquet", .{tmp.path});
     var sql: std.ArrayList(u8) = .empty;
     defer sql.deinit(gpa);
     try sql.print(gpa, "SELECT d.s, sum(e.x) AS sx, count(*) AS n FROM '{s}' c JOIN '{s}' d ON c.v = d.ts " ++
@@ -1894,7 +1894,7 @@ test "a group-join whose scan fails leaks nothing, request after request" {
     const gpa = std.testing.allocator;
     const sql_parser = @import("../core/expr/sql_parser.zig");
     const engine_join = @import("join.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     try std.Io.Dir.cwd().copyFile(fact, tmp.dir, "dim.parquet", std.testing.io, .{});
     // The probe: the same file with row group 0's first page of `b` unreadable.
@@ -1909,9 +1909,9 @@ test "a group-join whose scan fails leaks nothing, request after request" {
         @memset(bytes[at..][0..16], 0xff);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fact.parquet", .data = bytes });
     }
-    var path_buf: [2][96]u8 = undefined;
-    const probe = try std.fmt.bufPrint(&path_buf[0], ".zig-cache/tmp/{s}/fact.parquet", .{tmp.sub_path});
-    const dim = try std.fmt.bufPrint(&path_buf[1], ".zig-cache/tmp/{s}/dim.parquet", .{tmp.sub_path});
+    var path_buf: [2][std.Io.Dir.max_path_bytes]u8 = undefined;
+    const probe = try std.fmt.bufPrint(&path_buf[0], "{s}/fact.parquet", .{tmp.path});
+    const dim = try std.fmt.bufPrint(&path_buf[1], "{s}/dim.parquet", .{tmp.path});
     const sql = try std.fmt.allocPrint(gpa, "SELECT f.ts, sum(f.b) AS s, count(*) AS n FROM '{s}' f JOIN '{s}' d ON f.ts = d.ts GROUP BY f.ts", .{ probe, dim });
     defer gpa.free(sql);
     for ([_]usize{ 1, 4, 8, 8, 8, 8 }) |jobs| {

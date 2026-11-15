@@ -668,12 +668,12 @@ test "every write reads back whole, holding what an unbounded run writes, throug
     const mixed = metadata.readFileSlice("ci/fixtures/parquet/mixed_codec.parquet", gpa) catch return error.SkipZigTest;
     defer gpa.free(mixed);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const dir = try std.fmt.allocPrint(a, "{s}", .{tmp.path});
     const out = try std.fmt.allocPrint(a, "{s}/out.parquet", .{dir});
 
     // The tiny row groups again, with Bloom filters on two columns written after the last row group.
@@ -964,10 +964,10 @@ test "a recompressing S3 copy whose ranged read stalls writes the same bytes as 
     const gpa = std.testing.allocator;
     const bytes = metadata.readFileSlice("ci/fixtures/parquet/mixed_codec.parquet", gpa) catch return error.SkipZigTest;
     defer gpa.free(bytes);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1079,12 +1079,12 @@ test "a windowed row print waits for a row group left to its writer, and fails w
     const gpa = std.testing.allocator;
     const full = "ci/fixtures/parquet/full_match.parquet";
     std.Io.Dir.cwd().access(std.testing.io, full, .{}) catch return error.SkipZigTest;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var big_buf: [96]u8 = undefined;
-    var small_buf: [96]u8 = undefined;
-    const big_path = try std.fmt.bufPrint(&big_buf, ".zig-cache/tmp/{s}/big.parquet", .{tmp.sub_path});
-    const small_path = try std.fmt.bufPrint(&small_buf, ".zig-cache/tmp/{s}/small.parquet", .{tmp.sub_path});
+    var big_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var small_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const big_path = try std.fmt.bufPrint(&big_buf, "{s}/big.parquet", .{tmp.path});
+    const small_path = try std.fmt.bufPrint(&small_buf, "{s}/small.parquet", .{tmp.path});
     const local: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
     // A select re-encodes the big one into one row group, uncompressed so its column chunks are ranges of their own.
     {
@@ -1182,10 +1182,10 @@ test "every S3 write path writes the same bytes through a window as with everyth
     try fake.serveBytes("t/a.parquet", bytes);
     try fake.serveBytes("t/b.parquet", bytes);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [96]u8 = undefined;
-    const out = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/out.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const out = try std.fmt.bufPrint(&path_buf, "{s}/out.parquet", .{tmp.path});
 
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();

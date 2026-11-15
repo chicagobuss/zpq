@@ -919,10 +919,10 @@ test "aggregate drains retain input-change precedence over a later write error" 
     const a = std.testing.allocator;
     const bytes = try metadata.readFileSlice("ci/fixtures/parquet/full_match.parquet", a);
     defer a.free(bytes);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
     defer tmp.cleanup();
-    var path_buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/changed.parquet", .{tmp.sub_path});
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/changed.parquet", .{tmp.path});
     const Callback = struct {
         path: []const u8,
         failure: anyerror,

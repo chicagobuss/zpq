@@ -129,6 +129,7 @@ pub const Error = error{
     S3ServerError,
     S3RequestFailed,
     DirectoryBucketInvalidPrefix,
+    DirectoryBucketOperationUnsupported,
 } || tls.Error || http.Error || std.mem.Allocator.Error;
 
 pub const Range = struct {
@@ -1559,7 +1560,13 @@ pub fn refusal(op: diag_mod.S3Failure.Op, bucket: []const u8, key: []const u8, r
     if (resp.header("x-amz-bucket-region")) |region| failure.region.set(std.mem.trim(u8, region, " \t\r\n"));
 
     const redirect = resp.status == 301 or resp.status == 307 or resp.status == 308;
-    const err: Error = if (redirect or std.mem.eql(u8, code_raw, "AuthorizationHeaderMalformed") or
+    const unsupported = directoryBucketZone(bucket) != null and
+        (std.mem.eql(u8, code_raw, "NotImplemented") or std.mem.eql(u8, code_raw, "UnsupportedOperation") or
+            (std.mem.eql(u8, code_raw, "InvalidRequest") and
+                (std.mem.indexOf(u8, message_raw, "not supported") != null or std.mem.indexOf(u8, message_raw, "Not supported") != null)));
+    const err: Error = if (unsupported)
+        error.DirectoryBucketOperationUnsupported
+    else if (redirect or std.mem.eql(u8, code_raw, "AuthorizationHeaderMalformed") or
         std.mem.eql(u8, code_raw, "PermanentRedirect") or std.mem.eql(u8, code_raw, "TemporaryRedirect"))
         error.WrongRegion
     else if (std.mem.eql(u8, code_raw, "NoSuchKey"))
@@ -2426,6 +2433,16 @@ test "S3 Express errors redact the session used by the request" {
     try testing.expectEqual(error.AccessDenied, result.err);
     try testing.expectEqualStrings("[redacted] [redacted] [redacted]", result.failure.message.get());
     try testing.expectEqualStrings("AccessDenied", result.failure.code.get());
+}
+
+test "S3 Express unsupported operations retain the AWS error type" {
+    const creds: Credentials = .{ .access_key = "ak", .secret_key = "sk", .region = "us-west-2" };
+    const response: http.Response = .{ .status = 501, .headers = &.{}, .body = "<Error><Code>NotImplemented</Code><Message>not supported</Message></Error>" };
+    const result = refusal(.GetObject, "test--usw2-az1--x-s3", "file", response, creds);
+    try testing.expectEqual(error.DirectoryBucketOperationUnsupported, result.err);
+    try testing.expectEqualStrings("NotImplemented", result.failure.code.get());
+    try testing.expectEqualStrings("test--usw2-az1--x-s3", result.failure.bucket.get());
+    try testing.expectEqualStrings("file", result.failure.key.get());
 }
 
 test "S3 redirects never forward credentials to another host or scheme" {

@@ -35,10 +35,10 @@ zpq fanout --function zpq-worker:7 --workers 32 \
 ```
 
 Repeat `--endpoint http://host:port` to distribute invocations among local Lambda endpoints. A base URL gets the
-Lambda Invoke path; a URL with a path uses that path verbatim. Local endpoint requests are unsigned by default. Use `--sign-endpoints` with dummy environment credentials to exercise SigV4 against a local emulator. AWS Invoke uses
-the same HTTP/TLS pool and SigV4 signer as S3, with the Lambda service name. Function ARNs preserve the account;
-qualifiers stay attached to every request. AWS mode requires `--region` or `AWS_REGION` / `AWS_DEFAULT_REGION` and
-execution-role credentials in the environment.
+Lambda Invoke path; a URL with a path uses that path verbatim. Local endpoint requests are unsigned unless
+`--sign-endpoints` is given (with dummy environment credentials, to exercise SigV4 against an emulator). AWS Invoke
+uses the same HTTP/TLS pool and SigV4 signer as S3; function ARNs and qualifiers are preserved. AWS mode requires
+`--region` or `AWS_REGION` / `AWS_DEFAULT_REGION` and execution-role credentials in the environment.
 
 COUNT, SUM, MIN, MAX and AVG merge with or without GROUP BY. AVG stays sum/count until finalization. Numeric sums
 use checked decimal arithmetic and refuse overflow. Worker responses must agree on schema, plan and merge metadata.
@@ -64,8 +64,8 @@ partial rows are consumed by the coordinator and omitted from its response.
 Pass a join description in `--request` (or the coordinator event's `request`). By default the coordinator tries
 aligned splits: a worker prepares disjoint key ranges from the fact and build footers, then each worker reads and
 joins the row groups overlapping its range. Both sides filter to that range, so keys shared at row-group boundaries
-belong to one worker. No rows move between workers. This permits ordered fact/fact joins such as PDS-H
-lineitem/orders on orderkey, with replicated small dimensions beside or beneath the aligned build.
+belong to one worker and no rows move between workers. This permits ordered fact/fact joins such as PDS-H
+lineitem/orders on orderkey, with replicated small dimensions beside the aligned build.
 
 ```json
 {"inputs":["s3://bucket/facts.parquet"],"aggregate":"count(*) AS n, sum(amount) AS total","group_by":"region","join":{"kind":"inner","fk":"customer_id","build":{"path":"s3://bucket/customers.parquet","key":"id","columns":["region"]}}}
@@ -81,21 +81,20 @@ alignment report `footer_ms:null`; direct replicated and non-join splits retain 
 
 The fact inputs must be explicit S3 paths; joins with glob inputs are refused. Every build input must also be S3.
 Inner and left joins require unique build keys; semi joins test membership, and anti joins use `NOT IN` NULL
-semantics. Keys must use the engine's integer-compatible key types. String and composite keys are not supported.
-The existing join description also accepts stars and nested dimensions. Each auxiliary replicated build must fit its
-cap; an aligned main edge does not make an oversized auxiliary dimension eligible. String and composite alignment,
-unsorted large builds and exchange joins require another execution strategy.
+semantics. Keys must use the engine's integer-compatible key types; string and composite keys are not supported.
+Stars and nested dimensions are accepted, and each auxiliary replicated build must fit its cap even beside an aligned
+main edge.
 
 The worker fetches only the build columns it needs. Replicated source buffers and lookup storage together share the
-smaller of 64 MiB and one eighth of its query memory budget. This cap applies to retained projected bytes, rather
-than the physical object's size. The aligned main slice uses the query budget; all nested replicated dimensions
-still share the smaller cap. A build that does not fit fails with `JoinBuildExceedsBudget`.
+smaller of 64 MiB and one eighth of its query memory budget, counted in retained projected bytes rather than the
+object's size. The aligned main slice uses the query budget. A build that does not fit fails with
+`JoinBuildExceedsBudget`.
 
 Each source needs a strong ETag. Planned generations are checked before column fetching and pinned with `If-Match`
 on ranged reads; a mismatch fails with `AlignedJoinSnapshotChanged`. Workers also agree on build snapshots, fact
 schema and the common query before physical key restrictions. The versioned `partial_join_aggregate` and
 `partial_aligned_join_aggregate` operations make older workers refuse before input I/O. Immutable qualified workers
-cache positive capability acknowledgements. There is no shuffle, exchange pass or separate transport protocol.
+cache positive capability acknowledgements. There is no shuffle or exchange pass.
 
 S3 access: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION` (on Lambda, the execution
 role's). `S3_`-prefixed variables of the same names, plus `S3_ENDPOINT_URL`, take precedence and target S3-compatible

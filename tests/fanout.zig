@@ -77,6 +77,16 @@ const Fixture = struct {
         }
         try self.pool.init(a);
     }
+    /// Workers that read objects from `store` with fake credentials.
+    fn startS3(self: *Fixture, scratch: std.mem.Allocator, store: *const fake.FakeS3) !void {
+        return self.startWithEnv(&.{
+            .{ "S3_ENDPOINT_URL", try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}", .{store.port}) },
+            .{ "S3_ACCESS_KEY_ID", "fake" },
+            .{ "S3_SECRET_ACCESS_KEY", "fake" },
+            .{ "S3_REGION", "us-east-1" },
+            .{ "ZPQ_S3_PRECONNECT", "0" },
+        });
+    }
     fn stopWorkers(self: *Fixture) void {
         for (self.workers[0..self.started]) |*w| w.stop();
         self.arena.deinit();
@@ -142,6 +152,16 @@ const cases = [_]Case{
     .{ .inputs = &.{grouped}, .aggregate = "count(*) AS c, sum(i) AS si, min(x) AS mx, max(i) AS xi, avg(x) AS ax", .group_by = "k" },
     .{ .inputs = &.{ grouped, grouped }, .aggregate = "count(*) AS c, sum(x) AS sx, avg(i) AS ai", .group_by = "k AS key", .filter = "i > 5000" },
 };
+/// DuckDB's `-json` stdout for `script`, run single-threaded under a 1GB cap; any failure is `OracleFailed`.
+fn duckdb(scratch: std.mem.Allocator, script: []const u8) ![]const u8 {
+    const full_script = try std.mem.concat(scratch, u8, &.{ "SET memory_limit='1GB'; SET threads=1; ", script });
+    const result = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-json", "-c", full_script } });
+    if (result.term != .exited or result.term.exited != 0) {
+        std.debug.print("duckdb: {s}\n", .{result.stderr});
+        return error.OracleFailed;
+    }
+    return result.stdout;
+}
 fn request(scratch: std.mem.Allocator, c: Case) !V {
     return zpq.engine.fanout.parse(scratch, try std.json.Stringify.valueAlloc(scratch, c, .{ .emit_null_optional_fields = false }));
 }
@@ -157,16 +177,11 @@ fn oracleWithOrder(scratch: std.mem.Allocator, c: Case, suffix: []const u8) !V {
     }
     try names.append(scratch, ']');
     // GROUP BY aliases belong in SELECT; DuckDB accepts GROUP BY ALL for these aggregate-only requests.
-    const sql = try std.fmt.allocPrint(scratch, "SET memory_limit='1GB'; SET threads=1; SELECT {s}{s}{s} FROM read_parquet({s}) {s}{s} {s} {s};", .{
+    const sql = try std.fmt.allocPrint(scratch, "SELECT {s}{s}{s} FROM read_parquet({s}) {s}{s} {s} {s};", .{
         if (c.group_by != null) c.group_by.? else "", if (c.group_by != null) "," else "", c.aggregate,                                    names.items,
         if (c.filter != null) "WHERE " else "",       c.filter orelse "",                  if (c.group_by != null) "GROUP BY ALL" else "", suffix,
     });
-    const result = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-json", "-c", sql } });
-    if (result.term != .exited or result.term.exited != 0) {
-        std.debug.print("oracle: {s}\n", .{result.stderr});
-        return error.OracleFailed;
-    }
-    return zpq.engine.fanout.parse(scratch, result.stdout);
+    return zpq.engine.fanout.parse(scratch, try duckdb(scratch, sql));
 }
 
 test "fanout parity: eight query shapes, wrong counts, globs, real Invoke and DuckDB" {
@@ -379,11 +394,7 @@ test "fanout parity: grouped AVG orders ASC and DESC with NULL last against Duck
     try std.Io.Dir.cwd().createDirPath(io, "zig-out");
     const path = try zpq.test_scratch.filePath(scratch, "zig-out/fanout-avg-order.parquet");
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    const made = try std.process.run(scratch, io, .{ .argv = &.{
-        opts.duckdb,                                                                                                                                                                                                                                       "-no-init", "-c",
-        try std.mem.concat(scratch, u8, &.{ "SET memory_limit='1GB'; SET threads=1; COPY (SELECT i%3 AS k, ", "CASE WHEN i%3=2 THEN NULL ELSE i%2+10*(i%3) END AS x FROM range(6144) t(i)) ", "TO '", path, "' (FORMAT PARQUET, ROW_GROUP_SIZE 2048);" }),
-    } });
-    if (made.term != .exited or made.term.exited != 0) return error.OracleFailed;
+    _ = try duckdb(scratch, try std.mem.concat(scratch, u8, &.{ "COPY (SELECT i%3 AS k, ", "CASE WHEN i%3=2 THEN NULL ELSE i%2+10*(i%3) END AS x FROM range(6144) t(i)) ", "TO '", path, "' (FORMAT PARQUET, ROW_GROUP_SIZE 2048);" }));
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
@@ -484,8 +495,7 @@ test "fanout parity: schema disagreement and plan version refusals before I/O" {
     const big = try zpq.test_scratch.filePath(scratch, "zig-out/fanout-schema-big.parquet");
     defer std.Io.Dir.cwd().deleteFile(io, dec) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, big) catch {};
-    const made = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-c", try std.mem.concat(scratch, u8, &.{ "SET memory_limit='1GB'; SET threads=1; COPY (SELECT 1.00::DECIMAL(15,2) AS x) TO '", dec, "' (FORMAT parquet); COPY (SELECT 1::BIGINT AS x) TO '", big, "' (FORMAT parquet);" }) } });
-    if (made.term != .exited or made.term.exited != 0) return error.OracleFailed;
+    _ = try duckdb(scratch, try std.mem.concat(scratch, u8, &.{ "COPY (SELECT 1.00::DECIMAL(15,2) AS x) TO '", dec, "' (FORMAT parquet); COPY (SELECT 1::BIGINT AS x) TO '", big, "' (FORMAT parquet);" }));
     const mixed = try request(scratch, .{ .inputs = &.{ dec, big }, .aggregate = "count(*) AS c", .group_by = "x" });
     for ([_]?[]const u64{ null, &.{ 1, 1 }, &.{ 1, 0 } }) |hint| {
         try std.testing.expectError(error.SchemaMismatch, zpq.engine.fanout.run(scratch, a, client.transport(), mixed, .{ .workers = 2, .concurrency = 4, .counts = hint }));
@@ -522,21 +532,14 @@ test "fanout joins: bounded replicated S3 dimensions, inner left semi anti, gene
     const dim = try zpq.test_scratch.filePath(scratch, "zig-out/fanout-join-dimension.parquet");
     defer std.Io.Dir.cwd().deleteFile(io, fact) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, dim) catch {};
-    const made = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-c", try std.mem.concat(scratch, u8, &.{ "SET memory_limit='1GB'; SET threads=1; COPY (SELECT i::BIGINT AS id, CASE WHEN i%64=0 THEN NULL ELSE (i%4)::BIGINT END AS fk, i::BIGINT AS amount FROM range(8192) t(i)) TO '", fact, "' (FORMAT parquet, ROW_GROUP_SIZE 2048); COPY (SELECT k::BIGINT AS dim_key, 'r'||k AS region FROM range(3) t(k)) TO '", dim, "' (FORMAT parquet);" }) } });
-    if (made.term != .exited or made.term.exited != 0) return error.OracleFailed;
+    _ = try duckdb(scratch, try std.mem.concat(scratch, u8, &.{ "COPY (SELECT i::BIGINT AS id, CASE WHEN i%64=0 THEN NULL ELSE (i%4)::BIGINT END AS fk, i::BIGINT AS amount FROM range(8192) t(i)) TO '", fact, "' (FORMAT parquet, ROW_GROUP_SIZE 2048); COPY (SELECT k::BIGINT AS dim_key, 'r'||k AS region FROM range(3) t(k)) TO '", dim, "' (FORMAT parquet);" }));
     const fact_bytes = try fake.paddedParquet(scratch, fact, 2 << 20);
     const dim_bytes = try std.Io.Dir.cwd().readFileAlloc(io, dim, scratch, .limited(64 << 20));
     var store: fake.FakeS3 = undefined;
     try store.startPair(fact_bytes, dim_bytes, 0);
     defer store.deinit();
     var fixture: Fixture = undefined;
-    try fixture.startWithEnv(&.{
-        .{ "S3_ENDPOINT_URL", try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}", .{store.port}) },
-        .{ "S3_ACCESS_KEY_ID", "fake" },
-        .{ "S3_SECRET_ACCESS_KEY", "fake" },
-        .{ "S3_REGION", "us-east-1" },
-        .{ "ZPQ_S3_PRECONNECT", "0" },
-    });
+    try fixture.startS3(scratch, &store);
     defer fixture.stop();
     var client = fixture.client();
     for ([_][]const u8{ "inner", "left", "semi", "anti" }) |kind| {
@@ -569,21 +572,17 @@ test "fanout joins: bounded replicated S3 dimensions, inner left semi anti, gene
             try std.testing.expect(try numeric(try get(pool, "ttfb_ms_sum")) >= try numeric(try get(pool, "ttfb_ms_max")));
         }
         const sql = if (std.mem.eql(u8, kind, "anti"))
-            try std.fmt.allocPrint(scratch, "SET memory_limit='1GB'; SET threads=1; SELECT fk, count(*) AS c, sum(amount) AS s, avg(amount) AS a FROM read_parquet('{s}') WHERE fk NOT IN (SELECT dim_key FROM read_parquet('{s}')) GROUP BY ALL;", .{ fact, dim })
+            try std.fmt.allocPrint(scratch, "SELECT fk, count(*) AS c, sum(amount) AS s, avg(amount) AS a FROM read_parquet('{s}') WHERE fk NOT IN (SELECT dim_key FROM read_parquet('{s}')) GROUP BY ALL;", .{ fact, dim })
         else
-            try std.fmt.allocPrint(scratch, "SET memory_limit='1GB'; SET threads=1; SELECT {s}, count(*) AS c, sum(amount) AS s, avg(amount) AS a FROM read_parquet('{s}') f {s} JOIN read_parquet('{s}') d ON f.fk=d.dim_key GROUP BY ALL;", .{ if (simple) "fk" else "region", fact, kind, dim });
-        const reference = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-json", "-c", sql } });
-        if (reference.term != .exited or reference.term.exited != 0) return error.OracleFailed;
-        try std.testing.expect(same(try get(out, "agg"), try zpq.engine.fanout.parse(scratch, reference.stdout)));
+            try std.fmt.allocPrint(scratch, "SELECT {s}, count(*) AS c, sum(amount) AS s, avg(amount) AS a FROM read_parquet('{s}') f {s} JOIN read_parquet('{s}') d ON f.fk=d.dim_key GROUP BY ALL;", .{ if (simple) "fk" else "region", fact, kind, dim });
+        try std.testing.expect(same(try get(out, "agg"), try zpq.engine.fanout.parse(scratch, try duckdb(scratch, sql))));
         if (!simple) {
             var filtered = req;
             filtered.object = try req.object.clone(scratch);
             try filtered.object.put(scratch, "filter", .{ .string = "region = 'r1'" });
             const filtered_out = try zpq.engine.fanout.run(scratch, a, client.transport(), filtered, .{ .workers = 4, .concurrency = 4 });
-            const filtered_sql = try std.fmt.allocPrint(scratch, "SET memory_limit='1GB'; SET threads=1; SELECT region,count(*) AS c,sum(amount) AS s,avg(amount) AS a FROM read_parquet('{s}') f {s} JOIN read_parquet('{s}') d ON f.fk=d.dim_key WHERE region='r1' GROUP BY ALL;", .{ fact, kind, dim });
-            const filtered_ref = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-json", "-c", filtered_sql } });
-            if (filtered_ref.term != .exited or filtered_ref.term.exited != 0) return error.OracleFailed;
-            try std.testing.expect(same(try get(filtered_out, "agg"), try zpq.engine.fanout.parse(scratch, filtered_ref.stdout)));
+            const filtered_sql = try std.fmt.allocPrint(scratch, "SELECT region,count(*) AS c,sum(amount) AS s,avg(amount) AS a FROM read_parquet('{s}') f {s} JOIN read_parquet('{s}') d ON f.fk=d.dim_key WHERE region='r1' GROUP BY ALL;", .{ fact, kind, dim });
+            try std.testing.expect(same(try get(filtered_out, "agg"), try zpq.engine.fanout.parse(scratch, try duckdb(scratch, filtered_sql))));
         }
         if (std.mem.eql(u8, kind, "inner")) {
             var automatic = req;
@@ -644,27 +643,18 @@ test "fanout joins: bounded replicated S3 dimensions, inner left semi anti, gene
     }
     const dim_null = try zpq.test_scratch.filePath(scratch, "zig-out/fanout-join-dimension-null.parquet");
     defer std.Io.Dir.cwd().deleteFile(io, dim_null) catch {};
-    const null_made = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-c", try std.mem.concat(scratch, u8, &.{ "SET memory_limit='1GB'; SET threads=1; COPY (SELECT k::BIGINT AS dim_key FROM range(3) t(k) UNION ALL SELECT NULL::BIGINT) TO '", dim_null, "' (FORMAT parquet);" }) } });
-    if (null_made.term != .exited or null_made.term.exited != 0) return error.OracleFailed;
+    _ = try duckdb(scratch, try std.mem.concat(scratch, u8, &.{ "COPY (SELECT k::BIGINT AS dim_key FROM range(3) t(k) UNION ALL SELECT NULL::BIGINT) TO '", dim_null, "' (FORMAT parquet);" }));
     var null_store: fake.FakeS3 = undefined;
     try null_store.startPair(fact_bytes, try std.Io.Dir.cwd().readFileAlloc(io, dim_null, scratch, .limited(64 << 20)), 0);
     defer null_store.deinit();
     var null_fixture: Fixture = undefined;
-    try null_fixture.startWithEnv(&.{
-        .{ "S3_ENDPOINT_URL", try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}", .{null_store.port}) },
-        .{ "S3_ACCESS_KEY_ID", "fake" },
-        .{ "S3_SECRET_ACCESS_KEY", "fake" },
-        .{ "S3_REGION", "us-east-1" },
-        .{ "ZPQ_S3_PRECONNECT", "0" },
-    });
+    try null_fixture.startS3(scratch, &null_store);
     defer null_fixture.stop();
     var null_client = null_fixture.client();
     const null_req = try zpq.engine.fanout.parse(scratch, "{\"inputs\":[\"s3://test/fact.parquet\"],\"aggregate\":\"count(*) AS n\",\"group_by\":\"fk\",\"join\":{\"kind\":\"anti\",\"fk\":\"fk\",\"build\":{\"path\":\"s3://test/dimension.parquet\",\"key\":\"dim_key\"}}}");
     const null_out = try zpq.engine.fanout.run(scratch, a, null_client.transport(), null_req, .{ .workers = 4, .concurrency = 4 });
     try std.testing.expectEqual(0, (try get(null_out, "agg")).array.items.len);
-    const null_ref = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-json", "-c", try std.mem.concat(scratch, u8, &.{ "SET memory_limit='1GB'; SET threads=1; SELECT count(*) AS n FROM read_parquet('", fact, "') WHERE fk NOT IN (SELECT dim_key FROM read_parquet('", dim_null, "'));" }) } });
-    if (null_ref.term != .exited or null_ref.term.exited != 0) return error.OracleFailed;
-    const null_reference = try zpq.engine.fanout.parse(scratch, null_ref.stdout);
+    const null_reference = try zpq.engine.fanout.parse(scratch, try duckdb(scratch, try std.mem.concat(scratch, u8, &.{ "SELECT count(*) AS n FROM read_parquet('", fact, "') WHERE fk NOT IN (SELECT dim_key FROM read_parquet('", dim_null, "'));" })));
     try std.testing.expectEqual(@as(f64, 0), try numeric(try get(null_reference.array.items[0], "n")));
 }
 
@@ -677,8 +667,7 @@ test "fanout aligned joins: boundaries, both sides split, oversized source, smal
     const dim = try zpq.test_scratch.filePath(scratch, "zig-out/fanout-aligned-build.parquet");
     defer std.Io.Dir.cwd().deleteFile(io, fact) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, dim) catch {};
-    const made = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-c", try std.mem.concat(scratch, u8, &.{ "SET memory_limit='1GB'; SET threads=1; COPY (SELECT (i//3-4096)::BIGINT AS fk, i::BIGINT AS amount FROM range(24576) t(i)) TO '", fact, "' (FORMAT parquet, ROW_GROUP_SIZE 2048); COPY (SELECT (k-4096)::BIGINT AS dim_key, 'r'||(k%3) AS bucket FROM range(8192) t(k) WHERE k%5<>0) TO '", dim, "' (FORMAT parquet, ROW_GROUP_SIZE 2048);" }) } });
-    if (made.term != .exited or made.term.exited != 0) return error.OracleFailed;
+    _ = try duckdb(scratch, try std.mem.concat(scratch, u8, &.{ "COPY (SELECT (i//3-4096)::BIGINT AS fk, i::BIGINT AS amount FROM range(24576) t(i)) TO '", fact, "' (FORMAT parquet, ROW_GROUP_SIZE 2048); COPY (SELECT (k-4096)::BIGINT AS dim_key, 'r'||(k%3) AS bucket FROM range(8192) t(k) WHERE k%5<>0) TO '", dim, "' (FORMAT parquet, ROW_GROUP_SIZE 2048);" }));
     const fact_bytes = try fake.paddedParquet(scratch, fact, 2 << 20);
     const dimension = try fake.paddedParquet(scratch, dim, (64 << 20) + 4096);
     const small = try std.Io.Dir.cwd().readFileAlloc(io, dim, scratch, .limited(1 << 20));
@@ -686,13 +675,7 @@ test "fanout aligned joins: boundaries, both sides split, oversized source, smal
     try store.startTriple(fact_bytes, dimension, small, 0);
     defer store.deinit();
     var fixture: Fixture = undefined;
-    try fixture.startWithEnv(&.{
-        .{ "S3_ENDPOINT_URL", try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}", .{store.port}) },
-        .{ "S3_ACCESS_KEY_ID", "fake" },
-        .{ "S3_SECRET_ACCESS_KEY", "fake" },
-        .{ "S3_REGION", "us-east-1" },
-        .{ "ZPQ_S3_PRECONNECT", "0" },
-    });
+    try fixture.startS3(scratch, &store);
     defer fixture.stop();
     var client = fixture.client();
     for ([_][]const u8{ "inner", "left", "semi", "anti" }) |kind| {
@@ -708,14 +691,13 @@ test "fanout aligned joins: boundaries, both sides split, oversized source, smal
             try std.fmt.allocPrint(scratch, "SELECT fk,count(*) AS c,sum(amount) AS s,avg(amount) AS a FROM '{s}' WHERE fk NOT IN (SELECT dim_key FROM '{s}') GROUP BY ALL", .{ fact, dim })
         else
             try std.fmt.allocPrint(scratch, "SELECT {s},count(*) AS c,sum(amount) AS s,avg(amount) AS a FROM '{s}' f {s} JOIN '{s}' d ON f.fk=d.dim_key GROUP BY ALL", .{ if (simple) "fk" else "bucket", fact, kind, dim });
-        const reference = try std.process.run(scratch, io, .{ .argv = &.{ opts.duckdb, "-no-init", "-json", "-c", try std.fmt.allocPrint(scratch, "SET memory_limit='1GB'; SET threads=1; {s}", .{sql}) } });
-        if (reference.term != .exited or reference.term.exited != 0) return error.OracleFailed;
-        const expected = try zpq.engine.fanout.parse(scratch, reference.stdout);
+        const reference = try duckdb(scratch, sql);
+        const expected = try zpq.engine.fanout.parse(scratch, reference);
         for ([_]usize{ 1, 3, 8 }) |workers| {
             const out = try zpq.engine.fanout.run(scratch, a, client.transport(), req, .{ .workers = workers, .concurrency = 4, .counts = &.{1} });
             try std.testing.expectEqualStrings("aligned", (try get(out, "protocol")).string);
             if (!same(try get(out, "agg"), expected)) {
-                std.debug.print("aligned {s} N{d}: {s}\nexpected: {s}\n", .{ kind, workers, try std.json.Stringify.valueAlloc(scratch, out, .{}), reference.stdout });
+                std.debug.print("aligned {s} N{d}: {s}\nexpected: {s}\n", .{ kind, workers, try std.json.Stringify.valueAlloc(scratch, out, .{}), reference });
                 return error.AlignedAnswerMismatch;
             }
         }

@@ -361,6 +361,13 @@ pub fn slotsFor(j: *const Join, fk: filter_eval.Batch.Column, sel: *const select
 /// FK is not NULL and has none, and no row when a build key was NULL (SQL's `NOT IN`); LEFT every row. With `capture`
 /// (one entry per row of `sel`), the selected rows' slots stay there for the columns published later.
 pub fn narrow(j: *const Join, fk: filter_eval.Batch.Column, sel: *selection.SelectionVector, a: std.mem.Allocator, capture: ?[]u32) filter_eval.Error!void {
+    if (j.keys == .dense and (j.kind == .inner or j.kind == .semi)) switch (fk) {
+        inline .i32, .i64 => |c| if (c.codes == null) {
+            narrowDense(j.keys.dense, c, sel, capture);
+            return;
+        },
+        else => {},
+    };
     if (j.kind == .anti) {
         // `x NOT IN (...)` is UNKNOWN against a NULL in the list, and TRUE for every x, NULL too, against no row.
         if (j.null_key) @memset(sel.mask, 0);
@@ -382,6 +389,24 @@ pub fn narrow(j: *const Join, fk: filter_eval.Batch.Column, sel: *selection.Sele
             };
             if (drop) w.* &= ~(@as(u64, 1) << @intCast(r & 63));
         }
+    }
+}
+
+/// A plain dense probe can narrow each selection word while capturing its slots. No temporary slot array or
+/// second row pass is needed; inactive rows stay untouched, as in `slotsOf`.
+fn narrowDense(d: Dense, c: anytype, sel: *selection.SelectionVector, capture: ?[]u32) void {
+    const T = @TypeOf(c.values[0]);
+    for (sel.mask, 0..) |*word, wi| {
+        var bits = word.*;
+        var kept = bits;
+        while (bits != 0) : (bits &= bits - 1) {
+            const bit: u6 = @intCast(@ctz(bits));
+            const r = wi * 64 + bit;
+            const at = if (keyAt(T, c, r)) |key| d.slot(key) orelse EMPTY else EMPTY;
+            if (capture) |out| out[r] = at;
+            kept &= ~(@as(u64, @intFromBool(at == EMPTY)) << bit);
+        }
+        word.* = kept;
     }
 }
 
@@ -1922,6 +1947,48 @@ pub const GroupJoin = struct {
         return out;
     }
 };
+
+test "plain dense join narrows and captures NULLs, misses, prior selections and a short last word" {
+    const a = std.testing.allocator;
+    var bits = [_]u64{0b100101};
+    var rank = [_]u32{0};
+    inline for (.{ i32, i64 }) |T| {
+        var vals: [73]T = undefined;
+        var defs: [73]u32 = undefined;
+        for (&vals, &defs, 0..) |*v, *d, i| {
+            v.* = @as(T, @intCast(i % 9)) - 1;
+            d.* = @intFromBool(i % 5 != 0);
+        }
+        const tag = if (T == i32) "i32" else "i64";
+        const fk: filter_eval.Batch.Column = @unionInit(filter_eval.Batch.Column, tag, .{
+            .values = &vals,
+            .def_levels = &defs,
+            .max_def = 1,
+        });
+        for ([_]Kind{ .inner, .semi }) |kind| for ([_]bool{ false, true }) |capturing| {
+            const j: Join = .{
+                .kind = kind,
+                .build_name = "dim",
+                .key_name = "pk",
+                .n = 3,
+                .keys = .{ .dense = .{ .lo = 0, .bits = &bits, .rank = &rank } },
+                .payloads = &.{},
+                .bytes = 0,
+            };
+            var sel = try selection.SelectionVector.init(a, vals.len);
+            defer sel.deinit();
+            for (0..vals.len) |i| if (i % 7 == 0) sel.set(i, false);
+            var at: [73]u32 = @splat(12345);
+            try narrow(&j, fk, &sel, a, if (capturing) &at else null);
+            for (vals, defs, 0..) |v, d, i| {
+                const slot: u32 = if (v == 0) 0 else if (v == 2) 1 else if (v == 5) 2 else EMPTY;
+                const wanted = if (d == 0) EMPTY else slot;
+                try std.testing.expectEqual(i % 7 != 0 and wanted != EMPTY, sel.isActive(i));
+                if (capturing) try std.testing.expectEqual(if (i % 7 == 0) @as(u32, 12345) else wanted, at[i]);
+            }
+        };
+    }
+}
 
 test "an aborted scan frees the later row groups' partials waiting on it (review R10)" {
     const a = std.testing.allocator;

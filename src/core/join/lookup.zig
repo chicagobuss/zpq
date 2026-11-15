@@ -68,6 +68,7 @@ pub const Payload = struct {
 
     pub const Locator = struct { rg: u32, row: u32 };
     pub const Deferred = struct {
+        scratch: std.mem.Allocator,
         bytes: []const u8,
         meta: *const schema.FileMetaData,
         leaf: usize,
@@ -408,7 +409,7 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
         const vals = try a.alloc([]const u8, sel.len);
         @memset(vals, "");
         for (d.meta.row_groups.items, 0..) |*rg, ri| {
-            var scratch: std.heap.ArenaAllocator = .init(a);
+            var scratch: std.heap.ArenaAllocator = .init(d.scratch);
             defer scratch.deinit();
             const sa = scratch.allocator();
             var gate = try selection.SelectionVector.init(sa, @intCast(rg.num_rows));
@@ -1216,7 +1217,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
         const element = @import("../parquet/metadata.zig").leafSchemaElement(meta, leaf).?;
         if (spec.defers(pi)) {
             cs.* = .{ .identity = n };
-            out.* = .{ .name = element.name, .element = element, .codes = cs.*, .dict = .{ .string = &.{} }, .deferred = .{ .bytes = bytes, .meta = meta, .leaf = leaf, .rows = locators } };
+            out.* = .{ .name = element.name, .element = element, .codes = cs.*, .dict = .{ .string = &.{} }, .deferred = .{ .scratch = gpa, .bytes = bytes, .meta = meta, .leaf = leaf, .rows = locators } };
             continue;
         }
         if (is_plain) {
@@ -1300,16 +1301,19 @@ pub fn fetch(ctx: *const anyopaque, p: usize, key: i64, a: std.mem.Allocator) an
     const payload = j.payloads[p];
     const code = payload.codes.get(s);
     if (payload.deferred) |d| {
+        var scratch: std.heap.ArenaAllocator = .init(d.scratch);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
         const loc = d.rows[code];
         const rg = &d.meta.row_groups.items[loc.rg];
-        var gate = try selection.SelectionVector.init(a, @intCast(rg.num_rows));
+        var gate = try selection.SelectionVector.init(sa, @intCast(rg.num_rows));
         gate.clearAll();
         gate.set(loc.row, true);
         const cm = rg.columns.items[d.leaf].meta_data orelse return error.ColumnMetaMissing;
         const levels = d.meta.getColumnLevels(cm.path_in_schema.items);
         const options = column_mod.chunkOptions(.{ .row_gate = &gate }, d.meta, cm);
-        const col = try @import("../consumer/column.zig").decodeColumnTWithOptions([]const u8, a, try chunkOf(d.bytes, cm), cm.codec, levels, gate.len, options);
-        return .{ .bytes = col.values[loc.row] };
+        const col = try @import("../consumer/column.zig").decodeColumnTWithOptions([]const u8, sa, try chunkOf(d.bytes, cm), cm.codec, levels, gate.len, options);
+        return .{ .bytes = try a.dupe(u8, col.values[loc.row]) };
     }
     return switch (payload.dict) {
         .i32 => |d| .{ .int = d[code] },

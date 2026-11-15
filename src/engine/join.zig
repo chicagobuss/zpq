@@ -823,7 +823,7 @@ pub fn replicaFingerprint(p: *const Prepared, schema_fingerprint: [16]u8) [16]u8
 }
 
 // Only bare, functionally dependent group keys can bypass the scan. Expressions and predicates keep
-// their eager payloads, including their decode errors. Optional and nested columns keep that path too.
+// their eager payloads. Deferred optional columns still validate their definition levels during the build.
 fn deferredPayloads(a: std.mem.Allocator, query: ?*const syntax.Query, b: syntax.Build, fk: []const u8, meta: *const schema.FileMetaData, payload: []const usize) ![]const bool {
     const q = query orelse return &.{};
     const keys = q.keys orelse return &.{};

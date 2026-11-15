@@ -839,6 +839,7 @@ fn deferredPayloads(a: std.mem.Allocator, query: ?*const syntax.Query, b: syntax
     for (b.columns, payload, out) |name, leaf, *deferred| {
         const e = metadata.leafSchemaElement(meta, leaf) orelse continue;
         if (e.type != .BYTE_ARRAY or e.repetition_type == .REPEATED) continue;
+        if ((e.effectiveLogicalType() orelse continue) != .STRING) continue;
         const bare = for (keys) |k| {
             if (k.expr == .column and std.ascii.eqlIgnoreCase(k.expr.column, name)) break true;
         } else false;

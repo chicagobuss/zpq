@@ -409,9 +409,11 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
     if (payload.deferred) |d| {
         const vals = try a.alloc([]const u8, sel.len);
         @memset(vals, "");
+        var scratch: std.heap.ArenaAllocator = .init(d.scratch);
+        defer scratch.deinit();
         for (d.meta.row_groups.items, 0..) |*rg, ri| {
-            var scratch: std.heap.ArenaAllocator = .init(d.scratch);
-            defer scratch.deinit();
+            // Kept strings have already moved into `a`; recycle page/value storage across source groups.
+            defer _ = scratch.reset(.retain_capacity);
             const sa = scratch.allocator();
             var gate = try selection.SelectionVector.init(sa, @intCast(rg.num_rows));
             gate.clearAll();

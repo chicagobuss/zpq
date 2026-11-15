@@ -394,6 +394,11 @@ pub const Prepared = struct {
         return self.charge.refusal(err);
     }
 
+    /// Deferred build strings are read at the result cut, after `build` checked its file: one changed since refuses.
+    pub fn intact(self: *const Prepared) error{InputChanged}!void {
+        for (self.tasks) |t| for (t.maps.items) |h| try h.map.intact(h.path);
+    }
+
     /// Everything the join holds goes back: a group-join whose rows were not taken (an explained or failed query),
     /// the builds, their mappings.
     pub fn release(self: *Prepared) void {
@@ -524,7 +529,7 @@ const Task = struct {
     aligned: ?types.AlignedJoin = null,
     opened: std.ArrayList(input.OpenedInputs) = .empty,
     aligned_source_bytes: usize = 0,
-    maps: std.ArrayList(local_fs.Mapped) = .empty,
+    maps: std.ArrayList(struct { map: local_fs.Mapped, path: []const u8 }) = .empty,
     charged: usize = 0,
     diag: Diag = .{},
     leaf: Leaf = undefined,
@@ -541,7 +546,7 @@ const Task = struct {
         for (t.opened.items) |*opened| opened.deinit();
         t.aligned_store.deinit();
         t.store.deinit();
-        for (t.maps.items) |m| m.unmap();
+        for (t.maps.items) |h| h.map.unmap();
         t.arena.deinit();
     }
 };
@@ -557,7 +562,7 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: 
         Diag.setInput(diag, b.path, err);
         return err;
     };
-    if (file.map) |m| t.maps.appendAssumeCapacity(m);
+    if (file.map) |m| t.maps.appendAssumeCapacity(.{ .map = m, .path = b.path });
     const meta = try arena.create(schema.FileMetaData);
     meta.* = file.meta;
     const filter_syntax = if (aligned) |selection| try fanout_plan.intervalFilter(arena, b.filter, b.key, selection.low, selection.high) else b.filter;
@@ -910,4 +915,27 @@ fn deferredSyntax(source: plans.Source) ?*const syntax.Query {
     // general grouping tables can turn an admitted bounded-memory query into a refusal.
     for (keys) |k| if (k.expr == .column and std.ascii.eqlIgnoreCase(k.expr.column, j.fk)) return null;
     return q;
+}
+
+test "a build file rewritten after its build refuses at the result cut" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "Windows disallows truncating a mapped file");
+    var tmp = @import("../test_scratch.zig").tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/build.parquet", .{tmp.path});
+    var fd = try local_fs.createFile(path);
+    try local_fs.writeAll(fd, "PAR1 the build as it was read PAR1");
+    local_fs.close(fd);
+    var task: Task = undefined;
+    task.maps = .empty;
+    defer task.maps.deinit(std.testing.allocator);
+    try task.maps.append(std.testing.allocator, .{ .map = try local_fs.mapFile(path), .path = path });
+    defer task.maps.items[0].map.unmap();
+    var p: Prepared = undefined;
+    p.tasks = (&task)[0..1];
+    try p.intact();
+    fd = try local_fs.createFile(path);
+    try local_fs.writeAll(fd, "PAR1 rewritten PAR1");
+    local_fs.close(fd);
+    try std.testing.expectError(error.InputChanged, p.intact());
 }

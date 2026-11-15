@@ -348,7 +348,7 @@ fn executeAggregateOver(
         .footer_only = explain or empty_result,
     });
     defer opened.deinit();
-    errdefer changed.* = !opened.whole();
+    errdefer changed.* = !opened.whole() or if (joined) |j| std.meta.isError(j.intact()) else false;
     const t_open_end = nowMonoNs();
     t.read_ns = @intCast(t_open_end - t_open);
     profile.record(prof, .open_inputs, t_open, t_open_end, profile.args(.{args.inputs.len}));
@@ -596,6 +596,7 @@ pub fn answerAggregate(
     try program.finish(ctx.gpa, &r.output, &r.state.group_col_types);
     if (trace_tail) tail_start = traceTail("result program", tail_start);
     if (late) try fetchAfterCut(ctx.gpa, &r.output, program);
+    if (args.join) |j| try j.intact();
     if (trace_tail) _ = traceTail("fetch after cut", tail_start);
     const text_kinds = try answerTextKinds(ctx.gpa, r.output, r.state, args.output == null, args.diag);
     errdefer ctx.gpa.free(text_kinds);

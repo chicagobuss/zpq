@@ -40,6 +40,15 @@ pub const AcquireOptions = struct {
     fresh: bool = false,
 };
 
+pub const S3Observation = struct {
+    get: bool = false,
+    head: bool = false,
+    bytes: u64 = 0,
+    ttfb_ns: u64 = 0,
+    retry_status: u16 = 0,
+    slow_down: bool = false,
+};
+
 pub const Criteria = struct {
     host: []const u8,
     /// The host's addresses. New connections start at each in turn, so a pool spreads over all of them: S3's DNS
@@ -120,6 +129,42 @@ pub fn Pool(comptime N: usize) type {
             max_idle_ns: u64 = 0,
             acquire_wait_ns: u64 = 0,
             acquire_lock_ns: u64 = 0,
+            get_requests: u64 = 0,
+            head_requests: u64 = 0,
+            bytes_fetched: u64 = 0,
+            retry_http_408: u64 = 0,
+            retry_http_429: u64 = 0,
+            retry_http_500: u64 = 0,
+            retry_http_502: u64 = 0,
+            retry_http_503: u64 = 0,
+            retry_http_504: u64 = 0,
+            retry_http_other: u64 = 0,
+            last_retry_status: u16 = 0,
+            slow_down_retries: u64 = 0,
+            tls_handshake_ns_sum: u64 = 0,
+            tls_handshake_ns_max: u64 = 0,
+            ttfb_ns_sum: u64 = 0,
+            ttfb_ns_max: u64 = 0,
+
+            pub fn observeS3(self: *Stats, sample: S3Observation) void {
+                self.get_requests += @intFromBool(sample.get);
+                self.head_requests += @intFromBool(sample.head);
+                self.bytes_fetched +|= sample.bytes;
+                self.ttfb_ns_sum +|= sample.ttfb_ns;
+                self.ttfb_ns_max = @max(self.ttfb_ns_max, sample.ttfb_ns);
+                if (sample.retry_status == 0) return;
+                self.last_retry_status = sample.retry_status;
+                self.slow_down_retries += @intFromBool(sample.slow_down);
+                switch (sample.retry_status) {
+                    408 => self.retry_http_408 += 1,
+                    429 => self.retry_http_429 += 1,
+                    500 => self.retry_http_500 += 1,
+                    502 => self.retry_http_502 += 1,
+                    503 => self.retry_http_503 += 1,
+                    504 => self.retry_http_504 += 1,
+                    else => self.retry_http_other += 1,
+                }
+            }
         };
 
         allocator: std.mem.Allocator,
@@ -254,12 +299,15 @@ pub fn Pool(comptime N: usize) type {
             const host_owned = try self.allocator.dupe(u8, criteria.host);
             errdefer self.allocator.free(host_owned);
 
+            var handshake: tls.HandshakeTiming = .{};
+            defer self.noteHandshake(io, handshake);
             const peer: tls.Peer = .{
                 .addrs = criteria.addrs,
                 .first = first_addr,
                 .port = criteria.port,
                 .timeouts = criteria.timeouts,
                 .deadline_ms = criteria.deadline_ms,
+                .handshake_timing = &handshake,
             };
             const conn = if (criteria.use_tls)
                 try tls.Connection.connect(self.allocator, peer, criteria.host)
@@ -334,6 +382,20 @@ pub fn Pool(comptime N: usize) type {
                 },
                 .fatal => {},
             }
+        }
+
+        pub fn noteS3(self: *Self, io: Io, sample: S3Observation) void {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.stats.observeS3(sample);
+        }
+
+        fn noteHandshake(self: *Self, io: Io, timing: tls.HandshakeTiming) void {
+            if (timing.sum_ns == 0) return;
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.stats.tls_handshake_ns_sum +|= timing.sum_ns;
+            self.stats.tls_handshake_ns_max = @max(self.stats.tls_handshake_ns_max, timing.max_ns);
         }
 
         pub fn snapshotStats(self: *Self) Stats {
@@ -411,11 +473,14 @@ pub fn Pool(comptime N: usize) type {
         }
 
         fn finishPreconnect(self: *Self, slot: *PreSlot) void {
+            var handshake: tls.HandshakeTiming = .{};
+            defer self.noteHandshake(slot.io, handshake);
             const peer: tls.Peer = .{
                 .addrs = slot.addrs,
                 .port = slot.port,
                 .timeouts = slot.timeouts,
                 .deadline_ms = slot.deadline_ms,
+                .handshake_timing = &handshake,
             };
             const conn = if (slot.use_tls)
                 tls.Connection.connect(self.allocator, peer, slot.host) catch return
@@ -478,6 +543,7 @@ pub const AnyPool = struct {
         release: *const fn (*anyopaque, Io, Handle) void,
         discard: *const fn (*anyopaque, Io, Handle) void,
         noteRetry: *const fn (*anyopaque, Io, retry.Failure) void,
+        noteS3: *const fn (*anyopaque, Io, S3Observation) void,
     };
 
     pub fn of(p: anytype) AnyPool {
@@ -511,6 +577,11 @@ pub const AnyPool = struct {
                         typed(ptr).noteRetry(io, failure);
                     }
                 }.f,
+                .noteS3 = struct {
+                    fn f(ptr: *anyopaque, io: Io, sample: S3Observation) void {
+                        typed(ptr).noteS3(io, sample);
+                    }
+                }.f,
             };
         };
         return .{ .ptr = @ptrCast(p), .vtable = &gen.vtable };
@@ -527,6 +598,9 @@ pub const AnyPool = struct {
     }
     pub fn noteRetry(self: AnyPool, io: Io, failure: retry.Failure) void {
         self.vtable.noteRetry(self.ptr, io, failure);
+    }
+    pub fn noteS3(self: AnyPool, io: Io, sample: S3Observation) void {
+        self.vtable.noteS3(self.ptr, io, sample);
     }
 };
 
@@ -571,10 +645,43 @@ pub fn Lane(comptime P: type, comptime M: usize) type {
         pub fn noteRetry(self: *Self, io: Io, failure: retry.Failure) void {
             self.pool.noteRetry(io, failure);
         }
+        pub fn noteS3(self: *Self, io: Io, sample: S3Observation) void {
+            self.pool.noteS3(io, sample);
+        }
     };
 }
 
 const testing = std.testing;
+
+test "pool: fixed S3 counters and handshake summaries forward through erased views and reset" {
+    const P = Pool(2);
+    var p: P = undefined;
+    try p.init(testing.allocator);
+    defer p.deinit();
+    const any = AnyPool.of(&p);
+    any.noteS3(testing.io, .{ .get = true, .bytes = 5, .ttfb_ns = 7 });
+    var lane: Lane(P, 1) = undefined;
+    lane.init(&p);
+    lane.noteS3(testing.io, .{ .head = true, .ttfb_ns = 3 });
+    any.noteS3(testing.io, .{ .retry_status = 503, .slow_down = true });
+    any.noteS3(testing.io, .{ .retry_status = 599 });
+    p.noteHandshake(testing.io, .{ .sum_ns = 8, .max_ns = 5 });
+    p.noteHandshake(testing.io, .{ .sum_ns = 4, .max_ns = 4 });
+    const s = p.snapshotStats();
+    try testing.expectEqual(@as(u64, 1), s.get_requests);
+    try testing.expectEqual(@as(u64, 1), s.head_requests);
+    try testing.expectEqual(@as(u64, 5), s.bytes_fetched);
+    try testing.expectEqual(@as(u64, 10), s.ttfb_ns_sum);
+    try testing.expectEqual(@as(u64, 7), s.ttfb_ns_max);
+    try testing.expectEqual(@as(u64, 12), s.tls_handshake_ns_sum);
+    try testing.expectEqual(@as(u64, 5), s.tls_handshake_ns_max);
+    try testing.expectEqual(@as(u64, 1), s.retry_http_503);
+    try testing.expectEqual(@as(u64, 1), s.slow_down_retries);
+    try testing.expectEqual(@as(u64, 1), s.retry_http_other);
+    try testing.expectEqual(@as(u16, 599), s.last_retry_status);
+    p.resetStats();
+    try testing.expectEqualDeep(P.Stats{}, p.snapshotStats());
+}
 
 /// A listening localhost socket: plain connections to it complete in the kernel backlog without an `accept`.
 const TestListenerFd = if (@import("builtin").os.tag == .windows) usize else std.posix.fd_t;

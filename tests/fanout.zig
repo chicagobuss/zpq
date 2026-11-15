@@ -187,6 +187,11 @@ test "fanout parity: eight query shapes, wrong counts, globs, real Invoke and Du
             @memset(counts, 3);
             for ([_]?[]const u64{ null, counts }) |hint| {
                 const out = try zpq.engine.fanout.run(scratch, a, client.transport(), req, .{ .workers = workers, .concurrency = 4, .counts = hint });
+                for ((try get(out, "worker_stats")).array.items) |stat| {
+                    const pool = try get(stat, "pool");
+                    for ([_][]const u8{ "get_requests", "head_requests", "bytes_fetched", "tls_handshake_ms_sum", "ttfb_ms_sum" }) |key|
+                        try std.testing.expectEqual(@as(f64, 0), try numeric(try get(pool, key)));
+                }
                 const agg = try get(out, "agg");
                 const whole_agg = try get(whole, "agg");
                 const expected = if (c.group_by == null) ref.array.items[0] else ref;
@@ -556,6 +561,15 @@ test "fanout joins: bounded replicated S3 dimensions, inner left semi anti, gene
             return error.WorkerJoinFailed;
         }
         const out = try zpq.engine.fanout.run(scratch, a, client.transport(), req, .{ .workers = 4, .concurrency = 4 });
+        for ((try get(out, "worker_stats")).array.items) |stat| {
+            const pool = try get(stat, "pool");
+            try std.testing.expect(try numeric(try get(pool, "get_requests")) > 0);
+            try std.testing.expect(try numeric(try get(pool, "bytes_fetched")) > 0);
+            try std.testing.expectEqual(@as(f64, 0), try numeric(try get(pool, "head_requests")));
+            try std.testing.expectEqual(@as(f64, 0), try numeric(try get(pool, "tls_handshake_ms_sum")));
+            try std.testing.expect(try numeric(try get(pool, "ttfb_ms_max")) > 0);
+            try std.testing.expect(try numeric(try get(pool, "ttfb_ms_sum")) >= try numeric(try get(pool, "ttfb_ms_max")));
+        }
         const sql = if (std.mem.eql(u8, kind, "anti"))
             try std.fmt.allocPrint(scratch, "SET memory_limit='1GB'; SET threads=1; SELECT fk, count(*) AS c, sum(amount) AS s, avg(amount) AS a FROM read_parquet('{s}') WHERE fk NOT IN (SELECT dim_key FROM read_parquet('{s}')) GROUP BY ALL;", .{ fact, dim })
         else

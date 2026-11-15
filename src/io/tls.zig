@@ -264,6 +264,16 @@ pub const ClientContext = boring.tls_client.ClientContext;
 /// An IPv4 address, in network byte order.
 pub const Ipv4 = [4]u8;
 
+/// One synchronous connect's handshake samples, including failed and certificate-fallback attempts.
+pub const HandshakeTiming = struct {
+    sum_ns: u64 = 0,
+    max_ns: u64 = 0,
+    fn record(self: *HandshakeTiming, ns: u64) void {
+        self.sum_ns +|= ns;
+        self.max_ns = @max(self.max_ns, ns);
+    }
+};
+
 /// Where to connect: a host's IPv4 addresses, tried from `first` on (wrapping) until one accepts the TCP connection.
 /// A refused, unreachable or silent address (`Timeouts.connect_ms`) only costs a failed connect, which is the whole
 /// of the fallback: there is no racing. `deadline_ms`, when set, is one absolute bound over every address and over
@@ -276,6 +286,7 @@ pub const Peer = struct {
     timeouts: Timeouts = .{},
     /// Absolute millisecond deadline (`monoMs`) for this whole connect. Null: each stage uses only its own cap.
     deadline_ms: ?u64 = null,
+    handshake_timing: ?*HandshakeTiming = null,
 
     pub fn loopback(port: u16) Peer {
         return .{ .addrs = &.{.{ 127, 0, 0, 1 }}, .port = port };
@@ -423,6 +434,8 @@ pub const Connection = struct {
         var opts: SockTimeouts = .{};
         const budget = stageBudget(peer.timeouts.handshake_ms, peer.deadline_ms, peer.timeouts.clock_ms);
         if (peer.deadline_ms != null and budget == 0) return error.HandshakeTimeout;
+        const handshake_started = clock.monoNs();
+        defer if (peer.handshake_timing) |timing| timing.record(@intCast(@max(0, clock.monoNs() - handshake_started)));
         handshake(fd, &tls, budget, &opts) catch |err| {
             if (log_rejection and err == error.CertificateRejected) {
                 const reason = boring.tls.c.X509_verify_cert_error_string(boring.tls.c.SSL_get_verify_result(tls.ssl));
@@ -1356,9 +1369,13 @@ test "a TLS handshake the server never answers fails within its timeout, as a re
 
     var peer: Peer = .loopback(server.port);
     peer.timeouts = short;
+    var timing: HandshakeTiming = .{};
+    peer.handshake_timing = &timing;
     const t0 = monoMs();
     const got = Connection.connectWithContext(testing.allocator, &context, peer, "mute.test");
     try testing.expectError(error.HandshakeTimeout, got);
+    try testing.expect(timing.sum_ns > 0);
+    try testing.expectEqual(timing.sum_ns, timing.max_ns);
     try testing.expect(sinceMs(t0) < 2_000);
     try testing.expectEqual(retry.Failure.transient, retry.classifyConnect(error.HandshakeTimeout));
 }

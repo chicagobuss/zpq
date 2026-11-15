@@ -627,6 +627,7 @@ pub fn getViaPoolWithOpts(
     const tag: [2]u64 = if (r) |rr| (if (is_suffix) .{ 0, rr.end } else .{ rr.start, rr.end + 1 }) else .{ 0, 0 };
     return requestViaPool(io, p, arena, criteria, .{
         .idempotent = true,
+        .method = .GET,
         .prof = opts.prof,
         .tag = tag,
         .bytes = bytes,
@@ -634,6 +635,8 @@ pub fn getViaPoolWithOpts(
 }
 
 pub const RequestOpts = struct {
+    /// HTTP attempts counted after acquiring a connection; null for unclassified control operations.
+    method: ?http.Method = null,
     /// See `retry.Request.idempotent`; decides whether a dead pooled connection is retried at once or fails the
     /// request.
     idempotent: bool,
@@ -704,6 +707,8 @@ pub fn requestViaPool(
     defer trace.end();
     while (true) {
         var last_err: anyerror = error.RetryableStatus;
+        var retry_status: u16 = 0;
+        var slow_down = false;
         const failure: retry.Failure = blk: {
             const t_acquire = clock.monoNs();
             trace.attempts +|= 1;
@@ -720,6 +725,12 @@ pub fn requestViaPool(
                     const d = out.first_byte_ns - t_send;
                     if (d > 0) out.ttfb_ns = d;
                 }
+                p.noteS3(io, .{
+                    .get = opts.method == .GET,
+                    .head = opts.method == .HEAD,
+                    .bytes = if (opts.method == .HEAD) 0 else out.body.len,
+                    .ttfb_ns = @intCast(@max(0, out.ttfb_ns)),
+                });
                 if (opts.prof != null) {
                     const t_done = clock.monoNs();
                     const first = if (out.first_byte_ns != 0) out.first_byte_ns else t_done;
@@ -730,9 +741,13 @@ pub fn requestViaPool(
                     trace.body_ns = t_done - first;
                 }
                 if (!retry.retryableStatus(out.status)) return out;
+                retry_status = out.status;
+                const code = out.header("x-amz-error-code") orelse extractTag(out.body, "<Code>", "</Code>") orelse "";
+                slow_down = std.mem.eql(u8, std.mem.trim(u8, code, " \t\r\n"), "SlowDown");
                 throttled = out;
                 break :blk .transient;
             } else |err| {
+                p.noteS3(io, .{ .get = opts.method == .GET, .head = opts.method == .HEAD });
                 p.discard(io, handle);
                 last_err = err;
                 break :blk retry.classify(err, .{ .idempotent = opts.idempotent, .reused = handle.reused });
@@ -745,6 +760,7 @@ pub fn requestViaPool(
             return last_err;
         }
         p.noteRetry(io, failure);
+        if (retry_status != 0) p.noteS3(io, .{ .retry_status = retry_status, .slow_down = slow_down });
     }
 }
 
@@ -1093,6 +1109,7 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
     };
     const opts: RequestOpts = .{
         .idempotent = true,
+        .method = .GET,
         .prof = profile.threadOf(ctx.profiler, .fetch),
         .tag = .{ ctx.range.start, ctx.range.end },
         .bytes = ctx.target.len,
@@ -1904,6 +1921,7 @@ const ScriptedPool = struct {
     fresh_requests: usize = 0,
     stale_retries: usize = 0,
     backoff_retries: usize = 0,
+    telemetry: Pool(1).Stats = .{},
     slots: [8]Slot = undefined,
 
     fn deinit(self: *ScriptedPool) void {
@@ -1948,10 +1966,40 @@ const ScriptedPool = struct {
             .fatal => {},
         }
     }
+    pub fn noteS3(self: *ScriptedPool, _: Io, sample: pool_mod.S3Observation) void {
+        self.telemetry.observeS3(sample);
+    }
 };
 
 const test_creds: Credentials = .{ .access_key = "ak", .secret_key = "sk", .region = "us-east-1", .endpoint = "http://127.0.0.1:9" };
 const ok_206 = "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 0-1/2\r\n\r\nok";
+
+test "s3 telemetry counts GET attempts, SlowDown, HEAD bodies and completed-response first bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const body = "<Error><Code>SlowDown</Code></Error>";
+    const slow = try std.fmt.allocPrint(a, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    var p: ScriptedPool = .{ .steps = &.{
+        .{ .live = .{ .reused = true, .response = slow } },
+        .{ .live = .{ .reused = true, .response = ok_206 } },
+        .{ .live = .{ .reused = true, .response = "HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n" } },
+    } };
+    defer p.deinit();
+    _ = try getViaPool(testing.io, &p, a, test_creds, .{ .bucket = "b", .key = "k" }, Range.span(0, 1));
+    const Head = struct {
+        fn send(_: void, alloc: std.mem.Allocator, conn: *tls.Connection) !http.Response {
+            return http.sendRequest(alloc, conn, .{ .method = .HEAD, .host = "b", .path = "/k", .headers = &.{} });
+        }
+    };
+    _ = try requestViaPool(testing.io, &p, a, .{ .host = "b", .addrs = &.{}, .port = 9 }, .{ .idempotent = true, .method = .HEAD }, {}, Head.send);
+    try testing.expectEqual(@as(u64, 2), p.telemetry.get_requests);
+    try testing.expectEqual(@as(u64, 1), p.telemetry.head_requests);
+    try testing.expectEqual(@as(u64, body.len + 2), p.telemetry.bytes_fetched);
+    try testing.expectEqual(@as(u64, 1), p.telemetry.retry_http_503);
+    try testing.expectEqual(@as(u64, 1), p.telemetry.slow_down_retries);
+    try testing.expect(p.telemetry.ttfb_ns_max > 0 and p.telemetry.ttfb_ns_sum >= p.telemetry.ttfb_ns_max);
+}
 
 test "getViaPool retries a connection that fails its handshake, including the fresh one after a stale failure" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1971,6 +2019,7 @@ test "getViaPool retries a connection that fails its handshake, including the fr
     try testing.expectEqual(@as(usize, 1), p.stale_retries);
     try testing.expectEqual(@as(usize, 1), p.backoff_retries);
     try testing.expectEqual(@as(usize, 1), p.fresh_requests);
+    try testing.expectEqual(@as(u64, 2), p.telemetry.get_requests); // The failed handshake sent no GET.
 
     // A ClientHello that cannot be written surfaces from acquire as SendFailed; it is still only a connect failure.
     var q: ScriptedPool = .{ .steps = &.{

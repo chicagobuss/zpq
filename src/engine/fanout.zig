@@ -744,7 +744,7 @@ test "fanout: only explicit immutable transport acknowledgement is cached; bool 
 
 fn workerStats(a: A, answer: V, measured: InvokeStat) !V {
     var stats = object();
-    for ([_][]const u8{ "total_ms", "rows_in", "bytes_in", "row_groups_in", "files_in", "wall_ms", "worker_ms" }) |key| {
+    for ([_][]const u8{ "total_ms", "rows_in", "bytes_in", "row_groups_in", "files_in", "wall_ms", "worker_ms", "pool" }) |key| {
         try put(a, &stats, key, answer.object.get(key) orelse .null);
     }
     const total = answer.object.get("total_ms") orelse .null;
@@ -769,7 +769,7 @@ test "fanout: worker statistics retain cost and phase counters without partial r
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const answer = try parse(a, "{\"total_ms\":12.2,\"rows_in\":9,\"agg\":[{\"_g0\":\"large result\"}],\"wall_ms\":{\"fetch\":1}}");
+    const answer = try parse(a, "{\"total_ms\":12.2,\"rows_in\":9,\"agg\":[{\"_g0\":\"large result\"}],\"wall_ms\":{\"fetch\":1},\"pool\":{\"get_requests\":2,\"ttfb_ms_max\":3.5}}");
     const stats = try workerStats(a, answer, .{ .issue_ns = 2_000_000, .elapsed_ns = 25_000_000, .request_bytes = 30, .response_bytes = 40 });
     try std.testing.expect(stats.object.get("agg") == null);
     try std.testing.expectEqual(@as(i256, 13), (try Decimal.read(try member(stats, "billed_ms"))).coefficient);
@@ -777,6 +777,9 @@ test "fanout: worker statistics retain cost and phase counters without partial r
     try std.testing.expectEqual(@as(f64, 2), (try member(stats, "issue_ms")).float);
     try std.testing.expectEqualStrings("9", (try member(stats, "rows_in")).number_string);
     try std.testing.expect((try member(stats, "wall_ms")) == .object);
+    try std.testing.expectEqualStrings("2", (try member(try member(stats, "pool"), "get_requests")).number_string);
+    const legacy = try workerStats(a, try parse(a, "{}"), .{});
+    try std.testing.expect((try member(legacy, "pool")) == .null);
 }
 
 test "fanout: a legacy worker must not silently ignore a replicated join" {

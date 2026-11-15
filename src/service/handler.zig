@@ -1231,7 +1231,7 @@ fn writePoolStats(w: *std.Io.Writer, stats: s3.Pool(POOL_SIZE).Stats) !void {
     try w.print(
         "\"pool\":{{\"acquires\":{d},\"opens\":{d},\"reuses\":{d},\"discards\":{d},\"idle_evictions\":{d}," ++
             "\"stale_retries\":{d},\"backoff_retries\":{d},\"timeout_retries\":{d},\"max_idle_ms\":{d}," ++
-            "\"acquire_wait_ms\":{d},\"acquire_lock_ms\":{d}}}",
+            "\"acquire_wait_ms\":{d},\"acquire_lock_ms\":{d}",
         .{
             stats.acquires,
             stats.opens,
@@ -1246,6 +1246,17 @@ fn writePoolStats(w: *std.Io.Writer, stats: s3.Pool(POOL_SIZE).Stats) !void {
             stats.acquire_lock_ns / std.time.ns_per_ms,
         },
     );
+    try w.print(",\"retries\":{d}", .{stats.stale_retries + stats.backoff_retries});
+    inline for (.{ "get_requests", "head_requests", "bytes_fetched", "retry_http_408", "retry_http_429", "retry_http_500", "retry_http_502", "retry_http_503", "retry_http_504", "retry_http_other", "last_retry_status", "slow_down_retries" }) |field| {
+        try w.print(",\"{s}\":{d}", .{ field, @field(stats, field) });
+    }
+    inline for (.{ "tls_handshake", "ttfb" }) |field| {
+        try w.print(",\"{s}_ms_sum\":{d},\"{s}_ms_max\":{d}", .{
+            field, @as(f64, @floatFromInt(@field(stats, field ++ "_ns_sum"))) / 1e6,
+            field, @as(f64, @floatFromInt(@field(stats, field ++ "_ns_max"))) / 1e6,
+        });
+    }
+    try w.writeByte('}');
 }
 
 /// `{"error":kind,"reason":reason,"<key>":value}`: an early-exit response naming the field or text it rejects. `kind`

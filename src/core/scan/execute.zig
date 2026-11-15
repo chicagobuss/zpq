@@ -2244,6 +2244,7 @@ fn prepareAggregateWithMetas(
         var row_src: RowSource = .{
             .slots = slots.items,
             .outputs = outputs,
+            .result_width = args.result_width,
             .calls = agg_calls,
             .key_types = key_types,
             .key_exprs = keys,
@@ -2278,7 +2279,7 @@ fn prepareAggregateWithMetas(
         if (args.ledger != null or winner_copies != 0) {
             const bytes = (if (args.ledger != null)
                 answerBytesParallel(slots.items, col_types, if (row_src.borrowed_strings.len != 0) &.{} else key_types, typed, n_workers) +|
-                    row_src.denseStringBytes()
+                    row_src.denseStringBytes() +| (if (typed) 0 else slots.items.len *| (args.result_width -| outputs.len) *| @sizeOf(AggValue))
             else
                 0) +| winner_copies;
             answer_charge += group_budget.drawExact(bytes) orelse {

@@ -39,6 +39,8 @@ const OwnerRows = struct {
 pub const RowSource = struct {
     slots: []const MergedSlot,
     outputs: []const BoundOutputColumn,
+    /// The final result may add cells; leave room beside each row instead of copying its slab later.
+    result_width: usize = 0,
     calls: []const expr_agg.AggCall,
     key_types: []const KeyType,
     key_exprs: []const expr_ast.Expr = &.{},
@@ -560,7 +562,7 @@ pub fn buildGroupRows(
 ) !void {
     std.debug.assert(rows.len == src.slots.len);
     if (rows.len == 0) return;
-    const width = src.outputs.len;
+    const width = @max(src.outputs.len, src.result_width);
     const cells = try gpa.alloc(AggValue, rows.len * width);
     slab.* = cells;
     const n_threads = @max(1, @min(n_workers, std.math.divCeil(usize, rows.len, row_block) catch unreachable));
@@ -776,11 +778,11 @@ const RowBuildTask = struct {
         while (true) {
             const lo = t.cursor.fetchAdd(row_block, .monotonic);
             if (lo >= t.rows.len) return;
-            const width = t.src.outputs.len;
+            const width = @max(t.src.outputs.len, t.src.result_width);
             const hi = @min(t.rows.len, lo + row_block);
             // A row not yet given its cells stays empty: a failed build releases nothing of it.
             @memset(t.cells[lo * width .. hi * width], .null_val);
-            for (lo..hi) |i| t.rows[i] = t.cells[i * width ..][0..width];
+            for (lo..hi) |i| t.rows[i] = t.cells[i * width ..][0..t.src.outputs.len];
             for (lo..hi) |i| {
                 t.src.buildRow(t.gpa, t.src.slots[i], @constCast(t.rows[i]), if (t.strings) |*st| st else null) catch |e| {
                     t.err = e;
@@ -798,6 +800,7 @@ const RowFixture = struct {
     keys: [][]u8,
     accs: []expr_agg.Accumulator,
     slots: []MergedSlot,
+    result_width: usize = 0,
 
     const calls = [_]expr_agg.AggCall{
         .{ .func = .count, .alias = "n", .result = .i64, .arg = null, .where = null },
@@ -847,6 +850,7 @@ const RowFixture = struct {
         return .{
             .slots = f.slots,
             .outputs = &outputs,
+            .result_width = f.result_width,
             .calls = &calls,
             .key_types = &.{.string},
             .accs = f.accs,
@@ -909,10 +913,11 @@ test "buildGroupRows: the same rows at every -j, and when spawns fail" {
     // Five blocks of rows, so up to five threads build them.
     var f = try RowFixture.init(4 * row_block + 123);
     defer f.deinit();
-    const Run = struct { j: usize, fail_after: ?usize = null };
-    for ([_]Run{ .{ .j = 1 }, .{ .j = 3 }, .{ .j = 8 }, .{ .j = 8, .fail_after = 0 }, .{ .j = 8, .fail_after = 1 }, .{ .j = 8, .fail_after = 2 } }) |run| {
+    const Run = struct { j: usize, width: usize = 0, fail_after: ?usize = null };
+    for ([_]Run{ .{ .j = 1 }, .{ .j = 3 }, .{ .j = 8 }, .{ .j = 8, .width = 5 }, .{ .j = 8, .fail_after = 0 }, .{ .j = 8, .fail_after = 1 }, .{ .j = 8, .fail_after = 2 } }) |run| {
         var out: AggOutput = .{};
         defer out.deinit(testing.allocator);
+        f.result_width = run.width;
         if (run.fail_after) |n| spawn_util.injectFailureAfter(n);
         defer spawn_util.resetFailure();
         try f.build(testing.allocator, &out, run.j);

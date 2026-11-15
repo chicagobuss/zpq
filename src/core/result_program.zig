@@ -342,9 +342,14 @@ pub const ResultProgram = struct {
             }
             named += 1;
         }
-        const slab = try gpa.alloc(scan.AggValue, rows.len * width);
-        errdefer gpa.free(slab);
-        const wide = try gpa.alloc([]const scan.AggValue, rows.len);
+        // Only the original, uncut rows in a slab with the final stride can be widened in place. Other producers
+        // and already-cut answers keep the allocation-first path, whose failure leaves the answer whole.
+        const reuse = out.slab.len == rows.len * width and for (rows, 0..) |row, i| {
+            if (row.ptr != out.slab[i * width ..].ptr or row.len != raw_names.len) break false;
+        } else true;
+        const slab = if (reuse) out.slab else try gpa.alloc(scan.AggValue, rows.len * width);
+        errdefer if (!reuse) gpa.free(slab);
+        const wide = if (reuse) @constCast(rows) else try gpa.alloc([]const scan.AggValue, rows.len);
         const Widen = struct {
             rows: []const []const scan.AggValue,
             wide: [][]const scan.AggValue,
@@ -352,27 +357,34 @@ pub const ResultProgram = struct {
             programs: []const ?*const Compiled,
             out: *const scan.AggOutput,
             gpa: std.mem.Allocator,
+            reuse: bool,
             fn run(c: @This(), lo: usize, hi: usize) void {
                 const w = c.programs.len;
                 for (c.rows[lo..hi], c.wide[lo..hi], lo..) |row, *dst, i| {
                     const cells = c.slab[i * w ..][0..w];
-                    var at: usize = 0;
-                    for (cells, c.programs) |*cell, program| {
-                        if (program != null) {
-                            cell.* = .null_val;
+                    // Underived columns keep their relative order. Copy backwards so an inserted column never
+                    // overwrites a raw cell still to be read when both views share the same row.
+                    var at = row.len;
+                    var j = w;
+                    while (j > 0) {
+                        j -= 1;
+                        if (c.programs[j] != null) {
+                            cells[j] = .null_val;
                         } else {
-                            cell.* = row[at];
-                            at += 1;
+                            at -= 1;
+                            cells[j] = row[at];
                         }
                     }
                     dst.* = cells;
-                    c.out.releaseRowSlice(c.gpa, row);
+                    if (!c.reuse) c.out.releaseRowSlice(c.gpa, row);
                 }
             }
         };
-        eachRowBlock(self.workers, rows.len, Widen{ .rows = rows, .wide = wide, .slab = slab, .programs = programs, .out = out, .gpa = gpa }, Widen.run);
-        gpa.free(rows);
-        gpa.free(out.slab);
+        eachRowBlock(self.workers, rows.len, Widen{ .rows = rows, .wide = wide, .slab = slab, .programs = programs, .out = out, .gpa = gpa, .reuse = reuse }, Widen.run);
+        if (!reuse) {
+            gpa.free(rows);
+            gpa.free(out.slab);
+        }
         gpa.free(raw_names);
         gpa.free(out.owned_types);
         out.slab = slab;
@@ -1888,6 +1900,46 @@ test "a result column's scan column, and whether ranking, HAVING or a computed c
     const by_name = [_]expr_ast.OrderKey{.{ .column = 1, .descending = false }};
     const q: ResultProgram = .{ .order = .{ .keys = &by_name, .limit = 10, .post = true }, .select = &select, .grouped = true };
     try std.testing.expect(q.readsScanColumn(1));
+}
+
+test "post-aggregate reserved rows widen in place and stay whole on allocation failure" {
+    const Probe = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var out = try threeColumnOutput(gpa, &.{ "a", "b", "c" }, &.{ dec2(10), dec2(20), dec2(30) }, &.{ .{ .i = 1 }, .{ .i = 2 }, .{ .i = 3 } });
+            defer out.deinit(gpa);
+            const slab = try gpa.alloc(scan.AggValue, 15);
+            @memset(slab, .null_val);
+            for (@constCast(out.group_rows.?), 0..) |*row, i| {
+                @memcpy(slab[i * 5 ..][0..3], row.*);
+                gpa.free(row.*);
+                row.* = slab[i * 5 ..][0..3];
+            }
+            out.slab = slab;
+            var col_types: ?[]const scan.GroupColType = &scan_types;
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            const compiled = try compile(arena.allocator(), .{ .number = "1" }, &.{}, .{ .ints = &.{}, .rewritten = &.{} });
+            const programs = [_]?*const Compiled{ null, compiled, compiled, null, null };
+            const types = [_]scan.GroupColType{ scan_types[0], scan_types[2], scan_types[2], scan_types[1], scan_types[2] };
+            const p: ResultProgram = .{ .select = &post_select, .order = .{ .hidden = &post_hidden }, .workers = 8 };
+            p.widen(gpa, &out, &col_types, &programs, &types) catch |err| {
+                for (out.group_rows.?, 0..) |row, i| {
+                    try std.testing.expectEqual(@as(usize, 3), row.len);
+                    try std.testing.expectEqual(@as(i128, @intCast(i + 1)), row[2].i);
+                }
+                return err;
+            };
+            try std.testing.expectEqual(slab.ptr, out.slab.ptr);
+            for (out.group_rows.?, 0..) |row, i| {
+                try std.testing.expectEqual(@as(usize, 5), row.len);
+                try std.testing.expectEqual(@as(i128, @intCast((i + 1) * 10)), row[3].dec.v);
+                try std.testing.expectEqual(@as(i128, @intCast(i + 1)), row[4].i);
+                try std.testing.expect(row[1] == .null_val and row[2] == .null_val);
+                try std.testing.expectEqualStrings((&[_][]const u8{ "a", "b", "c" })[i], row[0].s);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 test "post-aggregate parallel evaluation preserves the earliest row error" {

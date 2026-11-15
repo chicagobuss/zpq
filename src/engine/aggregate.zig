@@ -713,6 +713,7 @@ inline fn aggregateScanArgs(
         .unordered = args.unordered,
         .select_cols = args.select_cols,
         .result_order = order,
+        .result_width = if (args.result_order.post) args.select_cols.?.len + args.result_order.hidden.len else 0,
         .typed_answer = args.typed_answer and args.output != null,
         .record_answer = (args.text_output != null or args.aggregate_sink != null) and args.output == null,
         .integer_records = !envDisables(ctx.env, "ZPQ_INTEGER_RECORDS"),

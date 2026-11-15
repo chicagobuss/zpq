@@ -134,6 +134,8 @@ pub const MultiAggArgs = struct {
     /// The cut the caller applies to the GROUP BY rows (`AggOutput.applyResultOrder`): a COUNT-descending cut lets the
     /// merge skip groups that cannot make it. The rows still arrive uncut, in their usual order.
     result_order: expr_ast.ResultOrder = .{},
+    /// Reserve the final post-expression width in row slabs, so ResultProgram can widen each row in place.
+    result_width: usize = 0,
     /// Comma-separated output column names. Only used with GROUP BY when
     /// `select_cols` is unset (e.g. CLI `--column-order`). Reorders the
     /// default key-then-aggregate layout.

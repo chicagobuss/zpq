@@ -1863,6 +1863,156 @@
    }
   },
   {
+   "id": "sql_cte:groupjoin:written",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g, count(*) AS c, sum(v) AS sv, min(id) AS lo, max(k2) AS hi, avg(v) AS av FROM '{fixture:cf}' JOIN '{fixture:cd}' ON g = pk GROUP BY g",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT g, count(*) AS c, sum(v) AS sv, min(id) AS lo, max(k2) AS hi, avg(v) AS av FROM '{fixture:cf}' JOIN '{fixture:cd}' ON g = pk GROUP BY g"
+   }
+  },
+  {
+   "id": "sql_cte:groupjoin:written-one-key",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g, count(*) AS c FROM '{fixture:cf}' JOIN '{fixture:cd}' ON g = pk WHERE id % 3 = 0 GROUP BY g",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT g, count(*) AS c FROM '{fixture:cf}' JOIN '{fixture:cd}' ON g = pk WHERE id % 3 = 0 GROUP BY g"
+   }
+  },
+  {
+   "id": "sql_cte:groupjoin:written-comma",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g, sum(id) AS s FROM '{fixture:cf}', '{fixture:cd}' WHERE g = pk AND w > 3 GROUP BY g",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT g, sum(id) AS s FROM '{fixture:cf}', '{fixture:cd}' WHERE g = pk AND w > 3 GROUP BY g"
+   }
+  },
+  {
+   "id": "sql_cte:groupjoin:cte",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "WITH j AS (SELECT g, count(*) AS c, sum(v) AS sv, min(id) AS lo, max(k2) AS hi, avg(v) AS av FROM '{fixture:cf}' JOIN '{fixture:cd}' ON g = pk GROUP BY g) SELECT g, c, sv, lo, hi FROM j ORDER BY g"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH j AS (SELECT g, count(*) AS c, sum(v) AS sv, min(id) AS lo, max(k2) AS hi, avg(v) AS av FROM '{fixture:cf}' JOIN '{fixture:cd}' ON g = pk GROUP BY g) SELECT g, c, sv, lo, hi FROM j ORDER BY g"
+   }
+  },
+  {
+   "id": "sql_cte:groupjoin:cte-total",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "WITH j AS (SELECT g, count(*) AS c, sum(v) AS sv, min(id) AS lo, max(k2) AS hi, avg(v) AS av FROM '{fixture:cf}' JOIN '{fixture:cd}' ON g = pk GROUP BY g) SELECT sum(c) AS t, count(*) AS n, max(hi) AS m FROM j"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "WITH j AS (SELECT g, count(*) AS c, sum(v) AS sv, min(id) AS lo, max(k2) AS hi, avg(v) AS av FROM '{fixture:cf}' JOIN '{fixture:cd}' ON g = pk GROUP BY g) SELECT sum(c) AS t, count(*) AS n, max(hi) AS m FROM j"
+   }
+  },
+  {
+   "id": "sql_cte:groupjoin:derived",
+   "fixture": "cf",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT t.g, t.c FROM (SELECT g, count(*) AS c, sum(v) AS sv, min(id) AS lo, max(k2) AS hi, avg(v) AS av FROM '{fixture:cf}' JOIN '{fixture:cd}' ON g = pk GROUP BY g) t WHERE t.c > 0 ORDER BY t.g"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT t.g, t.c FROM (SELECT g, count(*) AS c, sum(v) AS sv, min(id) AS lo, max(k2) AS hi, avg(v) AS av FROM '{fixture:cf}' JOIN '{fixture:cd}' ON g = pk GROUP BY g) t WHERE t.c > 0 ORDER BY t.g"
+   }
+  },
+  {
    "id": "sql_cte:derived:basic",
    "fixture": "cf",
    "cli": [

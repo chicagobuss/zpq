@@ -740,6 +740,7 @@ pub fn runPrintSink(
     sink: ?*std.Io.Writer,
 ) !PrintResult {
     const ctx = caller_ctx.forQuery(&initial_args);
+    if (initial_args.kind() == .rows) try initial_args.refuseRowJoin();
     // Rows are printed from Parquet: a CSV input is only ever written to Parquet whole (`csv_write.queryInput`). One
     // that gets here asked for more, such as a raw `--limit`, which travels beside the query's own result order.
     if (try @import("csv_write.zig").queryInput(initial_args) != null) return error.CsvQueryNotSupported;

@@ -202,6 +202,7 @@ pub fn runQuery(caller_ctx: Context, args: QueryArgs) !QueryResult {
     const span = profile.Span.begin(profile.threadOf(args.profiler, .main));
     defer span.end(.query, profile.args(.{}));
     if (args.inputs.len == 0) return error.NoInputs;
+    if (args.kind() == .rows) try args.refuseRowJoin();
     // A CSV input is written to Parquet whole, filtered or projected, or aggregated during its parse (`csv_agg`).
     if (try csv_write.csvInput(args)) |path| {
         if (args.kind() != .rows) return .{ .aggregate = try csv_agg.query(ctx, args, path) };
@@ -508,6 +509,14 @@ fn executeAggregateOver(
             for (old) |row| r.output.releaseRow(ctx.gpa, row);
             ctx.gpa.free(old);
         }
+        // A Parquet answer comes as typed columns or a stream instead of rows, which the writer prefers: the group
+        // tables' empty one would be written in place of the group-join's.
+        if (r.output.typed) |*typed| typed.deinit(ctx.gpa);
+        if (r.output.integer_stream) |stream| stream.state.deinit();
+        if (r.output.byte_stream) |stream| stream.state.deinit();
+        r.output.typed = null;
+        r.output.integer_stream = null;
+        r.output.byte_stream = null;
         r.output.group_rows = rows;
     };
     // Known once the reader has started, which the scan does once it has planned.

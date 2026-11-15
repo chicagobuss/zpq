@@ -964,7 +964,6 @@ fn runParsed(
         engine_max_mem = max_mem_limit -| opts.reservedBytes();
     }
 
-    if (plan_source) |s| if (s.join != null and aggregate == null and group_by == null) return error.JoinRowsNotSupported;
     if (explain) {
         if (aggregate == null and group_by == null) {
             diagnosticPrint("zpq query: --explain requires an aggregate or GROUP BY query\n", .{});

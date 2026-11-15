@@ -222,6 +222,12 @@ pub const QueryArgs = struct {
     pin_input_generation: bool = false,
     aligned_join: ?AlignedJoin = null,
 
+    /// A join or an `IN (SELECT ...)` is bound only on the aggregate path (`engine/join.zig`); row output would run the
+    /// probe alone and drop it. Every row entry point refuses it first, so no caller (the CLI, the service) can miss it.
+    pub fn refuseRowJoin(self: QueryArgs) error{JoinRowsNotSupported}!void {
+        if (self.plan_source) |s| if (s.join != null) return error.JoinRowsNotSupported;
+    }
+
     pub fn kind(self: QueryArgs) bound_plan.Kind {
         if (self.plan_source) |source| return source.kind;
         return if (self.group_by != null) .grouped else if (self.aggregate != null) .scalar else .rows;

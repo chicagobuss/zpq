@@ -1,7 +1,7 @@
 # zpq task runner. Every recipe here must work on the current tree.
 
-# Zig 0.17.0: prefer ~/.zvm/0.17.0 (where `just bootstrap` installs it) when present.
-export PATH := `[ -d ~/.zvm/0.17.0 ] && echo "$HOME/.zvm/0.17.0:$PATH" || echo "$PATH"`
+# Zig 0.17.1: prefer ~/.zvm/0.17.1 (where `just bootstrap` installs it) when present.
+export PATH := `[ -d ~/.zvm/0.17.1 ] && echo "$HOME/.zvm/0.17.1:$PATH" || echo "$PATH"`
 
 # Python for the tooling: the project .venv if present, else python3. The fixtures stage creates .venv from
 # tools/check/requirements.txt on first use.
@@ -41,15 +41,21 @@ lambda-build:
 
 # === Setup ===
 
-# Fresh Linux x86_64 machine: install Zig 0.17.0 under ~/.zvm if missing, then build once.
+# Fresh Linux x86_64 machine: install Zig 0.17.1 under ~/.zvm if missing, then build once.
 bootstrap:
     #!/usr/bin/env bash
     set -euo pipefail
-    ZV=0.17.0
+    ZV=0.17.1
+    # ziglang.org's published sha256 for zig-x86_64-linux-0.17.1.tar.xz; the tarball is checked before it is unpacked.
+    SHA=3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a
     if ! ~/.zvm/$ZV/zig version >/dev/null 2>&1; then
       echo "installing zig $ZV -> ~/.zvm/$ZV"
       mkdir -p ~/.zvm
-      curl -fsSL "https://ziglang.org/download/$ZV/zig-x86_64-linux-$ZV.tar.xz" | tar -xJ -C ~/.zvm
+      tmp=$(mktemp -d)  # the tarball, checked before it is unpacked; removed on every exit
+      trap 'rm -rf "$tmp"' EXIT
+      curl -fsSL -o "$tmp/zig.tar.xz" "https://ziglang.org/download/$ZV/zig-x86_64-linux-$ZV.tar.xz"
+      echo "$SHA  $tmp/zig.tar.xz" | sha256sum -c -
+      tar -xJf "$tmp/zig.tar.xz" -C ~/.zvm
       mv ~/.zvm/zig-x86_64-linux-$ZV ~/.zvm/$ZV
     fi
     ~/.zvm/$ZV/zig version

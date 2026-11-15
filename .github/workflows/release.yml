@@ -207,11 +207,11 @@ jobs:
           fi
           chmod +x zpq*
 
-      - name: Install Zig 0.17.0
+      - name: Install Zig 0.17.1
         if: matrix.target != 'x86_64-macos'
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0
+          version: 0.17.1
 
       # CLI cases use GNU timeout, which is not in the macOS default PATH.
       - name: Install GNU timeout on macOS

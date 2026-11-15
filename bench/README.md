@@ -39,7 +39,7 @@ local files to stage. Keep the inventory and host paths outside the repository:
     "cpu": "baseline",
     "optimize": "ReleaseFast",
     "strip": true,
-    "toolchain": "0.17.0"
+    "toolchain": "0.17.1"
   },
   "base": {
     "path": "/configured/bin/base",
@@ -49,7 +49,7 @@ local files to stage. Keep the inventory and host paths outside the repository:
     "cpu": "baseline",
     "optimize": "ReleaseFast",
     "strip": true,
-    "toolchain": "0.17.0"
+    "toolchain": "0.17.1"
   },
   "hosts": {
     "HOST": {

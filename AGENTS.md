@@ -13,7 +13,7 @@ Instructions for coding agents working on zpq.
 
 For any new primitive, wire-format feature, allocator change or parallelism change:
 
-1. Read the pinned Zig 0.17.0 stdlib for what you need (`std.Io`, `std.MultiArrayList`, `std.bit_set`, ...). Don't
+1. Read the pinned Zig 0.17.1 stdlib for what you need (`std.Io`, `std.MultiArrayList`, `std.bit_set`, ...). Don't
    guess APIs from memory.
 2. Read how a comparable does it, in `references/` (git-ignored): Hardwood, DuckDB, Polars, parx.
 3. Check the Parquet spec (parquet-format 2.14.0) or the AWS docs for format and service edge cases. Don't trust

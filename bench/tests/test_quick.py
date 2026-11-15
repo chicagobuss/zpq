@@ -66,7 +66,7 @@ class Quick(unittest.TestCase):
         subprocess.run([str(path), "--version"], capture_output=True, check=True)
         self.cfg["hosts"]["local"][name] = {
             "path": str(path), "sha": sha, "sha256": quick.digest(path), "target": "test",
-            "cpu": "baseline", "optimize": "ReleaseFast", "strip": True, "toolchain": "0.17.0"}
+            "cpu": "baseline", "optimize": "ReleaseFast", "strip": True, "toolchain": "0.17.1"}
 
     def write_config(self):
         quick.save(self.data / "manifest.json", self.manifest)

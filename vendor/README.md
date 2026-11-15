@@ -21,7 +21,7 @@ sources.
   stays off. (`b63f9c4`, `6ca9110`)
 - `build.zig`: no longer passes `-mno-avx` on x86. (`b63f9c4`)
 - `build.zig`, `root.zig`: `snappy-c.h` is imported through a translate-c step (`snappy_c`) instead of `@cImport`,
-  which Zig 0.17 removed; `build.zig.zon` requires Zig 0.17.0.
+  which Zig 0.17 removed; `build.zig.zon` requires Zig 0.17.1.
 - `build.zig`: `pic` and `hidden-symbols` options, which libzpq's archive sets: position-independent, with its
   symbols hidden so the shared library does not export them.
 - `snappy.cc`: `WorkingMemory` (the compressor's hash table and scratch buffers, up to ~200 KiB) takes its memory

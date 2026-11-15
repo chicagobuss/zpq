@@ -57,7 +57,7 @@ const Book = struct {
     cpu: []const u8 = "baseline",
     optimize: []const u8 = "ReleaseFast",
     strip: bool = true,
-    runner_zig: []const u8 = "0.17.0",
+    runner_zig: []const u8 = "0.17.1",
     threads: ?usize,
     thread_policy: []const u8,
     metric: []const u8 = "fresh process through full capture/reap; imports included for Polars",

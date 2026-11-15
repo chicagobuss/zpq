@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Zig 0.17.1: the pins name it.** `build.zig.zon`'s minimum, `.zig-version`, the CI and release workflows, `just bootstrap` and the docs move from 0.17.0, and bootstrap now checks the tarball against ziglang.org's published sha256 before unpacking it. Still any 0.17.x release, not only 0.17.1.
+
 - **S3 Express One Zone: directory buckets on zonal endpoints, CreateSession session credentials with one shared refresh, reads, writes and multipart with CRC32, and unsorted directory listings handled.**
 - **Tests honor ZPQ_TEST_PARQUET_DIR: every place zpq's tests write Parquet scratch goes under it.**
 - **Fan-out is native: `zpq fanout` and the Lambda coordinator mode plan, invoke and merge in Zig, replacing the Python coordinator.** Joins fan out too, by aligned key ranges from footer statistics or with a replicated small side. Invoke retries transient failures.

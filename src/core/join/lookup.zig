@@ -64,6 +64,16 @@ pub const Payload = struct {
     /// `inner`, and the column there. The FK's value determines it, as `inner`'s keys are unique.
     via: ?Via = null,
 
+    deferred: ?Deferred = null,
+
+    pub const Locator = struct { rg: u32, row: u32 };
+    pub const Deferred = struct {
+        bytes: []const u8,
+        meta: *const schema.FileMetaData,
+        leaf: usize,
+        rows: []Locator,
+    };
+
     pub const Via = struct { fk: usize, inner: *const Join, p: usize };
 };
 
@@ -394,6 +404,32 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
         }
         codes[r] = payload.codes.get(at[r]);
     }
+    if (payload.deferred) |d| {
+        const vals = try a.alloc([]const u8, sel.len);
+        @memset(vals, "");
+        for (d.meta.row_groups.items, 0..) |*rg, ri| {
+            var scratch: std.heap.ArenaAllocator = .init(a);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            var gate = try selection.SelectionVector.init(sa, @intCast(rg.num_rows));
+            gate.clearAll();
+            var kept = sel.iterator();
+            while (kept.next()) |r| {
+                if (at[r] != EMPTY and d.rows[codes[r]].rg == ri) gate.set(d.rows[codes[r]].row, true);
+            }
+            if (gate.count() == 0) continue;
+            const cm = rg.columns.items[d.leaf].meta_data orelse return error.ColumnMetaMissing;
+            const levels = d.meta.getColumnLevels(cm.path_in_schema.items);
+            const opts = column_mod.chunkOptions(.{ .row_gate = &gate }, d.meta, cm);
+            const decoded = try @import("../consumer/column.zig").decodeColumnTWithOptions([]const u8, sa, try chunkOf(d.bytes, cm), cm.codec, levels, gate.len, opts);
+            kept = sel.iterator();
+            while (kept.next()) |r| {
+                if (at[r] != EMPTY and d.rows[codes[r]].rg == ri)
+                    vals[r] = try a.dupe(u8, decoded.values[d.rows[codes[r]].row]);
+            }
+        }
+        return .{ .string = .{ .values = vals, .def_levels = def, .max_def = if (j.kind == .left) 1 else 0, .has_nulls = def != null } };
+    }
     if (payload.plain) return switch (payload.dict) {
         inline else => |dict, tag| blk: {
             const T = @TypeOf(dict[0]);
@@ -440,10 +476,15 @@ pub const Spec = struct {
     /// Build leaf indices.
     key: usize,
     payload: []const usize,
+    deferred: []const bool = &.{},
     filter: ?filter_ast.Filter,
     threads: usize,
     /// Bytes the build may hold; null when the query has no `--max-memory`.
     budget: ?usize,
+
+    fn defers(s: Spec, p: usize) bool {
+        return p < s.deferred.len and s.deferred[p];
+    }
 };
 
 /// One build row group's survivors: their keys, and per payload a local dictionary and each survivor's local code.
@@ -717,7 +758,7 @@ fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
         const col = cols.items[lookup[p].?];
         l.* = if (c.plain[pi]) try plainLocal(c.arena(rg_index, 1 + pi), col, keep.items) else try c.keepLocal(rg_index, pi, try localOf(c, sa, rg, p, keep.items, col));
     };
-    if (c.late.len != 0) part.kept = try c.gpa.dupe(u64, sel.mask);
+    if (c.late.len != 0 or c.spec.deferred.len != 0) part.kept = try c.gpa.dupe(u64, sel.mask);
     part.keys = if (keys.items.len != 0 and @as(i128, hi) - lo <= std.math.maxInt(u32)) blk: {
         const out = try c.gpa.alloc(u32, keys.items.len);
         for (keys.items, out) |k, *o| o.* = @intCast(k - lo);
@@ -750,6 +791,17 @@ const LateLocal = struct {
             }
         }
         const rg = &c.meta.row_groups.items[rg_index];
+        if (c.spec.defers(pi)) {
+            const cm = rg.columns.items[c.spec.payload[pi]].meta_data orelse return error.ColumnMetaMissing;
+            const levels = c.meta.getColumnLevels(cm.path_in_schema.items);
+            var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(try chunkOf(c.bytes, cm), cm.codec, levels, sa, column_mod.chunkOptions(.{}, c.meta, cm), null);
+            if (try reader.readAllLevels(@intCast(rg.num_rows))) |validity| {
+                if (validity.def_levels) |dl| for (keep) |r| {
+                    if (dl[r] < levels.max_def) return error.JoinPayloadType;
+                };
+            }
+            return;
+        }
         if (!c.plain[pi]) {
             part.local[pi] = try c.keepLocal(rg_index, pi, try localOf(c, sa, rg, c.spec.payload[pi], keep, null));
             return;
@@ -842,7 +894,7 @@ const Unify = struct {
 
     fn run(self: @This(), _: usize, p: usize) !void {
         const c = self.c;
-        if (c.parts.len == 0 or c.plain[p]) return;
+        if (c.parts.len == 0 or c.plain[p] or c.spec.defers(p)) return;
         self.out[p] = switch (c.parts[0].local[p].dict) {
             .i32 => try unify(i32, c, p),
             .i64 => try unify(i64, c, p),
@@ -853,7 +905,7 @@ const Unify = struct {
 
     /// The values into the dictionary allocated for them, strings into one blob.
     fn copy(self: @This(), _: usize, p: usize) !void {
-        if (self.c.plain[p]) return;
+        if (self.c.plain[p] or self.c.spec.defers(p)) return;
         const u = self.out[p];
         switch (u.values) {
             .string => |v| {
@@ -968,6 +1020,8 @@ const FillCodes = struct {
     codes: []const Codes,
     /// By payload: a plain one's values by slot and the blob its strings copy into, from each part's start in it.
     plain: []const Plain,
+    deferred: []const bool,
+    locators: []Payload.Locator,
 
     /// `values` is the payload's own dictionary, written here; a string's bytes copy into `blob`.
     const Plain = struct { on: bool = false, values: Dict = .{ .i64 = &.{} }, blob: []u8 = &.{}, starts: []usize = &.{} };
@@ -977,10 +1031,18 @@ const FillCodes = struct {
         const cursor = try c.gpa.alloc(usize, c.plain.len);
         defer c.gpa.free(cursor);
         for (c.plain, cursor) |pl, *at| at.* = if (pl.on) pl.starts[i] else 0;
+        var source_row: usize = 0;
         switch (part.keys) {
             inline else => |keys| for (keys, 0..) |raw, row| {
                 const s = c.j.slot(Keys.of(raw, part.lo)).?;
-                for (c.codes, part.local, c.plain, cursor) |dst, l, pl, *at| {
+                if (c.locators.len != 0) {
+                    while (part.kept[source_row / 64] & (@as(u64, 1) << @intCast(source_row % 64)) == 0)
+                        source_row += 1;
+                    c.locators[s] = .{ .rg = @intCast(i), .row = @intCast(source_row) };
+                    source_row += 1;
+                }
+                for (c.codes, part.local, c.plain, cursor, 0..) |dst, l, pl, *at, pi| {
+                    if (pi < c.deferred.len and c.deferred[pi]) continue;
                     if (!pl.on) {
                         dst.set(s, l.globalOf(row));
                         continue;
@@ -1132,6 +1194,10 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
         };
         j.keys = .{ .hash = h };
     }
+    const has_deferred = for (spec.deferred) |d| {
+        if (d) break true;
+    } else false;
+    const locators = try a.alloc(Payload.Locator, if (has_deferred) n else 0);
     const payloads = try a.alloc(Payload, spec.payload.len);
     const codes = try a.alloc(Codes, spec.payload.len);
     // Each payload's dictionaries unify on a task of its own (`Unify`); only the copy into `a`, which serves one thread,
@@ -1148,6 +1214,11 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     defer for (fill_plain) |fp| gpa.free(fp.starts);
     for (spec.payload, payloads, codes, unified, plain, fill_plain, 0..) |leaf, *out, *cs, *u, is_plain, *fp, pi| {
         const element = @import("../parquet/metadata.zig").leafSchemaElement(meta, leaf).?;
+        if (spec.defers(pi)) {
+            cs.* = .{ .identity = n };
+            out.* = .{ .name = element.name, .element = element, .codes = cs.*, .dict = .{ .string = &.{} }, .deferred = .{ .bytes = bytes, .meta = meta, .leaf = leaf, .rows = locators } };
+            continue;
+        }
         if (is_plain) {
             // A value per slot, the parts' strings in one blob, each part's from where the ones before it end.
             const starts = try gpa.alloc(usize, parts.len);
@@ -1185,7 +1256,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     try parallel(spec.payload.len, spec.threads, un, Unify.copy);
     j.payloads = payloads;
     if (trace) t = lap("unify dictionaries", t);
-    try parallel(parts.len, spec.threads, FillCodes{ .j = j, .gpa = gpa, .parts = parts, .codes = codes, .plain = fill_plain }, FillCodes.run);
+    try parallel(parts.len, spec.threads, FillCodes{ .j = j, .gpa = gpa, .parts = parts, .codes = codes, .plain = fill_plain, .deferred = spec.deferred, .locators = locators }, FillCodes.run);
     if (trace) _ = lap("codes by slot", t);
     // An estimate, now that each payload's code width is known; the caller measures what `a` holds.
     j.bytes = key_bytes;
@@ -1211,23 +1282,35 @@ pub fn chain(a: std.mem.Allocator, j: *Join, fk: usize, inner: *const Join) !voi
     const out = try a.alloc(Payload, j.payloads.len + inner.payloads.len);
     @memcpy(out[0..j.payloads.len], j.payloads);
     for (inner.payloads, out[j.payloads.len..], 0..) |ip, *op, ip_index| {
-        const codes: Codes = try .init(a, j.n, ip.dict.len());
+        const codes: Codes = try .init(a, j.n, if (ip.deferred) |d| d.rows.len else ip.dict.len());
         for (0..j.n) |s| {
             const at = by_code[f.codes.get(@intCast(s))];
             if (at == EMPTY) return error.LookupWithoutMatch;
             codes.set(@intCast(s), ip.codes.get(at));
         }
-        op.* = .{ .name = ip.name, .element = ip.element, .codes = codes, .dict = ip.dict, .plain = ip.plain, .via = .{ .fk = fk, .inner = inner, .p = ip_index } };
+        op.* = .{ .name = ip.name, .element = ip.element, .codes = codes, .dict = ip.dict, .plain = ip.plain, .deferred = ip.deferred, .via = .{ .fk = fk, .inner = inner, .p = ip_index } };
     }
     j.payloads = out;
 }
 
 /// Payload `p` at the build row whose key is `key` (`expr_ast.Fetch.value`, `ctx` the join); null for no such row.
-pub fn fetch(ctx: *const anyopaque, p: usize, key: i64) ?@import("../expr/ast.zig").FetchValue {
+pub fn fetch(ctx: *const anyopaque, p: usize, key: i64, a: std.mem.Allocator) anyerror!?@import("../expr/ast.zig").FetchValue {
     const j: *const Join = @ptrCast(@alignCast(ctx));
     const s = j.slot(key) orelse return null;
     const payload = j.payloads[p];
     const code = payload.codes.get(s);
+    if (payload.deferred) |d| {
+        const loc = d.rows[code];
+        const rg = &d.meta.row_groups.items[loc.rg];
+        var gate = try selection.SelectionVector.init(a, @intCast(rg.num_rows));
+        gate.clearAll();
+        gate.set(loc.row, true);
+        const cm = rg.columns.items[d.leaf].meta_data orelse return error.ColumnMetaMissing;
+        const levels = d.meta.getColumnLevels(cm.path_in_schema.items);
+        const options = column_mod.chunkOptions(.{ .row_gate = &gate }, d.meta, cm);
+        const col = try @import("../consumer/column.zig").decodeColumnTWithOptions([]const u8, a, try chunkOf(d.bytes, cm), cm.codec, levels, gate.len, options);
+        return .{ .bytes = col.values[loc.row] };
+    }
     return switch (payload.dict) {
         .i32 => |d| .{ .int = d[code] },
         .i64 => |d| .{ .int = d[code] },
@@ -1913,4 +1996,28 @@ test "dense bits: disjoint parts set their own words plainly and still see a dup
     try std.testing.expectEqual(@as(usize, 400), set);
     const overlapping = [_]Part{ .{ .keys = .{ .wide = &k0 }, .lo = 0, .hi = 199 }, .{ .keys = .{ .wide = &k1 }, .lo = 199, .hi = 399 } };
     try std.testing.expect(!try SetBits.disjointParts(a, &overlapping));
+}
+
+/// Fetch one output column together so each selected build page is decoded once per cut, even when
+/// several surviving groups name rows on it. Scratch values are copied into the answer by the caller.
+pub fn fetchBatch(ctx: *const anyopaque, p: usize, keys: []const ?i64, a: std.mem.Allocator) anyerror![]?expr_ast.FetchValue {
+    const j: *const Join = @ptrCast(@alignCast(ctx));
+    const out = try a.alloc(?expr_ast.FetchValue, keys.len);
+    @memset(out, null);
+    if (j.payloads[p].deferred == null) {
+        for (keys, out) |key, *v| if (key) |k| {
+            v.* = try fetch(ctx, p, k, a);
+        };
+        return out;
+    }
+    const slots = try a.alloc(u32, keys.len);
+    var sel = try selection.SelectionVector.init(a, keys.len);
+    for (keys, slots, 0..) |key, *slot, i| {
+        slot.* = if (key) |k| j.slot(k) orelse EMPTY else EMPTY;
+        if (slot.* == EMPTY) sel.set(i, false);
+    }
+    const col = try column(j, p, slots, &sel, a, true);
+    var it = sel.iterator();
+    while (it.next()) |i| out[i] = .{ .bytes = col.string.values[i] };
+    return out;
 }

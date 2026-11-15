@@ -282,9 +282,9 @@ pub const Prepared = struct {
             if (!lane_ok) continue;
             const via = j.payloads[q].via;
             const f: expr_ast.Fetch = if (via != null and isKey(keys, j.virtual_base + via.?.fk))
-                .{ .base = j.virtual_base + via.?.fk, .ctx = via.?.inner, .payload = via.?.p, .value = lookup.fetch }
+                .{ .base = j.virtual_base + via.?.fk, .ctx = via.?.inner, .payload = via.?.p, .value = lookup.fetch, .batch = lookup.fetchBatch }
             else if (j.domain == .signed and isKey(keys, j.fk_leaf))
-                .{ .base = j.fk_leaf, .ctx = j, .payload = q, .value = lookup.fetch }
+                .{ .base = j.fk_leaf, .ctx = j, .payload = q, .value = lookup.fetch, .batch = lookup.fetchBatch }
             else
                 continue;
             if (out == null) out = try arena.dupe(expr_ast.Expr, keys);
@@ -445,6 +445,7 @@ fn withLookup(arena: std.mem.Allocator, f: ?filter_ast.Filter, leaf: filter_ast.
 fn groupJoin(gpa: std.mem.Allocator, j: *lookup.Join, q: plans.Aggregate, meta: *const schema.FileMetaData) !?*lookup.GroupJoin {
     // An ANTI join's rows have no slot, and a LEFT join's misses none: their groups are the probe's own.
     if (j.kind == .anti or j.kind == .left) return null;
+    for (j.payloads) |p| if (p.deferred != null) return null;
     const keys = q.keys orelse return null;
     const outputs = q.outputs orelse return null;
     // Build columns alone (GROUP BY a dimension attribute) gather many slots into one group.
@@ -510,6 +511,7 @@ const Task = struct {
     threads: usize,
     fk: []const u8,
     build: syntax.Build,
+    query: ?*const syntax.Query = null,
     kind: lookup.Kind,
     arena: std.heap.ArenaAllocator,
     store: Store,
@@ -583,6 +585,7 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: 
         .key_name = b.key,
         .key = key,
         .payload = payload,
+        .deferred = try deferredPayloads(arena, t.query, b, fk, meta, payload),
         .filter = filter,
         .threads = t.threads,
         .budget = p.ledger.available(),
@@ -639,6 +642,10 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
         .threads = threads,
         .fk = undefined,
         .build = undefined,
+        .query = if (args.result_order.limit != null and
+            !@import("env.zig").envDisables(ctx.env, "ZPQ_GROUP_KEY_FD") and
+            !@import("env.zig").envDisables(ctx.env, "ZPQ_LATE_FETCH") and
+            !@import("env.zig").envDisables(ctx.env, "ZPQ_JOIN_LATE_PAYLOAD")) @import("syntax_plan.zig").syntaxOf(source) else null,
         .kind = undefined,
         .arena = .init(if (args.aligned_join != null) p.charge.allocator() else if (p.replica_limit != null) retained else gpa),
         .store = .init(retained),
@@ -813,4 +820,73 @@ pub fn replicaFingerprint(p: *const Prepared, schema_fingerprint: [16]u8) [16]u8
         hash.update(&snapshot.finalResult());
     }
     return hash.finalResult()[0..16].*;
+}
+
+// Only bare, functionally dependent group keys can bypass the scan. Expressions and predicates keep
+// their eager payloads, including their decode errors. Optional and nested columns keep that path too.
+fn deferredPayloads(a: std.mem.Allocator, query: ?*const syntax.Query, b: syntax.Build, fk: []const u8, meta: *const schema.FileMetaData, payload: []const usize) ![]const bool {
+    const q = query orelse return &.{};
+    const keys = q.keys orelse return &.{};
+    const key_leaf = try metadata.resolveColumn(meta, b.key);
+    const key_element = metadata.leafSchemaElement(meta, key_leaf) orelse return &.{};
+    if (lookup.KeyDomain.of(key_element) != .signed) return &.{};
+    const determines = for (keys) |k| {
+        if (k.expr == .column and std.ascii.eqlIgnoreCase(k.expr.column, fk)) break true;
+    } else false;
+    if (!determines) return &.{};
+    const out = try a.alloc(bool, payload.len);
+    @memset(out, false);
+    for (b.columns, payload, out) |name, leaf, *deferred| {
+        const e = metadata.leafSchemaElement(meta, leaf) orelse continue;
+        if (e.type != .BYTE_ARRAY or e.repetition_type == .REPEATED) continue;
+        const bare = for (keys) |k| {
+            if (k.expr == .column and std.ascii.eqlIgnoreCase(k.expr.column, name)) break true;
+        } else false;
+        if (!bare) continue;
+        if (q.filter) |f| if (predicateReads(f, name)) continue;
+        if (b.filter) |f| if (predicateReads(f, name)) continue;
+        const read = for (q.calls) |c| {
+            if (c.arg) |e2| if (exprReads(e2, name)) break true;
+            if (c.arg2) |e2| if (exprReads(e2, name)) break true;
+            if (c.where) |f| if (predicateReads(f, name)) break true;
+        } else false;
+        if (read) continue;
+        const computed = for (keys) |k| {
+            if (k.expr != .column and exprReads(k.expr, name)) break true;
+        } else false;
+        if (!computed) deferred.* = true;
+    }
+    return out;
+}
+
+fn exprReads(e: syntax.Expr, name: []const u8) bool {
+    return switch (e) {
+        .column => |n| std.ascii.eqlIgnoreCase(n, name),
+        .number, .string => false,
+        .negate, .cast_text => |x| exprReads(x.*, name),
+        .binary => |x| exprReads(x.left.*, name) or exprReads(x.right.*, name),
+        .call => |c| for (c.args) |arg| {
+            if (exprReads(arg.*, name)) break true;
+        } else false,
+        .case_ => |c| blk: {
+            for (c.whens) |w| {
+                if (predicateReads(w.cond, name)) break :blk true;
+                if (w.then) |x| if (exprReads(x.*, name)) break :blk true;
+            }
+            break :blk if (c.else_) |x| exprReads(x.*, name) else false;
+        },
+    };
+}
+
+fn predicateReads(f: syntax.Predicate, name: []const u8) bool {
+    return switch (f) {
+        .and_, .or_ => |children| for (children) |c| {
+            if (predicateReads(c, name)) break true;
+        } else false,
+        .not_ => |x| predicateReads(x.*, name),
+        inline .comparison, .in_list, .between => |x| std.ascii.eqlIgnoreCase(x.operand.column, name),
+        inline .null_check, .like => |x| std.ascii.eqlIgnoreCase(x.column, name),
+        .boolean => |n| std.ascii.eqlIgnoreCase(n, name),
+        .expr_compare => |x| exprReads(x.left.*, name) or exprReads(x.right.*, name),
+    };
 }

@@ -280,7 +280,13 @@ fn fetched(gpa: std.mem.Allocator, e: expr_ast.Expr, base: AggValue, strings: ?*
         .i => |v| std.math.cast(i64, v) orelse return .null_val,
         else => return error.BadGroupKey,
     };
-    const v = f.value(f.ctx, f.payload, key) orelse return .null_val;
+    var scratch: std.heap.ArenaAllocator = .init(gpa);
+    defer scratch.deinit();
+    const v = (try f.value(f.ctx, f.payload, key, scratch.allocator())) orelse return .null_val;
+    return fetchedValue(gpa, e, v, strings);
+}
+
+fn fetchedValue(gpa: std.mem.Allocator, e: expr_ast.Expr, v: expr_ast.FetchValue, strings: ?*FetchStrings) !AggValue {
     return switch (@import("key_decode.zig").keyTypeFromExpr(e)) {
         .i64 => .{ .i = v.int },
         .u64 => .{ .i = @as(u64, @bitCast(v.int)) },
@@ -293,11 +299,28 @@ fn fetched(gpa: std.mem.Allocator, e: expr_ast.Expr, base: AggValue, strings: ?*
 /// Fill the cells a row build left as a fetch's key (`RowSource.defer_fetch`): for each of `rows`' columns that
 /// `fetches` gives a fetch for, its value, as the row build would have fetched it. Strings are the answer's own.
 pub fn fillDeferred(gpa: std.mem.Allocator, rows: []const []const AggValue, fetches: []const ?expr_ast.Expr) !void {
-    for (rows) |row| for (@constCast(row), 0..) |*cell, j| {
-        if (j >= fetches.len) break;
-        const e = fetches[j] orelse continue;
-        cell.* = try fetched(gpa, e, cell.*, null);
-    };
+    for (fetches, 0..) |maybe, j| {
+        const e = maybe orelse continue;
+        const f = e.col_ref.fetch.?;
+        if (f.batch) |batch| {
+            var scratch: std.heap.ArenaAllocator = .init(gpa);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const keys = try a.alloc(?i64, rows.len);
+            for (rows, keys) |row, *k| k.* = switch (row[j]) {
+                .null_val => null,
+                .i => |v| std.math.cast(i64, v),
+                else => return error.BadGroupKey,
+            };
+            const values = try batch(f.ctx, f.payload, keys, a);
+            for (rows, values) |row, v| @constCast(row)[j] = if (v) |value|
+                try fetchedValue(gpa, e, value, null)
+            else
+                .null_val;
+        } else for (rows) |row| {
+            @constCast(row)[j] = try fetched(gpa, e, row[j], null);
+        }
+    }
 }
 
 /// Where a row build's fetched strings go: the answer that adopts their blocks, the ledger they are drawn from, and

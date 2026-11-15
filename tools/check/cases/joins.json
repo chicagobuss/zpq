@@ -110,7 +110,15 @@
   }
  ],
  "cases": [
-  {"id": "join:late:path-parity", "fixture": "fact", "sql": "SELECT f.fk, kind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY n DESC, f.fk LIMIT 7", "oracle": {"compare": "ordered", "sql": "SELECT f.fk, kind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY n DESC, f.fk LIMIT 7"}},
+  {
+   "id": "join:late:path-parity",
+   "fixture": "fact",
+   "sql": "SELECT f.fk, kind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY n DESC, f.fk LIMIT 7",
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, kind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, kind ORDER BY n DESC, f.fk LIMIT 7"
+   }
+  },
   {
    "id": "join:inner:comma:scalar",
    "fixture": "fact",
@@ -6704,6 +6712,72 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT sum(d) AS s, count(*) AS n FROM '{fixture:review-empty-dict}' WHERE dk <> 1"
+   }
+  },
+  {
+   "id": "join:late:locator:cut",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' d WHERE f.fk = d.pk GROUP BY f.fk, uname, ukind ORDER BY s DESC, f.fk LIMIT 7"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' d WHERE f.fk = d.pk GROUP BY f.fk, uname, ukind ORDER BY s DESC, f.fk LIMIT 7"
+   }
+  },
+  {
+   "id": "join:late:locator:rank-text",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' d WHERE f.fk = d.pk GROUP BY f.fk, uname, ukind ORDER BY uname DESC, f.fk LIMIT 7"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:plain_dim}' d WHERE f.fk = d.pk GROUP BY f.fk, uname, ukind ORDER BY uname DESC, f.fk LIMIT 7"
    }
   }
  ]

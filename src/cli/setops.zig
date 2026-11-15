@@ -257,7 +257,7 @@ fn nullability(optional: bool) []const u8 {
 }
 
 /// `name` as a double-quoted identifier.
-fn quoted(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
+pub fn quoted(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.append(arena, '"');
     for (name) |ch| {
@@ -269,7 +269,7 @@ fn quoted(arena: std.mem.Allocator, name: []const u8) ![]const u8 {
 }
 
 /// The columns of the Parquet file at `path`.
-fn readColumns(arena: std.mem.Allocator, path: []const u8) ![]const Col {
+pub fn readColumns(arena: std.mem.Allocator, path: []const u8) ![]const Col {
     const m = try local_fs.mapFile(path);
     defer m.unmap();
     const meta = try metadata.open(arena, m.bytes);

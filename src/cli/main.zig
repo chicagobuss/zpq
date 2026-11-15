@@ -35,6 +35,7 @@ const Diag = zpq.core.diag.Diag;
 const usage_text = @embedFile("help.txt");
 const setops = @import("setops.zig");
 const windows = @import("windows.zig");
+const cte = @import("cte.zig");
 
 var machine_diagnostics = false;
 var diagnostic_buffer: [16 * 1024]u8 = undefined;
@@ -519,6 +520,8 @@ const SetopStager = struct {
     arena: std.mem.Allocator,
     /// The input files of every branch run so far.
     collected: std.ArrayList([]const u8) = .empty,
+    /// The last query reads the user's inputs too (a CTE's), with their input options.
+    finish_reads_inputs: bool = false,
 
     fn interface(self: *SetopStager) setops.Stager {
         return .{ .ptr = self, .stage = stage, .finish = finish, .say = say };
@@ -535,10 +538,12 @@ const SetopStager = struct {
         const self: *SetopStager = @ptrCast(@alignCast(ptr));
         var o = self.options.*;
         o.query = sql;
-        o.input_format = .auto;
-        o.csv = .{};
-        o.csv_nulls = .empty;
-        o.csv_types = .empty;
+        if (!self.finish_reads_inputs) {
+            o.input_format = .auto;
+            o.csv = .{};
+            o.csv_nulls = .empty;
+            o.csv_types = .empty;
+        }
         o.protect = self.collected.items;
         try runParsed(self.init, &o, self.diag, self.arena);
     }
@@ -628,6 +633,20 @@ const ColumnNames = struct {
     }
 };
 
+fn planCte(arena: std.mem.Allocator, sql: []const u8, dir: []const u8) !?zpq.core.expr.sql_cte.Plan {
+    return zpq.core.expr.sql_cte.plan(arena, sql, dir) catch |err| {
+        switch (err) {
+            error.CteRecursive => diagnosticPrint("sql: WITH RECURSIVE is not supported\n", .{}),
+            error.CteDuplicate => diagnosticPrint("sql: two CTEs of one WITH have the same name\n", .{}),
+            error.CteCircular => diagnosticPrint("sql: a CTE reads itself; only WITH RECURSIVE may, which is not supported\n", .{}),
+            error.LateralNotSupported => diagnosticPrint("sql: LATERAL (a subquery in FROM that reads the tables beside it) is not supported\n", .{}),
+            error.SqlParseError => diagnosticPrint("sql: a WITH list or a subquery's alias in FROM does not parse\n", .{}),
+            error.OutOfMemory => {},
+        }
+        return err;
+    };
+}
+
 /// The query `options` describe. A set operation runs its branches through here too, on copies of the options.
 fn runParsed(
     init: std.process.Init,
@@ -648,6 +667,25 @@ fn runParsed(
     // `COLUMNS(...)` select items are written out once per column they name, which the footer says.
     var column_schemas: engine.join.LocalSchemas = .{ .arena = arena };
     defer column_schemas.deinit();
+    // CTEs and subqueries in FROM run first, as queries of their own into scratch files the query then reads.
+    if (comptime build_options.enable_sql) if (options.query) |q| {
+        const clean = try zpq.core.expr.sql_parser.stripComments(arena, q);
+        const sql_cte = zpq.core.expr.sql_cte;
+        if (try planCte(arena, clean, "") != null) {
+            if (explain) {
+                diagnosticPrint("zpq query: --explain is not supported for a query with CTEs or subqueries in FROM\n", .{});
+                return error.BadArgs;
+            }
+            const out_dir: ?[]const u8 = if (output) |o| blk: {
+                if (std.mem.eql(u8, o, "-") or std.mem.startsWith(u8, o, "s3://")) break :blk null;
+                break :blk std.fs.path.dirname(o) orelse ".";
+            } else null;
+            const dir = try cte.scratchDir(arena, clean, out_dir);
+            const plan: sql_cte.Plan = (try planCte(arena, clean, dir)).?;
+            var stager: SetopStager = .{ .init = init, .options = options, .diag = diag, .arena = arena, .finish_reads_inputs = true };
+            return cte.run(gpa, io, plan, dir, stager.interface());
+        }
+    };
     const query: ?[]const u8 = if (comptime build_options.enable_sql) if (options.query) |q| blk: {
         var names: ColumnNames = .{ .schemas = &column_schemas, .io = io, .env = env, .diag = diag };
         // Comments are gone first: a COLUMNS( in one is no call.
@@ -920,6 +958,7 @@ fn runParsed(
         engine_max_mem = max_mem_limit -| opts.reservedBytes();
     }
 
+    if (plan_source) |s| if (s.join != null and aggregate == null and group_by == null) return error.JoinRowsNotSupported;
     if (explain) {
         if (aggregate == null and group_by == null) {
             diagnosticPrint("zpq query: --explain requires an aggregate or GROUP BY query\n", .{});
@@ -1240,6 +1279,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "TemporalOutOfRange",          "ConstantTooDeep",       "IlikePatternNotAscii",         "PostAggNotSupported",         "UpdateWithoutWhere",         "UnparseError",
         "SetOperationAll",             "SetOperationByName",    "SetOperationOrder",            "SetOperationNesting",         "SetOperationColumns",        "SetOperationTypes",
         "SetOperationNullability",     "GroupingSetsKey",       "GroupingSetsDistinct",         "GroupingSetsNesting",         "GroupingSetsGrouping",       "GroupingSetsTooMany",
+        "CteRecursive",                "CteDuplicate",          "CteCircular",                  "LateralNotSupported",         "JoinRowsNotSupported",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

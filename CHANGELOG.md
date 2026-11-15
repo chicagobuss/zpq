@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **S3 Express: a failed refresh thread no longer fails requests.** If the background session refresh can't start a thread, zpq keeps serving the still-valid cached session instead of failing the request.
+
 - **Zig 0.17.1: the pins name it.** `build.zig.zon`'s minimum, `.zig-version`, the CI and release workflows, `just bootstrap` and the docs move from 0.17.0, and bootstrap now checks the tarball against ziglang.org's published sha256 before unpacking it. Still any 0.17.x release, not only 0.17.1.
 
 - **S3 Express One Zone: directory buckets on zonal endpoints, CreateSession session credentials with one shared refresh, reads, writes and multipart with CRC32, and unsorted directory listings handled.**

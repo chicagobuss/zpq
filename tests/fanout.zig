@@ -208,6 +208,133 @@ test "fanout parity: eight query shapes, wrong counts, globs, real Invoke and Du
     try std.testing.expectEqual(@as(f64, 1600), try numeric(try get(try get(out, "agg"), "n")));
 }
 
+test "fanout Invoke retries transient failures exactly once per split and reports terminal HTTP details" {
+    const Fault = struct {
+        status: u16 = 503,
+        close: bool = false,
+        truncated: bool = false,
+        repeat: bool = false,
+        function_error: bool = false,
+        header_type: bool = false,
+        code: []const u8 = "ServiceException",
+        expected: ?anyerror = null,
+        calls: usize = 5,
+        retries: u64 = 1,
+    };
+    const Server = struct {
+        server: fake.FakeServer,
+        fault: Fault,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn serve(self: *@This()) void {
+            while (true) {
+                var req = self.server.acceptRequest(a) catch return;
+                const n = self.calls.fetchAdd(1, .monotonic);
+                if (n == 0 or self.fault.repeat) {
+                    if (self.fault.close or self.fault.truncated) {
+                        if (self.fault.truncated) {
+                            const raw = if (self.fault.function_error)
+                                "HTTP/1.1 200 OK\r\nX-Amz-Function-Error: Unhandled\r\nContent-Length: 100\r\n\r\n{"
+                            else
+                                "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{";
+                            _ = std.os.linux.sendto(req.conn, raw.ptr, raw.len, std.os.linux.MSG.NOSIGNAL, null, 0);
+                        }
+                        req.deinit();
+                        continue;
+                    }
+                    var arena = std.heap.ArenaAllocator.init(a);
+                    defer arena.deinit();
+                    const scratch = arena.allocator();
+                    const body = std.fmt.allocPrint(scratch, "{{\"__type\":\"namespace#{s}\",\"message\":\"PRIVATE-MESSAGE\"}}", .{self.fault.code}) catch return;
+                    const headers = if (self.fault.function_error) "X-Amz-Function-Error: Unhandled\r\n" else if (self.fault.header_type)
+                        "x-amzn-ErrorType: TooManyRequestsException:extra\r\n"
+                    else
+                        "";
+                    req.replyAndClose(a, self.fault.status, headers, body) catch return;
+                } else {
+                    req.replyAndClose(a, 200, "",
+                        \\{"partial_version":1,"schema_fingerprint":"s","plan_digest":"p","groups":[],"aggregates":[{"function":"count","name":"n"}],"agg":{"_a0":1}}
+                    ) catch return;
+                }
+            }
+        }
+    };
+    for ([_]Fault{
+        .{ .close = true },
+        .{ .truncated = true },
+        .{ .status = 429, .header_type = true, .code = "TooManyRequestsException" },
+        .{},
+        .{ .code = "TooManyRequestsException" },
+        .{ .repeat = true, .expected = error.InvokeHttpFailed, .calls = 3, .retries = 2 },
+        .{ .status = 403, .repeat = true, .code = "AccessDeniedException", .expected = error.InvokeHttpFailed, .calls = 1, .retries = 0 },
+        .{ .status = 408, .repeat = true, .expected = error.InvokeHttpFailed, .calls = 1, .retries = 0 },
+        .{ .status = 400, .repeat = true, .code = "TooManyRequestsException", .expected = error.InvokeHttpFailed, .calls = 1, .retries = 0 },
+        .{ .function_error = true, .repeat = true, .expected = error.WorkerFunctionFailed, .calls = 1, .retries = 0 },
+        .{ .status = 200, .function_error = true, .repeat = true, .expected = error.WorkerFunctionFailed, .calls = 1, .retries = 0 },
+        .{ .truncated = true, .function_error = true, .expected = error.WorkerFunctionFailed, .calls = 1, .retries = 0 },
+    }) |fault| {
+        var server: Server = .{ .server = try fake.FakeServer.start(), .fault = fault };
+        defer server.server.deinit();
+        const thread = try std.Thread.spawn(.{}, Server.serve, .{&server});
+        defer {
+            _ = std.os.linux.shutdown(server.server.listen_fd, std.os.linux.SHUT.RDWR);
+            thread.join();
+        }
+        var pool: zpq.io.invoke.Pool = undefined;
+        try pool.init(a);
+        defer pool.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const url = try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}", .{server.server.port});
+        const event: zpq.fanout.Event = .{
+            .endpoints = &.{url},
+            .workers = if (fault.expected == null) 4 else 1,
+            .concurrency = 4,
+            .request = try zpq.engine.fanout.parse(scratch, "{\"inputs\":[\"unused\"],\"aggregate\":\"count(*) AS n\"}"),
+        };
+        const body = try std.json.Stringify.valueAlloc(scratch, event, .{});
+        const result = zpq.fanout.handle(io, a, .empty, &pool, body);
+        if (fault.expected) |err| {
+            try std.testing.expectError(err, result);
+            if (err == error.InvokeHttpFailed) {
+                var buffer: [256]u8 = undefined;
+                const detail = pool.errorMessage(io, err, &buffer);
+                try std.testing.expect(std.mem.indexOf(u8, detail, try std.fmt.allocPrint(scratch, "HTTP {d}", .{fault.status})) != null);
+                try std.testing.expect(std.mem.indexOf(u8, detail, fault.code) != null);
+                try std.testing.expect(std.mem.indexOf(u8, detail, "PRIVATE-MESSAGE") == null);
+            }
+        } else {
+            const answer = try result;
+            defer a.free(answer);
+            const parsed = try zpq.engine.fanout.parse(scratch, answer);
+            try std.testing.expectEqual(@as(f64, 4), try numeric(try get(try get(parsed, "agg"), "n")));
+            try std.testing.expectEqual(@as(f64, 1), try numeric(try get(try get(parsed, "transport"), "retries")));
+            const kind = if (fault.close or fault.truncated) "transport_retries" else if (fault.status == 429 or std.mem.eql(u8, fault.code, "TooManyRequestsException")) "throttle_retries" else "server_retries";
+            try std.testing.expectEqual(@as(f64, 1), try numeric(try get(try get(parsed, "transport"), kind)));
+        }
+        var retries: u64 = 0;
+        for (pool.snapshotRetries()) |n| retries += n;
+        try std.testing.expectEqual(fault.calls, server.calls.load(.monotonic));
+        try std.testing.expectEqual(fault.retries, retries);
+        if (fault.repeat and fault.status == 503 and !fault.function_error) {
+            var rt = try fake.FakeServer.start();
+            defer rt.deinit();
+            var child = try fake.spawnLambdaWithEnv(a, try std.fmt.allocPrint(scratch, "127.0.0.1:{d}", .{rt.port}), &.{});
+            defer fake.killChild(&child);
+            var poll = try rt.acceptRequest(scratch);
+            try poll.replyAndClose(scratch, 200, "Lambda-Runtime-Aws-Request-Id: retry-error\r\n", body);
+            var response = try rt.acceptRequest(scratch);
+            try std.testing.expect(std.mem.endsWith(u8, response.path, "/error"));
+            const failed = try zpq.engine.fanout.parse(scratch, response.body);
+            try response.replyAndClose(scratch, 202, "", "");
+            const detail = (try get(failed, "errorMessage")).string;
+            try std.testing.expect(std.mem.indexOf(u8, detail, "HTTP 503, AWS ServiceException") != null);
+            try std.testing.expect(std.mem.indexOf(u8, detail, "PRIVATE-MESSAGE") == null);
+            try std.testing.expectEqual(@as(usize, 6), server.calls.load(.monotonic));
+        }
+    }
+}
+
 test "fanout Invoke permits function execution beyond S3 first-byte and body idle limits" {
     const Slow = struct {
         fn serve(server: *fake.FakeServer) void {

@@ -47,5 +47,9 @@ pub fn run(init: std.process.Init, iter: *std.process.Args.Iterator, gpa: std.me
     var pool: zpq.io.invoke.Pool = undefined;
     try pool.init(gpa);
     defer pool.deinit();
-    return zpq.fanout.handle(init.io, gpa, init.minimal.environ, &pool, body);
+    return zpq.fanout.handle(init.io, gpa, init.minimal.environ, &pool, body) catch |err| {
+        var detail: [256]u8 = undefined;
+        std.log.err("{s}", .{pool.errorMessage(init.io, err, &detail)});
+        return err;
+    };
 }

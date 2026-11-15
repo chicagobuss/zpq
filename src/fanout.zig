@@ -33,6 +33,7 @@ pub fn handle(io: std.Io, gpa: std.mem.Allocator, env: std.process.Environ, pool
     return handleOver(io, gpa, env, pool, body, charged.allocator()) catch |err| return charged.refusal(err);
 }
 fn handleOver(io: std.Io, gpa: std.mem.Allocator, env: std.process.Environ, pool: *invoke.Pool, body: []const u8, backing: std.mem.Allocator) ![]u8 {
+    pool.beginRequest(io);
     const started = clock.monoNs();
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
@@ -50,6 +51,7 @@ fn handleOver(io: std.Io, gpa: std.mem.Allocator, env: std.process.Environ, pool
     var client: invoke.Client = .{ .io = io, .env = env, .pool = pool, .endpoints = endpoints, .region = if (event.endpoints.len == 0 or event.sign_endpoints) target.region else null };
     const ready_ns = clock.monoNs();
     const before = pool.connections.snapshotStats();
+    const retries_before = pool.snapshotRetries();
     var out = try coordinator.run(a, backing, client.transport(), event.request, .{
         .workers = event.workers,
         .concurrency = event.concurrency,
@@ -59,6 +61,14 @@ fn handleOver(io: std.Io, gpa: std.mem.Allocator, env: std.process.Environ, pool
     });
     const after = pool.connections.snapshotStats();
     var transport: std.json.Value = .{ .object = .{} };
+    const retries_after = pool.snapshotRetries();
+    var retries: u64 = 0;
+    inline for (invoke.retry_names, 0..) |key, i| {
+        const n = retries_after[i] -| retries_before[i];
+        retries += n;
+        try transport.object.put(a, key, .{ .integer = @intCast(n) });
+    }
+    try transport.object.put(a, "retries", .{ .integer = @intCast(retries) });
     inline for (.{ "acquires", "opens", "reuses", "stale_retries", "idle_evictions" }) |key| {
         try transport.object.put(a, key, .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{@field(after, key) -| @field(before, key)}) });
     }

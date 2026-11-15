@@ -9,17 +9,87 @@ const SigV4 = @import("sigv4.zig").SigV4;
 const envValue = @import("../core/system.zig").winEnvValue;
 const A = std.mem.Allocator;
 const invoke_ms = 15 * 60_000;
+const retry = @import("retry.zig");
+const max_attempts = 3; // AWS standard retry mode: the initial call plus two retries.
+const RetryKind = enum { connect, handshake, transport, throttle, server };
+pub const retry_names = [_][]const u8{ "connect_retries", "handshake_retries", "transport_retries", "throttle_retries", "server_retries" };
+
+const HttpFailure = struct {
+    index: usize,
+    status: u16,
+    attempts: usize,
+    aws_type: [96]u8 = undefined,
+    len: usize = 0,
+
+    fn read(a: A, response: http.Response, index: usize, attempts: usize) HttpFailure {
+        var out: HttpFailure = .{ .index = index, .status = response.status, .attempts = attempts };
+        var name = response.header("x-amzn-ErrorType") orelse "";
+        if (name.len == 0) {
+            const body = fanout.parse(a, response.body[0..@min(response.body.len, 4096)]) catch return out;
+            if (body == .object) for ([_][]const u8{ "__type", "code", "errorType", "Type" }) |key| {
+                if (body.object.get(key)) |v| if (v == .string) {
+                    name = v.string;
+                    break;
+                };
+            };
+        }
+        if (std.mem.lastIndexOfScalar(u8, name, '#')) |i| name = name[i + 1 ..];
+        // Only the type identifier is diagnostic: never the AWS message, payload, or signed headers.
+        for (name) |ch| {
+            if (out.len == out.aws_type.len or !(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.')) break;
+            out.aws_type[out.len] = ch;
+            out.len += 1;
+        }
+        return out;
+    }
+};
+
 pub const Pool = struct {
     connections: pool_mod.Pool(256) = undefined,
     capability_key: [32]u8 = @splat(0),
     prepared_v1: bool = false,
     aligned_v1: bool = false,
+    retry_counts: [retry_names.len]std.atomic.Value(u64) = @splat(.init(0)),
+    failure_mutex: std.Io.Mutex = .init,
+    http_failure: ?HttpFailure = null,
+    retry_start: u64 = 0,
     pub fn init(self: *Pool, a: A) !void {
         self.* = .{};
         try self.connections.init(a);
     }
     pub fn deinit(self: *Pool) void {
         self.connections.deinit();
+    }
+    pub fn snapshotRetries(self: *Pool) [retry_names.len]u64 {
+        var out: [retry_names.len]u64 = undefined;
+        for (&out, &self.retry_counts) |*n, *counter| n.* = counter.load(.monotonic);
+        return out;
+    }
+    pub fn beginRequest(self: *Pool, io: std.Io) void {
+        self.failure_mutex.lockUncancelable(io);
+        defer self.failure_mutex.unlock(io);
+        self.http_failure = null;
+        self.retry_start = 0;
+        for (self.snapshotRetries()) |n| self.retry_start += n;
+    }
+    fn recordFailure(self: *Pool, io: std.Io, failure: HttpFailure) void {
+        self.failure_mutex.lockUncancelable(io);
+        defer self.failure_mutex.unlock(io);
+        if (self.http_failure == null or failure.index < self.http_failure.?.index) self.http_failure = failure;
+    }
+    pub fn errorMessage(self: *Pool, io: std.Io, err: anyerror, buffer: []u8) []const u8 {
+        self.failure_mutex.lockUncancelable(io);
+        defer self.failure_mutex.unlock(io);
+        var total: u64 = 0;
+        for (self.snapshotRetries()) |n| total += n;
+        const retried = total -| self.retry_start;
+        if (err == error.InvokeHttpFailed) if (self.http_failure) |f| {
+            return std.fmt.bufPrint(buffer, "InvokeHttpFailed: HTTP {d}, AWS {s}, invoke {d}, attempts {d}, retries {d}", .{
+                f.status, if (f.len == 0) "Unknown" else f.aws_type[0..f.len], f.index, f.attempts, retried,
+            }) catch @errorName(err);
+        };
+        if (retried == 0) return @errorName(err);
+        return std.fmt.bufPrint(buffer, "{s}: retries {d}", .{ @errorName(err), retried }) catch @errorName(err);
     }
 };
 
@@ -144,44 +214,91 @@ pub const Client = struct {
         if (self.endpoints.len == 0) return error.NoInvokeEndpoints;
         if (body.len > 6 << 20) return error.InvokeRequestTooLarge;
         const endpoint = self.endpoints[index % self.endpoints.len];
-        // Retry only a stale keep-alive socket, once. Never retry a function or protocol error.
-        for (0..2) |attempt| {
-            const h = try self.pool.connections.acquire(self.io, .{
-                .host = endpoint.host,
-                .addrs = endpoint.addrs,
-                .port = endpoint.port,
-                .use_tls = endpoint.use_tls,
-                // Synchronous Invoke may be silent until the function finishes, even after response headers.
-                .timeouts = .{ .first_byte_ms = invoke_ms, .idle_ms = invoke_ms },
-            }, .{ .fresh = attempt != 0 });
-            var retained = false;
-            defer if (!retained) self.pool.connections.discard(self.io, h);
-            const signed_headers = try self.headers(a, endpoint, body);
-            const response = http.sendRequest(a, h.conn, .{
-                .method = .POST,
-                .host = endpoint.authority,
-                .path = endpoint.path,
-                .headers = signed_headers,
-                .body = body,
-                .total_ms = invoke_ms,
-            }) catch |err| {
-                if (attempt == 0 and h.reused and (err == error.ClosedBeforeResponse or err == error.SendFailed)) {
-                    self.pool.connections.noteRetry(self.io, .stale);
+        const invocation_deadline = tls.invocation_deadline_ms.load(.monotonic);
+        const deadline = @min(tls.deadlineFromNow(invoke_ms), if (invocation_deadline == 0) std.math.maxInt(u64) else invocation_deadline);
+        var fresh = false;
+        for (0..max_attempts) |attempt| {
+            if (remaining(deadline) == 0) return error.RequestTimeout;
+            var failure: Failure = .{};
+            return self.once(a, endpoint, index, body, fresh, deadline, attempt + 1, &failure) catch |err| {
+                if (failure.kind) |kind| if (try self.retryAfter(kind, attempt, deadline)) {
+                    if (failure.stale) self.pool.connections.noteRetry(self.io, .stale);
+                    fresh = kind == .connect or kind == .handshake or kind == .transport;
                     continue;
-                }
+                };
+                if (failure.http) |f| self.pool.recordFailure(self.io, f);
                 return err;
             };
-            const close = if (response.header("Connection")) |v| std.ascii.eqlIgnoreCase(v, "close") else false;
-            if (!close) {
-                self.pool.connections.release(self.io, h);
-                retained = true;
-            }
-            if (response.status != 200) return error.InvokeHttpFailed;
-            if (response.header("X-Amz-Function-Error") != null) return error.WorkerFunctionFailed;
-            if (response.body.len > 6 << 20) return error.InvokeResponseTooLarge;
-            return response.body;
         }
-        return error.InvokeHttpFailed;
+        unreachable;
+    }
+    const Failure = struct { kind: ?RetryKind = null, http: ?HttpFailure = null, stale: bool = false };
+    fn remaining(deadline: u64) u32 {
+        return @intCast(@min(deadline -| tls.deadlineFromNow(0), std.math.maxInt(u32)));
+    }
+    fn retryAfter(self: *Client, kind: RetryKind, attempt: usize, deadline: u64) !bool {
+        if (attempt + 1 == max_attempts or remaining(deadline) == 0) return false;
+        // AWS's standard full-jitter bases: 50 ms for transient errors, 1000 ms for throttling.
+        const policy: retry.Policy = .{ .base_ms = if (kind == .throttle) 1000 else 50, .cap_ms = 20_000 };
+        const delay = @min(retry.backoffMs(policy, @intCast(attempt)), remaining(deadline));
+        if (delay != 0) try self.io.sleep(.fromMilliseconds(@intCast(delay)), .awake);
+        if (remaining(deadline) == 0) return false;
+        _ = self.pool.retry_counts[@backingInt(kind)].fetchAdd(1, .monotonic);
+        return true;
+    }
+    fn once(self: *Client, a: A, endpoint: Endpoint, index: usize, body: []const u8, fresh: bool, deadline: u64, attempt: usize, failure: *Failure) ![]const u8 {
+        const h = self.pool.connections.acquire(self.io, .{
+            .host = endpoint.host,
+            .addrs = endpoint.addrs,
+            .port = endpoint.port,
+            .use_tls = endpoint.use_tls,
+            // Synchronous Invoke may be silent until the function finishes, even after response headers.
+            .timeouts = .{ .first_byte_ms = invoke_ms, .idle_ms = invoke_ms },
+            .deadline_ms = deadline,
+        }, .{ .fresh = fresh }) catch |err| {
+            if (retry.classifyConnect(err) != .fatal or err == error.ConnectionReset or err == error.UncleanClose) failure.kind = switch (err) {
+                error.HandshakeFailed, error.HandshakeTimeout => .handshake,
+                else => .connect,
+            };
+            return err;
+        };
+        var retained = false;
+        defer if (!retained) self.pool.connections.discard(self.io, h);
+        const signed_headers = try self.headers(a, endpoint, body);
+        const left = remaining(deadline);
+        if (left == 0) return error.RequestTimeout;
+        const response = http.sendRequest(a, h.conn, .{
+            .method = .POST,
+            .host = endpoint.authority,
+            .path = endpoint.path,
+            .headers = signed_headers,
+            .body = body,
+            .total_ms = left,
+            .reject_response_header = "X-Amz-Function-Error",
+        }) catch |err| {
+            if (err == error.RejectedResponseHeader) return error.WorkerFunctionFailed;
+            const classification = retry.classify(err, .{ .idempotent = true, .reused = h.reused });
+            if (classification != .fatal or err == error.ConnectionReset or err == error.UncleanClose) failure.kind = .transport;
+            failure.stale = classification == .stale;
+            return err;
+        };
+        const close = if (response.header("Connection")) |v| std.ascii.eqlIgnoreCase(v, "close") else false;
+        if (!close) {
+            self.pool.connections.release(self.io, h);
+            retained = true;
+        }
+        if (response.status != 200) {
+            failure.http = HttpFailure.read(a, response, index, attempt);
+            const f = failure.http.?;
+            const throttle = std.mem.eql(u8, f.aws_type[0..f.len], "TooManyRequestsException");
+            failure.kind = if (response.status == 429) .throttle else if (response.status >= 500 and response.status <= 599)
+                (if (throttle) .throttle else .server)
+            else
+                null;
+            return error.InvokeHttpFailed;
+        }
+        if (response.body.len > 6 << 20) return error.InvokeResponseTooLarge;
+        return response.body;
     }
     fn headers(self: *Client, a: A, endpoint: Endpoint, body: []const u8) ![]const http.Header {
         if (self.region) |region| {
@@ -220,4 +337,14 @@ test "fanout invoke: Lambda canonical ARN URI is escaped again, wire URI stays s
     try std.testing.expectEqualStrings("/2015-03-31/functions/123456789012%253Afunction%253Aworker/invocations", try encode(a, target.path[0..q], true));
     try std.testing.expectEqualStrings("/2015-03-31/functions/123456789012%3Afunction%3Aworker/invocations?Qualifier=7", target.path);
     try std.testing.expectEqualStrings("/plain/path", try encode(a, "/plain/path", true));
+}
+
+test "fanout invoke: retry backoff cannot start an attempt after its deadline or budget" {
+    var pool: Pool = undefined;
+    try pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var client: Client = .{ .io = std.testing.io, .env = .empty, .pool = &pool, .endpoints = &.{} };
+    try std.testing.expect(!try client.retryAfter(.handshake, 0, tls.deadlineFromNow(0)));
+    try std.testing.expect(!try client.retryAfter(.server, max_attempts - 1, tls.deadlineFromNow(1000)));
+    try std.testing.expectEqualDeep(@as([retry_names.len]u64, @splat(0)), pool.snapshotRetries());
 }

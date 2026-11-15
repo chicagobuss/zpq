@@ -49,6 +49,8 @@ pub const Criteria = struct {
     use_tls: bool = true,
     /// Deadlines for a new connection; a reused one takes them on too (`tls.Connection.setTimeouts`).
     timeouts: tls.Timeouts = .{},
+    /// Optional absolute deadline over the complete connect/handshake, including address fallback.
+    deadline_ms: ?u64 = null,
 };
 
 pub fn Pool(comptime N: usize) type {
@@ -257,6 +259,7 @@ pub fn Pool(comptime N: usize) type {
                 .first = first_addr,
                 .port = criteria.port,
                 .timeouts = criteria.timeouts,
+                .deadline_ms = criteria.deadline_ms,
             };
             const conn = if (criteria.use_tls)
                 try tls.Connection.connect(self.allocator, peer, criteria.host)

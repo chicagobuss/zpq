@@ -101,11 +101,14 @@ pub fn main(init: std.process.Init) !void {
             null else null;
         defer if (watcher) |t| watchdog.stop(t);
 
-        const response = (if (zpq.fanout.isCoordinator(allocator, inv.body))
+        const coordinating = zpq.fanout.isCoordinator(allocator, inv.body);
+        const response = (if (coordinating)
             zpq.fanout.handle(io, allocator, env, &invoke_pool, inv.body)
         else
             service.handle(io, allocator, env, inv.body, &pool, legacy)) catch |err| {
-            if (watchdog.claim()) client.postError(inv.request_id, "HandlerError", @errorName(err)) catch |perr| {
+            var detail: [256]u8 = undefined;
+            const message = if (coordinating) invoke_pool.errorMessage(io, err, &detail) else @errorName(err);
+            if (watchdog.claim()) client.postError(inv.request_id, "HandlerError", message) catch |perr| {
                 std.debug.print("zpq lambda: postError failed: {s}\n", .{@errorName(perr)});
             };
             continue;

@@ -917,9 +917,9 @@ const EncodeExecutor = struct {
     }
 
     fn admits(e: *const EncodeExecutor, count: usize, bytes: u64) bool {
-        // Wide groups already supply many columns/pages; fewer simultaneous groups avoid retaining idle scratch.
-        const groups = if (e.w.out_elems.len > e.workers) @max(1, e.workers / 4) else e.workers;
-        return count <= groups and bytes <= e.byte_limit;
+        // One group per worker, within the byte share, however wide: a group's plan phase waits on its slowest column,
+        // and only other groups' tasks fill the turns meanwhile.
+        return count <= e.workers and bytes <= e.byte_limit;
     }
 
     fn submit(e: *EncodeExecutor, work: Work) void {

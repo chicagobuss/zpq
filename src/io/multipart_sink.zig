@@ -729,7 +729,7 @@ fn abortUploadsStartedSince(
     };
     for (uploads) |u| {
         if (!std.mem.eql(u8, u.key, url.key)) continue;
-        const initiated = parseIso8601Seconds(u.initiated) orelse continue;
+        const initiated = s3.parseIso8601Seconds(u.initiated) orelse continue;
         if (initiated < since_s) continue;
         if (abortLogged(arena, creds, url, control, u.upload_id))
             std.log.warn("multipart sink: aborted an upload orphaned by a lost CreateMultipartUpload", .{});
@@ -811,34 +811,6 @@ fn xmlUnescape(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out.items;
 }
 
-/// Seconds since the epoch of an S3 timestamp such as `2026-10-03T22:21:03.000Z` (fraction ignored); null when it
-/// does not parse.
-fn parseIso8601Seconds(s: []const u8) ?i64 {
-    if (s.len < 20 or s[4] != '-' or s[7] != '-' or s[10] != 'T' or s[13] != ':' or s[16] != ':') return null;
-    if (s[s.len - 1] != 'Z') return null;
-    const num = struct {
-        fn f(t: []const u8) ?i64 {
-            return std.fmt.parseInt(i64, t, 10) catch null;
-        }
-    }.f;
-    const y = num(s[0..4]) orelse return null;
-    const m = num(s[5..7]) orelse return null;
-    const d = num(s[8..10]) orelse return null;
-    const hh = num(s[11..13]) orelse return null;
-    const mm = num(s[14..16]) orelse return null;
-    const ss = num(s[17..19]) orelse return null;
-    if (m < 1 or m > 12 or d < 1 or d > 31) return null;
-    // Days from 1970-01-01 to y-m-d in the proleptic Gregorian calendar (Howard Hinnant's days_from_civil).
-    const yy = if (m <= 2) y - 1 else y;
-    const era = @divFloor(yy, 400);
-    const yoe = yy - era * 400;
-    const mp = @mod(m + 9, 12);
-    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    const days = era * 146097 + doe - 719468;
-    return days * 86400 + hh * 3600 + mm * 60 + ss;
-}
-
 /// The ETag S3 gives an object completed from `parts`: the MD5 of the parts' binary MD5s, then `-` and the part count.
 /// Null when a part ETag is not a plain MD5 (SSE-KMS, for one), since then the object's ETag cannot be predicted.
 fn multipartEtag(arena: std.mem.Allocator, parts: []const *EtagSlot) !?[]const u8 {
@@ -876,13 +848,7 @@ fn headObject(arena: std.mem.Allocator, creds: s3.Credentials, url: s3.Url) !htt
     var conn = try s3.connect(arena, creds, addrs, host);
     defer conn.deinit();
 
-    const signer: sigv4.SigV4 = .{
-        .region = creds.region,
-        .access_key = creds.access_key,
-        .secret_key = creds.secret_key,
-        .session_token = creds.session_token,
-    };
-    const signed = try signer.sign(arena, "HEAD", host, path, null, &.{}, "", .{ .use_unsigned_payload = true });
+    const signed = try creds.signer().sign(arena, "HEAD", host, path, null, &.{}, "", .{ .use_unsigned_payload = true });
     var headers: std.ArrayList(http.Header) = .empty;
     for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
     return http.sendRequest(arena, &conn, .{ .method = .HEAD, .host = host, .path = path, .headers = headers.items });
@@ -1080,14 +1046,6 @@ test "a lost CompleteMultipartUpload that did not take effect still fails and ab
     try testing.expectError(error.ClosedBeforeResponse, writeThroughSink(&fake, "out.parquet", &test_payload));
     try testing.expect(fake.object("out.parquet") == null);
     try testing.expectEqual(@as(usize, 0), fake.openUploadsFor("out.parquet"));
-}
-
-test "parseIso8601Seconds reads S3 timestamps with and without a fraction" {
-    try testing.expectEqual(@as(?i64, 0), parseIso8601Seconds("1970-01-01T00:00:00Z"));
-    try testing.expectEqual(@as(?i64, 1_791_066_063), parseIso8601Seconds("2026-10-03T22:21:03.000Z"));
-    try testing.expectEqual(@as(?i64, 951_782_400), parseIso8601Seconds("2000-02-29T00:00:00.5Z"));
-    try testing.expectEqual(@as(?i64, null), parseIso8601Seconds("2026-10-03 22:21:03"));
-    try testing.expectEqual(@as(?i64, null), parseIso8601Seconds("2026-13-03T22:21:03Z"));
 }
 
 test "parseListedUploads decodes keys and keeps every upload's id and start time" {

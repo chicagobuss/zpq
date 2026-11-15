@@ -508,11 +508,13 @@ fn sessionCredentialsWait(io: ?Io, arena: std.mem.Allocator, base: Credentials, 
     if (e.session != null and e.expires > now + 60) return copyCredentials(arena, e.session.?);
     if (!e.refreshing) {
         e.refreshing = true;
-        const t = std.Thread.spawn(.{}, refreshSession, .{e}) catch {
+        if (std.Thread.spawn(.{}, refreshSession, .{e})) |t| {
+            t.detach();
+        } else |_| {
             e.refreshing = false;
+            if (e.session != null and e.expires > now + 5) return copyCredentials(arena, e.session.?);
             return error.S3RequestFailed;
-        };
-        t.detach();
+        }
     }
     if (e.session != null and e.expires > now + 5) return copyCredentials(arena, e.session.?);
     while (e.refreshing) {
@@ -582,12 +584,14 @@ fn createSession(arena: std.mem.Allocator, base: Credentials, bucket: []const u8
     creds.session_token = extractXml(arena, resp.body, "SessionToken") catch return error.BadResponse;
     creds.express_session = true;
     const exp = extractXml(arena, resp.body, "Expiration") catch return error.BadResponse;
-    const expires = parseSessionExpiration(exp) orelse return error.BadResponse;
+    const expires = parseIso8601Seconds(exp) orelse return error.BadResponse;
     if (expires <= clock.realtimeS() + 5) return error.BadResponse;
     return .{ .creds = creds, .expires = expires };
 }
 
-fn parseSessionExpiration(s: []const u8) ?i64 {
+/// Seconds since the epoch of an S3 timestamp such as `2026-10-03T22:21:03.000Z` (fraction ignored); null when it
+/// does not parse.
+pub fn parseIso8601Seconds(s: []const u8) ?i64 {
     if (s.len < 20 or s[4] != '-' or s[7] != '-' or s[10] != 'T' or s[13] != ':' or s[16] != ':' or s[s.len - 1] != 'Z') return null;
     const num = struct {
         fn f(t: []const u8) ?i64 {
@@ -601,6 +605,7 @@ fn parseSessionExpiration(s: []const u8) ?i64 {
     const mm = num(s[14..16]) orelse return null;
     const ss = num(s[17..19]) orelse return null;
     if (m < 1 or m > 12 or d < 1 or d > 31 or hh > 23 or mm > 59 or ss > 59) return null;
+    // Days from 1970-01-01 to y-m-d in the proleptic Gregorian calendar (Howard Hinnant's days_from_civil).
     const yy = if (m <= 2) y - 1 else y;
     const era = @divFloor(yy, 400);
     const yoe = yy - era * 400;
@@ -610,9 +615,16 @@ fn parseSessionExpiration(s: []const u8) ?i64 {
     return (era * 146097 + doe - 719468) * 86400 + hh * 3600 + mm * 60 + ss;
 }
 
-test "S3 Express session expiration and standard credentials" {
-    try std.testing.expectEqual(@as(?i64, 1_791_066_063), parseSessionExpiration("2026-10-03T22:21:03.000Z"));
-    try std.testing.expectEqual(@as(?i64, null), parseSessionExpiration("bad"));
+test "parseIso8601Seconds reads S3 timestamps with and without a fraction" {
+    try std.testing.expectEqual(@as(?i64, 0), parseIso8601Seconds("1970-01-01T00:00:00Z"));
+    try std.testing.expectEqual(@as(?i64, 1_791_066_063), parseIso8601Seconds("2026-10-03T22:21:03.000Z"));
+    try std.testing.expectEqual(@as(?i64, 951_782_400), parseIso8601Seconds("2000-02-29T00:00:00.5Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601Seconds("2026-10-03 22:21:03"));
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601Seconds("2026-13-03T22:21:03Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601Seconds("bad"));
+}
+
+test "S3 Express standard credentials pass through" {
     const base: Credentials = .{ .access_key = "key", .secret_key = "secret", .region = "us-west-2" };
     const got = try sessionCredentials(std.testing.allocator, base, "standard-bucket", .read_only);
     try std.testing.expectEqualStrings(base.access_key, got.access_key);
@@ -682,13 +694,16 @@ pub const Client = struct {
     /// Send a GET. Reuses the existing TLS connection when possible;
     /// reconnects on a stale-connection error and retries once.
     /// Body / headers are arena-allocated in `req_arena`.
-    pub fn get(
-        self: *Client,
-        req_arena: std.mem.Allocator,
-        key: []const u8,
-        range: ?Range,
-    ) Error!http.Response {
-        return self.sendOnce(req_arena, key, range) catch |err| switch (err) {
+    pub fn get(self: *Client, req_arena: std.mem.Allocator, key: []const u8, range: ?Range) Error!http.Response {
+        return self.request(.GET, req_arena, key, range);
+    }
+
+    pub fn head(self: *Client, arena: std.mem.Allocator, key: []const u8) Error!http.Response {
+        return self.request(.HEAD, arena, key, null);
+    }
+
+    fn request(self: *Client, method: http.Method, req_arena: std.mem.Allocator, key: []const u8, range: ?Range) Error!http.Response {
+        return self.sendOnce(method, req_arena, key, range) catch |err| switch (err) {
             // Stale-connection signals: server closed our idle socket
             // since the last request. Retry once with a fresh conn.
             error.ClosedBeforeResponse, error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => blk: {
@@ -696,7 +711,7 @@ pub const Client = struct {
                     conn.deinit();
                     self.conn = null;
                 }
-                break :blk try self.sendOnce(req_arena, key, range);
+                break :blk try self.sendOnce(method, req_arena, key, range);
             },
             else => return err,
         };
@@ -704,6 +719,7 @@ pub const Client = struct {
 
     fn sendOnce(
         self: *Client,
+        method: http.Method,
         req_arena: std.mem.Allocator,
         key: []const u8,
         range: ?Range,
@@ -719,29 +735,8 @@ pub const Client = struct {
             self.host,
             self.bucket,
             key,
-            .{ .range = range },
+            .{ .method = method, .range = range },
         );
-    }
-
-    pub fn head(self: *Client, arena: std.mem.Allocator, key: []const u8) Error!http.Response {
-        return self.headOnce(arena, key) catch |err| switch (err) {
-            error.ClosedBeforeResponse, error.RecvFailed, error.SendFailed, error.BodyTruncated, error.BadStatusLine => blk: {
-                if (self.conn) |*conn| conn.deinit();
-                self.conn = null;
-                break :blk try self.headOnce(arena, key);
-            },
-            else => return err,
-        };
-    }
-
-    fn headOnce(self: *Client, arena: std.mem.Allocator, key: []const u8) Error!http.Response {
-        const creds = try sessionCredentials(arena, self.creds, self.bucket, .read_only);
-        if (self.conn == null) self.conn = try connect(self.client_arena, creds, self.addrs, self.host);
-        const path = try pathFor(arena, creds, self.bucket, key);
-        const signed = creds.signer().sign(arena, "HEAD", self.host, path, null, &.{}, "", .{ .use_unsigned_payload = true }) catch return error.SignFailed;
-        var headers: std.ArrayList(http.Header) = .empty;
-        for (signed) |h| try headers.append(arena, .{ .name = h.name, .value = h.value });
-        return withRequestSecrets(try http.sendRequest(arena, &self.conn.?, .{ .method = .HEAD, .host = self.host, .path = path, .headers = headers.items }), creds);
     }
 
     /// One ListObjectsV2 page. Reuses the cached TLS connection.
@@ -857,6 +852,7 @@ pub fn getViaPool(
 /// Extra request options for ranged/conditional GET. Each field is
 /// optional; default-init reproduces a plain Range-only GET.
 pub const GetOpts = struct {
+    method: http.Method = .GET,
     range: ?Range = null,
     /// `If-None-Match: <etag>`. Server replies 304 (Not Modified) if
     /// the object's current ETag matches; the response body is empty
@@ -876,16 +872,17 @@ pub fn getViaPoolWithOpts(
     url: Url,
     opts: GetOpts,
 ) !http.Response {
-    const request_creds = try sessionCredentialsWithIo(io, arena, creds, url.bucket, .read_only);
     const host = try hostFor(arena, creds, url.bucket);
     const criteria = try poolCriteria(arena, creds, url.bucket);
     const Get = struct {
+        io: Io,
         creds: Credentials,
         host: []const u8,
         url: Url,
         opts: GetOpts,
         fn send(self: @This(), a: std.mem.Allocator, conn: *tls.Connection) !http.Response {
-            return buildAndSend(a, conn, self.creds, self.host, self.url.bucket, self.url.key, self.opts);
+            const request_creds = try sessionCredentialsWithIo(self.io, a, self.creds, self.url.bucket, .read_only);
+            return buildAndSend(a, conn, request_creds, self.host, self.url.bucket, self.url.key, self.opts);
         }
     };
     // A suffix range has no start until the object's size is known: its span shows [0, n).
@@ -893,14 +890,13 @@ pub fn getViaPoolWithOpts(
     const is_suffix = r != null and r.?.start == std.math.maxInt(u64);
     const bytes: u64 = if (r) |rr| (if (is_suffix) rr.end else rr.end - rr.start + 1) else 0;
     const tag: [2]u64 = if (r) |rr| (if (is_suffix) .{ 0, rr.end } else .{ rr.start, rr.end + 1 }) else .{ 0, 0 };
-    const response = try requestViaPool(io, p, arena, criteria, .{
+    return requestViaPool(io, p, arena, criteria, .{
         .idempotent = true,
         .method = .GET,
         .prof = opts.prof,
         .tag = tag,
         .bytes = bytes,
-    }, Get{ .creds = request_creds, .host = host, .url = url, .opts = opts }, Get.send);
-    return withRequestSecrets(response, request_creds);
+    }, Get{ .io = io, .creds = creds, .host = host, .url = url, .opts = opts }, Get.send);
 }
 
 pub const RequestOpts = struct {
@@ -1043,19 +1039,20 @@ pub fn putViaPool(
     url: Url,
     body: []const u8,
 ) !http.Response {
-    const request_creds = try sessionCredentialsWithIo(io, arena, creds, url.bucket, .read_write);
     const host = try hostFor(arena, creds, url.bucket);
     const criteria = try poolCriteria(arena, creds, url.bucket);
     const Put = struct {
+        io: Io,
         creds: Credentials,
         host: []const u8,
         url: Url,
         body: []const u8,
         fn send(self: @This(), a: std.mem.Allocator, conn: *tls.Connection) !http.Response {
-            return sendPut(a, conn, self.creds, self.host, self.url.bucket, self.url.key, self.body);
+            const request_creds = try sessionCredentialsWithIo(self.io, a, self.creds, self.url.bucket, .read_write);
+            return sendPut(a, conn, request_creds, self.host, self.url.bucket, self.url.key, self.body);
         }
     };
-    return requestViaPool(io, p, arena, criteria, .{ .idempotent = true }, Put{ .creds = request_creds, .host = host, .url = url, .body = body }, Put.send);
+    return requestViaPool(io, p, arena, criteria, .{ .idempotent = true }, Put{ .io = io, .creds = creds, .host = host, .url = url, .body = body }, Put.send);
 }
 
 fn sendPut(
@@ -1656,7 +1653,7 @@ fn buildAndSend(
 
     const signed_headers = signer.sign(
         req_arena,
-        "GET",
+        @tagName(opts.method),
         host,
         path,
         null,
@@ -1672,7 +1669,7 @@ fn buildAndSend(
     }
 
     return withRequestSecrets(try http.sendRequest(req_arena, conn, .{
-        .method = .GET,
+        .method = opts.method,
         .host = host,
         .path = path,
         .headers = req_headers.items,

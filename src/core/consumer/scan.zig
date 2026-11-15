@@ -1104,7 +1104,15 @@ fn scanRGForAggImpl(
         .num_rows = batch_rows,
         .expr_batch_rows = ws.expr_batch_rows,
     };
-    if (in.filter) |f| if (!filtered) {
+    // A lone GROUP BY key read as a histogram is filtered by that key alone (`planCodeUses`): per entry, not per row.
+    var hist_rows: ?usize = null;
+    if (in.filter) |f| if (!filtered and target == .grouped) {
+        if (agg_coded.histGroupKey(target.grouped.calls, target.grouped.keys)) |key| if (lookup[key]) |pos| {
+            if (batch_cols.items[pos].hist() != null)
+                hist_rows = try agg_coded.filterHist(ra, f, &batch_cols.items[pos], key, lookup.len);
+        };
+    };
+    if (in.filter) |f| if (!filtered and hist_rows == null) {
         if (gated) |*g|
             try g.evaluate(&batch, &sel, lookup, ra, true)
         else
@@ -1132,7 +1140,7 @@ fn scanRGForAggImpl(
         try agg_coded.codePlainKeys(ra, target.grouped.keys, batch_cols.items, lookup);
     const t_eval_end = nowMonoNs();
     ws.timings.eval_ns += @intCast(t_eval_end - t_decode_end);
-    const selected: usize = if (in.filter != null) sel.count() else num_rows;
+    const selected: usize = hist_rows orelse if (in.filter != null) sel.count() else num_rows;
     profile.record(prof, .filter, t_decode_end, t_eval_end, profile.args(.{ batch_rows, selected }));
     // A group-join folds into its build's slots: the query's group tables stay empty (`join/lookup.zig`).
     if (join_lookup.ofFilter(in.filter)) |j| if (j.group) |g| {

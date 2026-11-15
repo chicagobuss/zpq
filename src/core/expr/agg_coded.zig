@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const filter_eval = @import("../filter/eval.zig");
+const filter_ast = @import("../filter/ast.zig");
 const filter_selection = @import("../filter/selection.zig");
 const expr_ast = @import("ast.zig");
 const expr_eval = @import("eval.zig");
@@ -723,6 +724,29 @@ pub fn groupedCodedWithContext(
         });
     }
     return true;
+}
+
+/// A filter that reads only the lone GROUP BY key keeps or drops whole groups, so over the key's histogram
+/// (`histGroupKey`) it is evaluated once per dictionary entry: the entries it drops lose their counts. Returns the rows
+/// it keeps (a key's histogram has no null row). The fold reads the histogram alone, never the row selection.
+pub fn filterHist(ra: std.mem.Allocator, f: filter_ast.Filter, col: *Column, key: usize, lookup_len: usize) !usize {
+    const hist = col.hist().?;
+    var cols = [_]Column{col.dictColumn()};
+    const lookup = try ra.alloc(?usize, lookup_len);
+    @memset(lookup, null);
+    lookup[key] = 0;
+    var sel = try Sel.init(ra, hist.len);
+    try filter_eval.evaluate(f, &.{ .cols = &cols, .num_rows = hist.len }, &sel, lookup, ra);
+    const kept = try ra.alloc(u64, hist.len);
+    var rows: usize = 0;
+    for (kept, hist, 0..) |*k, count, code| {
+        k.* = if (sel.isActive(code)) count else 0;
+        rows += k.*;
+    }
+    switch (col.*) {
+        inline else => |*c| c.hist = kept,
+    }
+    return rows;
 }
 
 /// `groupedCoded` for a key decoded as a histogram with first rows (`histGroupKey`): each code a row holds becomes its

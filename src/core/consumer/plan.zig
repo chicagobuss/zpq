@@ -869,17 +869,20 @@ pub fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !
     // read it as a bare argument.
     @memset(u.hist_ok, in.filter == null and target == .scalar);
     // So does a lone GROUP BY key that only counts read, its groups resolved from the histogram
-    // (`agg_coded.groupedCoded`). A windowed, sketched or owned-record fold needs per-row identities.
-    if (in.filter == null) switch (target) {
+    // (`agg_coded.groupedCoded`), under no filter or one of that key alone (`agg_coded.filterHist`). A windowed,
+    // sketched or owned-record fold needs per-row identities.
+    switch (target) {
         .grouped => |g| if (g.records == null and g.part == null and g.table.sketch == null and
             g.table.discovery == null)
         {
-            if (agg_coded.histGroupKey(g.calls, g.keys)) |key| if (key < n) {
+            if (agg_coded.histGroupKey(g.calls, g.keys)) |key| if (key < n and
+                (in.filter == null or try keyOnlyFilter(ra, in.filter.?, key, n)))
+            {
                 u.hist_ok[key] = true;
             };
         },
         .scalar => {},
-    };
+    }
     if (target == .scalar) for (target.calls()) |call| {
         if (call.where) |w| markFilterSet(u.hist_ok, w, false);
         if (call.arg) |arg| {
@@ -913,6 +916,16 @@ pub fn planCodeUses(ra: std.mem.Allocator, in: AggRowGroup, target: AggTarget) !
         }
     };
     return u;
+}
+
+/// Whether `f` reads column `key` and no other, with no join lookup.
+fn keyOnlyFilter(ra: std.mem.Allocator, f: filter_ast.Filter, key: usize, n: usize) !bool {
+    if (join_lookup.inFilter(f)) return false;
+    const set = try ra.alloc(bool, n);
+    @memset(set, false);
+    markFilterSet(set, f, true);
+    for (set, 0..) |read, ci| if (read and ci != key) return false;
+    return true;
 }
 
 fn markFilterSet(set: []bool, f: filter_ast.Filter, v: bool) void {

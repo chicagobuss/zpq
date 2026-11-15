@@ -302,11 +302,11 @@ pub const ResultProgram = struct {
                 }
             };
             h.eachColumn(Reads{ .wanted = wanted }, Reads.mark);
-            try computeDerived(out.group_rows.?, programs, wanted, computed);
+            try computeDerived(out.group_rows.?, programs, wanted, computed, self.workers);
             try applyHaving(gpa, out, h.*);
         }
         @memset(wanted, true);
-        try computeDerived(out.group_rows.?, programs, wanted, computed);
+        try computeDerived(out.group_rows.?, programs, wanted, computed, self.workers);
         try out.applyResultOrder(gpa, self.order);
         try project(self.select.len, self.workers, gpa, out, col_types);
         out.compactRows(gpa) catch {};
@@ -1007,14 +1007,38 @@ fn computeDerived(
     programs: []const ?*const Compiled,
     wanted: []const bool,
     computed: []bool,
+    workers: usize,
 ) Error!void {
     for (programs, wanted, computed, 0..) |program, want, *done, j| {
         const p = program orelse continue;
         if (!want or done.*) continue;
-        for (rows) |row| {
-            // The wide rows are views into the slab `widen` allocated, which nothing else holds.
-            const cells: []scan.AggValue = @constCast(row);
-            cells[j] = postCell(p.ty, try eval(p, row));
+        const Fill = struct {
+            rows: []const []const scan.AggValue,
+            program: *const Compiled,
+            column: usize,
+            failed: *std.atomic.Value(usize),
+            fn run(c: @This(), lo: usize, hi: usize) void {
+                for (lo..hi) |i| {
+                    const value = eval(c.program, c.rows[i]) catch {
+                        _ = c.failed.fetchMin(i, .monotonic);
+                        return;
+                    };
+                    @constCast(c.rows[i])[c.column] = postCell(c.program.ty, value);
+                }
+            }
+        };
+        var failed: std.atomic.Value(usize) = .init(std.math.maxInt(usize));
+        ResultProgram.eachRowBlock(workers, rows.len, Fill{
+            .rows = rows,
+            .program = p,
+            .column = j,
+            .failed = &failed,
+        }, Fill.run);
+        const first = failed.load(.monotonic);
+        if (first < rows.len) {
+            // Evaluation is pure, and preceding columns are complete: replay the first failed row for its error.
+            _ = try eval(p, rows[first]);
+            unreachable;
         }
         done.* = true;
     }
@@ -1864,4 +1888,47 @@ test "a result column's scan column, and whether ranking, HAVING or a computed c
     const by_name = [_]expr_ast.OrderKey{.{ .column = 1, .descending = false }};
     const q: ResultProgram = .{ .order = .{ .keys = &by_name, .limit = 10, .post = true }, .select = &select, .grouped = true };
     try std.testing.expect(q.readsScanColumn(1));
+}
+
+test "post-aggregate parallel evaluation preserves the earliest row error" {
+    const gpa = std.testing.allocator;
+    var state: std.heap.ArenaAllocator = .init(gpa);
+    defer state.deinit();
+    const arena = state.allocator();
+    const n = 10000;
+    const cells = try arena.alloc(scan.AggValue, n * 3);
+    const rows = try arena.alloc([]const scan.AggValue, n);
+    for (rows, 0..) |*row, i| row.* = cells[i * 3 ..][0..3];
+    const types = [_]scan.GroupColType{ .{ .lane = .i64, .nullable = false }, .{ .lane = .i64, .nullable = false } };
+    const add: expr_ast.PostExpr = .{ .binary = .{
+        .op = .add,
+        .left = &.{ .col = .{ .column = 0 } },
+        .right = &.{ .number = "1" },
+    } };
+    const expr: expr_ast.PostExpr = .{ .binary = .{
+        .op = .mul,
+        .left = &add,
+        .right = &.{ .col = .{ .column = 1 } },
+    } };
+    const program = try compile(arena, expr, &types, .{ .ints = &.{ .i32, .i32 }, .rewritten = &.{ false, false } });
+    const programs = [_]?*const Compiled{ null, null, program };
+    for ([_]usize{ 1, 8 }) |workers| {
+        for (rows) |row| {
+            @constCast(row)[0] = .{ .i = 1 };
+            @constCast(row)[1] = .{ .i = 1 };
+            @constCast(row)[2] = .null_val;
+        }
+        @constCast(rows[137])[0] = .{ .i = std.math.maxInt(i32) };
+        @constCast(rows[8000])[0] = .{ .i = 100000 };
+        @constCast(rows[8000])[1] = .{ .i = 100000 };
+        var computed = [_]bool{ false, false, false };
+        try std.testing.expectError(error.IntegerOverflowAdd, computeDerived(rows, &programs, &.{ false, false, true }, &computed, workers));
+        try std.testing.expect(!computed[2]);
+        @constCast(rows[137])[0] = .{ .i = 1 };
+        @constCast(rows[8000])[0] = .{ .i = 1 };
+        @constCast(rows[8000])[1] = .{ .i = 1 };
+        try computeDerived(rows, &programs, &.{ false, false, true }, &computed, workers);
+        try std.testing.expect(computed[2]);
+        for (rows) |row| try std.testing.expectEqual(@as(i128, 2), row[2].i);
+    }
 }

@@ -568,7 +568,12 @@ pub fn answerAggregate(
     intact: Intact,
     fingerprint: ?[16]u8,
 ) !AggResult {
-    defer r.state.deinit(ctx.gpa);
+    const trace_tail = engine_env.envFlag(ctx.env, "ZPQ_JOIN_TRACE");
+    defer {
+        const start = if (trace_tail) nowMonoNs() else 0;
+        r.state.deinit(ctx.gpa);
+        if (trace_tail) std.debug.print("join tail: state release {d:.2} ms\n", .{@as(f64, @floatFromInt(nowMonoNs() - start)) / 1e6});
+    }
     errdefer r.output.deinit(ctx.gpa);
     // ORDER BY keys index the SELECT list then the hidden terms, which GROUP BY rows follow column for column; with
     // computed columns they index the wider row `ResultProgram` makes.
@@ -585,9 +590,13 @@ pub fn answerAggregate(
         .sources = r.state.agg_sources,
         .workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env),
     };
+    var tail_start = if (trace_tail) nowMonoNs() else 0;
     const late = try fetchBeforeCut(ctx.gpa, &r.output, program);
+    if (trace_tail) tail_start = traceTail("fetch before cut", tail_start);
     try program.finish(ctx.gpa, &r.output, &r.state.group_col_types);
+    if (trace_tail) tail_start = traceTail("result program", tail_start);
     if (late) try fetchAfterCut(ctx.gpa, &r.output, program);
+    if (trace_tail) _ = traceTail("fetch after cut", tail_start);
     const text_kinds = try answerTextKinds(ctx.gpa, r.output, r.state, args.output == null, args.diag);
     errdefer ctx.gpa.free(text_kinds);
     const answer_types = try answerTypes(ctx.gpa, r.output, r.state);
@@ -973,4 +982,10 @@ test "released group metadata never emits a scalar phantom row" {
         try writeAggregateText(&writer, answer, &.{}, &.{}, answer.rowCount(), format);
         try std.testing.expectEqualStrings(want, writer.buffered());
     }
+}
+
+fn traceTail(label: []const u8, since: i64) i64 {
+    const now = nowMonoNs();
+    std.debug.print("join tail: {s} {d:.2} ms\n", .{ label, @as(f64, @floatFromInt(now - since)) / 1e6 });
+    return now;
 }

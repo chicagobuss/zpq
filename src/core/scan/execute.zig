@@ -2317,11 +2317,16 @@ fn prepareAggregateWithMetas(
                 output.deferred_fetch = deferred;
                 row_src.defer_fetch = true;
             }
+            const trace_rows = std.c.getenv("ZPQ_JOIN_TRACE") != null;
+            const rows_start = if (trace_rows) nowMonoNs() else 0;
             try buildGroupRows(gpa, &output.slab, row_src, rows, n_workers, if (fetches and !late) .{
                 .out = &output,
                 .budget = if (args.ledger != null) group_budget else null,
                 .charge = &answer_charge,
             } else null);
+            if (trace_rows) std.debug.print("join tail: build {d} rows {d:.2} ms\n", .{
+                rows.len, @as(f64, @floatFromInt(nowMonoNs() - rows_start)) / 1e6,
+            });
         }
 
         const cols = try gpa.alloc([]const u8, outputs.len);

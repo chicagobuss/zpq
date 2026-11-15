@@ -405,8 +405,13 @@ pub const Prepared = struct {
     }
 
     fn releaseBuilds(self: *Prepared) void {
+        const trace = std.c.getenv("ZPQ_JOIN_TRACE") != null;
+        const start = if (trace) @import("../clock.zig").monoNs() else 0;
         for (self.tasks) |*t| t.release();
         self.tasks = &.{};
+        if (trace) std.debug.print("join tail: build release {d:.2} ms\n", .{
+            @as(f64, @floatFromInt(@import("../clock.zig").monoNs() - start)) / 1e6,
+        });
     }
 };
 

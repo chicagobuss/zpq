@@ -305,7 +305,7 @@ pub const Fetch = struct {
     /// The source's charged allocator, for page decode and batch scratch.
     scratch: ?std.mem.Allocator = null,
     /// Fetch retained keys together so each selected source page decodes once.
-    batch: ?*const fn (ctx: *const anyopaque, payload: usize, keys: []const ?i64, scratch: std.mem.Allocator, workers: usize) anyerror![]?FetchValue = null,
+    batch: ?*const fn (ctx: *const anyopaque, payload: usize, keys: []const ?i64, scratch: std.mem.Allocator) anyerror![]?FetchValue = null,
     value: *const fn (ctx: *const anyopaque, payload: usize, key: i64, scratch: std.mem.Allocator) anyerror!?FetchValue,
 };
 

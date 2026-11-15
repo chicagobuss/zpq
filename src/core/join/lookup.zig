@@ -402,17 +402,36 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
                 @memset(def.?, 1);
             }
             def.?[r] = 0;
-            if (payload.deferred != null) codes[r] = EMPTY;
             continue;
         }
         codes[r] = payload.codes.get(at[r]);
     }
-    if (payload.deferred) |d| return .{ .string = .{
-        .values = try deferredValues(d, codes, sel, a, 1),
-        .def_levels = def,
-        .max_def = if (j.kind == .left) 1 else 0,
-        .has_nulls = def != null,
-    } };
+    if (payload.deferred) |d| {
+        const vals = try a.alloc([]const u8, sel.len);
+        @memset(vals, "");
+        for (d.meta.row_groups.items, 0..) |*rg, ri| {
+            var scratch: std.heap.ArenaAllocator = .init(d.scratch);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            var gate = try selection.SelectionVector.init(sa, @intCast(rg.num_rows));
+            gate.clearAll();
+            var kept = sel.iterator();
+            while (kept.next()) |r| {
+                if (at[r] != EMPTY and d.rows[codes[r]].rg == ri) gate.set(d.rows[codes[r]].row, true);
+            }
+            if (gate.count() == 0) continue;
+            const cm = rg.columns.items[d.leaf].meta_data orelse return error.ColumnMetaMissing;
+            const levels = d.meta.getColumnLevels(cm.path_in_schema.items);
+            const opts = column_mod.chunkOptions(.{ .fast_levels = true, .row_gate = &gate }, d.meta, cm);
+            const decoded = try @import("../consumer/column.zig").decodeColumnTWithOptions([]const u8, sa, try chunkOf(d.bytes, cm), cm.codec, levels, gate.len, opts);
+            kept = sel.iterator();
+            while (kept.next()) |r| {
+                if (at[r] != EMPTY and d.rows[codes[r]].rg == ri)
+                    vals[r] = try a.dupe(u8, decoded.values[d.rows[codes[r]].row]);
+            }
+        }
+        return .{ .string = .{ .values = vals, .def_levels = def, .max_def = if (j.kind == .left) 1 else 0, .has_nulls = def != null } };
+    }
     if (payload.plain) return switch (payload.dict) {
         inline else => |dict, tag| blk: {
             const T = @TypeOf(dict[0]);
@@ -1986,95 +2005,24 @@ test "dense bits: disjoint parts set their own words plainly and still see a dup
 
 /// Fetch one output column together so each selected build page is decoded once per cut, even when
 /// several surviving groups name rows on it. Scratch values are copied into the answer by the caller.
-pub fn fetchBatch(ctx: *const anyopaque, p: usize, keys: []const ?i64, a: std.mem.Allocator, workers: usize) anyerror![]?expr_ast.FetchValue {
+pub fn fetchBatch(ctx: *const anyopaque, p: usize, keys: []const ?i64, a: std.mem.Allocator) anyerror![]?expr_ast.FetchValue {
     const j: *const Join = @ptrCast(@alignCast(ctx));
-    const payload = j.payloads[p];
-    const d = payload.deferred orelse return error.BadColumn;
     const out = try a.alloc(?expr_ast.FetchValue, keys.len);
     @memset(out, null);
-    const codes = try a.alloc(u32, keys.len);
+    if (j.payloads[p].deferred == null) {
+        for (keys, out) |key, *v| if (key) |k| {
+            v.* = try fetch(ctx, p, k, a);
+        };
+        return out;
+    }
+    const slots = try a.alloc(u32, keys.len);
     var sel = try selection.SelectionVector.init(a, keys.len);
-    for (keys, codes, 0..) |key, *code, i| {
-        const slot = if (key) |k| j.slot(k) else null;
-        code.* = if (slot) |at| payload.codes.get(at) else EMPTY;
-        if (slot == null) sel.set(i, false);
+    for (keys, slots, 0..) |key, *slot, i| {
+        slot.* = if (key) |k| j.slot(k) orelse EMPTY else EMPTY;
+        if (slot.* == EMPTY) sel.set(i, false);
     }
-    const values = try deferredValues(d, codes, &sel, a, workers);
+    const col = try column(j, p, slots, &sel, a, true);
     var it = sel.iterator();
-    while (it.next()) |i| out[i] = .{ .bytes = values[i] };
+    while (it.next()) |i| out[i] = .{ .bytes = col.string.values[i] };
     return out;
-}
-
-fn deferredValues(d: Payload.Deferred, codes: []const u32, sel: *const selection.SelectionVector, a: std.mem.Allocator, workers: usize) ![]const []const u8 {
-    // Worker arenas can be released immediately: only selected strings cross back to the caller's arena.
-    const owned = try d.scratch.alloc([]const u8, sel.len);
-    @memset(owned, "");
-    defer {
-        for (owned) |value| d.scratch.free(value);
-        d.scratch.free(owned);
-    }
-    const Task = struct {
-        d: Payload.Deferred,
-        codes: []const u32,
-        sel: *const selection.SelectionVector,
-        values: [][]const u8,
-        cursor: *std.atomic.Value(usize),
-        err: ?anyerror = null,
-        err_rg: usize = std.math.maxInt(usize),
-
-        fn run(t: *@This()) void {
-            while (true) {
-                const ri = t.cursor.fetchAdd(1, .monotonic);
-                if (ri >= t.d.meta.row_groups.items.len) return;
-                t.read(ri) catch |err| {
-                    if (ri < t.err_rg) {
-                        t.err = err;
-                        t.err_rg = ri;
-                    }
-                };
-            }
-        }
-
-        fn read(t: *@This(), ri: usize) !void {
-            var it = t.sel.iterator();
-            const any = while (it.next()) |r| {
-                if (t.codes[r] != EMPTY and t.d.rows[t.codes[r]].rg == ri) break true;
-            } else false;
-            if (!any) return;
-            var scratch: std.heap.ArenaAllocator = .init(t.d.scratch);
-            defer scratch.deinit();
-            const sa = scratch.allocator();
-            const rg = &t.d.meta.row_groups.items[ri];
-            var gate = try selection.SelectionVector.init(sa, @intCast(rg.num_rows));
-            gate.clearAll();
-            it = t.sel.iterator();
-            while (it.next()) |r| if (t.codes[r] != EMPTY and t.d.rows[t.codes[r]].rg == ri)
-                gate.set(t.d.rows[t.codes[r]].row, true);
-            const cm = rg.columns.items[t.d.leaf].meta_data orelse return error.ColumnMetaMissing;
-            const levels = t.d.meta.getColumnLevels(cm.path_in_schema.items);
-            const opts = column_mod.chunkOptions(.{ .fast_levels = true, .row_gate = &gate }, t.d.meta, cm);
-            const decoded = try @import("../consumer/column.zig").decodeColumnTWithOptions([]const u8, sa, try chunkOf(t.d.bytes, cm), cm.codec, levels, gate.len, opts);
-            it = t.sel.iterator();
-            while (it.next()) |r| if (t.codes[r] != EMPTY and t.d.rows[t.codes[r]].rg == ri) {
-                t.values[r] = try t.d.scratch.dupe(u8, decoded.values[t.d.rows[t.codes[r]].row]);
-            };
-        }
-    };
-    var cursor: std.atomic.Value(usize) = .init(0);
-    var storage: [max_workers]Task = undefined;
-    const tasks = storage[0..@max(1, @min(storage.len, workers, d.meta.row_groups.items.len))];
-    for (tasks) |*t| t.* = .{ .d = d, .codes = codes, .sel = sel, .values = owned, .cursor = &cursor };
-    if (tasks.len == 1 or !@import("../spawn.zig").runTree(Task, tasks, .{
-        .stack_size = @import("../scan/types.zig").WORKER_STACK_SIZE,
-    }, Task.run)) tasks[0].run();
-    var first: ?anyerror = null;
-    var rg: usize = std.math.maxInt(usize);
-    for (tasks) |t| if (t.err_rg < rg) {
-        rg = t.err_rg;
-        first = t.err;
-    };
-    if (first) |err| return err;
-    const values = try a.alloc([]const u8, sel.len);
-    for (owned, values) |value, *out| out.* = try a.dupe(u8, value);
-    return values;
 }

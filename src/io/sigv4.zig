@@ -10,6 +10,8 @@ pub const SigV4 = struct {
     access_key: []const u8,
     secret_key: []const u8,
     session_token: ?[]const u8 = null,
+    /// Directory-bucket session credentials use a distinct token header.
+    s3express_session: bool = false,
 
     /// Configuration for signing
     pub const Options = struct {
@@ -73,7 +75,8 @@ pub const SigV4 = struct {
         }
 
         if (self.session_token) |token| {
-            try signed_headers_list.append(allocator, .{ .name = try allocator.dupe(u8, "X-Amz-Security-Token"), .value = try allocator.dupe(u8, token) });
+            const name = if (self.s3express_session) "x-amz-s3session-token" else "X-Amz-Security-Token";
+            try signed_headers_list.append(allocator, .{ .name = try allocator.dupe(u8, name), .value = try allocator.dupe(u8, token) });
         }
 
         // Add user provided headers
@@ -323,6 +326,31 @@ test "sign with session token includes X-Amz-Security-Token" {
         }
     }
     try testing.expect(found_token);
+}
+
+test "S3 Express session uses its token header and signing scope" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const signer: SigV4 = .{
+        .region = "us-west-2", .service = "s3express", .access_key = "AKIA", .secret_key = "secret",
+        .session_token = "token-xyz", .s3express_session = true,
+    };
+    const headers = try signer.sign(arena.allocator(), "GET", "bucket.example", "/key", null, &.{}, "", .{ .timestamp = 1369353600 });
+    var token = false;
+    var auth = false;
+    for (headers) |h| {
+        try testing.expect(!std.ascii.eqlIgnoreCase(h.name, "X-Amz-Security-Token"));
+        if (std.ascii.eqlIgnoreCase(h.name, "x-amz-s3session-token")) {
+            try testing.expectEqualStrings("token-xyz", h.value);
+            token = true;
+        }
+        if (std.ascii.eqlIgnoreCase(h.name, "Authorization")) {
+            try testing.expect(std.mem.indexOf(u8, h.value, "/us-west-2/s3express/aws4_request") != null);
+            try testing.expect(std.mem.indexOf(u8, h.value, "x-amz-s3session-token") != null);
+            auth = true;
+        }
+    }
+    try testing.expect(token and auth);
 }
 
 test "sign accepts a 64-char secret (R2 key length)" {

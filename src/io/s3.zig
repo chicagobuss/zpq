@@ -277,6 +277,7 @@ fn defaultPort(use_tls: bool) u16 {
 /// bucket without dots: AWS's certificate covers `*.s3.<region>.amazonaws.com`, one label, so `my.bucket.s3...` fails
 /// hostname verification and dotted buckets go path-style, as the AWS SDKs send them.
 pub fn virtualHosted(creds: Credentials, bucket: []const u8) bool {
+    if (creds.endpoint == null and directoryBucketZone(bucket) != null) return true;
     if (creds.path_style) return false;
     return creds.endpoint == null and std.mem.indexOfScalar(u8, bucket, '.') == null;
 }
@@ -300,8 +301,37 @@ pub fn connectHostFor(arena: std.mem.Allocator, creds: Credentials, bucket: []co
 }
 
 fn awsHost(arena: std.mem.Allocator, creds: Credentials, bucket: []const u8) ![]u8 {
+    if (directoryBucketZone(bucket)) |zone| {
+        return std.fmt.allocPrint(arena, "{s}.s3express-{s}.{s}.amazonaws.com", .{ bucket, zone, creds.region });
+    }
     if (!virtualHosted(creds, bucket)) return std.fmt.allocPrint(arena, "s3.{s}.amazonaws.com", .{creds.region});
     return std.fmt.allocPrint(arena, "{s}.s3.{s}.amazonaws.com", .{ bucket, creds.region });
+}
+
+/// The zone is the component immediately before the directory-bucket suffix.
+pub fn directoryBucketZone(bucket: []const u8) ?[]const u8 {
+    const suffix = "--x-s3";
+    if (!std.mem.endsWith(u8, bucket, suffix)) return null;
+    const stem = bucket[0 .. bucket.len - suffix.len];
+    const separator = std.mem.lastIndexOf(u8, stem, "--") orelse return null;
+    if (separator == 0 or separator + 2 == stem.len) return null;
+    const zone = stem[separator + 2 ..];
+    for (zone) |ch| if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-')) return null;
+    return zone;
+}
+
+test "directory bucket zonal host and virtual path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bucket = "example--usw2-az1--x-s3";
+    const creds: Credentials = .{ .access_key = "a", .secret_key = "s", .region = "us-west-2", .path_style = true };
+    try std.testing.expectEqualStrings("usw2-az1", directoryBucketZone(bucket).?);
+    try std.testing.expectEqualStrings("example--usw2-az1--x-s3.s3express-usw2-az1.us-west-2.amazonaws.com", try hostFor(a, creds, bucket));
+    try std.testing.expectEqualStrings("/object", try pathFor(a, creds, bucket, "object"));
+    try std.testing.expect(directoryBucketZone("example--x-s3") == null);
+    try std.testing.expect(directoryBucketZone("example----x-s3") == null);
+    try std.testing.expect(directoryBucketZone("example--zone--x-s3.extra") == null);
 }
 
 pub fn portFor(creds: Credentials) u16 {

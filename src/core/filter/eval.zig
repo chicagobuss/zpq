@@ -525,7 +525,7 @@ pub fn evaluate(
         .lookup => |leaf| {
             const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
             try @import("../join/lookup.zig").narrow(leaf.join, batch.cols[col_pos], sel, arena, null);
-            if (leaf.residual) |r| try evalResidual(r, batch, sel, column_lookup, arena);
+            if (leaf.residual) |r| try evalResidual(r, batch, sel, column_lookup, arena, null);
         },
         .expr => |x| try evalExprCompare(x, batch, sel, column_lookup, arena),
         .int32 => |leaf| {
@@ -790,13 +790,21 @@ fn rescaled(v: i128, from: u8, to: expr_ast.Dec) Error!i256 {
 }
 
 /// A join's residual over the rows its lookups kept (`ast.Residual`): each build column it reads is published for
-/// them, from slots looked up again from its join's FK, beside the batch's own columns, and the residual narrows.
-pub fn evalResidual(r: *const ast.Residual, batch: *const Batch, sel: *selection.SelectionVector, column_lookup: []const ?usize, arena: std.mem.Allocator) Error!void {
+/// them, beside the batch's own columns, and the residual narrows. The current lookup's capture is already valid;
+/// other joins still probe their FK here, since their own filter pass may not have run yet.
+pub fn evalResidual(
+    r: *const ast.Residual,
+    batch: *const Batch,
+    sel: *selection.SelectionVector,
+    column_lookup: []const ?usize,
+    arena: std.mem.Allocator,
+    captured: ?struct { join: *const @import("../join/lookup.zig").Join, slots: []const u32 },
+) Error!void {
     const join_lookup = @import("../join/lookup.zig");
     const lookup = try arena.dupe(?usize, column_lookup);
     var cols: std.ArrayList(Batch.Column) = .empty;
     try cols.appendSlice(arena, batch.cols);
-    const slots = try arena.alloc(?[]u32, r.joins.len);
+    const slots = try arena.alloc(?[]const u32, r.joins.len);
     @memset(slots, null);
     for (r.virtual) |ci| {
         if (ci >= lookup.len) return error.BadColumn;
@@ -806,10 +814,16 @@ pub fn evalResidual(r: *const ast.Residual, batch: *const Batch, sel: *selection
         } else return error.BadColumn;
         const j = r.joins[k];
         if (slots[k] == null) {
-            const fk = column_lookup[j.fk_leaf] orelse return error.BadColumn;
-            slots[k] = try join_lookup.slotsFor(j, batch.cols[fk], sel, arena);
+            if (captured) |c| if (c.join == j) {
+                std.debug.assert(c.slots.len == sel.len);
+                slots[k] = c.slots;
+            };
+            if (slots[k] == null) {
+                const fk = column_lookup[j.fk_leaf] orelse return error.BadColumn;
+                slots[k] = try join_lookup.slotsFor(j, batch.cols[fk], sel, arena);
+            }
         }
-        const col = join_lookup.column(j, j.virtualPayload(ci).?, slots[k].?, sel, arena, true) catch |err| return switch (err) {
+        const col = join_lookup.column(j, j.virtualPayload(ci).?, slots[k].?, sel, arena, false) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.BadColumn,
         };
@@ -1755,6 +1769,63 @@ test "column comparisons read independent codes-only string dictionaries" {
             const want = if (lv != null and rv != null) ast.applyOpStr(lv.?.str, op, rv.?.str) else false;
             try std.testing.expectEqual(want, sel.isActive(i));
         }
+    }
+}
+
+test "join residual reuses only the current capture and filters coded payloads" {
+    const join = @import("../join/lookup.zig");
+    var state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    var bits = [_]u64{7};
+    var rank = [_]u32{0};
+    var codes = [_]u8{ 1, 0, 1 };
+    const payloads = [_]join.Payload{.{
+        .name = "label",
+        .element = .{
+            .name = "label",
+            .type = .BYTE_ARRAY,
+            .type_length = null,
+            .repetition_type = .REQUIRED,
+            .num_children = null,
+            .scale = null,
+            .precision = null,
+            .field_id = null,
+        },
+        .codes = .{ .u8 = &codes },
+        .dict = .{ .string = &.{ "drop", "keep" } },
+    }};
+    const j: join.Join = .{
+        .kind = .inner,
+        .build_name = "dim",
+        .key_name = "pk",
+        .n = 3,
+        .keys = .{ .dense = .{ .lo = 0, .bits = &bits, .rank = &rank } },
+        .payloads = &payloads,
+        .bytes = 0,
+        .virtual_base = 1,
+    };
+    const other = j;
+    const residual: ast.Residual = .{
+        .filter = .{ .string = .{ .col_idx = 1, .op = .Eq, .value = "keep" } },
+        .reads = &.{0},
+        .virtual = &.{1},
+        .joins = &.{&j},
+    };
+    for (0..3) |mode| {
+        // The current capture must avoid a second FK read; a different join's capture must be ignored.
+        const fk: Batch.Column = if (mode == 1)
+            .{ .f64 = .{ .values = &.{ 99, 99, 99 } } }
+        else
+            .{ .i64 = .{ .values = &.{ 0, 1, 2 } } };
+        const batch: Batch = .{ .cols = &.{fk}, .num_rows = 3 };
+        var sel = try selection.SelectionVector.init(a, 3);
+        sel.set(0, false);
+        try evalResidual(&residual, &batch, &sel, &.{ 0, null }, a, if (mode == 0) null else .{
+            .join = if (mode == 1) &j else &other,
+            .slots = if (mode == 1) &.{ 0, 1, 2 } else &.{ 1, 0, 1 },
+        });
+        try testing.expect(!sel.isActive(0) and !sel.isActive(1) and sel.isActive(2));
     }
 }
 

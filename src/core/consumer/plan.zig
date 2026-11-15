@@ -576,7 +576,10 @@ pub const GatedFilter = struct {
                 else
                     null;
                 try join_lookup.narrow(l.join, batch.cols[pos], sel, a, capture);
-                if (l.residual) |r| try filter_eval.evalResidual(r, batch, sel, lookup, a);
+                if (l.residual) |r| try filter_eval.evalResidual(r, batch, sel, lookup, a, if (capture) |slots|
+                    .{ .join = l.join, .slots = slots }
+                else
+                    null);
             },
             .predicate => {},
         };

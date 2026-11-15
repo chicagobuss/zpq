@@ -499,8 +499,8 @@ pub const Lookup = struct {
 };
 
 /// A join's conditions on build columns, which no build's filter can take: they need its published columns, which
-/// exist only once its lookups ran. They are built, for the rows still selected, from their slots, which are looked up
-/// again from each join's FK (`filter/eval.zig` `evalResidual`).
+/// exist only once its lookups ran. They are built for the rows still selected, reusing the current lookup's slots
+/// and looking up the other joins' FK (`filter/eval.zig` `evalResidual`).
 pub const Residual = struct {
     filter: Filter,
     /// The probe's leaves it reads: its own real columns and each of `joins`' FK, decoded with the filter.

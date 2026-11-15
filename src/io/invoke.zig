@@ -8,6 +8,7 @@ const tls = @import("tls.zig");
 const SigV4 = @import("sigv4.zig").SigV4;
 const envValue = @import("../core/system.zig").winEnvValue;
 const A = std.mem.Allocator;
+const invoke_ms = 15 * 60_000;
 pub const Pool = struct {
     connections: pool_mod.Pool(256) = undefined,
     capability_key: [32]u8 = @splat(0),
@@ -150,6 +151,8 @@ pub const Client = struct {
                 .addrs = endpoint.addrs,
                 .port = endpoint.port,
                 .use_tls = endpoint.use_tls,
+                // Synchronous Invoke may be silent until the function finishes, even after response headers.
+                .timeouts = .{ .first_byte_ms = invoke_ms, .idle_ms = invoke_ms },
             }, .{ .fresh = attempt != 0 });
             var retained = false;
             defer if (!retained) self.pool.connections.discard(self.io, h);
@@ -160,7 +163,7 @@ pub const Client = struct {
                 .path = endpoint.path,
                 .headers = signed_headers,
                 .body = body,
-                .total_ms = 900_000,
+                .total_ms = invoke_ms,
             }) catch |err| {
                 if (attempt == 0 and h.reused and (err == error.ClosedBeforeResponse or err == error.SendFailed)) {
                     self.pool.connections.noteRetry(self.io, .stale);

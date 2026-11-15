@@ -208,6 +208,73 @@ test "fanout parity: eight query shapes, wrong counts, globs, real Invoke and Du
     try std.testing.expectEqual(@as(f64, 1600), try numeric(try get(try get(out, "agg"), "n")));
 }
 
+test "fanout Invoke permits function execution beyond S3 first-byte and body idle limits" {
+    const Slow = struct {
+        fn serve(server: *fake.FakeServer) void {
+            var req = server.acceptRequest(a) catch return;
+            defer req.deinit();
+            zpq.clock.sleepNs(11 * std.time.ns_per_s);
+            const header = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
+            const linux = std.os.linux;
+            if (linux.sendto(req.conn, header.ptr, header.len, linux.MSG.NOSIGNAL, null, 0) != header.len) return;
+            zpq.clock.sleepNs(11 * std.time.ns_per_s);
+            _ = linux.sendto(req.conn, "{}".ptr, 2, linux.MSG.NOSIGNAL, null, 0);
+        }
+    };
+    var server = try fake.FakeServer.start();
+    defer server.deinit();
+    const thread = try std.Thread.spawn(.{}, Slow.serve, .{&server});
+    defer {
+        _ = std.os.linux.shutdown(server.listen_fd, std.os.linux.SHUT.RDWR);
+        thread.join();
+    }
+    var pool: zpq.io.invoke.Pool = undefined;
+    try pool.init(a);
+    defer pool.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const endpoints = [_]zpq.io.invoke.Endpoint{try zpq.io.invoke.Endpoint.init(scratch, try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}", .{server.port}), "/2015-03-31/functions/worker/invocations")};
+    var client: zpq.io.invoke.Client = .{ .io = io, .env = .empty, .pool = &pool, .endpoints = &endpoints };
+    const transport = client.transport();
+    try std.testing.expectEqualStrings("{}", try transport.invoke(transport.ctx, scratch, 0, "{}"));
+}
+
+test "fanout parity: grouped AVG orders ASC and DESC with NULL last against DuckDB" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const path = "zig-out/fanout-avg-order.parquet";
+    try std.Io.Dir.cwd().createDirPath(io, "zig-out");
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    const made = try std.process.run(scratch, io, .{ .argv = &.{
+        opts.duckdb, "-no-init", "-c",
+        "SET memory_limit='1GB'; SET threads=1; COPY (SELECT i%3 AS k, " ++
+            "CASE WHEN i%3=2 THEN NULL ELSE i%2+10*(i%3) END AS x FROM range(6144) t(i)) " ++
+            "TO '" ++ path ++ "' (FORMAT PARQUET, ROW_GROUP_SIZE 2048);",
+    } });
+    if (made.term != .exited or made.term.exited != 0) return error.OracleFailed;
+    var fixture: Fixture = undefined;
+    try fixture.start();
+    defer fixture.stop();
+    var client = fixture.client();
+    const c: Case = .{ .inputs = &.{path}, .aggregate = "avg(x) AS a", .group_by = "k" };
+    for ([_][]const u8{ "a ASC, k", "a DESC, k" }) |ordering| {
+        const out = try zpq.engine.fanout.run(scratch, a, client.transport(), try request(scratch, c), .{
+            .workers = 4,
+            .concurrency = 4,
+            .order_by = ordering,
+        });
+        const expected = try oracleWithOrder(scratch, c, try std.fmt.allocPrint(scratch, "ORDER BY {s}", .{ordering}));
+        const rows = (try get(out, "agg")).array.items;
+        try std.testing.expectEqual(3, rows.len);
+        try std.testing.expectEqual(3, expected.array.items.len);
+        try std.testing.expect((try get(rows[0], "a")) == .float and (try get(rows[1], "a")) == .float);
+        try std.testing.expect((try get(rows[2], "a")) == .null);
+        for (rows, expected.array.items) |l, r| if (!same(l, r)) return error.OrderMismatch;
+    }
+}
+
 test "fanout parity: worker refusals, quoted aliases, empty ranges and global order" {
     var fixture: Fixture = undefined;
     try fixture.start();

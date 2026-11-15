@@ -215,6 +215,16 @@ fn compare(left: V, right: V) !std.math.Order {
         const scale = @max(l.scale, r.scale);
         return std.math.order(try l.aligned(scale), try r.aligned(scale));
     }
+    if ((left == .float and (right == .float or right == .number_string)) or
+        (right == .float and left == .number_string))
+    {
+        const l = if (left == .float) left.float else try std.fmt.parseFloat(f64, left.number_string);
+        const r = if (right == .float) right.float else try std.fmt.parseFloat(f64, right.number_string);
+        // DuckDB orders NaN after every other number, with NaN equal to NaN.
+        if (std.math.isNan(l) or std.math.isNan(r))
+            return if (std.math.isNan(l) == std.math.isNan(r)) .eq else if (std.math.isNan(l)) .gt else .lt;
+        return std.math.order(l, r);
+    }
     if (left == .string and right == .string) return std.mem.order(u8, left.string, right.string);
     if (left == .bool and right == .bool) return std.math.order(@intFromBool(left.bool), @intFromBool(right.bool));
     return error.InvalidAggregateState;
@@ -535,6 +545,7 @@ pub fn run(a: A, backing: A, transport: Transport, request: V, opts: Options) !V
         try put(a, &prep_request, "plan_version", try number(a, 1));
         prepared = try parse(a, try transport.invoke(transport.ctx, a, 0, try std.json.Stringify.valueAlloc(a, prep_request, .{})));
         const p = prepared.?;
+        try checkWorker(p);
         const pv = try member(p, "plan_version");
         if (pv != .number_string or !std.mem.eql(u8, pv.number_string, "1")) return error.UnsupportedPlanVersion;
         const urls = try array(try member(p, "inputs"));
@@ -656,6 +667,22 @@ test "fanout: refusal and transport failures never produce partial answers" {
     try std.testing.expectError(error.WorkerLacksPartialAggregate, agree(alloc, &.{old}));
 }
 
+test "fanout: float ordering includes mixed numeric tokens, infinities and DuckDB NaN equality" {
+    const values = [_]f64{ -std.math.inf(f64), -2.5, 0, 2.5, std.math.inf(f64), std.math.nan(f64), std.math.nan(f64) };
+    for (values, 0..) |l, i| for (values, 0..) |r, j| {
+        const expected: std.math.Order = if (i >= 5 and j >= 5) .eq else std.math.order(i, j);
+        try std.testing.expectEqual(expected, try compare(.{ .float = l }, .{ .float = r }));
+    };
+    const token: V = .{ .number_string = "2.5" };
+    try std.testing.expectEqual(.eq, try compare(token, .{ .float = 2.5 }));
+    try std.testing.expectEqual(.eq, try compare(.{ .float = 2.5 }, token));
+    try std.testing.expectEqual(.gt, try compare(token, .{ .float = -2.5 }));
+    try std.testing.expectEqual(.lt, try compare(.{ .float = -2.5 }, token));
+    try std.testing.expectEqual(.gt, try compare(.{ .float = std.math.nan(f64) }, token));
+    try std.testing.expectEqual(.lt, try compare(token, .{ .float = std.math.nan(f64) }));
+    try std.testing.expectEqual(.eq, try compare(.{ .float = -0.0 }, .{ .float = 0.0 }));
+}
+
 test "fanout: splits preserve coverage for every footer count and malformed hints refuse" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -680,6 +707,7 @@ test "fanout: only explicit immutable transport acknowledgement is cached; bool 
     const Mock = struct {
         caps: std.atomic.Value(usize) = .init(0),
         bad: bool = false,
+        refused: bool = false,
         fn invoke(ctx: *anyopaque, alloc: A, _: usize, bytes: []const u8) ![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             const req = try parse(alloc, bytes);
@@ -691,6 +719,7 @@ test "fanout: only explicit immutable transport acknowledgement is cached; bool 
                     else
                         "{\"prepare_aggregate_version\":1,\"structured_plan_versions\":[1]}");
                 }
+                if (self.refused) return alloc.dupe(u8, "{\"error\":\"bad_json\",\"reason\":\"MissingField\"}");
                 return alloc.dupe(u8, "{\"plan_version\":1,\"plan\":{},\"inputs\":[\"x\"],\"row_group_counts\":[1],\"aggregates\":[{\"function\":\"count\",\"name\":\"n\"}],\"groups\":[]}");
             }
             return alloc.dupe(u8, "{\"agg\":{\"_a0\":1}}");
@@ -709,6 +738,8 @@ test "fanout: only explicit immutable transport acknowledgement is cached; bool 
     try std.testing.expectEqual(4, mock.caps.load(.monotonic));
     mock.bad = true;
     try std.testing.expectError(error.UnsupportedPlanVersion, run(alloc, std.heap.smp_allocator, .{ .ctx = &mock, .invoke = Mock.invoke }, req, .{ .workers = 1 }));
+    mock.refused = true;
+    try std.testing.expectError(error.WorkerLacksPartialAggregate, run(alloc, std.heap.smp_allocator, transport, req, .{ .workers = 1 }));
 }
 
 fn workerStats(a: A, answer: V, measured: InvokeStat) !V {

@@ -960,6 +960,11 @@ pub fn ColumnChunkReader(comptime T: type) type {
             try self.holdScratch();
             const max_def: u32 = @intCast(self.levels.max_def);
             var hist: []u64 = &.{};
+            var n_dict: usize = 0;
+            // Interleaved counter tables per entry: a run of rows on one entry would otherwise serialize on one
+            // counter's store-to-load chain. Four only where they fit what the chunk's decode is charged (a
+            // dictionary of at most num_leaves / 8 entries, against 8 bytes a leaf).
+            var lanes: usize = 1;
             var first_leaf: ?[]u32 = null;
             // Entries with no first leaf yet; once none is left, the rest of the chunk only counts.
             var unfound: usize = 0;
@@ -987,7 +992,9 @@ pub fn ColumnChunkReader(comptime T: type) type {
                         if (p != d.ptr) return null;
                     } else {
                         dict_ptr = d.ptr;
-                        hist = try self.arena.alloc(u64, d.len);
+                        n_dict = d.len;
+                        if (n_dict <= num_leaves / 8) lanes = 4;
+                        hist = try self.arena.alloc(u64, n_dict * lanes);
                         @memset(hist, 0);
                         if (track_first) {
                             first_leaf = try self.arena.alloc(u32, d.len);
@@ -1003,7 +1010,6 @@ pub fn ColumnChunkReader(comptime T: type) type {
                     if (track_first and present != want) return null;
                     const idx = &self.active.rle_dict.indices;
                     // Bounded by the buffer allocated, not by whatever dictionary is installed now.
-                    const n_dict = hist.len;
                     if (n_dict == 0 or d.len != n_dict) return error.UnexpectedPage;
                     var left = present;
                     while (left > 0) {
@@ -1016,19 +1022,18 @@ pub fn ColumnChunkReader(comptime T: type) type {
                                 first_leaf.?[run.value] = @intCast(leaf);
                                 unfound -= 1;
                             }
-                            hist[run.value] += run.count;
+                            hist[run.value * lanes] += run.count;
                             left -= run.count;
                             continue;
                         }
-                        const take = @min(left, buf.len);
+                        const take = @min(left, buf.len, idx.packedLeft());
                         const got = idx.decode(buf[0..take]) catch return error.UnexpectedPage;
                         if (got == 0) return error.UnexpectedPage;
-                        var oob: u32 = 0;
-                        for (buf[0..got]) |k| {
-                            oob |= @intFromBool(k >= n_dict);
-                            hist[@min(k, n_dict - 1)] += 1;
-                        }
-                        if (oob != 0) return error.UnexpectedPage;
+                        const oob = switch (lanes) {
+                            inline 1, 4 => |l| countCodes(l, hist, n_dict, buf[0..got]),
+                            else => unreachable,
+                        };
+                        if (oob) return error.UnexpectedPage;
                         if (unfound > 0) for (buf[0..got], 0..) |k, j| {
                             if (first_leaf.?[k] == no_leaf) {
                                 first_leaf.?[k] = @intCast(leaf + j);
@@ -1047,9 +1052,33 @@ pub fn ColumnChunkReader(comptime T: type) type {
             }
             if (written != num_leaves) return error.ShortDecode;
             if (num_leaves == 0) return null;
+            // In place: entry i's total lands in slot i, a lane of an entry no later than i, already summed.
+            if (lanes > 1) for (0..n_dict) |i| {
+                var t: u64 = 0;
+                for (hist[i * lanes ..][0..lanes]) |c| t += c;
+                hist[i] = t;
+            };
+            hist = hist[0..n_dict];
             const dict = self.dictionary orelse return null;
             const owned: []const T = if (T == []const u8) dict else try self.arena.dupe(T, dict);
             return .{ .hist = .{ .hist = hist, .dict = owned, .num_present = present_total, .first = first_leaf } };
+        }
+
+        /// Count `codes` into `hist`'s `lanes` interleaved tables, row j into lane j % lanes. True if a code is past
+        /// the dictionary (it is counted, clamped, and the caller fails the chunk).
+        fn countCodes(comptime lanes: usize, hist: []u64, n_dict: usize, codes: []const u32) bool {
+            var oob: u32 = 0;
+            var j: usize = 0;
+            while (j + lanes <= codes.len) : (j += lanes) inline for (0..lanes) |l| {
+                const k = codes[j + l];
+                oob |= @intFromBool(k >= n_dict);
+                hist[@as(usize, @min(k, n_dict - 1)) * lanes + l] += 1;
+            };
+            for (codes[j..]) |k| {
+                oob |= @intFromBool(k >= n_dict);
+                hist[@as(usize, @min(k, n_dict - 1)) * lanes] += 1;
+            }
+            return oob != 0;
         }
 
         /// Drain only the definition levels (count(col) needs nothing else). Pages are still

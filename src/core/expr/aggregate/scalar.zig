@@ -837,6 +837,12 @@ pub fn updateSharedInteger(
     const col = batch.cols[pos];
     if (col != .i32 and col != .i64) return false;
     if (col.codes() != null or col.levelsOnly() or col.nullInfo().max_rep != 0) return false;
+    // A histogram column (planned only for unfiltered calls, so every present row is selected) folds each entry
+    // once for all the calls, instead of once per call: `sum(x + k)` repeated 90 times is one pass.
+    if (col.hist()) |h| return foldShared(calls, states, handled, outer.count(), switch (col) {
+        inline .i32, .i64 => |c| histIntegerStats(h, c.dict),
+        else => unreachable,
+    });
     // COUNT-only decoding may carry rows in levels without a value lane. The shared kernel reads values.
     if (switch (col) {
         inline .i32, .i64 => |c| c.values.len < outer.len,
@@ -858,7 +864,16 @@ pub fn updateSharedInteger(
         },
         else => unreachable,
     };
-    const outer_count = outer.count();
+    return foldShared(calls, states, handled, outer.count(), stats);
+}
+
+fn foldShared(
+    calls: []const AggCall,
+    states: []Accumulator,
+    handled: []const bool,
+    outer_count: u64,
+    stats: IntegerStats,
+) bool {
     for (calls, states, handled) |call, *state, h| {
         if (h) continue;
         switch (call.func) {
@@ -888,6 +903,18 @@ const IntegerStats = struct {
     max: i64 = std.math.minInt(i64),
     count: u64 = 0,
 };
+
+fn histIntegerStats(hist: []const u64, dict: anytype) IntegerStats {
+    var out: IntegerStats = .{};
+    for (hist, dict) |n, v| {
+        if (n == 0) continue;
+        out.count += n;
+        out.sum += @as(i128, v) * n;
+        out.min = @min(out.min, v);
+        out.max = @max(out.max, v);
+    }
+    return out;
+}
 
 fn sharedIntegerStats(comptime ops: u3, vals: anytype, sel: *const filter_selection.SelectionVector) IntegerStats {
     var out: IntegerStats = .{};

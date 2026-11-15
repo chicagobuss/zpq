@@ -191,6 +191,12 @@ pub const HybridRleDecoder = struct {
         return .{ .value = self.rle_value, .count = n };
     }
 
+    /// Bit-packed values left before the next run starts (none on an RLE run). `decode` of at most this many never
+    /// expands an RLE run, so a caller folding runs whole through `takeRleRun` sees every one.
+    pub fn packedLeft(self: *const HybridRleDecoder) usize {
+        return self.bp_carry_count + if (self.in_rle) 0 else self.remaining_in_run;
+    }
+
     /// A performance hint only: keep run-dominated pages encoded. On mostly packed levels, decoding twice
     /// (validation then consumption) costs more than copying the expanded page. Malformed hints fall back to
     /// decodeLevels, which retains the error and its precedence. Sixty-four levels are one selection-mask word.

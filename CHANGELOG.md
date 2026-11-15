@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Fan-out is native: `zpq fanout` and the Lambda coordinator mode plan, invoke and merge in Zig, replacing the Python coordinator.** Joins fan out too, by aligned key ranges from footer statistics or with a replicated small side. Invoke retries transient failures.
 - **Native Windows x86_64: the CLI, Parquet reads and writes, S3 and TLS with system certificates, Unicode and verbatim (`\\?\`) paths, and a release zip.**
 - **Compaction coalesces small row groups by merging their pages, without re-encoding: DuckDB-like row groups at 2-4x DuckDB's speed.** Row groups already near the target are still byte-copied.
 - **Copy and compaction no longer add Bloom filters nobody asked for.**

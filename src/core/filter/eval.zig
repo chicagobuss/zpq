@@ -911,7 +911,7 @@ fn compareColumns(x: ast.ExprCompare, batch: *const Batch, sel: *selection.Selec
     if (lc.unsigned_32 or rc.unsigned_32 or lc.unsigned_64 or rc.unsigned_64) return false;
     const l = batch.cols[column_lookup[lc.col_idx] orelse return error.BadColumn];
     const r = batch.cols[column_lookup[rc.col_idx] orelse return error.BadColumn];
-    if (std.meta.activeTag(l) != std.meta.activeTag(r) or l.codes() != null or r.codes() != null) return false;
+    if (std.meta.activeTag(l) != std.meta.activeTag(r)) return false;
     switch (l) {
         inline .i32, .i64, .f32, .f64 => |lv, tag| {
             const rv = @field(r, @tagName(tag));
@@ -922,7 +922,7 @@ fn compareColumns(x: ast.ExprCompare, batch: *const Batch, sel: *selection.Selec
                 while (bits != 0) : (bits &= bits - 1) {
                     const row = wi * 64 + @ctz(bits);
                     const keep = !rowIsNull(lv.def_levels, lv.max_def, row) and !rowIsNull(rv.def_levels, rv.max_def, row) and
-                        ast.applyOp(T, lv.values[row], x.op, rv.values[row]);
+                        ast.applyOp(T, if (lv.codes) |codes| lv.dict[codes[row]] else lv.values[row], x.op, if (rv.codes) |codes| rv.dict[codes[row]] else rv.values[row]);
                     if (!keep) w.* &= ~(@as(u64, 1) << @intCast(row & 63));
                 }
             }
@@ -1755,5 +1755,41 @@ test "column comparisons read independent codes-only string dictionaries" {
             const want = if (lv != null and rv != null) ast.applyOpStr(lv.?.str, op, rv.?.str) else false;
             try std.testing.expectEqual(want, sel.isActive(i));
         }
+    }
+}
+
+test "column comparisons use independent numeric dictionaries without widening" {
+    const a = std.testing.allocator;
+    inline for (.{ i32, i64, f32, f64 }) |T| {
+        const tag = if (T == i32) "i32" else if (T == i64) "i64" else if (T == f32) "f32" else "f64";
+        const physical: @import("../schema.zig").Type = if (T == i32) .INT32 else if (T == i64) .INT64 else if (T == f32) .FLOAT else .DOUBLE;
+        const lane: expr_ast.Type = if (T == i32 or T == i64) .i64 else .f64;
+        const ld = [_]T{ 7, -4, 1 };
+        const rd = [_]T{ -4, 7, 1 };
+        const lc = [_]u32{ 0, 1, 2, 0, 1, 2, 2 };
+        const rc = [_]u32{ 1, 2, 0, 0, 2, 1, 2 };
+        const lv = [_]T{ 7, -4, 1, 7, -4, 1, 1 };
+        const rv = [_]T{ 7, 1, -4, -4, 1, 7, 1 };
+        const dl = [_]u32{ 1, 1, 0, 1, 1, 1, 1 };
+        const dr = [_]u32{ 1, 1, 1, 0, 1, 1, 1 };
+        for ([_]bool{ false, true }) |left_coded| for ([_]bool{ false, true }) |right_coded| {
+            const cols = [_]Batch.Column{
+                @unionInit(Batch.Column, tag, .{ .values = if (left_coded) &.{} else &lv, .dict = &ld, .codes = if (left_coded) &lc else null, .def_levels = &dl, .max_def = 1 }),
+                @unionInit(Batch.Column, tag, .{ .values = if (right_coded) &.{} else &rv, .dict = &rd, .codes = if (right_coded) &rc else null, .def_levels = &dr, .max_def = 1 }),
+            };
+            const batch: Batch = .{ .cols = &cols, .num_rows = lv.len };
+            var l: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = physical, .expr_type = lane } };
+            var r: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = physical, .expr_type = lane } };
+            for ([_]ast.Operator{ .Eq, .NotEq, .Lt, .LtEq, .Gt, .GtEq }) |op| {
+                var sel = try selection.SelectionVector.init(a, lv.len);
+                defer sel.deinit();
+                sel.set(5, false);
+                try std.testing.expect(try compareColumns(.{ .op = op, .left = &l, .right = &r }, &batch, &sel, &.{ 0, 1 }));
+                for (lv, rv, 0..) |left, right, i| {
+                    const expected = i != 5 and dl[i] == 1 and dr[i] == 1 and ast.applyOp(T, left, op, right);
+                    try std.testing.expectEqual(expected, sel.isActive(i));
+                }
+            }
+        };
     }
 }

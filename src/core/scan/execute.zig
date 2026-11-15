@@ -2277,12 +2277,18 @@ fn prepareAggregateWithMetas(
         // on one worker the tables it reads are one.
         const winner_copies = row_src.winnerStringBytes();
         if (args.ledger != null or winner_copies != 0) {
+            const reserved = if (typed or args.ledger == null) 0 else slots.items.len *| (args.result_width -| outputs.len) *| @sizeOf(AggValue);
             const bytes = (if (args.ledger != null)
                 answerBytesParallel(slots.items, col_types, if (row_src.borrowed_strings.len != 0) &.{} else key_types, typed, n_workers) +|
-                    row_src.denseStringBytes() +| (if (typed) 0 else slots.items.len *| (args.result_width -| outputs.len) *| @sizeOf(AggValue))
+                    row_src.denseStringBytes()
             else
                 0) +| winner_copies;
-            answer_charge += group_budget.drawExact(bytes) orelse {
+            // Reservation is optional: a budget that admits the raw answer must still admit it without padding.
+            answer_charge += group_budget.drawExact(bytes +| reserved) orelse blk: {
+                if (reserved != 0) {
+                    row_src.result_width = 0;
+                    if (group_budget.drawExact(bytes)) |charge| break :blk charge;
+                }
                 if (args.taken) |taken| taken.insert(.merge_memory);
                 return error.ExceededMemoryBudget;
             };

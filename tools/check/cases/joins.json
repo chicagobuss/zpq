@@ -110,7 +110,11 @@
   },
   {
    "name": "dim_dec",
-   "copy": "COPY (SELECT k AS pk, ((k % 200) * 0.02)::DECIMAL(9, 2) AS ddec FROM range(1, 801) t(k)) TO '{path}' (FORMAT PARQUET)"
+   "copy": "COPY (SELECT k AS pk, ((k % 200) * 0.02 - 1.5)::DECIMAL(9, 2) AS ddec, ((k % 97) * 1.0625 - 40)::DECIMAL(18, 4) AS d18, ((k % 13) * 0.5)::DECIMAL(4, 1) AS d4, (CASE WHEN k % 3 = 0 THEN 99999999999999999999999999999999999999 WHEN k % 3 = 1 THEN -99999999999999999999999999999999999999 ELSE k - 400 END)::DECIMAL(38, 0) AS d38, ((k % 50) * -0.0000001234)::DECIMAL(38, 10) AS d38s FROM range(0, 801) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 256)"
+  },
+  {
+   "name": "plain_dec",
+   "copy": "COPY (SELECT k AS pk, ((k % 200) * 0.02 - 1.5)::DECIMAL(9, 2) AS ddec, ((k % 97) * 1.0625 - 40)::DECIMAL(18, 4) AS d18, ((k % 13) * 0.5)::DECIMAL(4, 1) AS d4, (CASE WHEN k % 3 = 0 THEN 99999999999999999999999999999999999999 WHEN k % 3 = 1 THEN -99999999999999999999999999999999999999 ELSE k - 400 END)::DECIMAL(38, 0) AS d38, ((k % 50) * -0.0000001234)::DECIMAL(38, 10) AS d38s FROM range(0, 1001) t(k) WHERE k % 9 <> 4) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 300, DICTIONARY_SIZE_LIMIT 1)"
   }
  ],
  "cases": [
@@ -6938,48 +6942,6 @@
    }
   },
   {
-   "id": "join:refuse:decimal-build-column",
-   "fixture": "fact",
-   "cli": [
-    "query",
-    "--query",
-    "SELECT count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_dec}' d WHERE f.fk = d.pk AND d.ddec < f.dec"
-   ],
-   "axes": [
-    {
-     "jobs": 1
-    },
-    {
-     "jobs": 3
-    }
-   ],
-   "refuse": {
-    "error": "exit 1",
-    "diag": "DECIMAL column ddec"
-   }
-  },
-  {
-   "id": "join:refuse:decimal-build-filter",
-   "fixture": "fact",
-   "cli": [
-    "query",
-    "--query",
-    "SELECT count(*) AS n FROM '{fixture:fact}' f WHERE f.fk IN (SELECT pk FROM '{fixture:dim_dec}' WHERE ddec < 1.5)"
-   ],
-   "axes": [
-    {
-     "jobs": 1
-    },
-    {
-     "jobs": 3
-    }
-   ],
-   "refuse": {
-    "error": "exit 1",
-    "diag": "DECIMAL column ddec"
-   }
-  },
-  {
    "id": "join:refuse:self-join-shared-name",
    "fixture": "fact",
    "cli": [
@@ -6998,6 +6960,330 @@
    "refuse": {
     "error": "exit 1",
     "diag": "one column per name"
+   }
+  },
+  {
+   "id": "join:decimal:aggregates",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(x.ddec) AS s9, avg(x.d18) AS a18, sum(x.d38s) AS s38, min(x.d38) AS lo, max(x.d38) AS hi, min(x.d4) AS m4, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(x.ddec) AS s9, avg(x.d18) AS a18, sum(x.d38s) AS s38, min(x.d38) AS lo, max(x.d38) AS hi, min(x.d4) AS m4, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk"
+   }
+  },
+  {
+   "id": "join:decimal:group-by-dimension",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT x.d4, count(*) AS n, sum(x.ddec) AS s, avg(x.ddec) AS a, max(x.d38s) AS m FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk GROUP BY x.d4 ORDER BY x.d4 DESC"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT x.d4, count(*) AS n, sum(x.ddec) AS s, avg(x.ddec) AS a, max(x.d38s) AS m FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk GROUP BY x.d4 ORDER BY x.d4 DESC"
+   }
+  },
+  {
+   "id": "join:decimal:group-join-keys",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, x.d38, x.ddec, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk GROUP BY f.fk, x.d38, x.ddec ORDER BY x.ddec, f.fk LIMIT 7"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, x.d38, x.ddec, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk GROUP BY f.fk, x.d38, x.ddec ORDER BY x.ddec, f.fk LIMIT 7"
+   }
+  },
+  {
+   "id": "join:decimal:fetched-keys",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, x.d18, x.d38, count(*) AS n, sum(f.q) AS s FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk AND f.q > 1 GROUP BY f.fk, x.d18, x.d38 ORDER BY n DESC, f.fk LIMIT 9"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, x.d18, x.d38, count(*) AS n, sum(f.q) AS s FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk AND f.q > 1 GROUP BY f.fk, x.d18, x.d38 ORDER BY n DESC, f.fk LIMIT 9"
+   }
+  },
+  {
+   "id": "join:decimal:build-filter",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(x.d18) AS s FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk AND x.ddec < 0 AND x.d38s > -0.0000040000 AND x.d38 <> 99999999999999999999999999999999999999"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(x.d18) AS s FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk AND x.ddec < 0 AND x.d38s > -0.0000040000 AND x.d38 <> 99999999999999999999999999999999999999"
+   }
+  },
+  {
+   "id": "join:decimal:compare-across-scales",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(f.dec) AS s FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk AND x.ddec < f.dec AND x.d18 > f.dec - 30 AND x.d38s < f.dec AND x.d4 <= f.dec + 1"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(f.dec) AS s FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk AND x.ddec < f.dec AND x.d18 > f.dec - 30 AND x.d38s < f.dec AND x.d4 <= f.dec + 1"
+   }
+  },
+  {
+   "id": "join:decimal:residual-or",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, count(*) AS n, sum(x.d38s) AS s FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk AND (x.ddec > f.dec OR x.d4 = 2.5) GROUP BY f.q ORDER BY f.q"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q, count(*) AS n, sum(x.d38s) AS s FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk AND (x.ddec > f.dec OR x.d4 = 2.5) GROUP BY f.q ORDER BY f.q"
+   }
+  },
+  {
+   "id": "join:decimal:semi-and-anti",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(f.dec) AS s FROM '{fixture:fact}' f WHERE f.fk IN (SELECT pk FROM '{fixture:dim_dec}' WHERE d38 > 0 AND ddec >= -0.5) AND f.fk NOT IN (SELECT pk FROM '{fixture:plain_dec}' WHERE d18 < -20)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(f.dec) AS s FROM '{fixture:fact}' f WHERE f.fk IN (SELECT pk FROM '{fixture:dim_dec}' WHERE d38 > 0 AND ddec >= -0.5) AND f.fk NOT IN (SELECT pk FROM '{fixture:plain_dec}' WHERE d18 < -20)"
+   }
+  },
+  {
+   "id": "join:decimal:plain-payloads",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, p.d18, count(*) AS n, sum(p.d38s) AS s, max(p.d38) AS b, min(p.d38) AS lo FROM '{fixture:fact}' f, '{fixture:plain_dec}' p WHERE f.fk = p.pk AND p.d4 > 1 GROUP BY f.fk, p.d18 ORDER BY s, f.fk LIMIT 8"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, p.d18, count(*) AS n, sum(p.d38s) AS s, max(p.d38) AS b, min(p.d38) AS lo FROM '{fixture:fact}' f, '{fixture:plain_dec}' p WHERE f.fk = p.pk AND p.d4 > 1 GROUP BY f.fk, p.d18 ORDER BY s, f.fk LIMIT 8"
+   }
+  },
+  {
+   "id": "join:decimal:left-misses",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT x.ddec, count(*) AS n, sum(x.d18) AS s FROM '{fixture:fact}' f LEFT JOIN '{fixture:plain_dec}' x ON f.fk = x.pk GROUP BY x.ddec ORDER BY x.ddec NULLS FIRST LIMIT 6"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT x.ddec, count(*) AS n, sum(x.d18) AS s FROM '{fixture:fact}' f LEFT JOIN '{fixture:plain_dec}' x ON f.fk = x.pk GROUP BY x.ddec ORDER BY x.ddec NULLS FIRST LIMIT 6"
+   }
+  },
+  {
+   "id": "join:decimal:through-a-chain",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT x.d4, count(*) AS n, sum(x.ddec) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_dec}' x WHERE f.fk = d.pk AND d.grp = x.pk GROUP BY x.d4 ORDER BY x.d4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT x.d4, count(*) AS n, sum(x.ddec) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:dim_dec}' x WHERE f.fk = d.pk AND d.grp = x.pk GROUP BY x.d4 ORDER BY x.d4"
+   }
+  },
+  {
+   "id": "join:decimal:having-and-derived-order",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, x.ddec, sum(x.d18) AS s, sum(x.d18) / count(*) AS m FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk GROUP BY f.fk, x.ddec HAVING sum(x.ddec) > 10 ORDER BY m DESC, f.fk LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, x.ddec, sum(x.d18) AS s, sum(x.d18) / count(*) AS m FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk GROUP BY f.fk, x.ddec HAVING sum(x.ddec) > 10 ORDER BY m DESC, f.fk LIMIT 5"
    }
   }
  ]

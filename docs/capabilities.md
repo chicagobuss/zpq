@@ -420,10 +420,11 @@ after the row groups, column by column). The bytes written depend only on the in
 An explicit `--max-memory` caps row groups at a sixteenth of it, so there the file can depend on that value (never
 on `-j`). Holding a row group's decoded rows until it is encoded is the write's largest fixed cost: with the default
 budget a machine needs a few times `--row-group-bytes` of memory, or an explicit `--max-memory`.
-Plain copies coalesce consecutive small source row groups without decoding values. They close at the first source
-boundary reaching the row target or the sum of source chunks' encoded `total_uncompressed_size` (pages plus headers)
-reaching the byte target. This encoded accounting differs from the reencoder's PLAIN value accounting above; cuts
-may overshoot by one source group. A source group already at target copies whole. Dictionary entries are interned
+Plain copies coalesce consecutive small source row groups without decoding values. A merged group takes source
+groups while it stays within the row target and the byte target, counted as the source chunks' encoded
+`total_uncompressed_size` (pages plus headers). This encoded accounting differs from the reencoder's PLAIN value
+accounting above. A source group already at target, or one its neighbours can't join within it (DuckDB's
+122,880-row groups), copies whole. Dictionary entries are interned
 and only nonidentity dictionary index streams are remapped; existing PLAIN, DELTA and BYTE_STREAM_SPLIT pages stay
 encoded. The explicit memory limit applies the same one-sixteenth byte cap as reencoding, using encoded bytes here.
 Different codecs, unsupported chunk shapes, dictionary-page overflow or insufficient merge working memory can end

@@ -585,13 +585,11 @@ const WriteRows = struct {
                 self.rgs_in += 1;
                 self.rows_in += rg.num_rows;
                 const nr: u64 = @intCast(rg.num_rows);
-                var nb: u64 = 0;
-                for (rg.columns.items, 0..) |c, ci| {
-                    if (self.kept_set != null and !self.kept_arr[ci]) continue;
-                    nb +|= @intCast(@max(0, (c.meta_data orelse return error.InvalidColumnOffsets).total_uncompressed_size));
-                }
+                const nb = try self.keptBytes(rg);
                 const whole = target.reached(nr, nb);
-                if (whole and sources.items.len > 0) {
+                // A merge never carries a group past the target: a source that would starts the next group, so groups
+                // near it (DuckDB's 122,880 rows) are byte-copied, not page-merged into pairs twice the target.
+                if ((whole or !fits(target, rows + nr, encoded_bytes +| nb)) and sources.items.len > 0) {
                     try self.flushSources(&scratch, sources.items, kept);
                     _ = pending.reset(.free_all);
                     sources = .empty;
@@ -602,7 +600,12 @@ const WriteRows = struct {
                 // Release before waiting for the next fetch: retaining several gates can exhaust a one-group window.
                 defer if (in.gate) |g| g.done(g.ctx, ri, 1);
                 const source: fastpath.coalesce.Source = .{ .bytes = in.bytes, .meta = meta, .rg = rg, .fd = self.inputFd(ii), .file_offsets = self.fileOffsets(ii) };
-                if (whole) {
+                // A group the next one cannot join is copied as it stands, never staged (a gated input's staging
+                // copies its bytes).
+                const next = self.nextGroup(ii, ri);
+                const alone = sources.items.len == 0 and
+                    if (next) |n| !fits(target, nr + @as(u64, @intCast(n.num_rows)), nb +| try self.keptBytes(n)) else true;
+                if (whole or alone) {
                     try self.copySource(source);
                     continue;
                 }
@@ -631,6 +634,31 @@ const WriteRows = struct {
         }
         try self.flushSources(&scratch, sources.items, kept);
         for (self.metas) |*m| try self.copied_from.append(self.arena, m);
+    }
+
+    fn fits(target: fastpath.coalesce.Target, rows: u64, bytes: u64) bool {
+        return rows <= target.rows and bytes <= target.encoded_uncompressed_bytes;
+    }
+
+    /// The kept columns' encoded uncompressed bytes: what a merge accounts a source group at.
+    fn keptBytes(self: *const WriteRows, rg: *const schema.RowGroup) !u64 {
+        var nb: u64 = 0;
+        for (rg.columns.items, 0..) |c, ci| {
+            if (self.kept_set != null and !self.kept_arr[ci]) continue;
+            nb +|= @intCast(@max(0, (c.meta_data orelse return error.InvalidColumnOffsets).total_uncompressed_size));
+        }
+        return nb;
+    }
+
+    /// The source group after input `ii`'s group `ri`, in write order across inputs.
+    fn nextGroup(self: *const WriteRows, ii: usize, ri: usize) ?*const schema.RowGroup {
+        var i = ii;
+        var r = ri + 1;
+        while (i < self.metas.len) : ({
+            i += 1;
+            r = 0;
+        }) if (r < self.metas[i].row_groups.items.len) return &self.metas[i].row_groups.items[r];
+        return null;
     }
 
     fn inputFd(self: *const WriteRows, i: usize) ?local_fs.fd_t {

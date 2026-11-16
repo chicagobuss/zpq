@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const blocking = @import("blocking.zig");
 
 /// Linux's fixed affinity mask capacity. An unrepresentable CPU is reported as unknown, never aliased to CPU 0.
 pub const cpu_capacity = std.os.linux.CPU_SETSIZE * 8;
@@ -41,7 +42,7 @@ pub const Cpu = struct {
 
 /// A calling thread's test fixture; never changes the discovered host or another query's fixture.
 pub threadlocal var test_cpu: ?Cpu = null;
-var state: std.atomic.Value(u8) = .init(0);
+var state: std.atomic.Value(u32) = .init(0);
 var detected: [cpu_capacity]Cpu = @splat(.{});
 var process_l1d: usize = 0;
 var process_line: usize = 0;
@@ -54,10 +55,12 @@ const unknown: Cpu = .{};
 pub fn forCpu(id: usize) *const Cpu {
     while (true) switch (state.load(.acquire)) {
         2 => return if (id < detected.len) &detected[id] else &unknown,
-        1 => std.atomic.spinLoopHint(),
+        // Waiters sleep: a spinning worker holds a CPU the discovering thread may need.
+        1 => blocking.io.futexWaitUncancelable(u32, &state.raw, 1),
         else => if (state.cmpxchgStrong(0, 1, .acq_rel, .acquire) == null) {
             discover();
             state.store(2, .release);
+            blocking.io.futexWake(u32, &state.raw, std.math.maxInt(u32));
         },
     };
 }
@@ -153,7 +156,7 @@ fn discover() void {
         const possible = readFile("/sys/devices/system/cpu/online", &buf);
         const cpus = if (possible) |text| parseCpuList(text) else null;
         if (cpus) |set| {
-            scanSysfs(set, &detected, id, true);
+            if (!scanSysfsUniform(set, &detected, id)) scanSysfs(set, &detected, id, true);
             if (comptime builtin.target.cpu.arch == .aarch64) fillLineBytes(set, &detected, ctrLineBytes(ctrEl0()));
         }
     }
@@ -296,6 +299,91 @@ fn readFile(path: [:0]const u8, buf: []u8) ?[]const u8 {
     return if (n == buf.len) null else std.mem.trim(u8, buf[0..n], " \t\r\n");
 }
 
+/// `scanSysfs`'s records from far fewer files, on x86 Linux that is not hybrid. CPUID on the seeded CPU gives each
+/// level's size and line, and Linux numbers `cache/index*` in CPUID's subleaf order, so sysfs is read only for what
+/// CPUID cannot say: which CPUs share each cache. One `shared_cpu_list` per L2 domain (an L1d shares exactly its
+/// L2's, checked on the seed), and the list and size per L3 group: about 25 files for 16 cores, where reading every
+/// CPU's caches took ~300 (~1 ms). False, with `out` as it was, when the host is not that: the caller reads every CPU.
+fn scanSysfsUniform(online: CpuSet, out: []Cpu, seeded: usize) bool {
+    const x86 = builtin.target.cpu.arch == .x86 or builtin.target.cpu.arch == .x86_64;
+    if (comptime builtin.target.os.tag != .linux or !x86) return false;
+    if (seeded >= out.len or !online.isSet(seeded)) return false;
+    if (cpuid(0, 0)[0] >= 7 and cpuid(7, 0)[3] & (1 << 15) != 0) return false; // hybrid: core types differ
+    const index = cpuidIndexes();
+    const l1, const l2 = .{ index[0] orelse return false, index[1] orelse return false };
+    const seed = out[seeded];
+    if (seed.l1d.bytes == 0 or seed.l2.bytes == 0) return false;
+    if (cacheLevel(seeded, l2) != 2) return false;
+    if (index[2]) |l3| if (cacheLevel(seeded, l3) != 3) return false;
+    const seed_l1 = cacheShared(seeded, l1) orelse return false;
+    var done_l2: CpuSet = .empty;
+    var done_l3: CpuSet = .empty;
+    var written: CpuSet = .empty;
+    var it = online.iterator(.{});
+    while (it.next()) |cpu| {
+        if (cpu >= out.len) continue;
+        if (!done_l2.isSet(cpu)) {
+            const set = cacheShared(cpu, l2) orelse return restore(out, written, seeded, seed);
+            if (!set.isSet(cpu) or (cpu == seeded and !set.eql(seed_l1))) return restore(out, written, seeded, seed);
+            const members = set.intersectWith(online);
+            var m = members.iterator(.{});
+            while (m.next()) |c| if (c < out.len) {
+                // The seed keeps CPUID's sharing counts; the others' records, read from sysfs, have none.
+                out[c].l1d = .{ .bytes = seed.l1d.bytes, .line_bytes = seed.l1d.line_bytes, .cpus = set };
+                out[c].l2 = .{ .bytes = seed.l2.bytes, .line_bytes = seed.l2.line_bytes, .cpus = set };
+                written.set(c);
+            };
+            done_l2.setUnion(set);
+        }
+        const l3 = index[2] orelse continue;
+        if (done_l3.isSet(cpu)) continue;
+        const set = cacheShared(cpu, l3) orelse return restore(out, written, seeded, seed);
+        if (!set.isSet(cpu)) return restore(out, written, seeded, seed);
+        var buf: [64]u8 = undefined;
+        const bytes = if (set.isSet(seeded)) seed.l3.bytes else parseSize(cacheFile(cpu, l3, "size", &buf) orelse
+            return restore(out, written, seeded, seed)) orelse 0;
+        const members = set.intersectWith(online);
+        var m = members.iterator(.{});
+        while (m.next()) |c| if (c < out.len) {
+            out[c].l3 = .{ .bytes = bytes, .line_bytes = seed.l3.line_bytes, .cpus = set };
+            written.set(c);
+        };
+        done_l3.setUnion(set);
+    }
+    out[seeded].l1d.max_sharing = seed.l1d.max_sharing;
+    out[seeded].l2.max_sharing = seed.l2.max_sharing;
+    out[seeded].l3.max_sharing = seed.l3.max_sharing;
+    return true;
+}
+
+/// Undo a partial `scanSysfsUniform`: the full scan reads into records it expects empty, the seed's CPUID one aside.
+fn restore(out: []Cpu, written: CpuSet, seeded: usize, seed: Cpu) bool {
+    var it = written.iterator(.{});
+    while (it.next()) |c| out[c] = .{};
+    out[seeded] = seed;
+    return false;
+}
+
+fn cacheFile(cpu: usize, index: u32, name: []const u8, buf: []u8) ?[]const u8 {
+    var path: [96]u8 = undefined;
+    const p = std.fmt.bufPrintSentinel(&path, "/sys/devices/system/cpu/cpu{d}/cache/index{d}/{s}", .{
+        cpu,
+        index,
+        name,
+    }, 0) catch return null;
+    return readFile(p, buf);
+}
+
+fn cacheShared(cpu: usize, index: u32) ?CpuSet {
+    var buf: [4096]u8 = undefined;
+    return parseCpuList(cacheFile(cpu, index, "shared_cpu_list", &buf) orelse return null);
+}
+
+fn cacheLevel(cpu: usize, index: u32) ?u8 {
+    var buf: [16]u8 = undefined;
+    return std.fmt.parseInt(u8, cacheFile(cpu, index, "level", &buf) orelse return null, 10) catch null;
+}
+
 /// Fill `out` for every CPU in `online` from sysfs, over whatever CPUID already put in `out[seeded]`. With `share`, a
 /// CPU that an earlier one's L1d, L2 and L3 (where it has one) all list as a sharer takes that CPU's record: it sits
 /// behind those same caches, so sysfs would describe them identically. That is an SMT sibling, and it halves the
@@ -413,7 +501,7 @@ fn cpuid(leaf: u32, sub: u32) [4]u32 {
 
 fn fromCpuid() Cpu {
     var out: Cpu = .{};
-    const leaf: u32 = if (cpuid(0x80000000, 0)[0] >= 0x8000001d) 0x8000001d else if (cpuid(0, 0)[0] >= 4) 4 else return out;
+    const leaf = cacheLeaf() orelse return out;
     var sub: u32 = 0;
     while (sub < 32) : (sub += 1) {
         const regs = cpuid(leaf, sub);
@@ -427,6 +515,28 @@ fn fromCpuid() Cpu {
             else => continue,
         };
         cache.* = decodeLeaf(regs) orelse .{};
+    }
+    return out;
+}
+
+/// The CPUID leaf that enumerates caches: AMD's extended one where present, else Intel's.
+fn cacheLeaf() ?u32 {
+    if (cpuid(0x80000000, 0)[0] >= 0x8000001d) return 0x8000001d;
+    return if (cpuid(0, 0)[0] >= 4) 4 else null;
+}
+
+/// The CPUID subleaf of the executing CPU's L1d, L2 and L3 (null where absent): on x86 Linux, its `cache/index`.
+fn cpuidIndexes() [3]?u32 {
+    var out: [3]?u32 = @splat(null);
+    const leaf = cacheLeaf() orelse return out;
+    var sub: u32 = 0;
+    while (sub < 32) : (sub += 1) {
+        const regs = cpuid(leaf, sub);
+        const kind = regs[0] & 31;
+        if (kind == 0) break;
+        if (kind != 1 and kind != 3) continue;
+        const level = (regs[0] >> 5) & 7;
+        if (level >= 1 and level <= 3) out[level - 1] = sub;
     }
     return out;
 }
@@ -509,6 +619,34 @@ test "hardware discovery that shares a sibling's record finds what reading every
             return err;
         };
     }
+}
+
+test "hardware discovery from CPUID and sharing lists alone finds what reading every CPU finds" {
+    if (builtin.target.os.tag != .linux) return;
+    var buf: [4096]u8 = undefined;
+    const online = parseCpuList(readFile("/sys/devices/system/cpu/online", &buf) orelse return) orelse return;
+    const full = try std.testing.allocator.alloc(Cpu, cpu_capacity);
+    defer std.testing.allocator.free(full);
+    const fast = try std.testing.allocator.alloc(Cpu, cpu_capacity);
+    defer std.testing.allocator.free(fast);
+    // CPUID describes the executing CPU, so seed the one this thread runs on, as discovery does.
+    const seed = currentId();
+    if (seed >= cpu_capacity) return;
+    @memset(full, .{});
+    @memset(fast, .{});
+    full[seed] = fromCpuid();
+    fast[seed] = full[seed];
+    scanSysfs(online, full, seed, false);
+    const seeded = fast[seed];
+    if (!scanSysfsUniform(online, fast, seed)) {
+        // Not a uniform x86 host: declined, with the records as they were for the full scan.
+        for (fast, 0..) |got, cpu| try std.testing.expect(std.meta.eql(got, if (cpu == seed) seeded else Cpu{}));
+        return;
+    }
+    for (full, fast, 0..) |want, got, cpu| std.testing.expect(std.meta.eql(want, got)) catch |err| {
+        std.debug.print("cpu {d} (seed {d}) differs\n", .{ cpu, seed });
+        return err;
+    };
 }
 
 /// sysctl answers by name, for `fromSysctl`.

@@ -492,6 +492,12 @@ fn joinPaths(args: MultiAggArgs) MultiAggArgs {
     out.grouped_distinct_bitmap = .off;
     out.count_ranked_distinct = .off;
     out.dense = false;
+    // A group-join folds in every pass that reaches a row group, so its query takes the one established pass. The
+    // hot certificate samples its keys from the probe's own chunks, where a build column has none.
+    if (join_lookup.ofFilter(bound_filter)) |j| if (j.group != null) {
+        out.sketch_topk = null;
+    };
+    if (out.sketch_topk) |*cfg| cfg.hot = false;
     return out;
 }
 

@@ -31,12 +31,18 @@ pub const Reader = struct {
     }
 
     pub fn readVarInt(self: *Reader, comptime T: type) !T {
-        const d = readUleb128(self.data[self.pos..]) catch |err| return switch (err) {
-            error.Truncated => error.EndOfStream,
-            error.Overflow => error.VarIntTooLong,
+        // Most footer varints (field deltas, enums, small counts) are one byte.
+        const result: u64 = if (self.pos < self.data.len and self.data[self.pos] < 0x80) one: {
+            self.pos += 1;
+            break :one self.data[self.pos - 1];
+        } else many: {
+            const d = readUleb128(self.data[self.pos..]) catch |err| return switch (err) {
+                error.Truncated => error.EndOfStream,
+                error.Overflow => error.VarIntTooLong,
+            };
+            self.pos += d.len;
+            break :many d.value;
         };
-        self.pos += d.len;
-        const result = d.value;
 
         // Check for overflow if T is smaller than u64?
         // For signed T, we just bitcast

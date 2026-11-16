@@ -840,11 +840,18 @@ pub const Statistics = struct {
     nan_count: ?i64 = null,
 
     pub fn read(reader: *thrift.Reader) !Statistics {
+        var stats: Statistics = .{};
+        try readInto(reader, &stats);
+        return stats;
+    }
+
+    /// `read` into `stats`, in place: the footer reads one per chunk, and a returned copy is what it stalled on.
+    pub fn readInto(reader: *thrift.Reader, stats: *Statistics) !void {
         const saved_id = reader.last_field_id;
         reader.last_field_id = 0;
         defer reader.last_field_id = saved_id;
 
-        var stats = Statistics{};
+        stats.* = .{};
         reader.readStructBegin();
         while (true) {
             const field = try reader.readFieldBegin();
@@ -870,7 +877,6 @@ pub const Statistics = struct {
                 else => try reader.skip(field.type),
             }
         }
-        return stats;
     }
 
     pub fn write(self: *const Statistics, writer: *thrift.Writer) !void {
@@ -946,11 +952,19 @@ pub const ColumnMetaData = struct {
     bloom_filter_length: ?i32 = null,
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnMetaData {
+        var meta: ColumnMetaData = undefined;
+        try readInto(allocator, reader, &meta);
+        return meta;
+    }
+
+    /// `read` into `meta`, in place, which it overwrites: a returned copy of this struct, per chunk, then copied
+    /// again into its `ColumnChunk`, was most of a large footer's parse (store-forwarding stalls, not decode).
+    pub fn readInto(allocator: std.mem.Allocator, reader: *thrift.Reader, meta: *ColumnMetaData) !void {
         const saved_id = reader.last_field_id;
         reader.last_field_id = 0;
         defer reader.last_field_id = saved_id;
 
-        var meta = ColumnMetaData{
+        meta.* = ColumnMetaData{
             .type = .INT32,
             .encodings = .empty,
             .path_in_schema = .empty,
@@ -1017,9 +1031,12 @@ pub const ColumnMetaData = struct {
                     // computation falls back to data_page_offset instead of reading
                     // the magic bytes as a page header.
                     const dpo = try reader.readZigZag(i64);
-                    meta.dictionary_page_offset = if (dpo >= 4) dpo else null;
+                    if (dpo >= 4) meta.dictionary_page_offset = dpo else meta.dictionary_page_offset = null;
                 },
-                12 => meta.statistics = try Statistics.read(reader),
+                12 => {
+                    meta.statistics = @as(Statistics, .{});
+                    try Statistics.readInto(reader, &meta.statistics.?);
+                },
                 13 => {
                     const header = try reader.readByte();
                     var size = @as(usize, header >> 4);
@@ -1044,7 +1061,6 @@ pub const ColumnMetaData = struct {
                 else => try reader.skip(field.type),
             }
         }
-        return meta;
     }
 
     pub fn deinit(self: *ColumnMetaData, allocator: std.mem.Allocator) void {
@@ -1116,15 +1132,18 @@ pub const ColumnChunk = struct {
     offset_index_out: []const u8 = &.{},
 
     pub fn read(allocator: std.mem.Allocator, reader: *thrift.Reader) !ColumnChunk {
+        var chunk: ColumnChunk = undefined;
+        try readInto(allocator, reader, &chunk);
+        return chunk;
+    }
+
+    /// `read` into `chunk`, in place, which it overwrites (see `ColumnMetaData.readInto`).
+    pub fn readInto(allocator: std.mem.Allocator, reader: *thrift.Reader, chunk: *ColumnChunk) !void {
         const saved_id = reader.last_field_id;
         reader.last_field_id = 0;
         defer reader.last_field_id = saved_id;
 
-        var chunk = ColumnChunk{
-            .file_path = null,
-            .file_offset = 0,
-            .meta_data = null,
-        };
+        chunk.* = .{ .file_path = null, .file_offset = 0, .meta_data = null };
 
         reader.readStructBegin();
         while (true) {
@@ -1136,9 +1155,12 @@ pub const ColumnChunk = struct {
                 2 => chunk.file_offset = try reader.readZigZag(i64),
                 3 => {
                     // Repeated: the later one wins, and the earlier one is freed rather than leaked.
-                    const m = try ColumnMetaData.read(allocator, reader);
                     if (chunk.meta_data) |*old| old.deinit(allocator);
-                    chunk.meta_data = m;
+                    chunk.meta_data = @as(ColumnMetaData, undefined);
+                    ColumnMetaData.readInto(allocator, reader, &chunk.meta_data.?) catch |err| {
+                        chunk.meta_data = null;
+                        return err;
+                    };
                 },
                 4 => chunk.offset_index_offset = try reader.readZigZag(i64),
                 5 => chunk.offset_index_length = try reader.readZigZag(i32),
@@ -1151,7 +1173,6 @@ pub const ColumnChunk = struct {
                 else => try reader.skip(field.type),
             }
         }
-        return chunk;
     }
 
     pub fn deinit(self: *ColumnChunk, allocator: std.mem.Allocator) void {
@@ -1434,8 +1455,11 @@ pub const RowGroup = struct {
                     );
                     var i: usize = 0;
                     while (i < size) : (i += 1) {
-                        const col = try ColumnChunk.read(allocator, reader);
-                        try rg.columns.append(allocator, col);
+                        const col = try rg.columns.addOne(allocator);
+                        ColumnChunk.readInto(allocator, reader, col) catch |err| {
+                            rg.columns.items.len -= 1;
+                            return err;
+                        };
                     }
                 },
                 2 => rg.total_byte_size = try reader.readZigZag(i64),

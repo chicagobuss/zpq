@@ -21,6 +21,7 @@ const filter_eval = @import("../filter/eval.zig");
 const selection = @import("../filter/selection.zig");
 const column_mod = @import("../parquet/column.zig");
 const metadata = @import("../parquet/metadata.zig");
+const decimal = @import("../parquet/decimal.zig");
 
 /// INNER and LEFT builds are N:1 (a key twice refuses); SEMI and ANTI take duplicates. INNER and SEMI keep a probe
 /// row with a match, ANTI one without (`NOT IN`), and LEFT every row, a miss reading its build columns as NULL.
@@ -39,6 +40,8 @@ pub const Kind = enum {
 pub const Dict = union(enum) {
     i32: []const i32,
     i64: []const i64,
+    /// A DECIMAL stored as bytes. Every DECIMAL payload holds its exact unscaled integers (`column` scales them).
+    i128: []const i128,
     f64: []const f64,
     string: []const []const u8,
 
@@ -459,6 +462,25 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
         }
         return .{ .string = .{ .values = vals, .def_levels = def, .max_def = if (j.kind == .left) 1 else 0, .has_nulls = def != null } };
     }
+    // A DECIMAL reads as the scan decodes one (`decimal.decodeColumnExact`): its f64 view beside its exact integers.
+    if (decimal.kindFromSchema(&payload.element)) |k| switch (payload.dict) {
+        inline .i32, .i64, .i128 => |dict| {
+            const exact = try a.alloc(@TypeOf(dict[0]), sel.len);
+            if (dict.len == 0) @memset(exact, 0) else for (codes, exact) |code, *v| {
+                v.* = dict[code];
+            }
+            const vals = try a.alloc(f64, sel.len);
+            for (exact, vals) |v, *f| f.* = decimal.applyScaleInt(@TypeOf(v), v, k.scale);
+            return .{ .f64 = .{
+                .values = vals,
+                .unscaled = @unionInit(filter_eval.Exact, @typeName(@TypeOf(dict[0])), exact),
+                .def_levels = def,
+                .max_def = if (j.kind == .left) 1 else 0,
+                .has_nulls = def != null,
+            } };
+        },
+        else => unreachable,
+    };
     if (payload.plain) return switch (payload.dict) {
         inline else => |dict, tag| blk: {
             const T = @TypeOf(dict[0]);
@@ -642,6 +664,8 @@ fn decodeValues(a: std.mem.Allocator, bytes: []const u8, meta: *const schema.Fil
     const rows: usize = @intCast(rg.num_rows);
     const options = column_mod.chunkOptions(.{}, meta, cm);
     const decode = @import("../consumer/column.zig").decodeColumnTWithOptions;
+    if (meta.getColumnSchema(cm.path_in_schema.items)) |e| if (decimal.kindFromSchema(&e)) |k|
+        return .{ .f64 = try decimal.decodeColumnExact(a, chunk, cm.codec, levels, rows, k, options, null) };
     return switch (cm.type) {
         .INT32 => .{ .i32 = try decode(i32, a, chunk, cm.codec, levels, rows, options) },
         .INT64 => .{ .i64 = try decode(i64, a, chunk, cm.codec, levels, rows, options) },
@@ -680,11 +704,17 @@ fn localDict(comptime T: type, a: std.mem.Allocator, c: filter_eval.ColumnT(T), 
     const d: Dict = switch (T) {
         i32 => .{ .i32 = dict.items },
         i64 => .{ .i64 = dict.items },
+        i128 => .{ .i128 = dict.items },
         f64 => .{ .f64 = dict.items },
         []const u8 => .{ .string = dict.items },
         else => unreachable,
     };
     return .{ .codes = .{ .u32 = codes }, .dict = d };
+}
+
+/// A DECIMAL's exact unscaled integers (`decodeValues`), which its payload holds; any other column as it is.
+fn exactOf(col: filter_eval.Batch.Column) !filter_eval.Batch.Column {
+    return if (col == .f64 and col.f64.unscaled != null) try expr_eval.exactColumn(col) else col;
 }
 
 /// A payload chunk that is dictionary-encoded throughout, as its own dictionary and the survivors' codes in it: the
@@ -727,9 +757,10 @@ fn localOf(c: *const Ctx, sa: std.mem.Allocator, rg: *const schema.RowGroup, p: 
             else => null,
         }) |coded| return coded;
     }
-    return switch (decoded orelse try decodeValues(sa, c.bytes, c.meta, rg, p)) {
+    return switch (try exactOf(decoded orelse try decodeValues(sa, c.bytes, c.meta, rg, p))) {
         .i32 => |pc| try localDict(i32, sa, pc, keep),
         .i64 => |pc| try localDict(i64, sa, pc, keep),
+        .i128 => |pc| try localDict(i128, sa, pc, keep),
         .f64 => |pc| try localDict(f64, sa, pc, keep),
         .string => |pc| try localDict([]const u8, sa, pc, keep),
         else => error.JoinPayloadType,
@@ -844,8 +875,8 @@ const LateLocal = struct {
 /// A plain payload's local (`Payload.plain`): the `keep` rows' values of `col`, copied into `a`, unhashed; strings
 /// still point into `col`.
 fn plainLocal(a: std.mem.Allocator, col: filter_eval.Batch.Column, keep: []const u32) !Local {
-    return switch (col) {
-        inline .i32, .i64, .f64, .string => |cc, tag| blk: {
+    return switch (try exactOf(col)) {
+        inline .i32, .i64, .i128, .f64, .string => |cc, tag| blk: {
             const values = try a.alloc(@TypeOf(cc.values[0]), keep.len);
             var bytes: usize = 0;
             for (keep, values) |r, *v| {
@@ -927,6 +958,7 @@ const Unify = struct {
         self.out[p] = switch (c.parts[0].local[p].dict) {
             .i32 => try unify(i32, c, p),
             .i64 => try unify(i64, c, p),
+            .i128 => try unify(i128, c, p),
             .f64 => try unify(f64, c, p),
             .string => try unify([]const u8, c, p),
         };
@@ -954,6 +986,7 @@ fn unify(comptime T: type, c: *Ctx, p: usize) !Unified {
     const tag = switch (T) {
         i32 => "i32",
         i64 => "i64",
+        i128 => "i128",
         f64 => "f64",
         else => "string",
     };
@@ -1243,6 +1276,11 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     defer for (fill_plain) |fp| gpa.free(fp.starts);
     for (spec.payload, payloads, codes, unified, plain, fill_plain, 0..) |leaf, *out, *cs, *u, is_plain, *fp, pi| {
         const element = @import("../parquet/metadata.zig").leafSchemaElement(meta, leaf).?;
+        // A DECIMAL's integers: in its own lane when stored as one, else 128 bits (`decimal.decodeColumnExact`).
+        const lane: schema.Type = if (decimal.kindFromSchema(&element) == null) element.type.? else switch (element.type.?) {
+            .INT32, .INT64 => |physical| physical,
+            else => .FIXED_LEN_BYTE_ARRAY,
+        };
         if (spec.defers(pi)) {
             cs.* = .{ .identity = n };
             out.* = .{ .name = element.name, .element = element, .codes = cs.*, .dict = .{ .string = &.{} }, .deferred = .{ .scratch = gpa, .bytes = bytes, .meta = meta, .leaf = leaf, .rows = locators } };
@@ -1256,9 +1294,10 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
                 st.* = total;
                 total += part.local[pi].bytes;
             }
-            const values: Dict = switch (element.type.?) {
+            const values: Dict = switch (lane) {
                 .INT32 => .{ .i32 = try a.alloc(i32, n) },
                 .INT64 => .{ .i64 = try a.alloc(i64, n) },
+                .FIXED_LEN_BYTE_ARRAY => .{ .i128 = try a.alloc(i128, n) },
                 .DOUBLE => .{ .f64 = try a.alloc(f64, n) },
                 else => .{ .string = try a.alloc([]const u8, n) },
             };
@@ -1268,8 +1307,9 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
             continue;
         }
         // With no row group the dictionary's type comes from the column's: a LEFT miss still reads it, as NULL.
-        if (parts.len == 0) u.values = switch (element.type orelse .INT64) {
+        if (parts.len == 0) u.values = switch (lane) {
             .INT32 => .{ .i32 = &.{} },
+            .FIXED_LEN_BYTE_ARRAY => .{ .i128 = &.{} },
             .DOUBLE => .{ .f64 = &.{} },
             .BYTE_ARRAY => .{ .string = &.{} },
             else => .{ .i64 = &.{} },
@@ -1346,6 +1386,7 @@ pub fn fetch(ctx: *const anyopaque, p: usize, key: i64, a: std.mem.Allocator) an
     return switch (payload.dict) {
         .i32 => |d| .{ .int = d[code] },
         .i64 => |d| .{ .int = d[code] },
+        .i128 => unreachable, // never fetched (`engine/join.zig` `withFetches`)
         .f64 => |d| .{ .float = d[code] },
         .string => |d| .{ .bytes = d[code] },
     };
@@ -1854,11 +1895,19 @@ pub const GroupJoin = struct {
                 const leaf = g.keys[k];
                 const p = j.virtualPayload(leaf) orelse return .{ .i = keyOfSlot(j, s) };
                 const code = j.payloads[p].codes.get(s);
+                if (decimal.kindFromSchema(&j.payloads[p].element)) |dk| return .{ .dec = .{
+                    .v = switch (j.payloads[p].dict) {
+                        inline .i32, .i64, .i128 => |d| d[code],
+                        else => unreachable,
+                    },
+                    .spec = .{ .precision = @intCast(dk.precision), .scale = @intCast(dk.scale) },
+                } };
                 // An unsigned column's lane holds its bits: read as the scan reads it, zero-extended.
                 const unsigned = if (KeyDomain.of(j.payloads[p].element)) |dom| dom == .unsigned else false;
                 return switch (j.payloads[p].dict) {
                     .i32 => |d| .{ .i = if (unsigned) @as(u32, @bitCast(d[code])) else d[code] },
                     .i64 => |d| .{ .i = if (unsigned) @as(u64, @bitCast(d[code])) else d[code] },
+                    .i128 => unreachable,
                     .f64 => |d| .{ .f = d[code] },
                     .string => |d| .{ .s = if (gpa) |a| try a.dupe(u8, d[code]) else d[code] },
                 };

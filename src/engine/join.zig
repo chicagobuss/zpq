@@ -5,7 +5,6 @@
 const std = @import("std");
 const schema = @import("../core/schema.zig");
 const metadata = @import("../core/parquet/metadata.zig");
-const decimal = @import("../core/parquet/decimal.zig");
 const syntax = @import("../core/expr/syntax.zig");
 const expr_ast = @import("../core/expr/ast.zig");
 const filter_ast = @import("../core/filter/ast.zig");
@@ -281,6 +280,7 @@ pub const Prepared = struct {
                 .string => k.col_ref.expr_type == .str,
                 .f64 => k.col_ref.expr_type == .f64,
                 .i32, .i64 => k.col_ref.expr_type == .i64 or k.col_ref.expr_type == .dec,
+                .i128 => false,
             };
             if (!lane_ok) continue;
             const via = j.payloads[q].via;
@@ -589,16 +589,6 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: 
     const key = metadata.resolveColumn(meta, b.key) catch |err| {
         Diag.setColumn(diag, b.key);
         return err;
-    };
-    // A DECIMAL build column would reach the probe as its unscaled integers, where its expressions read exact
-    // decimals: refused by name until a join carries a decimal's scale.
-    var reads: std.ArrayList(usize) = .empty;
-    if (filter) |f| try f.collectColumns(&reads, arena);
-    try reads.appendSlice(arena, payload);
-    for (reads.items) |leaf| if (metadata.leafSchemaElement(meta, leaf)) |e| if (decimal.kindFromSchema(&e) != null) {
-        Diag.setInput(diag, b.path, null);
-        Diag.setColumn(diag, e.name);
-        return error.JoinDecimalColumn;
     };
     const store = if (aligned != null) &t.aligned_store else &t.store;
     const before = store.capacity();

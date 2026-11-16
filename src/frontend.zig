@@ -265,10 +265,6 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             "zpq query: a column the query reads from '{s}' holds NULLs or a type a join does not carry in this release\n",
             .{diag.input orelse "the build"},
         ),
-        error.JoinDecimalColumn => diagnosticPrint(
-            "zpq query: a join does not carry the DECIMAL column {s} of '{s}' in this release\n",
-            .{ diag.column.get(), diag.input orelse "the build" },
-        ),
         error.JoinKeyTypeMismatch => diagnosticPrint(
             "zpq query: the join compares {s} with a key of another SQL type; a join's keys must share one\n",
             .{diag.column.get()},

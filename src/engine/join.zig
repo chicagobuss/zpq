@@ -249,7 +249,9 @@ pub const Prepared = struct {
                 j.group = g;
             }
         }
-        if (j.group) |g| g.order = self.order;
+        // Under `post`, ORDER BY and HAVING index the result program's wider row, not the slots' outputs: the
+        // group-join then keeps every slot, and the result program ranks and cuts them.
+        if (j.group) |g| g.order = if (self.order.post) .{} else self.order;
         // Without a group-join, a GROUP BY key that is a build column another key determines groups by that key alone,
         // and reads once per group (`expr_ast.Fetch`).
         if (j.group == null) if (a.keys) |keys| {

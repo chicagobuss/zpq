@@ -22,6 +22,7 @@ pub const Error = error{
     JoinKeyNotFound,
     JoinResidualNotSupported,
     AmbiguousJoinColumn,
+    JoinColumnsShareName,
     LeftJoinOn,
     LeftJoinWhere,
     OutOfMemory,
@@ -653,6 +654,11 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
     };
     // A snowflake's table reads its FK off its parent's build: the parent publishes it.
     for (0..n) |d| if (d != probe and parent[d] != probe) try addName(a, &columns[parent[d]], fks[d].?);
+    // A build column reaches the probe under its own name: one name two tables publish (a self join's `a.w < b.w`)
+    // would be one ambiguous column there.
+    for (0..n) |d| for (d + 1..n) |e| for (columns[d].items) |x| for (columns[e].items) |y| {
+        if (std.ascii.eqlIgnoreCase(x, y)) return error.JoinColumnsShareName;
+    };
     const probe_from = list.items[live.items[probe]];
     probe_from.*.u.from_table.alias = null;
     sel.from = probe_from;

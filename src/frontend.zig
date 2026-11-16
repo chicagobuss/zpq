@@ -243,6 +243,11 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             .{},
         ),
         error.AmbiguousJoinColumn => diagnosticPrint("zpq query: a column name is in both tables of the join; qualify it\n", .{}),
+        error.JoinColumnsShareName => diagnosticPrint(
+            "zpq query: two tables of the join have a column of one name the query reads\n" ++
+                "  (a self join's a.w < b.w); a join carries one column per name in this release\n",
+            .{},
+        ),
         error.JoinRowsNotSupported => diagnosticPrint("zpq query: a join or an IN (SELECT ...) must aggregate (or GROUP BY) in this release\n", .{}),
         error.SubqueryLimitNotSupported => diagnosticPrint(
             "zpq query: an IN (SELECT ...) with LIMIT or OFFSET is not supported in this release\n",

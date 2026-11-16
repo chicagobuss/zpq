@@ -107,6 +107,10 @@
   {
    "name": "sfact",
    "copy": "COPY (SELECT i AS id, (i % 997)::BIGINT AS fk, (i * 1.25)::DOUBLE AS amt, (i % 7)::BIGINT AS q, (CASE WHEN i % 17 = 0 THEN NULL ELSE 'm' || (i % 5) END) AS mode, 'i' || (i % 3) AS inst FROM range(1, 20000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 4096)"
+  },
+  {
+   "name": "dim_dec",
+   "copy": "COPY (SELECT k AS pk, ((k % 200) * 0.02)::DECIMAL(9, 2) AS ddec FROM range(1, 801) t(k)) TO '{path}' (FORMAT PARQUET)"
   }
  ],
  "cases": [
@@ -1473,8 +1477,8 @@
     }
    ],
    "refuse": {
-    "error": "exit 2",
-    "diag": "ambiguous column name"
+    "error": "exit 1",
+    "diag": "one column per name"
    }
   },
   {
@@ -6778,6 +6782,213 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT d.w, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_dim}' p WHERE f.fk = d.pk AND d.w = p.pk GROUP BY d.w, uname, ukind ORDER BY uname DESC, d.w LIMIT 7"
+   }
+  },
+  {
+   "id": "join:groupjoin:having-one-derived-order-another",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, d.kind, sum(f.amt) / count(*) AS m, sum(f.q) - count(*) AS k FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, d.kind HAVING sum(f.q) - count(*) > 41 ORDER BY m DESC, f.fk LIMIT 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, d.kind, sum(f.amt) / count(*) AS m, sum(f.q) - count(*) AS k FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, d.kind HAVING sum(f.q) - count(*) > 41 ORDER BY m DESC, f.fk LIMIT 3"
+   }
+  },
+  {
+   "id": "join:groupjoin:derived-order-hidden-offset",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, d.kind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, d.kind HAVING sum(f.q) - count(*) > 41 ORDER BY sum(f.amt) / count(*), f.fk LIMIT 4 OFFSET 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, d.kind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, d.kind HAVING sum(f.q) - count(*) > 41 ORDER BY sum(f.amt) / count(*), f.fk LIMIT 4 OFFSET 2"
+   }
+  },
+  {
+   "id": "join:groupjoin:derived-order-past-the-outputs",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, count(*) * 2 - 1 AS c, sum(f.q) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk ORDER BY 100000 - count(*) DESC, f.fk LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, count(*) * 2 - 1 AS c, sum(f.q) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk ORDER BY 100000 - count(*) DESC, f.fk LIMIT 4"
+   }
+  },
+  {
+   "id": "join:groupjoin:count-cut-second-aggregate",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, d.w, count(*) AS n, sum(f.q) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, d.w ORDER BY n DESC, f.fk LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, d.w, count(*) AS n, sum(f.q) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, d.w ORDER BY n DESC, f.fk LIMIT 5"
+   }
+  },
+  {
+   "id": "join:groupjoin:count-cut-residual",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, d.kind, count(*) AS n, sum(f.q) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND (d.kind = 'kind3' OR f.q = 1) GROUP BY f.fk, d.kind ORDER BY n DESC, f.fk LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, d.kind, count(*) AS n, sum(f.q) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk AND (d.kind = 'kind3' OR f.q = 1) GROUP BY f.fk, d.kind ORDER BY n DESC, f.fk LIMIT 5"
+   }
+  },
+  {
+   "id": "join:count-cut:dimension-column-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, d.w, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, d.w ORDER BY n DESC, f.fk LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, d.w, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, d.w ORDER BY n DESC, f.fk LIMIT 5"
+   }
+  },
+  {
+   "id": "join:refuse:decimal-build-column",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_dec}' d WHERE f.fk = d.pk AND d.ddec < f.dec"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "DECIMAL column ddec"
+   }
+  },
+  {
+   "id": "join:refuse:decimal-build-filter",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f WHERE f.fk IN (SELECT pk FROM '{fixture:dim_dec}' WHERE ddec < 1.5)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "DECIMAL column ddec"
+   }
+  },
+  {
+   "id": "join:refuse:self-join-shared-name",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' a, '{fixture:dim}' b WHERE f.fk = a.pk AND f.q = b.pk AND a.w < b.w"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "one column per name"
    }
   }
  ]

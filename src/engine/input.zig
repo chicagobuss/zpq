@@ -209,7 +209,7 @@ pub fn materializeMetas(
         }
         const span = profile.Span.begin(prof);
         defer span.end(.footer_parse, profile.args(.{ i, in.bytes.len }));
-        metas[i] = metadata.open(arena, in.bytes) catch |err| {
+        metas[i] = parseFooter(arena, in.bytes) catch |err| {
             Diag.setInput(diag, in.name, err);
             return switch (err) {
                 error.EncryptedFile, error.ExternalColumnChunk, error.InvalidDecimalType => err,
@@ -219,6 +219,23 @@ pub fn materializeMetas(
         if (opened.row_groups) |ranges| try restrictRowGroups(arena, &metas[i], ranges[i], diag, in.name);
     }
     return metas;
+}
+
+/// `metadata.open` into one block of the query arena, by a bump allocator: the parse runs on this thread alone, and
+/// the arena's thread-safe step (an atomic per allocation) and the block's first-touch faults were half of a large
+/// footer's parse (hits.parquet: 2.4 MB of footer, 12.6 MB parsed). The block is sized from the footer and advised
+/// for huge pages where the host has them free; what outgrows it goes to the arena. Its last byte stays unused: no
+/// parsed slice then ends where the arena's newest allocation does, so the arena never resizes or frees into it.
+fn parseFooter(arena: std.mem.Allocator, bytes: []const u8) !schema.FileMetaData {
+    if (bytes.len < 12) return metadata.open(arena, bytes);
+    const footer_len = @min(std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little), bytes.len);
+    // hits.parquet parses to 5.2 bytes per footer byte.
+    const block = arena.alignedAlloc(u8, .fromByteUnits(huge_pages.huge_page_size), footer_len *| 6 +| 1) catch
+        return metadata.open(arena, bytes);
+    const huge = block.len >= 2 * huge_pages.huge_page_size and huge_pages.worthAdvising(block.len);
+    if (huge) huge_pages.adviseBlock(block);
+    var region: huge_pages.Region = .{ .child = arena, .buf = block[0 .. block.len - 1] };
+    return metadata.open(region.allocator(), bytes);
 }
 
 /// Keep the row groups `range` resolves to in a footer (`RowGroupRange.resolve`), and the row count they hold. A range

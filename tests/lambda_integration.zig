@@ -329,6 +329,18 @@ pub const FakeS3 = struct {
     fn respond(self: *FakeS3, fd: linux.fd_t, head: []const u8) !void {
         _ = self.requests.fetchAdd(1, .monotonic);
         const first_line = head[0 .. std.mem.indexOf(u8, head, "\r\n") orelse head.len];
+        if (std.mem.indexOf(u8, first_line, "/missing.parquet") != null or
+            std.mem.indexOf(u8, first_line, "/bad-auth.parquet") != null)
+        {
+            const missing = std.mem.indexOf(u8, first_line, "/missing.parquet") != null;
+            const body = if (missing)
+                "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>"
+            else
+                "<Error><Code>SignatureDoesNotMatch</Code><Message>The request signature does not match.</Message></Error>";
+            var error_header: [128]u8 = undefined;
+            try writeAllFd(fd, try std.fmt.bufPrint(&error_header, "HTTP/1.1 {s}\r\nContent-Length: {d}\r\n\r\n", .{ if (missing) "404 Not Found" else "403 Forbidden", body.len }));
+            return writeAllFd(fd, body);
+        }
         if (std.mem.indexOf(u8, first_line, "list-type=2") != null) {
             const body = "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>fact.parquet</Key><Size>1</Size></Contents></ListBucketResult>";
             var list_header: [128]u8 = undefined;

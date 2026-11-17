@@ -623,7 +623,6 @@ const ColumnNames = struct {
         const self: *ColumnNames = @ptrCast(@alignCast(ctx));
         const matches = try expandGlob(arena, self.io, table, self.env, self.diag);
         if (matches.len == 0) return error.NoMatches;
-        // A footer is read from a local file only.
         const meta = engine.join.LocalSchemas.footer(self.schemas, matches[0]) catch |err| return if (err == error.JoinNotLocal) error.ColumnsNotSupported else err;
         const items = meta.schema.items;
         var out: std.ArrayList([]const u8) = .empty;
@@ -700,7 +699,7 @@ fn runParsedOnce(
     var aggregate = options.aggregate;
     const explain = options.explain;
     // `COLUMNS(...)` select items are written out once per column they name, which the footer says.
-    var column_schemas: engine.join.LocalSchemas = .{ .arena = arena, .ctx = .{ .gpa = gpa, .io = io, .env = env } };
+    var column_schemas: engine.join.LocalSchemas = .{ .arena = arena, .ctx = .{ .gpa = gpa, .io = io, .env = env, .diag = diag } };
     defer column_schemas.deinit();
     // CTEs and subqueries in FROM run first, as queries of their own into scratch files the query then reads.
     if (comptime build_options.enable_sql) if (options.query) |q| {
@@ -889,7 +888,7 @@ fn runParsedOnce(
                 return runUpdate(io, gpa, arena, up, output, fsync, summary, max_memory orelse zpq.core.system.discoverAvailableMemory(env));
             }
             // A two-table join binds its column names against both footers; the engine reads the build.
-            var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena, .ctx = .{ .gpa = gpa, .io = io, .env = env } } };
+            var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena, .ctx = .{ .gpa = gpa, .io = io, .env = env, .diag = diag } } };
             defer schemas.deinit();
             const sql = zpq.core.expr.sql_parser;
             const pq = (try sql.parseSqlJoinPlanRoot(arena, q_str, .{ .ctx = &schemas, .footer = zpq.frontend.JoinSchemas.footer }, root)) orelse

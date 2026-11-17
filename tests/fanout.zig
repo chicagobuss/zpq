@@ -766,3 +766,33 @@ test "fanout fixture: CLI joins S3 and local tables and an S3 glob" {
         }
     }
 }
+
+test "fanout fixture: CLI join S3 errors match plain query diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, full, scratch, .limited(64 << 20));
+    var store: fake.FakeS3 = undefined;
+    try store.start(bytes, 0);
+    defer store.deinit();
+    var env_map: std.process.Environ.Map = .{ .allocator = scratch, .array_hash_map = .empty };
+    defer env_map.deinit();
+    try env_map.put("S3_ENDPOINT_URL", try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}", .{store.port}));
+    try env_map.put("S3_ACCESS_KEY_ID", "fake");
+    try env_map.put("S3_SECRET_ACCESS_KEY", "incorrect");
+    try env_map.put("S3_REGION", "us-east-1");
+    try env_map.put("PATH", "/usr/bin:/bin");
+    for ([_][]const u8{ "missing.parquet", "bad-auth.parquet" }) |name| {
+        const path = try std.fmt.allocPrint(scratch, "s3://test/{s}", .{name});
+        const plain = try std.fmt.allocPrint(scratch, "SELECT count(*) FROM '{s}'", .{path});
+        const join_sql = try std.fmt.allocPrint(scratch, "SELECT count(*) FROM '{s}' f JOIN '{s}' d ON f.n=d.pk", .{ full, path });
+        const single = try std.process.run(scratch, io, .{ .argv = &.{ opts.cli_bin, "query", "--query", plain }, .environ_map = &env_map });
+        const joined = try std.process.run(scratch, io, .{ .argv = &.{ opts.cli_bin, "query", "--query", join_sql }, .environ_map = &env_map });
+        try std.testing.expect(single.term == .exited and single.term.exited != 0);
+        try std.testing.expect(joined.term == .exited and joined.term.exited != 0);
+        try std.testing.expectEqualStrings(single.stderr, joined.stderr);
+        try std.testing.expect(std.mem.indexOf(u8, joined.stderr, path) != null);
+        try std.testing.expect(std.mem.indexOf(u8, joined.stderr, if (std.mem.eql(u8, name, "missing.parquet")) "NoSuchKey" else "SignatureDoesNotMatch") != null);
+        if (std.mem.eql(u8, name, "bad-auth.parquet")) try std.testing.expect(std.mem.indexOf(u8, joined.stderr, "check AWS_ACCESS_KEY_ID") != null);
+    }
+}

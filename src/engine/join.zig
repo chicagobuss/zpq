@@ -36,7 +36,10 @@ pub const LocalSchemas = struct {
         if (std.mem.startsWith(u8, path, "s3://")) {
             self.remote_seen = true;
             const ctx = self.ctx orelse return error.JoinNotLocal;
-            m.* = try input.fetchS3Schema(ctx, path, self.arena);
+            const args: types.QueryArgs = .{ .inputs = &.{path}, .diag = ctx.diag };
+            var opened = try input.openInputs(ctx, self.arena, args, .{ .limit = args.max_memory, .footer_only = true });
+            defer opened.deinit();
+            m.* = (try input.materializeMetas(self.arena, opened, ctx.diag, null))[0];
         } else {
             try self.maps.ensureUnusedCapacity(self.arena, 1);
             const opened = try open(self.arena, path);

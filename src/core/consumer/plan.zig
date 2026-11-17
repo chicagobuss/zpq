@@ -416,6 +416,9 @@ pub const Conjunct = union(enum) {
             .predicate => |f| filter_ast.markColumns(f, marks),
             .lookup => |l| {
                 if (l.col_idx < marks.len) marks[l.col_idx] = true;
+                for (l.more) |ci| if (ci < marks.len) {
+                    marks[ci] = true;
+                };
                 if (l.residual) |r| for (r.reads) |ci| if (ci < marks.len) {
                     marks[ci] = true;
                 };
@@ -428,8 +431,8 @@ pub const Conjunct = union(enum) {
     pub fn soleColumn(c: Conjunct) ?usize {
         return switch (c) {
             .predicate => |f| filter_ast.leafColumn(f),
-            // A residual reads more than the key.
-            .lookup => |l| if (l.residual == null) l.col_idx else null,
+            // A residual reads more than the key, and a composite key is more than one column.
+            .lookup => |l| if (l.residual == null and l.more.len == 0) l.col_idx else null,
         };
     }
 };
@@ -575,7 +578,8 @@ pub const GatedFilter = struct {
                     g.slots[l.join.slot_index][g.at..][0..sel.len]
                 else
                     null;
-                try join_lookup.narrow(l.join, batch.cols[pos], sel, a, capture);
+                const more = try join_lookup.moreColumns(a, batch.cols, lookup, l.more);
+                try join_lookup.narrow(l.join, batch.cols[pos], more, sel, a, capture);
                 if (l.residual) |r| try filter_eval.evalResidual(r, batch, sel, lookup, a, if (capture) |slots|
                     .{ .join = l.join, .slots = slots }
                 else
@@ -956,10 +960,14 @@ fn markFilter(u: CodeUses, f: filter_ast.Filter) void {
         // A coded foreign key is looked up once per dictionary entry (`join.lookup.narrow`).
         .lookup => |l| {
             mark(u.code, l.col_idx);
+            for (l.more) |ci| mark(u.code, ci);
             // A residual's columns are read as its own predicates read them; the joins' FKs as their lookups do.
             if (l.residual) |r| {
                 markFilter(u, r.filter);
-                for (r.joins) |j| mark(u.code, j.fk_leaf);
+                for (r.joins) |j| {
+                    mark(u.code, j.fk_leaf);
+                    for (j.fk_more) |ci| mark(u.code, ci);
+                }
             }
         },
         .expr => |e| {

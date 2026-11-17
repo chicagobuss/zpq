@@ -104,7 +104,7 @@ pub const Explained = struct {
                 .fk = try a.dupe(u8, l.fk),
                 .input = try a.dupe(u8, j.build_name),
                 .key = try a.dupe(u8, j.key_name),
-                .structure = if (j.strings != null) "strings" else @tagName(j.keys),
+                .structure = if (j.cols.len > 1) "composite" else if (j.cols.len == 1) "strings" else @tagName(j.keys),
                 .keys = j.n,
                 .bytes = j.bytes,
                 .columns = columns,
@@ -117,7 +117,14 @@ pub const Explained = struct {
 
 /// One lookup conjunct of a filter: the FK it reads, by name, and the build it probes; with that build's own SEMI
 /// joins, the inner tables of a chain (`--explain` shows them).
-pub const Leaf = struct { fk: []const u8, join: *lookup.Join, semis: []const Leaf = &.{}, dims: []const Leaf = &.{} };
+pub const Leaf = struct {
+    fk: []const u8,
+    /// A composite key's further FK columns, as its build's `key_more`.
+    fk_more: []const []const u8 = &.{},
+    join: *lookup.Join,
+    semis: []const Leaf = &.{},
+    dims: []const Leaf = &.{},
+};
 
 /// The builds' memory: an arena for their many small pieces, and an exact allocation of its own for each large array (a
 /// key map, a payload's codes). In an arena alone each new block is half again the previous one plus the request, so a
@@ -243,9 +250,9 @@ pub const Prepared = struct {
         };
         // Conditions on build columns come out of the probe's filter: they narrow after the lookups (`Residual`).
         const residual = try self.splitResidual(arena, &a.filter);
-        for (self.semis) |s| a.filter = try withLookup(arena, a.filter, try leafOf(meta, s, diag));
-        for (self.dims) |d| a.filter = try withLookup(arena, a.filter, try leafOf(meta, d, diag));
-        var main_leaf = try leafOf(meta, self.main, diag);
+        for (self.semis) |s| a.filter = try withLookup(arena, a.filter, try leafOf(arena, meta, s, diag));
+        for (self.dims) |d| a.filter = try withLookup(arena, a.filter, try leafOf(arena, meta, d, diag));
+        var main_leaf = try leafOf(arena, meta, self.main, diag);
         if (residual.items.len != 0) main_leaf.lookup.residual = try self.residualOf(arena, residual.items);
         a.filter = try withLookup(arena, a.filter, main_leaf);
         const j = self.main.join;
@@ -296,11 +303,11 @@ pub const Prepared = struct {
             };
             if (!lane_ok) continue;
             const via = j.payloads[q].via;
-            // A fetch reads a build row by its integer key: a string key's columns stay GROUP BY keys.
-            const by_via = via != null and via.?.inner.strings == null and isKey(keys, j.virtual_base + via.?.fk);
+            // A fetch reads a build row by its integer key: a string or composite key's columns stay GROUP BY keys.
+            const by_via = via != null and via.?.inner.ownKey() and isKey(keys, j.virtual_base + via.?.fk);
             const f: expr_ast.Fetch = if (by_via)
                 fetchOf(j.virtual_base + via.?.fk, via.?.inner, via.?.p)
-            else if (j.domain == .signed and isKey(keys, j.fk_leaf))
+            else if (j.domain == .signed and j.ownKey() and isKey(keys, j.fk_leaf))
                 fetchOf(j.fk_leaf, j, q)
             else
                 continue;
@@ -372,6 +379,7 @@ pub const Prepared = struct {
                 if (std.mem.indexOfScalar(*const lookup.Join, joins.items, j) == null) {
                     try joins.append(a, j);
                     try reads.append(a, j.fk_leaf);
+                    try reads.appendSlice(a, j.fk_more);
                 }
             };
         }
@@ -437,19 +445,28 @@ pub const Prepared = struct {
     }
 };
 
-fn leafOf(meta: *const schema.FileMetaData, l: Leaf, diag: ?*Diag) !filter_ast.Filter {
-    const fk = metadata.resolveColumn(meta, l.fk) catch |err| {
-        Diag.setColumn(diag, l.fk);
-        return err;
-    };
-    // The FK compares with the build key only within one SQL domain (`lookup.KeyDomain`).
-    const same = if (metadata.leafSchemaElement(meta, fk)) |e| if (lookup.KeyDomain.of(e)) |d| d.eql(l.join.domain) else false else false;
-    if (!same) {
-        Diag.setColumn(diag, l.fk);
-        return error.JoinKeyTypeMismatch;
+fn leafOf(arena: std.mem.Allocator, meta: *const schema.FileMetaData, l: Leaf, diag: ?*Diag) !filter_ast.Filter {
+    const j = l.join;
+    const leaves = try arena.alloc(usize, 1 + l.fk_more.len);
+    for (leaves, 0..) |*leaf, i| {
+        const name = if (i == 0) l.fk else l.fk_more[i - 1];
+        leaf.* = metadata.resolveColumn(meta, name) catch |err| {
+            Diag.setColumn(diag, name);
+            return err;
+        };
+        // Each FK column compares with its key column only within one SQL domain (`lookup.KeyDomain`).
+        const key: ?lookup.KeyDomain = if (i == 0) j.domain else if (i < j.cols.len) j.cols[i].domain else null;
+        const own = if (metadata.leafSchemaElement(meta, leaf.*)) |e| lookup.KeyDomain.of(e) else null;
+        if (key == null or own == null or !own.?.eql(key.?)) {
+            Diag.setColumn(diag, name);
+            return error.JoinKeyTypeMismatch;
+        }
     }
-    if (l.join.publishes) l.join.fk_leaf = fk;
-    return .{ .lookup = .{ .col_idx = fk, .join = l.join } };
+    if (j.publishes) {
+        j.fk_leaf = leaves[0];
+        j.fk_more = leaves[1..];
+    }
+    return .{ .lookup = .{ .col_idx = leaves[0], .more = leaves[1..], .join = j } };
 }
 
 /// The filter's top-level AND with the lookup last: the cheaper conjuncts narrow first.
@@ -470,9 +487,9 @@ fn withLookup(arena: std.mem.Allocator, f: ?filter_ast.Filter, leaf: filter_ast.
 /// A group-join when the FK is a GROUP BY key and every other key is a build column (each group is one build slot)
 /// and every aggregate is one the slots fold; else null, and the query groups as any other.
 fn groupJoin(gpa: std.mem.Allocator, j: *lookup.Join, q: plans.Aggregate, meta: *const schema.FileMetaData) !?*lookup.GroupJoin {
-    // An ANTI join's rows have no slot, and a LEFT join's misses none: their groups are the probe's own. A string
-    // key's slot gives back its number, not the FK's value.
-    if (j.kind == .anti or j.kind == .left or j.strings != null) return null;
+    // An ANTI join's rows have no slot, and a LEFT join's misses none: their groups are the probe's own. A string or
+    // composite key's slot gives back what its columns pack to, not the FK's value.
+    if (j.kind == .anti or j.kind == .left or !j.ownKey()) return null;
     for (j.payloads) |p| if (p.deferred != null) return null;
     const keys = q.keys orelse return null;
     const outputs = q.outputs orelse return null;
@@ -537,7 +554,7 @@ const Task = struct {
     ctx: types.Context,
     snapshot: std.crypto.hash.sha2.Sha256 = .init(.{}),
     threads: usize,
-    fk: []const u8,
+    edge: Edge,
     build: syntax.Build,
     query: ?*const syntax.Query = null,
     kind: lookup.Kind,
@@ -554,7 +571,7 @@ const Task = struct {
     err: ?anyerror = null,
 
     fn run(t: *Task) void {
-        t.leaf = build(t, t.fk, t.build, t.kind, t.aligned) catch |err| {
+        t.leaf = build(t, t.edge, t.build, t.kind, t.aligned) catch |err| {
             t.err = err;
             return;
         };
@@ -569,9 +586,34 @@ const Task = struct {
     }
 };
 
-/// Read one build side (its own SEMI joins first) into the lookup conjunct on `fk`, charged to the ledger as it is
-/// read.
-fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: ?types.AlignedJoin) !Leaf {
+/// How a build joins its parent: the parent's FK columns, and the further key columns when the binder wrote them
+/// beside the FK rather than in the build (`syntax.Build.key_more`, which the engine reads).
+const Edge = struct {
+    fk: []const u8,
+    fk_more: []const []const u8 = &.{},
+    key_more: []const []const u8 = &.{},
+    /// An ANTI join that is a NOT EXISTS, not a NOT IN.
+    not_exists: bool = false,
+
+    fn of(x: anytype) Edge {
+        return .{
+            .fk = x.fk,
+            .fk_more = x.fk_more,
+            .key_more = x.key_more,
+            .not_exists = if (@hasField(@TypeOf(x), "not_exists")) x.not_exists else false,
+        };
+    }
+};
+
+/// Read one build side (its own SEMI joins first) into the lookup conjunct on its edge's FK, charged to the ledger as
+/// it is read.
+fn build(t: *Task, edge: Edge, build_syntax: syntax.Build, kind: lookup.Kind, aligned: ?types.AlignedJoin) !Leaf {
+    var b = build_syntax;
+    if (b.key_more.len == 0) b.key_more = edge.key_more;
+    const fk = edge.fk;
+    if (b.key_more.len != edge.fk_more.len) return error.JoinKeyNotFound;
+    // `NOT IN` over a row of columns has its own NULL rules, which the lookup's one `null_key` does not hold.
+    if (kind == .anti and b.key_more.len != 0 and !edge.not_exists) return error.JoinNotInComposite;
     const arena = t.arena.allocator();
     const p = t.p;
     const diag = &t.diag;
@@ -587,14 +629,14 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: 
     var filter: ?filter_ast.Filter = if (filter_syntax) |f| try filters.bindSyntax(arena, f, meta, diag) else null;
     const semis = try arena.alloc(Leaf, b.semis.len);
     for (b.semis, semis) |s, *inner| {
-        inner.* = try build(t, s.fk, s.build, semiKind(s), null);
-        filter = try withLookup(arena, filter, try leafOf(meta, inner.*, diag));
+        inner.* = try build(t, .of(s), s.build, semiKind(s), null);
+        filter = try withLookup(arena, filter, try leafOf(arena, meta, inner.*, diag));
     }
     // A snowflake's tables under this build: INNER lookups of its filter, whose columns it publishes (`lookup.chain`).
     const dims = try arena.alloc(Leaf, b.dims.len);
     for (b.dims, dims) |d, *inner| {
-        inner.* = try build(t, d.fk, d.build, .inner, null);
-        filter = try withLookup(arena, filter, try leafOf(meta, inner.*, diag));
+        inner.* = try build(t, .of(d), d.build, .inner, null);
+        filter = try withLookup(arena, filter, try leafOf(arena, meta, inner.*, diag));
     }
     const payload = try arena.alloc(usize, b.columns.len);
     for (b.columns, payload) |name, *leaf| leaf.* = metadata.resolveColumn(meta, name) catch |err| {
@@ -605,6 +647,11 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: 
         Diag.setColumn(diag, b.key);
         return err;
     };
+    const key_more = try arena.alloc(usize, b.key_more.len);
+    for (b.key_more, key_more) |name, *leaf| leaf.* = metadata.resolveColumn(meta, name) catch |err| {
+        Diag.setColumn(diag, name);
+        return err;
+    };
     const store = if (aligned != null) &t.aligned_store else &t.store;
     const before = store.capacity();
     const j = lookup.build(store.allocator(), p.charge.allocator(), file.bytes, meta, .{
@@ -612,6 +659,7 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: 
         .build_name = b.path,
         .key_name = b.key,
         .key = key,
+        .key_more = key_more,
         .payload = payload,
         .deferred = if (file.map == null) &.{} else try deferredPayloads(arena, t.query, b, fk, meta, payload),
         .filter = filter,
@@ -622,11 +670,15 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: 
         Diag.setColumn(diag, b.key);
         return if (p.charge.refusal(err) == error.ExceededMemoryBudget) error.JoinBuildExceedsBudget else err;
     };
-    // The binder publishes each FK a snowflake's table reads.
+    // The binder publishes each FK column a snowflake's table reads.
     for (b.dims, dims) |d, inner| {
-        const at = for (b.columns, 0..) |name, i| {
-            if (std.mem.eql(u8, name, d.fk)) break i;
-        } else unreachable;
+        const at = try arena.alloc(usize, 1 + d.fk_more.len);
+        for (at, 0..) |*column, k| {
+            const fk_name = if (k == 0) d.fk else d.fk_more[k - 1];
+            column.* = for (b.columns, 0..) |name, i| {
+                if (std.mem.eql(u8, name, fk_name)) break i;
+            } else return error.JoinKeyNotFound;
+        }
         lookup.chain(store.allocator(), j, at, inner.join) catch |err| {
             Diag.setInput(diag, b.path, null);
             Diag.setColumn(diag, d.fk);
@@ -640,7 +692,7 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: 
     };
     j.bytes = store.capacity() - before;
     t.charged += j.bytes;
-    return .{ .fk = fk, .join = j, .semis = semis, .dims = dims };
+    return .{ .fk = fk, .fk_more = edge.fk_more, .join = j, .semis = semis, .dims = dims };
 }
 
 /// Read every build of `args`' join; null for a query without one.
@@ -664,7 +716,7 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
         .p = p,
         .ctx = ctx,
         .threads = threads,
-        .fk = undefined,
+        .edge = undefined,
         .build = undefined,
         .query = if (!(args.typed_answer and args.output != null) and args.result_order.limit != null and
             !@import("env.zig").envDisables(ctx.env, "ZPQ_GROUP_KEY_FD") and
@@ -677,19 +729,19 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
     };
     // A copy of an arena or a store that has allocated nothing is a fresh one.
     for (tasks) |*t| t.* = task;
-    tasks[0].fk = sj.fk;
+    tasks[0].edge = .of(sj.*);
     tasks[0].build = sj.build;
     tasks[0].aligned = args.aligned_join;
     tasks[0].kind = switch (sj.kind) {
         inline else => |k| @field(lookup.Kind, @tagName(k)),
     };
     for (sj.semis, tasks[1..][0..sj.semis.len]) |s, *t| {
-        t.fk = s.fk;
+        t.edge = .of(s);
         t.build = s.build;
         t.kind = semiKind(s);
     }
     for (sj.dims, tasks[1 + sj.semis.len ..]) |d, *t| {
-        t.fk = d.fk;
+        t.edge = .of(d);
         t.build = d.build;
         t.kind = if (d.left) .left else .inner;
     }
@@ -805,9 +857,16 @@ fn buildColumns(raw: *const anyopaque, a: std.mem.Allocator, meta: *const schema
     const mask = try a.alloc(bool, metadata.leafCount(meta));
     @memset(mask, false);
     mask[try metadata.resolveColumn(meta, b.key)] = true;
+    for (b.key_more) |name| mask[try metadata.resolveColumn(meta, name)] = true;
     for (b.columns) |name| mask[try metadata.resolveColumn(meta, name)] = true;
-    for (b.semis) |s| mask[try metadata.resolveColumn(meta, s.fk)] = true;
-    for (b.dims) |d| mask[try metadata.resolveColumn(meta, d.fk)] = true;
+    for (b.semis) |s| {
+        mask[try metadata.resolveColumn(meta, s.fk)] = true;
+        for (s.fk_more) |name| mask[try metadata.resolveColumn(meta, name)] = true;
+    }
+    for (b.dims) |d| {
+        mask[try metadata.resolveColumn(meta, d.fk)] = true;
+        for (d.fk_more) |name| mask[try metadata.resolveColumn(meta, name)] = true;
+    }
     if (b.filter) |node| {
         const filter = try filters.bindSyntax(a, node, meta, diag);
         var cols: std.ArrayList(usize) = .empty;
@@ -851,6 +910,8 @@ pub fn replicaFingerprint(p: *const Prepared, schema_fingerprint: [16]u8) [16]u8
 fn deferredPayloads(a: std.mem.Allocator, query: ?*const syntax.Query, b: syntax.Build, fk: []const u8, meta: *const schema.FileMetaData, payload: []const usize) ![]const bool {
     const q = query orelse return &.{};
     const keys = q.keys orelse return &.{};
+    // A deferred string is read back by the build's one integer key.
+    if (b.key_more.len != 0) return &.{};
     const key_leaf = try metadata.resolveColumn(meta, b.key);
     const key_element = metadata.leafSchemaElement(meta, key_leaf) orelse return &.{};
     if ((lookup.KeyDomain.of(key_element) orelse return &.{}) != .signed) return &.{};
@@ -869,8 +930,9 @@ fn deferredPayloads(a: std.mem.Allocator, query: ?*const syntax.Query, b: syntax
         } else false;
         if (!bare) continue;
         // A snowflake's string FK is read by slot when its table chains (`lookup.chain`).
-        const chained = for (b.dims) |d| {
+        const chained = chain: for (b.dims) |d| {
             if (std.ascii.eqlIgnoreCase(d.fk, name)) break true;
+            for (d.fk_more) |more| if (std.ascii.eqlIgnoreCase(more, name)) break :chain true;
         } else false;
         if (chained) continue;
         if (q.filter) |f| if (predicateReads(f, name)) continue;

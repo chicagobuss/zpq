@@ -345,6 +345,14 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
                 "  nor a string\n",
             .{diag.column.get()},
         ),
+        error.JoinKeyRange => diagnosticPrint(
+            "zpq query: the join's key columns in '{s}' span more values together than fit 63 bits\n",
+            .{diag.input orelse "the build"},
+        ),
+        error.JoinNotInComposite => diagnosticPrint(
+            "zpq query: NOT IN over more than one key column is not supported; NOT EXISTS is\n",
+            .{},
+        ),
         error.JoinPayloadType => diagnosticPrint(
             "zpq query: a column the query reads from '{s}' holds NULLs or a type a join does not carry in this release\n",
             .{diag.input orelse "the build"},

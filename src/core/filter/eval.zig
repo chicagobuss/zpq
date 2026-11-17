@@ -524,7 +524,9 @@ pub fn evaluate(
     switch (filter) {
         .lookup => |leaf| {
             const col_pos = column_lookup[leaf.col_idx] orelse return error.BadColumn;
-            try @import("../join/lookup.zig").narrow(leaf.join, batch.cols[col_pos], sel, arena, null);
+            const join_lookup = @import("../join/lookup.zig");
+            const more = try join_lookup.moreColumns(arena, batch.cols, column_lookup, leaf.more);
+            try join_lookup.narrow(leaf.join, batch.cols[col_pos], more, sel, arena, null);
             if (leaf.residual) |r| try evalResidual(r, batch, sel, column_lookup, arena, null);
         },
         .expr => |x| try evalExprCompare(x, batch, sel, column_lookup, arena),
@@ -820,7 +822,8 @@ pub fn evalResidual(
             };
             if (slots[k] == null) {
                 const fk = column_lookup[j.fk_leaf] orelse return error.BadColumn;
-                slots[k] = try join_lookup.slotsFor(j, batch.cols[fk], sel, arena);
+                const more = try join_lookup.moreColumns(arena, batch.cols, column_lookup, j.fk_more);
+                slots[k] = try join_lookup.slotsFor(j, batch.cols[fk], more, sel, arena);
             }
         }
         const col = join_lookup.column(j, j.virtualPayload(ci).?, slots[k].?, sel, arena, false) catch |err| return switch (err) {

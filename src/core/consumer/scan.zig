@@ -1958,7 +1958,10 @@ fn publishLookups(
         const ci = j.virtual_base + p;
         if (ci >= in.read.len or !in.read[ci]) continue;
         const fk_pos = lookup[j.fk_leaf] orelse return error.BadColumn;
-        if (at == null) at = try join_lookup.slotsFor(j, batch_cols.items[fk_pos], sel, ra);
+        if (at == null) {
+            const more = try join_lookup.moreColumns(ra, batch_cols.items, lookup, j.fk_more);
+            at = try join_lookup.slotsFor(j, batch_cols.items[fk_pos], more, sel, ra);
+        }
         // Codes alone serve coded consumers (filters, CASE conditions, grouping); values only where one reads them.
         const col = try join_lookup.column(j, p, at.?, sel, ra, ci < values.len and values[ci]);
         lookup[ci] = batch_cols.items.len;

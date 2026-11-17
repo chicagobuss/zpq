@@ -23,6 +23,8 @@ const selection = @import("../filter/selection.zig");
 const column_mod = @import("../parquet/column.zig");
 const metadata = @import("../parquet/metadata.zig");
 const decimal = @import("../parquet/decimal.zig");
+const Column = filter_eval.Batch.Column;
+const Selection = selection.SelectionVector;
 
 /// INNER and LEFT builds are N:1 (a key twice refuses); SEMI and ANTI take duplicates. INNER and SEMI keep a probe
 /// row with a match, ANTI one without (`NOT IN`), and LEFT every row, a miss reading its build columns as NULL.
@@ -216,12 +218,44 @@ const Strings = struct {
         return @intCast(std.hash.Wyhash.hash(0, v) & (s.table.len - 1));
     }
 
+    /// Give `values[n]`, which no smaller number holds, the number `n`.
+    fn put(s: *const Strings, n: u32) void {
+        var i = s.home(s.values[n]);
+        while (s.table[i] != EMPTY) i = (i + 1) & (s.table.len - 1);
+        s.table[i] = n;
+    }
+
     fn number(s: *const Strings, v: []const u8) ?u32 {
         var i = s.home(v);
         while (s.table[i] != EMPTY) : (i = (i + 1) & (s.table.len - 1)) {
             if (std.mem.eql(u8, s.values[s.table[i]], v)) return s.table[i];
         }
         return null;
+    }
+};
+
+/// One column of a key that is not its own integer: a string column, or any column of a composite key. The key the
+/// integer structures hold is then each column's place in its range, weighted (a mixed radix): for one string column,
+/// its number.
+pub const KeyColumn = struct {
+    domain: KeyDomain,
+    /// A string column's values, numbered.
+    strings: ?Strings = null,
+    /// The column's range among the build's rows, verified as they were read: its smallest value (0 for a string
+    /// column's numbers) and how many values it spans. `weight`: the product of the spans of the columns before it.
+    lo: i64 = 0,
+    span: u64 = 0,
+    weight: u64 = 1,
+
+    /// `v`'s weighted place in the range; null for a value outside it, which no build row holds.
+    fn place(k: KeyColumn, v: anytype) ?u64 {
+        const at: u64 = if (@TypeOf(v) == []const u8)
+            (k.strings orelse return null).number(v) orelse return null
+        else if (v < k.lo)
+            return null
+        else
+            @bitCast(@as(i64, v) -% k.lo);
+        return if (at < k.span) at * k.weight else null;
     }
 };
 
@@ -278,8 +312,8 @@ pub const Join = struct {
     key_name: []const u8,
     n: usize,
     keys: union(enum) { dense: Dense, hash: Hash },
-    /// A string key's values: `keys` then holds their numbers (`Strings`).
-    strings: ?Strings = null,
+    /// The key's columns when it is not one integer column (`KeyColumn`): `keys` then holds what they pack to.
+    cols: []const KeyColumn = &.{},
     payloads: []const Payload,
     /// Bytes the build holds for the query (charged against `--max-memory`).
     bytes: usize,
@@ -292,8 +326,9 @@ pub const Join = struct {
     /// its place among them (the main join's 0), where the filter pass keeps its slots (`GatedFilter.slots`).
     publishes: bool = false,
     slot_index: usize = 0,
-    /// The probe's foreign key leaf, set when the probe query binds.
+    /// The probe's foreign key leaf, and a composite key's further ones, set when the probe query binds.
     fk_leaf: usize = 0,
+    fk_more: []const usize = &.{},
     /// Set when the query's GROUP BY is one the build key determines (`GroupJoin`).
     group: ?*GroupJoin = null,
     /// A build row the build's filter kept had a NULL key (`Part.null_key`): an ANTI join then keeps no row.
@@ -305,11 +340,17 @@ pub const Join = struct {
         };
     }
 
-    /// The slot of a foreign key's value: an integer is its own key, a string its number among the build's.
+    /// Whether a foreign key's value is the key itself: one integer column. Only then does a key read a build row
+    /// back (a fetched GROUP BY key, the group-join's FK).
+    pub fn ownKey(j: *const Join) bool {
+        return j.cols.len == 0;
+    }
+
+    /// The slot of a one-column foreign key's value: an integer is its own key, a string its number.
     fn slotOf(j: *const Join, v: anytype) ?u32 {
         if (@TypeOf(v) != []const u8) return j.slot(v);
-        const strings = j.strings orelse return null;
-        return j.slot(strings.number(v) orelse return null);
+        if (j.cols.len != 1) return null;
+        return j.slot(@intCast(j.cols[0].place(v) orelse return null));
     }
 
     /// The payload a probe leaf index stands for, or null for a real leaf.
@@ -413,7 +454,43 @@ fn slotsOf(j: *const Join, comptime T: type, c: filter_eval.ColumnT(T), sel: *co
     }
 }
 
-fn slotsOfColumn(j: *const Join, fk: filter_eval.Batch.Column, sel: *const selection.SelectionVector, out: []u32, a: std.mem.Allocator) filter_eval.Error!void {
+/// Slots of a composite foreign key's selected rows. Each column's value takes its place in the build's range for
+/// that column (`KeyColumn.place`), once per dictionary entry where the column is coded, and the places add up to the
+/// key the build packed. A NULL in any column, or a value outside its range, matches nothing.
+fn slotsOfComposite(j: *const Join, fk: Column, more: []const Column, sel: *const Selection, out: []u32, a: std.mem.Allocator) filter_eval.Error!void {
+    if (more.len + 1 != j.cols.len) return error.BadColumn;
+    const none = std.math.maxInt(u64);
+    const keys = try a.alloc(u64, sel.len);
+    defer a.free(keys);
+    @memset(keys, 0);
+    for (j.cols, 0..) |kc, i| switch (if (i == 0) fk else more[i - 1]) {
+        inline .i32, .i64, .string => |c| {
+            const by_code: []u64 = if (c.codes != null) try a.alloc(u64, c.dict.len) else &.{};
+            defer a.free(by_code);
+            if (c.codes != null) for (c.dict, by_code) |v, *at| {
+                at.* = kc.place(v) orelse none;
+            };
+            var it = sel.iterator();
+            while (it.next()) |r| {
+                if (keys[r] == none) continue;
+                const is_null = if (c.def_levels) |dl| dl[r] < c.max_def else false;
+                const at = if (is_null)
+                    none
+                else if (c.codes) |codes|
+                    by_code[codes[r]]
+                else
+                    kc.place(c.values[r]) orelse none;
+                keys[r] = if (at == none) none else keys[r] + at;
+            }
+        },
+        else => return error.BadColumn,
+    };
+    var it = sel.iterator();
+    while (it.next()) |r| out[r] = if (keys[r] == none) EMPTY else j.slot(@intCast(keys[r])) orelse EMPTY;
+}
+
+fn slotsOfColumn(j: *const Join, fk: Column, more: []const Column, sel: *const Selection, out: []u32, a: std.mem.Allocator) filter_eval.Error!void {
+    if (j.cols.len > 1) return slotsOfComposite(j, fk, more, sel, out, a);
     return switch (fk) {
         .i32 => |c| slotsOf(j, i32, c, sel, out, a),
         .i64 => |c| slotsOf(j, i64, c, sel, out, a),
@@ -422,10 +499,18 @@ fn slotsOfColumn(j: *const Join, fk: filter_eval.Batch.Column, sel: *const selec
     };
 }
 
-/// The slots of `fk`'s selected rows, on `a`.
-pub fn slotsFor(j: *const Join, fk: filter_eval.Batch.Column, sel: *const selection.SelectionVector, a: std.mem.Allocator) filter_eval.Error![]u32 {
+/// The slots of `fk`'s selected rows (with `more`, a composite key's further columns), on `a`.
+pub fn slotsFor(j: *const Join, fk: Column, more: []const Column, sel: *const Selection, a: std.mem.Allocator) filter_eval.Error![]u32 {
     const out = try a.alloc(u32, sel.len);
-    try slotsOfColumn(j, fk, sel, out, a);
+    try slotsOfColumn(j, fk, more, sel, out, a);
+    return out;
+}
+
+/// A composite key's further FK columns in a batch, by their leaves; none for a key of one column.
+pub fn moreColumns(a: std.mem.Allocator, cols: []const Column, lookup: []const ?usize, leaves: []const usize) filter_eval.Error![]const Column {
+    if (leaves.len == 0) return &.{};
+    const out = try a.alloc(Column, leaves.len);
+    for (leaves, out) |leaf, *col| col.* = cols[lookup[leaf] orelse return error.BadColumn];
     return out;
 }
 
@@ -434,8 +519,8 @@ pub fn slotsFor(j: *const Join, fk: filter_eval.Batch.Column, sel: *const select
 /// Keep the selected rows the join keeps (`Kind`): INNER and SEMI those whose FK has a build match; ANTI those whose
 /// FK is not NULL and has none, and no row when a build key was NULL (SQL's `NOT IN`); LEFT every row. With `capture`
 /// (one entry per row of `sel`), the selected rows' slots stay there for the columns published later.
-pub fn narrow(j: *const Join, fk: filter_eval.Batch.Column, sel: *selection.SelectionVector, a: std.mem.Allocator, capture: ?[]u32) filter_eval.Error!void {
-    if (j.keys == .dense and (j.kind == .inner or j.kind == .semi)) switch (fk) {
+pub fn narrow(j: *const Join, fk: Column, more: []const Column, sel: *Selection, a: std.mem.Allocator, capture: ?[]u32) filter_eval.Error!void {
+    if (j.ownKey() and j.keys == .dense and (j.kind == .inner or j.kind == .semi)) switch (fk) {
         inline .i32, .i64 => |c| if (c.codes == null) {
             narrowDense(j.keys.dense, c, sel, capture);
             return;
@@ -449,7 +534,7 @@ pub fn narrow(j: *const Join, fk: filter_eval.Batch.Column, sel: *selection.Sele
     }
     const at = capture orelse try a.alloc(u32, sel.len);
     defer if (capture == null) a.free(at);
-    try slotsOfColumn(j, fk, sel, at, a);
+    try slotsOfColumn(j, fk, more, sel, at, a);
     if (j.kind == .left) return;
     const info = fk.nullInfo();
     for (sel.mask, 0..) |*w, wi| {
@@ -601,8 +686,9 @@ pub const Spec = struct {
     kind: Kind,
     build_name: []const u8,
     key_name: []const u8,
-    /// Build leaf indices.
+    /// Build leaf indices. `key_more`: a composite key's further columns.
     key: usize,
+    key_more: []const usize = &.{},
     payload: []const usize,
     deferred: []const bool = &.{},
     filter: ?filter_ast.Filter,
@@ -620,8 +706,9 @@ const Part = struct {
     keys: Keys = .{ .wide = &.{} },
     /// A row the build's filter kept had a NULL key: `NOT IN` is then UNKNOWN for every probe row.
     null_key: bool = false,
-    /// A string key's survivors as a local dictionary, until they are numbered into `keys` (`numberStrings`).
-    key_local: Local = Local.empty,
+    /// A numbered key's columns over the survivors, until they pack into `keys` (`packKeys`): an integer column's
+    /// values, or a string column's local dictionary and then its numbers.
+    key_cols: []KeyValues = &.{},
     local: []Local = &.{},
     lo: i64 = std.math.maxInt(i64),
     hi: i64 = std.math.minInt(i64),
@@ -629,16 +716,27 @@ const Part = struct {
     /// (`LateLocal`).
     kept: []u64 = &.{},
 
-    fn localOf(p: *Part, payload: ?usize) *Local {
-        return if (payload) |i| &p.local[i] else &p.key_local;
+    const KeyValues = struct { ints: []i64 = &.{}, strings: Local = Local.empty };
+
+    /// One of the locals that unify over the parts: a payload's, or a string key column's.
+    const Which = union(enum) { payload: usize, key: usize };
+
+    fn localOf(p: *Part, which: Which) *Local {
+        return switch (which) {
+            .payload => |i| &p.local[i],
+            .key => |i| &p.key_cols[i].strings,
+        };
     }
 
     /// The keys, the survivors' mask and the local codes, which the build allocates from its `gpa` rather than an
     /// arena.
     fn freeLarge(p: *Part, gpa: std.mem.Allocator) void {
         p.keys.free(gpa);
-        p.key_local.codes.free(gpa);
-        p.key_local = Local.empty;
+        for (p.key_cols) |kv| {
+            gpa.free(kv.ints);
+            kv.strings.codes.free(gpa);
+        }
+        p.key_cols = &.{};
         gpa.free(p.kept);
         for (p.local) |l| l.codes.free(gpa);
         p.keys = .{ .wide = &.{} };
@@ -663,6 +761,14 @@ const Keys = union(enum) {
         switch (k) {
             inline else => |v| a.free(v),
         }
+    }
+
+    /// `keys`, whose range is `[lo, hi]`, held on `gpa`.
+    fn from(gpa: std.mem.Allocator, keys: []const i64, lo: i64, hi: i64) !Keys {
+        if (keys.len == 0 or @as(i128, hi) - lo > std.math.maxInt(u32)) return .{ .wide = try gpa.dupe(i64, keys) };
+        const out = try gpa.alloc(u32, keys.len);
+        for (keys, out) |k, *o| o.* = @intCast(k - lo);
+        return .{ .narrow = out };
     }
 
     /// Key `raw` of `v` as an i64, for a part whose smallest key is `lo`.
@@ -691,7 +797,7 @@ const Local = struct {
     }
 };
 
-pub const BuildError = error{ DuplicateBuildKey, JoinKeyType, JoinPayloadType, JoinBuildExceedsBudget, OutOfMemory };
+pub const BuildError = error{ DuplicateBuildKey, JoinKeyType, JoinKeyRange, JoinPayloadType, JoinBuildExceedsBudget, OutOfMemory };
 
 const Ctx = struct {
     /// Per build row group, one for the row group and one per payload (`arena`): its survivors' dictionaries and
@@ -886,6 +992,8 @@ fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
         try filter_eval.evaluate(f, &batch, &sel, lookup, sa);
     }
     const key_col = cols.items[lookup[c.spec.key].?];
+    const key_more = try sa.alloc(Column, c.spec.key_more.len);
+    for (c.spec.key_more, key_more) |leaf, *col| col.* = cols.items[lookup[leaf].?];
     const kept = sel.count();
     var keep: std.ArrayList(u32) = try .initCapacity(sa, kept);
     var keys: std.ArrayList(i64) = try .initCapacity(sa, kept);
@@ -896,12 +1004,12 @@ fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
         const k: ?i64 = switch (key_col) {
             .i32 => |kc| keyAt(i32, kc, r),
             .i64 => |kc| keyAt(i64, kc, r),
-            // A string's key is its number among the build's, known once every part is read (`numberStrings`).
+            // A string's key is its number among the build's, known once every part is read (`packKeys`).
             .string => |kc| if (kc.def_levels != null and kc.def_levels.?[r] < kc.max_def) null else 0,
             else => return error.JoinKeyType,
         };
-        // A NULL build key matches no probe row, NULL ones included.
-        const key = k orelse {
+        // A NULL build key matches no probe row, NULL ones included; nor does a composite key with a NULL column.
+        const key = if (k != null and !(key_more.len != 0 and nullAmong(key_more, r))) k.? else {
             part.null_key = true;
             sel.mask[r / 64] &= ~(@as(u64, 1) << @intCast(r & 63));
             continue;
@@ -917,17 +1025,31 @@ fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
         l.* = if (c.plain[pi]) try plainLocal(pa, col, keep.items) else try c.keepLocal(pa, try localOf(c, sa, rg, p, keep.items, col));
     };
     if (c.late.len != 0 or c.spec.deferred.len != 0) part.kept = try c.gpa.dupe(u64, sel.mask);
-    if (key_col == .string) {
-        part.key_local = try c.keepLocal(c.arena(rg_index, 0), try localDict([]const u8, sa, key_col.string, keep.items));
+    if (key_col == .string or key_more.len != 0) {
+        const a = c.arena(rg_index, 0);
+        part.key_cols = try a.alloc(Part.KeyValues, 1 + key_more.len);
+        @memset(part.key_cols, .{});
+        for (part.key_cols, 0..) |*kv, i| switch (if (i == 0) key_col else key_more[i - 1]) {
+            inline .i32, .i64 => |kc| {
+                kv.ints = try c.gpa.alloc(i64, keep.items.len);
+                for (keep.items, kv.ints) |r, *v| v.* = kc.values[r];
+            },
+            .string => |kc| kv.strings = try c.keepLocal(a, try localDict([]const u8, sa, kc, keep.items)),
+            else => return error.JoinKeyType,
+        };
         return;
     }
-    part.keys = if (keys.items.len != 0 and @as(i128, hi) - lo <= std.math.maxInt(u32)) blk: {
-        const out = try c.gpa.alloc(u32, keys.items.len);
-        for (keys.items, out) |k, *o| o.* = @intCast(k - lo);
-        break :blk .{ .narrow = out };
-    } else .{ .wide = try c.gpa.dupe(i64, keys.items) };
+    part.keys = try Keys.from(c.gpa, keys.items, lo, hi);
     part.lo = lo;
     part.hi = hi;
+}
+
+fn nullAmong(cols: []const Column, r: usize) bool {
+    for (cols) |col| {
+        const info = col.nullInfo();
+        if (info.def_levels) |dl| if (dl[r] < info.max_def) return true;
+    }
+    return false;
 }
 
 /// One payload no filter reads, over one row group's survivors (`Part.kept`): task `i` is row group `i / late.len`'s
@@ -1067,11 +1189,11 @@ const Unify = struct {
         const c = self.c;
         if (c.parts.len == 0 or c.plain[p] or c.spec.defers(p)) return;
         self.out[p] = switch (c.parts[0].local[p].dict) {
-            .i32 => try unify(i32, c, p),
-            .i64 => try unify(i64, c, p),
-            .i128 => try unify(i128, c, p),
-            .f64 => try unify(f64, c, p),
-            .string => try unify([]const u8, c, p),
+            .i32 => try unify(i32, c, .{ .payload = p }),
+            .i64 => try unify(i64, c, .{ .payload = p }),
+            .i128 => try unify(i128, c, .{ .payload = p }),
+            .f64 => try unify(f64, c, .{ .payload = p }),
+            .string => try unify([]const u8, c, .{ .payload = p }),
         };
     }
 
@@ -1093,8 +1215,8 @@ const Unify = struct {
     }
 };
 
-/// `p`'s local dictionaries as one, or with no `p` the string key's.
-fn unify(comptime T: type, c: *Ctx, p: ?usize) !Unified {
+/// The parts' local dictionaries of one payload, or of one string key column, as one.
+fn unify(comptime T: type, c: *Ctx, p: Part.Which) !Unified {
     const tag = switch (T) {
         i32 => "i32",
         i64 => "i64",
@@ -1126,7 +1248,7 @@ fn unify(comptime T: type, c: *Ctx, p: ?usize) !Unified {
     for (c.parts, 0..) |*part, rg_index| {
         const l = part.localOf(p);
         const local = @field(l.dict, tag);
-        l.global = try c.arena(rg_index, if (p) |i| 1 + i else 0).alloc(u32, local.len);
+        l.global = try c.arena(rg_index, if (p == .payload) 1 + p.payload else 0).alloc(u32, local.len);
         for (local, l.global) |v, *g| {
             const gop = try map.getOrPut(gpa, v);
             if (!gop.found_existing) {
@@ -1140,10 +1262,10 @@ fn unify(comptime T: type, c: *Ctx, p: ?usize) !Unified {
     return .{ .values = @unionInit(Dict, tag, try dict.toOwnedSlice(gpa)), .owned = true, .bytes = bytes };
 }
 
-/// A string key's values over every part, numbered into `a` (the build's), and each part's survivors as those
-/// numbers: its keys. A value twice among the survivors is then a key twice, which the key structure sees.
-fn numberStrings(a: std.mem.Allocator, c: *Ctx) !Strings {
-    const u = try unify([]const u8, c, null);
+/// String key column `col`'s values over every part, numbered into `a` (the build's), and each part's survivors as
+/// those numbers.
+fn numberStrings(a: std.mem.Allocator, c: *Ctx, col: usize) !Strings {
+    const u = try unify([]const u8, c, .{ .key = col });
     defer u.deinit(c.gpa);
     const values = try a.alloc([]const u8, u.values.string.len);
     const blob = try a.alloc(u8, u.bytes);
@@ -1154,22 +1276,57 @@ fn numberStrings(a: std.mem.Allocator, c: *Ctx) !Strings {
         @memcpy(blob[at..][0..v.len], v);
         out.* = blob[at..][0..v.len];
         at += v.len;
-        var i = s.home(v);
-        while (s.table[i] != EMPTY) i = (i + 1) & (s.table.len - 1);
-        s.table[i] = @intCast(number);
+        s.put(@intCast(number));
     }
     for (c.parts) |*part| {
-        const keys = try c.gpa.alloc(u32, part.key_local.codes.len());
-        part.keys = .{ .narrow = keys };
-        if (keys.len == 0) continue;
-        part.lo = 0;
-        part.hi = 0;
-        for (keys, 0..) |*k, row| {
-            k.* = part.key_local.globalOf(row);
-            part.hi = @max(part.hi, k.*);
-        }
+        const kv = &part.key_cols[col];
+        kv.ints = try c.gpa.alloc(i64, kv.strings.codes.len());
+        for (kv.ints, 0..) |*number, row| number.* = kv.strings.globalOf(row);
     }
     return s;
+}
+
+/// The keys of a build whose key is not one integer column. Each string column is numbered; each column's range is
+/// the one its surviving rows span; and a row's key is its columns' places in their ranges, packed by mixed radix
+/// (one string column's number, as it is). A key twice among the rows is then an integer twice, which the key
+/// structure sees. Ranges whose product does not fit 63 bits refuse.
+fn packKeys(a: std.mem.Allocator, c: *Ctx, domains: []const KeyDomain) ![]const KeyColumn {
+    const cols = try a.alloc(KeyColumn, domains.len);
+    var weight: u64 = 1;
+    for (cols, domains, 0..) |*kc, domain, i| {
+        kc.* = .{ .domain = domain, .weight = weight };
+        if (domain.text()) {
+            kc.strings = try numberStrings(a, c, i);
+            kc.span = kc.strings.?.values.len;
+        } else {
+            var lo: i64 = std.math.maxInt(i64);
+            var hi: i64 = std.math.minInt(i64);
+            for (c.parts) |part| for (part.key_cols[i].ints) |v| {
+                lo = @min(lo, v);
+                hi = @max(hi, v);
+            };
+            if (lo <= hi) {
+                kc.lo = lo;
+                kc.span = std.math.cast(u64, @as(i128, hi) - lo + 1) orelse return error.JoinKeyRange;
+            }
+        }
+        weight = std.math.mul(u64, weight, @max(kc.span, 1)) catch return error.JoinKeyRange;
+        if (weight > std.math.maxInt(i64)) return error.JoinKeyRange;
+    }
+    for (c.parts) |*part| {
+        const keys = try c.gpa.alloc(i64, part.key_cols[0].ints.len);
+        defer c.gpa.free(keys);
+        @memset(keys, 0);
+        for (cols, part.key_cols) |kc, kv| for (keys, kv.ints) |*k, v| {
+            k.* += @intCast(@as(u64, @bitCast(v -% kc.lo)) * kc.weight);
+        };
+        for (keys) |k| {
+            part.lo = @min(part.lo, k);
+            part.hi = @max(part.hi, k);
+        }
+        part.keys = try Keys.from(c.gpa, keys, part.lo, part.hi);
+    }
+    return cols;
 }
 
 /// Each part's keys into the dense map's bits, flagging a key set twice. With `disjoint` (no two parts' key ranges
@@ -1295,8 +1452,13 @@ fn lap(what: []const u8, since: i64) i64 {
 /// group's survivors and decode scratch until the build is laid out. Both draw from the query's ledger as they
 /// allocate (`engine/join.zig`), so a build that does not fit refuses while it builds.
 pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, meta: *const schema.FileMetaData, spec: Spec) !*Join {
-    const domain = KeyDomain.of(metadata.leafSchemaElement(meta, spec.key) orelse return error.JoinKeyType) orelse
-        return error.JoinKeyType;
+    const domains = try a.alloc(KeyDomain, 1 + spec.key_more.len);
+    for (domains, 0..) |*d, i| {
+        const leaf = if (i == 0) spec.key else spec.key_more[i - 1];
+        const element = metadata.leafSchemaElement(meta, leaf) orelse return error.JoinKeyType;
+        d.* = KeyDomain.of(element) orelse return error.JoinKeyType;
+    }
+    const domain = domains[0];
     const parts = try a.alloc(Part, meta.row_groups.items.len);
     @memset(parts, .{});
     const arenas = try a.alloc(std.heap.ArenaAllocator, parts.len * (spec.payload.len + 1));
@@ -1312,6 +1474,9 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     defer gpa.free(filter_cols);
     @memset(filter_cols, false);
     if (leaves != 0) filter_cols[spec.key] = true;
+    if (leaves != 0) for (spec.key_more) |leaf| {
+        filter_cols[leaf] = true;
+    };
     if (leaves != 0) if (spec.filter) |f| {
         var fc: std.ArrayList(usize) = .empty;
         defer fc.deinit(gpa);
@@ -1346,7 +1511,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
         }
     }.f);
     if (trace) t = lap("decode+local dictionaries", t);
-    const strings = if (domain.text()) try numberStrings(a, &ctx) else null;
+    const key_cols: []const KeyColumn = if (domain.text() or domains.len > 1) try packKeys(a, &ctx, domains) else &.{};
     var n: usize = 0;
     var lo: i64 = std.math.maxInt(i64);
     var hi: i64 = std.math.minInt(i64);
@@ -1358,7 +1523,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
         null_key = null_key or p.null_key;
     }
     const j = try a.create(Join);
-    j.* = .{ .kind = spec.kind, .build_name = spec.build_name, .key_name = spec.key_name, .n = n, .keys = undefined, .payloads = &.{}, .bytes = 0, .domain = domain, .null_key = null_key, .strings = strings };
+    j.* = .{ .kind = spec.kind, .build_name = spec.build_name, .key_name = spec.key_name, .n = n, .keys = undefined, .payloads = &.{}, .bytes = 0, .domain = domain, .null_key = null_key, .cols = key_cols };
     // Bytes per structure, from the survivors' own domain: a bit per possible key plus a rank per 64, against two
     // slots per key of an 8-byte key and a 4-byte slot.
     const span: u128 = if (n == 0) 0 else @as(u128, @intCast(@as(i128, hi) - lo)) + 1;
@@ -1492,20 +1657,32 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     return j;
 }
 
-/// Publish `inner`'s payloads through `j` (a snowflake): each slot of `j` reads the `inner` slot its payload `fk`, the
-/// FK into `inner`, names, and the codes keep `inner`'s dictionaries. Every slot has one: `inner`'s lookup in `j`'s
+/// Publish `inner`'s payloads through `j` (a snowflake): each slot of `j` reads the `inner` slot its payloads `fks`,
+/// the FK into `inner`, name, and the codes keep `inner`'s dictionaries. Every slot has one: `inner`'s lookup in `j`'s
 /// build filter kept only the rows it matches. The payloads are `j`'s after its own, `inner`'s own publishing through
 /// it already, so a chain of any length publishes at its top.
-pub fn chain(a: std.mem.Allocator, j: *Join, fk: usize, inner: *const Join) !void {
+pub fn chain(a: std.mem.Allocator, j: *Join, fks: []const usize, inner: *const Join) !void {
+    const fk = fks[0];
     const f = j.payloads[fk];
-    // Each FK value's slot in `inner`, once per dictionary entry.
-    const by_code = try a.alloc(u32, f.dict.len());
+    // Each slot's place in `inner`: for a key of one column, each FK value's, once per dictionary entry.
+    const by_code = try a.alloc(u32, if (fks.len == 1) f.dict.len() else j.n);
     defer a.free(by_code);
-    switch (f.dict) {
+    if (fks.len == 1) switch (f.dict) {
         inline .i32, .i64, .string => |d| for (d, by_code) |k, *s| {
             s.* = inner.slotOf(k) orelse EMPTY;
         },
         else => return error.JoinKeyType,
+    } else {
+        // A composite FK: its columns as the scan would publish them for every slot, looked up as a probe's are.
+        var scratch: std.heap.ArenaAllocator = .init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const all = try selection.SelectionVector.init(sa, j.n);
+        const slots = try sa.alloc(u32, j.n);
+        for (slots, 0..) |*s, i| s.* = @intCast(i);
+        const cols = try sa.alloc(Column, fks.len);
+        for (fks, cols) |p, *col| col.* = try column(j, p, slots, &all, sa, true);
+        try slotsOfColumn(inner, cols[0], cols[1..], &all, by_code, sa);
     }
     const out = try a.alloc(Payload, j.payloads.len + inner.payloads.len);
     @memcpy(out[0..j.payloads.len], j.payloads);
@@ -1513,7 +1690,7 @@ pub fn chain(a: std.mem.Allocator, j: *Join, fk: usize, inner: *const Join) !voi
         const codes: Codes = try .init(a, j.n, if (ip.deferred) |d| d.rows.len else ip.dict.len());
         var nulls: []u64 = &.{};
         for (0..j.n) |s| {
-            const at = by_code[f.codes.get(@intCast(s))];
+            const at = by_code[if (fks.len == 1) f.codes.get(@intCast(s)) else s];
             if (at == EMPTY) return error.LookupWithoutMatch;
             codes.set(@intCast(s), ip.codes.get(at));
             if (ip.isNull(at)) try markBit(a, &nulls, j.n, s);
@@ -1796,7 +1973,7 @@ pub const GroupJoin = struct {
         errdefer fold.deinit();
         const at = if (slots.len != 0) slots else blk: {
             const fk_pos = lookup[j.fk_leaf] orelse return error.BadColumn;
-            break :blk try slotsFor(j, batch.cols[fk_pos], sel, a);
+            break :blk try slotsFor(j, batch.cols[fk_pos], &.{}, sel, a);
         };
         try fold.add(a, at, batch, lookup, sel);
         try fold.finish(rg_index);
@@ -2187,7 +2364,7 @@ test "plain dense join narrows and captures NULLs, misses, prior selections and 
             defer sel.deinit();
             for (0..vals.len) |i| if (i % 7 == 0) sel.set(i, false);
             var at: [73]u32 = @splat(12345);
-            try narrow(&j, fk, &sel, a, if (capturing) &at else null);
+            try narrow(&j, fk, &.{}, &sel, a, if (capturing) &at else null);
             for (vals, defs, 0..) |v, d, i| {
                 const slot: u32 = if (v == 0) 0 else if (v == 2) 1 else if (v == 5) 2 else EMPTY;
                 const wanted = if (d == 0) EMPTY else slot;
@@ -2195,6 +2372,50 @@ test "plain dense join narrows and captures NULLs, misses, prior selections and 
                 if (capturing) try std.testing.expectEqual(if (i % 7 == 0) @as(u32, 12345) else wanted, at[i]);
             }
         };
+    }
+}
+
+test "a composite key packs its columns' places; a NULL, a value out of range or an unknown string matches nothing" {
+    const a = std.testing.allocator;
+    // The build's keys (10, "a"), (12, "b") and (14, "c"): an integer in [10, 15) weighing 1, a string weighing 5.
+    const values = [_][]const u8{ "a", "b", "c" };
+    var table: [16]u32 = @splat(EMPTY);
+    const strings: Strings = .{ .values = &values, .table = &table };
+    for (0..values.len) |n| strings.put(@intCast(n));
+    const cols = [_]KeyColumn{
+        .{ .domain = .signed, .lo = 10, .span = 5 },
+        .{ .domain = .string, .strings = strings, .span = 3, .weight = 5 },
+    };
+    var bits = [_]u64{(1 << 0) | (1 << 7) | (1 << 14)};
+    var rank = [_]u32{0};
+    const ints = [_]i64{ 10, 12, 14, 12, 9, 15, 10, 12, 10 };
+    const defs = [_]u32{ 1, 1, 1, 1, 1, 1, 0, 1, 1 };
+    const dict = [_][]const u8{ "b", "a", "zz", "c" };
+    const codes = [_]u32{ 1, 0, 3, 3, 1, 1, 1, 0, 2 };
+    const texts = [_][]const u8{ "a", "b", "c", "c", "a", "a", "a", "b", "zz" };
+    const fk: Column = .{ .i64 = .{ .values = &ints, .def_levels = &defs, .max_def = 1 } };
+    // Rows 3 (12, "c": no such pair), 4 and 5 (out of range), 6 (NULL) and 8 (no such string) have no slot.
+    const wanted = [_]u32{ 0, 1, 2, EMPTY, EMPTY, EMPTY, EMPTY, 1, EMPTY };
+    const coded: Column = .{ .string = .{ .values = &.{}, .codes = &codes, .dict = &dict } };
+    for ([_]Column{ coded, .{ .string = .{ .values = &texts } } }) |more| {
+        for ([_]Kind{ .inner, .left }) |kind| {
+            const j: Join = .{
+                .kind = kind,
+                .build_name = "dim",
+                .key_name = "pk",
+                .n = 3,
+                .keys = .{ .dense = .{ .lo = 0, .bits = &bits, .rank = &rank } },
+                .cols = &cols,
+                .payloads = &.{},
+                .bytes = 0,
+            };
+            var sel = try selection.SelectionVector.init(a, ints.len);
+            defer sel.deinit();
+            var at: [9]u32 = @splat(12345);
+            try narrow(&j, fk, &.{more}, &sel, a, &at);
+            try std.testing.expectEqualSlices(u32, &wanted, &at);
+            for (wanted, 0..) |slot, r| try std.testing.expectEqual(kind == .left or slot != EMPTY, sel.isActive(r));
+        }
     }
 }
 

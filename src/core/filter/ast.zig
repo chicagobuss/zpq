@@ -122,7 +122,8 @@ pub fn reads(f: Filter, ci: usize) bool {
         .expr => |e| e.readsColumn(ci),
         // A lookup carrying a residual reads the residual's columns too (`Residual.reads`): a probe column it compares
         // is filter input, decoded with its values, not a code stream only a fold reads.
-        .lookup => |l| l.col_idx == ci or if (l.residual) |r| std.mem.indexOfScalar(usize, r.reads, ci) != null else false,
+        .lookup => |l| l.col_idx == ci or std.mem.indexOfScalar(usize, l.more, ci) != null or
+            if (l.residual) |r| std.mem.indexOfScalar(usize, r.reads, ci) != null else false,
         inline else => |l| l.col_idx == ci,
     };
 }
@@ -478,6 +479,7 @@ pub const Filter = union(enum) {
             .like => |f| try list.append(allocator, f.col_idx),
             .lookup => |f| {
                 try list.append(allocator, f.col_idx);
+                try list.appendSlice(allocator, f.more);
                 if (f.residual) |r| try list.appendSlice(allocator, r.reads);
             },
             .expr => |e| {
@@ -491,6 +493,8 @@ pub const Filter = union(enum) {
 
 pub const Lookup = struct {
     col_idx: usize,
+    /// A composite key's further FK columns, decoded with the first.
+    more: []const usize = &.{},
     join: *const @import("../join/lookup.zig").Join,
     /// Conditions on build columns of more than one join, or on build and probe columns (a cycle of the join tree,
     /// PDS-H q5's `c_nationkey = s_nationkey`): narrowed right after this lookup, the main one, which runs after every
@@ -514,8 +518,8 @@ pub const Residual = struct {
 pub fn leafColumn(f: Filter) ?usize {
     return switch (f) {
         .and_filter, .or_filter, .expr => null,
-        // With a residual it reads more than its key.
-        .lookup => |l| if (l.residual == null) l.col_idx else null,
+        // With a residual or a composite key it reads more than one column.
+        .lookup => |l| if (l.residual == null and l.more.len == 0) l.col_idx else null,
         inline else => |leaf| leaf.col_idx,
     };
 }
@@ -558,7 +562,8 @@ pub fn eql(a: Filter, b: Filter) bool {
             l.trust_missing_nan_count == b.double.trust_missing_nan_count and l.trust_stats == b.double.trust_stats,
         .null_check => |n| n.col_idx == b.null_check.col_idx and n.is_not == b.null_check.is_not and
             n.trust_stats == b.null_check.trust_stats,
-        .lookup => |l| l.col_idx == b.lookup.col_idx and l.join == b.lookup.join and l.residual == b.lookup.residual,
+        .lookup => |l| l.col_idx == b.lookup.col_idx and l.join == b.lookup.join and l.residual == b.lookup.residual and
+            std.mem.eql(usize, l.more, b.lookup.more),
         // The same bound sides only: two spellings of one comparison are not recognized as one.
         .expr => |e| e.op == b.expr.op and e.left == b.expr.left and e.right == b.expr.right,
         .like => |m| m.col_idx == b.like.col_idx and m.kind == b.like.kind and m.negate == b.like.negate and
@@ -645,6 +650,9 @@ fn markAllColumns(f: Filter, cols: []bool) void {
         },
         .lookup => |l| {
             if (l.col_idx < cols.len) cols[l.col_idx] = true;
+            for (l.more) |ci| if (ci < cols.len) {
+                cols[ci] = true;
+            };
             if (l.residual) |r| for (r.reads) |ci| if (ci < cols.len) {
                 cols[ci] = true;
             };

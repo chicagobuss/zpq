@@ -8,11 +8,10 @@ Instructions for coding agents working on zpq.
 - Taco bell programming: zpq is one small Unix tool that does one job well and pipes into the next. The job is
   Parquet: query, filter, aggregate and rewrite it, locally or on S3, and emit NDJSON, CSV or Parquet. No joins
   (yet), no dataframe API (yet).
-- Exact by default, fastest anyway. A default answer never depends on a file's metadata being right: verify
-  statistics, dictionaries and other footer claims before skipping work on them. Shortcuts that are exact only if
-  that metadata is right go behind `--trust-stats`, not a new flag. zpq aims to be the fastest engine either way:
-  by default against rivals however they treat statistics, and with `--trust-stats` against rivals that trust them.
-  When a rival wins by trusting statistics, first check whether its statistics, and so its answer, are incorrect.
+- Exact by default, fastest anyway. zpq does the least work a query needs for an exact answer (README.md), and trusting
+  statistics is opt-in (docs/statistics-trust.md). A shortcut that is exact only if file metadata is right belongs
+  behind `--trust-stats`, not a new flag. Be the fastest engine both by default and with `--trust-stats`. When a rival
+  wins by trusting statistics, first check whether its statistics, and so its answer, are incorrect.
 
 ## Before you build something
 

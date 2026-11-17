@@ -155,8 +155,16 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             else => diagnosticPrint("zpq query: a nested column is selected where a value is wanted\n", .{}),
         },
         error.ExpressionInPredicate => diagnosticPrint(
-            "zpq query: `{s}` is an expression; a predicate compares a column with a literal\n",
-            .{diag.column.get()},
+            "zpq query: a predicate comparison over an expression is not supported; compare a column with a literal\n",
+            .{},
+        ),
+        error.FileNotFound => diagnosticPrint(
+            "zpq query: Parquet input {s} was not found; check its path or glob pattern\n",
+            .{diag.input orelse "file"},
+        ),
+        error.UnsupportedFromClause => diagnosticPrint(
+            "zpq query: this FROM clause is not supported; joins require supported table and join forms\n",
+            .{},
         ),
         error.UnexpectedEnd => diagnosticPrint("zpq query: unexpected end of expression\n", .{}),
         error.BadNumber => diagnosticPrint("zpq query: invalid number in expression\n", .{}),
@@ -707,7 +715,7 @@ fn printDetail(diag: *const Diag) void {
     switch (diag.detail) {
         .none => {},
         .ambiguous_column => |a| diagnosticPrint(
-            "{s}: column `{s}` is ambiguous: {s}\n",
+            "{s}: column `{s}` has a name collision: {s}\n",
             .{ @tagName(a.parser), name, a.hint },
         ),
         .schema_mismatch => |m| diagnosticPrint("schema mismatch: file 0 ({s}) vs file {d} ({s}): '{s}' vs '{s}'\n", .{

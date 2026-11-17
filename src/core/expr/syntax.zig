@@ -66,6 +66,8 @@ pub const Join = struct {
     kind: JoinKind,
     /// The probe's foreign key.
     fk: []const u8,
+    fk_more: []const []const u8 = &.{},
+    key_more: []const []const u8 = &.{},
     build: Build,
     /// More SEMI joins of the probe itself: a third table the frontend reduced onto it.
     semis: []const Semi = &.{},
@@ -74,15 +76,24 @@ pub const Join = struct {
 };
 
 /// One more dimension of a star: the probe's FK into it, and its build. `left`: a LEFT JOIN's, every probe row kept.
-pub const Dim = struct { fk: []const u8, build: Build, left: bool = false };
+pub const Dim = struct {
+    fk: []const u8,
+    fk_more: []const []const u8 = &.{},
+    key_more: []const []const u8 = &.{},
+    build: Build,
+    left: bool = false,
+};
 
 pub const JoinKind = enum { inner, semi, anti, left };
 
 pub const Build = struct {
     path: []const u8,
     key: []const u8,
+    fk_more: []const []const u8 = &.{},
+    key_more: []const []const u8 = &.{},
     /// The build columns the query reads, which bind as virtual leaves of the probe.
     columns: []const []const u8 = &.{},
+    columns_as: []const []const u8 = &.{},
     /// The build's own conjuncts.
     filter: ?Predicate = null,
     /// SEMI joins of the build: a third table the frontend reduced onto it (q3's customer inside orders).
@@ -95,7 +106,15 @@ pub const Build = struct {
 /// `unique`: an INNER edge the frontend reduced to a SEMI join because no column of its table is read. Its keys must
 /// be unique, as any INNER join's are: a duplicate would multiply rows the SEMI join keeps once. `anti`: the query's
 /// `NOT IN (SELECT ...)`, an ANTI join.
-pub const Semi = struct { fk: []const u8, build: Build, unique: bool = false, anti: bool = false };
+pub const Semi = struct {
+    fk: []const u8,
+    fk_more: []const []const u8 = &.{},
+    key_more: []const []const u8 = &.{},
+    build: Build,
+    unique: bool = false,
+    anti: bool = false,
+    not_exists: bool = false,
+};
 
 pub const Query = struct {
     /// Null for a single-table query.

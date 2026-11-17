@@ -143,7 +143,50 @@ fn parse(sql: [:0]const u8) Error!Parsed {
     // The plan's pieces are unparsed and read back (`toSql`): with NOT only above leaves they mean what was written,
     // as the single-table parser's do, however the planner regroups the conditions (`hoistOrs`).
     @import("sql_parser.zig").pushNotsDown(root, arena) catch return error.OutOfMemory;
+    try unquoteAliases(root, arena);
     return .{ .arena = arena, .root = root };
+}
+
+/// Every alias as the name it spells. The grammar keeps a quoted alias in its quotes (`AS "dup"` is held as `"dup"`),
+/// where it holds a column or a qualifier as its text. Left so, the alias would name nothing a reference could match,
+/// and unparsed (quoted as its text needs) it would come back with its quotes as part of the name.
+fn unquoteAliases(root: *c.LpNode, arena: *c.arena_t) Error!void {
+    const Visit = struct {
+        arena: *c.arena_t,
+        failed: bool = false,
+
+        fn enter(v: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(v.*.user_data));
+            const alias: *[*c]u8 = switch (node.*.kind) {
+                c.LP_RESULT_COLUMN => &node.*.u.result_column.alias,
+                c.LP_FROM_TABLE => &node.*.u.from_table.alias,
+                c.LP_FROM_SUBQUERY => &node.*.u.from_subquery.alias,
+                else => return 0,
+            };
+            if (alias.* == null) return 0;
+            const raw = std.mem.span(alias.*);
+            if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return 0;
+            const out: [*]u8 = @ptrCast(c.arena_alloc(self.arena, raw.len - 1) orelse {
+                self.failed = true;
+                return 2;
+            });
+            var n: usize = 0;
+            var i: usize = 1;
+            while (i < raw.len - 1) : (i += 1) {
+                // A doubled quote is one quote.
+                if (raw[i] == '"' and i + 2 < raw.len and raw[i + 1] == '"') i += 1;
+                out[n] = raw[i];
+                n += 1;
+            }
+            out[n] = 0;
+            alias.* = out;
+            return 0;
+        }
+    };
+    var state: Visit = .{ .arena = arena };
+    var visitor: c.LpVisitor = .{ .user_data = &state, .enter = Visit.enter, .leave = null };
+    c.lp_ast_walk(root, &visitor);
+    if (state.failed) return error.OutOfMemory;
 }
 
 const FromTable = struct {
@@ -410,11 +453,60 @@ fn columnRefs(n: *c.LpNode, a: std.mem.Allocator) ![]*c.LpNode {
         const s = n.u.select;
         for (0..@intCast(s.result_columns.count)) |i| if (s.result_columns.items[i]) |rc| c.lp_ast_walk(rc, &visitor);
         for (0..@intCast(s.group_by.count)) |i| if (s.group_by.items[i]) |g| c.lp_ast_walk(g, &visitor);
-        for (0..@intCast(s.order_by.count)) |i| if (s.order_by.items[i]) |o| c.lp_ast_walk(o, &visitor);
+        for (0..@intCast(s.order_by.count)) |i| if (s.order_by.items[i]) |o| {
+            if (!orderByAlias(n, o)) c.lp_ast_walk(o, &visitor);
+        };
         if (s.having) |h| c.lp_ast_walk(h, &visitor);
     } else c.lp_ast_walk(n, &visitor);
     if (refs.failed) return error.OutOfMemory;
     return refs.list.items;
+}
+
+/// Whether ORDER BY term `term` is a select item by its alias: a bare name an item is aliased, which ORDER BY reads
+/// as that item whatever columns the tables have of that name. It is no reference to a table, so the binder leaves
+/// it as written, for the probe query to resolve as the same alias.
+fn orderByAlias(select: *c.LpNode, term: *c.LpNode) bool {
+    const e: *c.LpNode = if (term.kind == c.LP_ORDER_TERM) term.u.order_term.expr orelse return false else term;
+    if (e.kind != c.LP_EXPR_COLUMN_REF or e.u.column_ref.table != null or e.u.column_ref.column == null) return false;
+    const name = span(e.u.column_ref.column);
+    const s = select.u.select;
+    for (0..@intCast(s.result_columns.count)) |i| {
+        const rc = s.result_columns.items[i] orelse continue;
+        if (rc.*.kind != c.LP_RESULT_COLUMN) continue;
+        // Aliases are their text here (`unquoteAliases`).
+        if (std.ascii.eqlIgnoreCase(span(rc.*.u.result_column.alias), name)) return true;
+    }
+    return false;
+}
+
+/// The ORDER BY terms that name a column: a bare reference that is no alias (`orderByAlias`), qualified or not.
+fn orderColumns(a: std.mem.Allocator, select: *c.LpNode) ![]*c.LpNode {
+    var out: std.ArrayList(*c.LpNode) = .empty;
+    const s = select.u.select;
+    for (0..@intCast(s.order_by.count)) |i| {
+        const term: *c.LpNode = s.order_by.items[i] orelse continue;
+        const e: *c.LpNode = term.u.order_term.expr orelse continue;
+        if (e.kind == c.LP_EXPR_COLUMN_REF and !orderByAlias(select, term)) try out.append(a, e);
+    }
+    return out.items;
+}
+
+/// The probe query resolves a bare ORDER BY name as a select alias first, and the binder leaves every reference
+/// bare. A column an ORDER BY term names (`columns`, taken before any was rewritten) whose name is now an alias too
+/// would so rank by another item: qualified by the probe's table (`probe`, its path), it is the column again.
+fn keepOrderColumns(a: std.mem.Allocator, select: *c.LpNode, columns: []const *c.LpNode, probe: []const u8) !void {
+    const s = select.u.select;
+    for (columns) |e| {
+        const name = span(e.u.column_ref.column);
+        const shadowed = for (0..@intCast(s.result_columns.count)) |i| {
+            const rc = s.result_columns.items[i] orelse continue;
+            if (rc.*.kind == c.LP_RESULT_COLUMN and std.ascii.eqlIgnoreCase(span(rc.*.u.result_column.alias), name)) break true;
+        } else false;
+        if (!shadowed) continue;
+        const table: FromTable = .{ .path = probe, .alias = null };
+        e.u.column_ref.table = (try a.dupeSentinel(u8, table.name(), 0)).ptr;
+        e.u.column_ref.quoted |= c.LP_QUOTED_TABLE;
+    }
 }
 
 const Sides = struct {
@@ -889,6 +981,7 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         const e = rc.*.u.result_column.expr;
         nm.* = if (rc.*.u.result_column.alias == null and e != null and e.*.kind == c.LP_EXPR_COLUMN_REF) span(e.*.u.column_ref.column) else null;
     }
+    const order_columns = try orderColumns(a, p.root);
     var refs: std.ArrayList(*c.LpNode) = .empty;
     try refs.appendSlice(a, try columnRefs(p.root, a));
     for (residuals.items) |node| try refs.appendSlice(a, try columnRefs(node, a));
@@ -957,6 +1050,7 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         if (rc.*.u.result_column.alias != null or e.*.kind == c.LP_EXPR_COLUMN_REF) continue;
         for (try columnRefs(e, a)) |ref| if (std.mem.indexOfScalar(*c.LpNode, moved.items, ref) != null) return error.JoinColumnNeedsAlias;
     }
+    try keepOrderColumns(a, p.root, order_columns, t.paths[live.items[probe]]);
     const probe_from = list.items[live.items[probe]];
     probe_from.*.u.from_table.alias = null;
     sel.from = probe_from;
@@ -1163,12 +1257,14 @@ fn planSemi(a: std.mem.Allocator, p: Parsed, sel: anytype, from: *c.LpNode, t: T
     sel.where = try andOf(a, probe_conj.items);
     // The subquery's table is not in scope outside it: every other name is the probe's, or a build column an earlier
     // join published under its own name (which the subquery's table may share), and a qualifier names the probe.
+    const order_columns = try orderColumns(a, p.root);
     var outer = try columnRefs(p.root, a);
     if (sel.where) |w| outer = try std.mem.concat(a, *c.LpNode, &.{ outer, try columnRefs(w, a) });
     for (outer) |ref| {
         if (!qualifies(outer_name, ref)) return error.UnsupportedJoin;
         ref.*.u.column_ref.table = null;
     }
+    try keepOrderColumns(a, p.root, order_columns, t.paths[0]);
     const semis = try a.alloc(Exists, rest.len);
     for (rest, semis) |x, *out| out.* = try x.planned(a, p);
     return .{
@@ -1393,4 +1489,42 @@ test "a column two tables of a join have goes by a name of its own, which the qu
     // An unaliased expression would be named by the name its column goes by; an unqualified shared name is nobody's.
     try std.testing.expectError(error.JoinColumnNeedsAlias, plan(a, "SELECT sum(a.w), sum(b.w) AS sb FROM 'f.parquet' f JOIN 'd.parquet' a ON f.fk = a.pk JOIN 'd.parquet' b ON f.q = b.pk", t));
     try std.testing.expectError(error.AmbiguousJoinColumn, plan(a, "SELECT sum(name) AS s FROM 'f.parquet' f JOIN 'd.parquet' a ON f.fk = a.pk JOIN 'd.parquet' b ON f.q = b.pk", t));
+}
+
+test "an alias is its text: a quoted table alias qualifies, and an ORDER BY alias is no table's column" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const Cols = struct {
+        const of = [_][]const []const u8{ &.{ "fk", "amt", "dup" }, &.{ "pk", "grp", "w" } };
+        fn has(_: *const anyopaque, table: usize, name: []const u8) bool {
+            for (of[table]) |col| if (std.mem.eql(u8, col, name)) return true;
+            return false;
+        }
+    };
+    const t: Tables = .{ .paths = &.{ "f.parquet", "d.parquet" }, .has = Cols.has, .rows = &.{ 1000, 100 }, .ctx = undefined };
+    // The alias shadows the build's key, which the binder reads as the FK: ORDER BY means the item (REVIEW-WP4b).
+    const key = try plan(a, "SELECT f.amt AS \"pk\" FROM 'f.parquet' \"F\" JOIN 'd.parquet' \"my d\" ON \"F\".fk = \"my d\".pk WHERE \"my d\".w > 1 ORDER BY \"pk\" DESC", t);
+    try std.testing.expectEqualStrings("fk", key.fk);
+    try std.testing.expectEqualStrings("w > 1", key.build_where.?);
+    try std.testing.expectEqual(@as(usize, 0), key.build_columns.len);
+    try std.testing.expect(std.mem.startsWith(u8, key.probe_sql, "SELECT amt AS pk FROM "));
+    try std.testing.expect(std.mem.endsWith(u8, key.probe_sql, " ORDER BY \"pk\" DESC"));
+    // It shadows a build column: not published for it, and not renamed.
+    const build = try plan(a, "SELECT f.amt AS \"grp\" FROM 'f.parquet' f JOIN 'd.parquet' d ON f.fk = d.pk ORDER BY grp", t);
+    try std.testing.expectEqual(@as(usize, 0), build.build_columns.len);
+    try std.testing.expect(std.mem.endsWith(u8, build.probe_sql, " ORDER BY grp"));
+    // Inside an expression the name is the column, and a qualified name always is.
+    const expr = try plan(a, "SELECT f.amt AS grp FROM 'f.parquet' f JOIN 'd.parquet' d ON f.fk = d.pk ORDER BY grp + 1, d.grp", t);
+    try std.testing.expectEqual(@as(usize, 1), expr.build_columns.len);
+    // A qualified name is the column. Bare, the probe query would read it as the alias: it stays qualified, by the
+    // probe's own name, whichever table it came from (a build's column, a key read as the FK).
+    const column = try plan(a, "SELECT f.amt AS grp, f.dup AS fk FROM 'f.parquet' f JOIN 'd.parquet' d ON f.fk = d.pk ORDER BY d.grp, d.pk, f.dup", t);
+    try std.testing.expect(std.mem.endsWith(u8, column.probe_sql, " ORDER BY \"f\".grp, \"f\".fk, dup"));
+    const semi = try plan(a, "SELECT f.amt AS dup FROM 'f.parquet' f WHERE f.fk IN (SELECT pk FROM 'd.parquet') ORDER BY f.dup", t);
+    try std.testing.expect(std.mem.endsWith(u8, semi.probe_sql, " ORDER BY \"f\".dup"));
+    // An alias that needs its quotes is written back in them, once.
+    const spaced = try plan(a, "SELECT f.amt AS \"my n\", d.w AS \"Select\" FROM 'f.parquet' f JOIN 'd.parquet' d ON f.fk = d.pk ORDER BY \"my n\"", t);
+    try std.testing.expect(std.mem.startsWith(u8, spaced.probe_sql, "SELECT amt AS \"my n\", w AS \"Select\" FROM "));
+    try std.testing.expect(std.mem.endsWith(u8, spaced.probe_sql, " ORDER BY \"my n\""));
 }

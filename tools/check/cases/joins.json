@@ -200,7 +200,9 @@
   {"name": "wide_fact", "copy": "COPY (SELECT i AS wid, (i % 6000) * 1000003 AS fa, ((i % 6000) * 31 % 7919)::INTEGER AS fb, (i % 3)::BIGINT AS wq FROM range(0, 40000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 8192)"},
   {"name": "wide_dim", "copy": "COPY (SELECT k * 1000003 AS wa, (k * 31 % 7919)::INTEGER AS wb, (k % 9)::BIGINT AS wg FROM range(0, 5000) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 1024)"},
   {"name": "over_dim", "copy": "COPY (SELECT (CASE WHEN k % 2 = 0 THEN 1 ELSE -1 END) * 4611686018427387904 + k AS wa, (k * 1099511627776)::BIGINT AS ob, k AS og FROM range(0, 64) t(k)) TO '{path}' (FORMAT PARQUET)"},
-  {"name": "day_dim", "copy": "COPY (SELECT k AS dk, DATE '2024-01-01' + (k * 3 % 500)::INTEGER AS d_date, (2000 + k % 3)::INTEGER AS d_year FROM range(0, 1000) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 256)"}
+  {"name": "day_dim", "copy": "COPY (SELECT k AS dk, DATE '2024-01-01' + (k * 3 % 500)::INTEGER AS d_date, (2000 + k % 3)::INTEGER AS d_year FROM range(0, 1000) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 256)"},
+  {"name": "alias_probe", "copy": "COPY (SELECT i AS id, (i * 7 % 60)::BIGINT AS fk, (i % 7)::BIGINT AS dup, CASE WHEN i % 11 = 0 THEN NULL ELSE (i * 3 % 7)::BIGINT END AS q FROM range(1, 5000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 1000)"},
+  {"name": "alias_build", "copy": "COPY (SELECT k AS pk, (k % 4)::BIGINT AS grp, 'n' || k AS name FROM range(0, 50) t(k)) TO '{path}' (FORMAT PARQUET)"}
  ],
  "cases": [
   {
@@ -13315,6 +13317,744 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT count(*) AS n, sum(d.w) AS w FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk AND f.q = d.grp"
+   }
+  },
+  {
+   "id": "join:alias:quoted-shadows-a-probe-column",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS \"dup\" FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"dup\" NULLS FIRST LIMIT 8"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS \"dup\" FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"dup\" NULLS FIRST LIMIT 8"
+   }
+  },
+  {
+   "id": "join:alias:quoted-shadows-a-build-column",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id AS \"grp\", d.name FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"grp\" DESC LIMIT 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.id AS \"grp\", d.name FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"grp\" DESC LIMIT 3"
+   }
+  },
+  {
+   "id": "join:alias:quoted-in-a-semi-join",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk AS \"id\" FROM '{fixture:alias_probe}' f WHERE f.fk IN (SELECT pk FROM '{fixture:alias_build}' WHERE grp = 1) ORDER BY \"id\" LIMIT 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk AS \"id\" FROM '{fixture:alias_probe}' f WHERE f.fk IN (SELECT pk FROM '{fixture:alias_build}' WHERE grp = 1) ORDER BY \"id\" LIMIT 3"
+   }
+  },
+  {
+   "id": "join:alias:quoted-alias-unquoted-reference",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS \"dup\" FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY dup NULLS FIRST LIMIT 8"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS \"dup\" FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY dup NULLS FIRST LIMIT 8"
+   }
+  },
+  {
+   "id": "join:alias:unquoted-alias-quoted-reference",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS dup FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"dup\" NULLS FIRST LIMIT 8"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS dup FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"dup\" NULLS FIRST LIMIT 8"
+   }
+  },
+  {
+   "id": "join:alias:unquoted-shadows-a-probe-column",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS dup FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY dup NULLS FIRST LIMIT 8"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS dup FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY dup NULLS FIRST LIMIT 8"
+   }
+  },
+  {
+   "id": "join:alias:mixed-case-quoted",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS \"Dup\" FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY dup DESC LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS \"Dup\" FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY dup DESC LIMIT 4"
+   }
+  },
+  {
+   "id": "join:alias:mixed-case-unquoted",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS Dup FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY DUP DESC, f.id LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS Dup FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY DUP DESC, f.id LIMIT 4"
+   }
+  },
+  {
+   "id": "join:alias:not-a-column-needs-quotes",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.dup AS \"my n\", d.name FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"my n\" DESC, d.name, f.id LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.dup AS \"my n\", d.name FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"my n\" DESC, d.name, f.id LIMIT 5"
+   }
+  },
+  {
+   "id": "join:alias:holds-a-quote",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id AS \"a\"\"b\", d.name FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk WHERE f.id < 9 ORDER BY \"a\"\"b\" DESC"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.id AS \"a\"\"b\", d.name FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk WHERE f.id < 9 ORDER BY \"a\"\"b\" DESC"
+   }
+  },
+  {
+   "id": "join:alias:shadows-the-build-key",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS pk, f.id FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY pk DESC, f.id LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS pk, f.id FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY pk DESC, f.id LIMIT 5"
+   }
+  },
+  {
+   "id": "join:alias:shadows-the-build-key-quoted",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS \"pk\", d.pk AS k2 FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"pk\" NULLS FIRST, k2, f.id LIMIT 6"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS \"pk\", d.pk AS k2 FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"pk\" NULLS FIRST, k2, f.id LIMIT 6"
+   }
+  },
+  {
+   "id": "join:alias:shadows-the-fk",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS fk, f.id FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY fk DESC, f.id LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS fk, f.id FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY fk DESC, f.id LIMIT 4"
+   }
+  },
+  {
+   "id": "join:alias:in-an-expression-is-the-column",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id AS \"grp\", d.name FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"grp\" + 0 DESC, d.name, f.id LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.id AS \"grp\", d.name FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"grp\" + 0 DESC, d.name, f.id LIMIT 4"
+   }
+  },
+  {
+   "id": "join:alias:grouped-quoted",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp AS \"dup\", count(*) AS \"N\" FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY \"dup\" DESC, n"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp AS \"dup\", count(*) AS \"N\" FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY \"dup\" DESC, n"
+   }
+  },
+  {
+   "id": "join:alias:grouped-shadows-the-key",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp AS pk, count(*) AS n FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY pk DESC"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp AS pk, count(*) AS n FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY pk DESC"
+   }
+  },
+  {
+   "id": "join:alias:distinct-quoted",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT DISTINCT f.q AS \"dup\" FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"dup\" NULLS FIRST LIMIT 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT DISTINCT f.q AS \"dup\" FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"dup\" NULLS FIRST LIMIT 3"
+   }
+  },
+  {
+   "id": "join:alias:quoted-tables",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS \"dup\" FROM '{fixture:alias_probe}' \"F\" JOIN '{fixture:alias_build}' \"my d\" ON \"F\".fk = \"my d\".pk WHERE \"my d\".grp = 2 ORDER BY \"dup\" NULLS FIRST, f.id LIMIT 6"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS \"dup\" FROM '{fixture:alias_probe}' \"F\" JOIN '{fixture:alias_build}' \"my d\" ON \"F\".fk = \"my d\".pk WHERE \"my d\".grp = 2 ORDER BY \"dup\" NULLS FIRST, f.id LIMIT 6"
+   }
+  },
+  {
+   "id": "join:alias:quoted-tables-exists",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:alias_probe}' \"x y\" WHERE EXISTS (SELECT 1 FROM '{fixture:alias_build}' \"d d\" WHERE \"d d\".pk = \"x y\".fk AND \"d d\".grp = 1) AND NOT EXISTS (SELECT 1 FROM '{fixture:alias_build}' \"E\" WHERE e.pk = \"x y\".q)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:alias_probe}' \"x y\" WHERE EXISTS (SELECT 1 FROM '{fixture:alias_build}' \"d d\" WHERE \"d d\".pk = \"x y\".fk AND \"d d\".grp = 1) AND NOT EXISTS (SELECT 1 FROM '{fixture:alias_build}' \"E\" WHERE e.pk = \"x y\".q)"
+   }
+  },
+  {
+   "id": "join:alias:quoted-tables-two-copies",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT \"A\".name AS \"n1\", b.name AS \"N2\", count(*) AS c FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' \"A\" ON f.fk = a.pk JOIN '{fixture:alias_build}' \"b\" ON f.dup = B.pk GROUP BY \"A\".name, b.name ORDER BY \"n1\", n2 LIMIT 6"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT \"A\".name AS \"n1\", b.name AS \"N2\", count(*) AS c FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' \"A\" ON f.fk = a.pk JOIN '{fixture:alias_build}' \"b\" ON f.dup = B.pk GROUP BY \"A\".name, b.name ORDER BY \"n1\", n2 LIMIT 6"
+   }
+  },
+  {
+   "id": "join:alias:quoted-tables-using",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT name AS \"k\", count(*) AS n FROM '{fixture:alias_probe}' \"L\" JOIN '{fixture:alias_build}' \"R\" ON \"L\".fk = \"R\".pk GROUP BY name ORDER BY \"K\" LIMIT 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT name AS \"k\", count(*) AS n FROM '{fixture:alias_probe}' \"L\" JOIN '{fixture:alias_build}' \"R\" ON \"L\".fk = \"R\".pk GROUP BY name ORDER BY \"K\" LIMIT 3"
+   }
+  },
+  {
+   "id": "join:alias:header-is-the-text",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id AS \"my id\", d.name AS \"Select\", f.q AS \"Dup\", d.grp AS plain FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk WHERE f.id < 4 ORDER BY 1"
+   ],
+   "oracle": {
+    "compare": "names",
+    "names": [
+     "my id",
+     "Select",
+     "Dup",
+     "plain"
+    ]
+   }
+  },
+  {
+   "id": "join:alias:qualified-is-the-build-column",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id AS grp, d.name FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY d.grp DESC, f.id DESC LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.id AS grp, d.name FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY d.grp DESC, f.id DESC LIMIT 4"
+   }
+  },
+  {
+   "id": "join:alias:qualified-is-the-probe-column",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS dup, f.id FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY f.dup DESC, f.id LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS dup, f.id FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY f.dup DESC, f.id LIMIT 4"
+   }
+  },
+  {
+   "id": "join:alias:qualified-quoted-is-the-column",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS \"dup\", f.id FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"f\".\"dup\" DESC, f.id LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS \"dup\", f.id FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY \"f\".\"dup\" DESC, f.id LIMIT 4"
+   }
+  },
+  {
+   "id": "join:alias:qualified-key-reads-as-an-aliased-fk",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS fk, f.id FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY d.pk DESC, f.id LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS fk, f.id FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk ORDER BY d.pk DESC, f.id LIMIT 4"
+   }
+  },
+  {
+   "id": "join:alias:qualified-in-a-grouped-join",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS grp, count(*) AS n FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk GROUP BY f.q, d.grp ORDER BY d.grp DESC, f.q NULLS FIRST LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS grp, count(*) AS n FROM '{fixture:alias_probe}' f JOIN '{fixture:alias_build}' d ON f.fk = d.pk GROUP BY f.q, d.grp ORDER BY d.grp DESC, f.q NULLS FIRST LIMIT 4"
+   }
+  },
+  {
+   "id": "join:alias:qualified-in-a-semi-join",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS dup, f.id FROM '{fixture:alias_probe}' f WHERE f.fk IN (SELECT pk FROM '{fixture:alias_build}' WHERE grp = 1) ORDER BY f.dup DESC, f.id LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS dup, f.id FROM '{fixture:alias_probe}' f WHERE f.fk IN (SELECT pk FROM '{fixture:alias_build}' WHERE grp = 1) ORDER BY f.dup DESC, f.id LIMIT 4"
+   }
+  },
+  {
+   "id": "join:alias:qualified-on-one-table-rows",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT q AS dup, id FROM '{fixture:alias_probe}' f ORDER BY f.dup DESC, id LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT q AS dup, id FROM '{fixture:alias_probe}' f ORDER BY f.dup DESC, id LIMIT 4"
+   }
+  },
+  {
+   "id": "join:alias:qualified-on-one-table-grouped",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT q AS dup, count(*) AS n FROM '{fixture:alias_probe}' f GROUP BY q, dup ORDER BY f.dup DESC, q NULLS FIRST LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT q AS dup, count(*) AS n FROM '{fixture:alias_probe}' f GROUP BY q, dup ORDER BY f.dup DESC, q NULLS FIRST LIMIT 4"
+   }
+  },
+  {
+   "id": "join:alias:bare-on-one-table-is-the-alias",
+   "fixture": "alias_probe",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT q AS dup, id FROM '{fixture:alias_probe}' ORDER BY dup DESC NULLS LAST, id LIMIT 4"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT q AS dup, id FROM '{fixture:alias_probe}' ORDER BY dup DESC NULLS LAST, id LIMIT 4"
    }
   }
  ]

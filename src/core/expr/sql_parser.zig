@@ -233,13 +233,13 @@ fn rowsAsGroups(root: *c.LpNode, lp_arena: *c.arena_t) !bool {
         const expr: *c.LpNode = term.*.u.order_term.expr orelse continue;
         // A position or a SELECT alias is that item, already a key.
         if (expr.kind == c.LP_EXPR_LITERAL_INT) continue;
-        if (expr.kind == c.LP_EXPR_COLUMN_REF and expr.u.column_ref.table == null) {
+        if (mayBeAlias(expr)) {
             const name = std.mem.span(expr.u.column_ref.column);
             const is_alias = for (0..n) |i| {
                 const rc = sel.result_columns.items[i] orelse continue;
                 if (rc.*.kind != c.LP_RESULT_COLUMN) continue;
                 const alias = rc.*.u.result_column.alias orelse continue;
-                if (std.ascii.eqlIgnoreCase(std.mem.span(alias), name)) break true;
+                if (aliasIs(std.mem.span(alias), name)) break true;
             } else false;
             if (is_alias) continue;
         }
@@ -361,7 +361,7 @@ fn quoteWholePaths(root: *c.LpNode) void {
         fn enter(_: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
             if (node.*.kind != c.LP_EXPR_COLUMN_REF) return 0;
             const ref = &node.*.u.column_ref;
-            if (ref.quoted == 0) return 0;
+            if (ref.quoted & ~was_qualified == 0) return 0;
             if (ref.schema != null) ref.quoted |= c.LP_QUOTED_SCHEMA;
             if (ref.table != null) ref.quoted |= c.LP_QUOTED_TABLE;
             ref.quoted |= c.LP_QUOTED_COLUMN;
@@ -378,6 +378,35 @@ fn tableQualifier(path: []const u8, alias: ?[]const u8) []const u8 {
     if (alias) |a| return a;
     const base = std.fs.path.basename(path);
     return if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
+}
+
+/// Set on an ORDER BY term written `t.g`, `t` the query's one table, before `dropTableQualifier` makes it `g` (a bit
+/// of `quoted` the grammar and the unparser leave alone). A bare ORDER BY name is a SELECT alias first, and `t.g` is
+/// the column `g`, never an alias `g`: the mark keeps the two apart until the term is resolved (`orderName`).
+const was_qualified: c_uint = 1 << 8;
+
+fn markQualifiedOrder(root: *c.LpNode, qualifier: []const u8) void {
+    const sel = &root.u.select;
+    for (0..@intCast(sel.order_by.count)) |i| {
+        const term = sel.order_by.items[i] orelse continue;
+        const e: *c.LpNode = term.*.u.order_term.expr orelse continue;
+        if (e.kind != c.LP_EXPR_COLUMN_REF or e.u.column_ref.schema != null) continue;
+        const table = e.u.column_ref.table orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.span(table), qualifier)) e.u.column_ref.quoted |= was_qualified;
+    }
+}
+
+/// Whether `expr` is a bare name a SELECT alias may answer to: an unqualified column reference, as it was written.
+fn mayBeAlias(expr: *const c.LpNode) bool {
+    return expr.kind == c.LP_EXPR_COLUMN_REF and expr.u.column_ref.schema == null and expr.u.column_ref.table == null and
+        expr.u.column_ref.quoted & was_qualified == 0;
+}
+
+/// `mayBeAlias`, for the place that resolves the term: the mark is spent, and the reference is as any other from here.
+fn orderName(expr: *c.LpNode) bool {
+    const bare = mayBeAlias(expr);
+    if (expr.kind == c.LP_EXPR_COLUMN_REF) expr.u.column_ref.quoted &= ~was_qualified;
+    return bare;
 }
 
 /// A column written `t.g` where `t` names the query's one table is the column `g`: drop the qualifier everywhere, so the
@@ -421,7 +450,7 @@ fn boolLiterals(root: *c.LpNode) void {
         fn enter(_: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
             if (node.*.kind != c.LP_EXPR_COLUMN_REF) return 0;
             const ref = &node.*.u.column_ref;
-            if (ref.quoted != 0 or ref.schema != null or ref.table != null or ref.column == null) return 0;
+            if (ref.quoted & ~was_qualified != 0 or ref.schema != null or ref.table != null or ref.column == null) return 0;
             const name = std.mem.span(ref.column);
             const value: [*c]const u8 = if (std.ascii.eqlIgnoreCase(name, "true"))
                 "TRUE"
@@ -586,6 +615,21 @@ fn selectColumn(rc: *c.LpNode, lp_arena: *c.arena_t, allocator: std.mem.Allocato
     if (rc.kind == c.LP_RESULT_COLUMN and rc.u.result_column.alias != null) {
         out.alias = try aliasText(allocator, std.mem.span(rc.u.result_column.alias));
     }
+}
+
+/// Whether the alias the parser kept as `raw` (a quoted one still in its quotes, `aliasText`) is the name `name`, as
+/// SQL compares names: by their text, whatever the case. `AS "dup"` is the alias `dup`, and `"dup"` is not.
+fn aliasIs(raw: []const u8, name: []const u8) bool {
+    if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return std.ascii.eqlIgnoreCase(raw, name);
+    var at: usize = 0;
+    var i: usize = 1;
+    while (i < raw.len - 1) : (i += 1) {
+        // A doubled quote is one quote.
+        if (raw[i] == '"' and i + 2 < raw.len and raw[i + 1] == '"') i += 1;
+        if (at == name.len or std.ascii.toLower(raw[i]) != std.ascii.toLower(name[at])) return false;
+        at += 1;
+    }
+    return at == name.len;
 }
 
 /// The output name an alias spells: the parser keeps a quoted one quoted (`"n m"`, `"a""b"`); the name is its text,
@@ -1697,7 +1741,9 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
     defer allocator.free(namable);
     if (root.*.u.select.from) |from| if (from.*.kind == c.LP_FROM_TABLE and from.*.u.from_table.name != null) {
         const alias: ?[]const u8 = if (from.*.u.from_table.alias) |a| std.mem.span(a) else null;
-        _ = dropTableQualifier(root, tableQualifier(stripQuotes(std.mem.span(from.*.u.from_table.name)), alias));
+        const qualifier = tableQualifier(stripQuotes(std.mem.span(from.*.u.from_table.name)), alias);
+        markQualifiedOrder(root, qualifier);
+        _ = dropTableQualifier(root, qualifier);
     };
     try distinctAsGroupBy(root, lp_arena);
     try groupByAll(root, lp_arena, markers.groupAll());
@@ -2140,7 +2186,7 @@ fn rowOrder(
                 return error.OrderByNotSupported;
             }
             expr = selectExpr(sel, @intCast(pos - 1)) orelse return error.SqlParseError;
-        } else if (expr.kind == c.LP_EXPR_COLUMN_REF and expr.u.column_ref.table == null) {
+        } else if (orderName(expr)) {
             const name = std.mem.span(expr.u.column_ref.column);
             for (select_cols, 0..) |col, idx| if (col.alias) |alias| if (std.ascii.eqlIgnoreCase(alias, name)) {
                 expr = selectExpr(sel, idx) orelse return error.SqlParseError;
@@ -2587,7 +2633,7 @@ fn orderColumn(sel: anytype, lp_arena: *c.arena_t, select_cols: []const ast.Sele
         diagnosticPrint("sql: ORDER BY position {d} is not in the SELECT list\n", .{pos});
         return error.OrderByNotSupported;
     }
-    if (expr.kind == c.LP_EXPR_COLUMN_REF and expr.u.column_ref.schema == null and expr.u.column_ref.table == null) {
+    if (orderName(expr)) {
         const name = std.mem.span(expr.u.column_ref.column);
         for (select_cols, 0..) |col, idx| {
             if (col.alias) |alias| if (std.ascii.eqlIgnoreCase(alias, name)) return idx;
@@ -2679,7 +2725,7 @@ fn groupedExpr(allocator: std.mem.Allocator, sel: anytype, lp_arena: *c.arena_t,
         for (0..@intCast(sel.result_columns.count)) |i| {
             const rc = sel.result_columns.items[i] orelse continue;
             if (rc.*.kind != c.LP_RESULT_COLUMN or rc.*.u.result_column.alias == null) continue;
-            if (!std.ascii.eqlIgnoreCase(std.mem.span(rc.*.u.result_column.alias), name)) continue;
+            if (!aliasIs(std.mem.span(rc.*.u.result_column.alias), name)) continue;
             if (try sameTerm(lp_arena, expr, a, rc.*.u.result_column.expr orelse continue)) return true;
         }
     }
@@ -3542,4 +3588,47 @@ test "a join's plain rows parse as their groups, with a hidden count to repeat b
     try std.testing.expect(!single.is_aggregate);
     try std.testing.expectError(error.JoinRowsShape, parseFolded(true, a, "SELECT * FROM 't'", markers, true));
     try std.testing.expectError(error.JoinRowsShape, parseFolded(true, a, "SELECT q + 1 FROM 't'", markers, true));
+}
+
+test "an ORDER BY name that is a select alias is that item, quoted or not, whatever a column is called" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const markers: literals.Markers = .{};
+    // REVIEW-WP4b: the raw alias `"dup"` matched no name, so `dup` became a hidden key and ranked by the column.
+    for ([_][]const u8{
+        "SELECT q AS \"dup\" FROM 't' ORDER BY \"dup\"",
+        "SELECT q AS \"dup\" FROM 't' ORDER BY dup",
+        "SELECT q AS dup FROM 't' ORDER BY \"dup\"",
+        "SELECT q AS \"Dup\" FROM 't' ORDER BY DUP",
+        "SELECT q AS \"my n\" FROM 't' ORDER BY \"my n\"",
+        "SELECT q AS \"a\"\"b\" FROM 't' ORDER BY \"a\"\"b\"",
+    }) |sql| {
+        const q = try parseFolded(true, a, sql, markers, true);
+        // One key (the item), one hidden term (the count), and the ranking is the item itself.
+        try std.testing.expectEqual(@as(usize, 1), q.syntax.?.keys.?.len);
+        try std.testing.expectEqual(@as(usize, 1), q.result_order.hidden.len);
+        try std.testing.expectEqual(@as(usize, 1), q.result_order.keys.len);
+        try std.testing.expectEqual(@as(usize, 0), q.result_order.keys[0].column);
+    }
+    // A name no item is aliased is a column: a key of its own, ranked by but not shown.
+    const col = try parseFolded(true, a, "SELECT q AS \"dup2\" FROM 't' ORDER BY dup", markers, true);
+    try std.testing.expectEqual(@as(usize, 2), col.syntax.?.keys.?.len);
+    try std.testing.expectEqual(@as(usize, 1), col.result_order.keys[0].column);
+    // A qualified name is the column, never the alias: one key more, ranked by it.
+    for ([_][]const u8{ "SELECT q AS dup FROM 't' ORDER BY t.dup", "SELECT q AS \"dup\" FROM 't' x ORDER BY \"x\".\"dup\"" }) |sql| {
+        const q = try parseFolded(true, a, sql, markers, true);
+        try std.testing.expectEqual(@as(usize, 2), q.syntax.?.keys.?.len);
+        try std.testing.expectEqual(@as(usize, 1), q.result_order.keys[0].column);
+    }
+    // On one table's plain rows too: ranked by the column `dup`, not by the item aliased so.
+    const rows = try parseFolded(true, a, "SELECT q AS dup FROM 't' ORDER BY t.dup", markers, false);
+    try std.testing.expectEqualStrings("dup", rows.result_order.rows[0].expr);
+    const by_alias = try parseFolded(true, a, "SELECT q AS dup FROM 't' ORDER BY dup", markers, false);
+    try std.testing.expectEqualStrings("q", by_alias.result_order.rows[0].expr);
+    try std.testing.expect(aliasIs("\"a\"\"b\"", "a\"b"));
+    try std.testing.expect(aliasIs("Dup", "dup"));
+    try std.testing.expect(!aliasIs("\"dup\"", "\"dup\""));
+    try std.testing.expect(!aliasIs("\"dup\"", "du"));
+    try std.testing.expect(!aliasIs("\"du\"", "dup"));
 }

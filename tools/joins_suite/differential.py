@@ -239,7 +239,7 @@ def queries(seed, p, T, count, shapes):
                        f'GROUP BY g.egrp ORDER BY g.egrp')
         elif shape == 'rows':
             form = r.choice(['probe-cols', 'build-cols', 'distinct', 'left', 'semi', 'group-offset',
-                             'hidden-order', 'anti', 'expr', 'unordered', 'star', 'strings'])
+                             'hidden-order', 'anti', 'expr', 'unordered', 'star', 'strings', 'alias'])
             frm = f'{F} f JOIN {D} d ON f.fk = d.pk'
             L, O = lim(), r.choice([0, 0, 1, 5, 40])
             if form == 'probe-cols':
@@ -267,6 +267,12 @@ def queries(seed, p, T, count, shapes):
             elif form == 'star':
                 w += ['f.fk = d.pk', 'f.fk2 = s.pk3']
                 sql = f'SELECT f.dup, d.grp, s.g3 FROM {F} f, {D} d, {S} s{wh()} ORDER BY 1, 2, 3 LIMIT {L} OFFSET {O}'
+            elif form == 'alias':   # an alias named as a column of the probe, the build or the key: bare it is the item, qualified the column
+                name = r.choice(['dup', 'grp', 'pk', 'fk'])
+                item = r.choice(['f.q', 'f.id % 5'])
+                alias = r.choice([name, f'"{name}"', f'"{name.capitalize()}"'])
+                by = r.choice([name, f'"{name}"', name.upper(), ('f.' if name in ('dup', 'fk') else 'd.') + name])
+                sql = (f"SELECT {item} AS {alias}, d.w FROM {frm}{wh()} ORDER BY {by} {r.choice(['', 'DESC'])}, f.id LIMIT {L} OFFSET {O}")
             elif form == 'strings':   # a build's strings under a LIMIT, which are fetched after the cut
                 sql = f'SELECT f.dup, d.name FROM {frm}{wh()} ORDER BY f.dup, d.name LIMIT {L} OFFSET {O}'
             else:

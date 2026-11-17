@@ -1283,6 +1283,7 @@ fn resolveDims(a: std.mem.Allocator, plan_dims: []const sql_join.Dim, schemas: S
 /// One build: its own conjuncts, the SEMI joins the binder reduced onto it (tables of a chain), and a snowflake's
 /// tables under it.
 fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, columns: []const []const u8, where: ?[]const u8, plan_dims: []const sql_join.Dim, schemas: Schemas, markers: literals.Markers, unique: bool) anyerror!syntax.Build {
+    if (std.mem.indexOfScalar(u8, path, '*') != null) return error.JoinMultiFileBuild;
     var build: syntax.Build = .{ .path = path, .key = key, .columns = columns, .dims = try resolveDims(a, plan_dims, schemas, markers, unique) };
     const w = where orelse return build;
     const text = try std.fmt.allocPrint(a, "SELECT count(*) FROM '{s}' WHERE {s}", .{ path, w });

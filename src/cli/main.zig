@@ -859,10 +859,10 @@ fn runParsed(
                 return runUpdate(io, gpa, arena, up, output, fsync, summary, max_memory orelse zpq.core.system.discoverAvailableMemory(env));
             }
             // A two-table join binds its column names against both footers; the engine reads the build.
-            var schemas: engine.join.LocalSchemas = .{ .arena = arena };
+            var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena } };
             defer schemas.deinit();
             const sql = zpq.core.expr.sql_parser;
-            const pq = (try sql.parseSqlJoinPlan(arena, q_str, .{ .ctx = &schemas, .footer = engine.join.LocalSchemas.footer })) orelse
+            const pq = (try sql.parseSqlJoinPlan(arena, q_str, .{ .ctx = &schemas, .footer = zpq.frontend.JoinSchemas.footer })) orelse
                 try sql.parseSqlPlan(arena, q_str);
             plan_source = engine.syntax_plan.source(pq.syntax.?);
             filter = pq.filter_str;

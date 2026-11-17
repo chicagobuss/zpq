@@ -5,6 +5,43 @@ const local_fs = zpq.local_fs;
 const s3 = zpq.io.s3;
 const Diag = zpq.core.diag.Diag;
 
+/// Resolve a table pattern for join planning while keeping the footer mappings alive through binding.
+pub const JoinSchemas = struct {
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: std.process.Environ,
+    diag: ?*Diag,
+    local: zpq.engine.join.LocalSchemas,
+
+    pub fn footer(raw: *const anyopaque, path: []const u8) anyerror!*const zpq.core.schema.FileMetaData {
+        const self: *JoinSchemas = @ptrCast(@alignCast(@constCast(raw)));
+        const files = try expandGlob(self.arena, self.io, path, self.env, self.diag);
+        if (files.len == 0) {
+            noSqlMatches(path);
+            return error.NoMatches;
+        }
+        var total: i64 = 0;
+        var first: ?*const zpq.core.schema.FileMetaData = null;
+        for (files) |file| {
+            const m = zpq.engine.join.LocalSchemas.footer(&self.local, file) catch |err| {
+                if (self.diag) |d| d.input = file;
+                return err;
+            };
+            if (first == null) first = m;
+            total = std.math.add(i64, total, m.num_rows) catch return error.Overflow;
+        }
+        if (files.len == 1) return first.?;
+        const combined = try self.arena.create(zpq.core.schema.FileMetaData);
+        combined.* = first.?.*;
+        combined.num_rows = total;
+        return combined;
+    }
+
+    pub fn deinit(self: *JoinSchemas) void {
+        self.local.deinit();
+    }
+};
+
 /// Receives each diagnostic, bounded to 16 KiB; a longer one is dropped, so the receiver falls back to the error
 /// name. Unset, diagnostics print to stderr whole.
 pub threadlocal var diagnostic_fn: ?*const fn ([]const u8) void = null;
@@ -239,6 +276,10 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         ),
         error.JoinKeyNotFound => diagnosticPrint(
             "zpq query: a join needs a column-to-column key equality; expression join keys are not supported\n",
+            .{},
+        ),
+        error.JoinMultiFileBuild => diagnosticPrint(
+            "zpq query: a glob table can only be the scanned side of a join, not a lookup build\n",
             .{},
         ),
         error.JoinResidualNotSupported => diagnosticPrint(

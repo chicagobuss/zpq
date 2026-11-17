@@ -1,5 +1,8 @@
 {
  "fixtures": [
+  {"name": "glob_a", "copy": "COPY (SELECT i % 200 + 1 AS fk FROM range(0, 600) t(i)) TO '{path}' (FORMAT PARQUET)"},
+  {"name": "glob_b", "copy": "COPY (SELECT i % 200 + 1 AS fk FROM range(0, 600) t(i)) TO '{path}' (FORMAT PARQUET)"},
+  {"name": "glob_probe", "glob": "glob_*.parquet"},
   {
    "name": "extract_fact",
    "copy": "COPY (SELECT i % 2 + 1 AS fk, CASE WHEN i % 2 = 0 THEN TIMESTAMP '2024-01-01 01:00:00' ELSE TIMESTAMP '2024-01-01 02:00:00' END AS ts FROM range(0, 1000) t(i)) TO '{path}' (FORMAT PARQUET)"
@@ -122,6 +125,15 @@
   }
  ],
  "cases": [
+  {
+   "id": "join:glob:probe",
+   "fixture": "glob_probe",
+   "sql": "SELECT d.grp, count(*) AS n FROM '{fixture:glob_probe}' f JOIN '{fixture:dim}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY d.grp",
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, count(*) AS n FROM '{fixture:glob_probe}' f JOIN '{fixture:dim}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY d.grp"
+   }
+  },
   {
    "id": "join:extract:hour",
    "fixture": "extract_fact",

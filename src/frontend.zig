@@ -285,6 +285,10 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             "zpq query: a glob table can only be the scanned side of a join, not a lookup build\n",
             .{},
         ),
+        error.UsingJoinNotSupported => diagnosticPrint(
+            "zpq query: JOIN USING supports one column between two tables in this release\n",
+            .{},
+        ),
         error.JoinResidualNotSupported => diagnosticPrint(
             "zpq query: a join condition reads both tables beyond its one key equality\n",
             .{},

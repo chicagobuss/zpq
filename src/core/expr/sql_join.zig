@@ -23,6 +23,7 @@ pub const Error = error{
     JoinResidualNotSupported,
     AmbiguousJoinColumn,
     JoinColumnsShareName,
+    UsingJoinNotSupported,
     LeftJoinOn,
     LeftJoinWhere,
     OutOfMemory,
@@ -148,7 +149,8 @@ fn flattenFrom(n: *c.LpNode, out: *std.ArrayList(*c.LpNode), on: ?*std.ArrayList
         const j = n.u.join;
         const left = j.join_type & c.LP_JOIN_LEFT != 0;
         const allowed: c_int = if (left) c.LP_JOIN_LEFT | c.LP_JOIN_OUTER else c.LP_JOIN_INNER | c.LP_JOIN_CROSS;
-        if (j.join_type & ~allowed != 0 or j.using_columns.count != 0) return error.UnsupportedJoin;
+        if (j.join_type & ~allowed != 0) return error.UnsupportedJoin;
+        if (j.using_columns.count != 0 and on != null) return error.UsingJoinNotSupported;
         try flattenFrom(j.left orelse return error.UnsupportedJoin, out, on, nulls, a);
         if (left) {
             const right = j.right orelse return error.UnsupportedJoin;
@@ -496,11 +498,44 @@ fn toSql(a: std.mem.Allocator, p: Parsed, n: *c.LpNode) ![]const u8 {
     return a.dupe(u8, std.mem.span(text));
 }
 
+/// USING publishes the left key unqualified. Lower the single-key two-table form to the existing ON machinery.
+fn lowerUsing(a: std.mem.Allocator, root: *c.LpNode, t: Tables) Error!void {
+    const sel = &root.u.select;
+    const from = sel.from orelse return;
+    if (from.*.kind != c.LP_JOIN_CLAUSE) return;
+    const j = &from.*.u.join;
+    if (j.using_columns.count == 0) return;
+    if (j.using_columns.count != 1 or t.paths.len != 2) return error.UsingJoinNotSupported;
+    const left = j.left orelse return error.UsingJoinNotSupported;
+    const right = j.right orelse return error.UsingJoinNotSupported;
+    if (left.*.kind != c.LP_FROM_TABLE or right.*.kind != c.LP_FROM_TABLE) return error.UsingJoinNotSupported;
+    const key = j.using_columns.items[0] orelse return error.UsingJoinNotSupported;
+    if (key.*.kind != c.LP_EXPR_COLUMN_REF) return error.UsingJoinNotSupported;
+    const name = span(key.*.u.column_ref.column);
+    if (!t.has(t.ctx, 0, name) or !t.has(t.ctx, 1, name)) return error.JoinKeyNotFound;
+    if (left.*.u.from_table.alias == null) left.*.u.from_table.alias = (try a.dupeSentinel(u8, "__zpq_using_left", 0)).ptr;
+    if (right.*.u.from_table.alias == null) right.*.u.from_table.alias = (try a.dupeSentinel(u8, "__zpq_using_right", 0)).ptr;
+    const l = try create(a, c.LP_EXPR_COLUMN_REF);
+    l.u.column_ref.column = key.*.u.column_ref.column;
+    l.u.column_ref.table = left.*.u.from_table.alias;
+    const r = try create(a, c.LP_EXPR_COLUMN_REF);
+    r.u.column_ref.column = key.*.u.column_ref.column;
+    r.u.column_ref.table = right.*.u.from_table.alias;
+    j.on_expr = try binaryOf(a, c.LP_OP_EQ, l, r);
+    j.using_columns.count = 0;
+    var refs = try columnRefs(root, a);
+    if (sel.where) |w| refs = try std.mem.concat(a, *c.LpNode, &.{ refs, try columnRefs(w, a) });
+    for (refs) |ref| if (ref.u.column_ref.table == null and std.ascii.eqlIgnoreCase(span(ref.u.column_ref.column), name)) {
+        ref.u.column_ref.table = left.*.u.from_table.alias;
+    };
+}
+
 /// Split `sql` into the probe query and the build specs: one build for a two-table join or an IN, one per dimension for
 /// a star (each joined to the probe by one key equality), after every filter-only table is reduced to an IN.
 pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
     const p = try parse(sql);
     defer p.deinit();
+    try lowerUsing(a, p.root, t);
     const sel = &p.root.u.select;
     const from = sel.from orelse return error.UnsupportedJoin;
     if (from.*.kind != c.LP_JOIN_CLAUSE) return planSemi(a, p, sel, from, t);

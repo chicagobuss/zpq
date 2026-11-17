@@ -1,0 +1,1488 @@
+{
+ "about": "Analyst join queries over s3://zpq-public-data with DuckDB 2.0.0 answers (CSV, memory_limit 8GB). Tables are {ns.table} tokens, see suite.py TABLES. answer_tlc_single: the answer with the six-month TLC globs replaced by the January file (--tlc-single). duckdb_ms: hot median of 3 fresh-process runs, 8 threads, when recorded; indicative only.",
+ "duckdb": "v2.0.0 (Cyanoptera) d54cbbe3df",
+ "cases": [
+  {
+   "id": "ds01",
+   "set": "analyst",
+   "tags": [
+    "inner",
+    "groupby-dim"
+   ],
+   "sql": "SELECT d.d_year, sum(ss.ss_net_paid) AS revenue, count(*) AS n FROM {ds.store_sales} ss JOIN {ds.date_dim} d ON ss.ss_sold_date_sk = d.d_date_sk GROUP BY d.d_year ORDER BY d.d_year",
+   "answer": "d_year,revenue,n\n1998,9156908129.19,5443210\n1999,9260268310.25,5506824\n2000,9282641086.37,5519143\n2001,9193152456.40,5470761\n2002,9258148636.22,5504626\n2003,100853472.81,60250\n",
+   "duckdb_ms": 78.8
+  },
+  {
+   "id": "ds02",
+   "set": "analyst",
+   "tags": [
+    "star",
+    "where-both",
+    "groupby-dim",
+    "orderby"
+   ],
+   "sql": "SELECT s.s_state, sum(ss.ss_net_paid) AS revenue FROM {ds.store_sales} ss JOIN {ds.date_dim} d ON ss.ss_sold_date_sk = d.d_date_sk JOIN {ds.store} s ON ss.ss_store_sk = s.s_store_sk WHERE d.d_year = 2001 AND ss.ss_quantity > 10 GROUP BY s.s_state ORDER BY revenue DESC",
+   "answer": "s_state,revenue\nTN,3156533662.08\nAL,3132882767.86\nSD,2639579778.17\n",
+   "duckdb_ms": 89.5
+  },
+  {
+   "id": "ds03",
+   "set": "analyst",
+   "tags": [
+    "star",
+    "topk",
+    "decimal"
+   ],
+   "sql": "SELECT d.d_year, i.i_brand_id, i.i_brand, sum(ss.ss_ext_sales_price) AS sum_agg FROM {ds.date_dim} d, {ds.store_sales} ss, {ds.item} i WHERE d.d_date_sk = ss.ss_sold_date_sk AND ss.ss_item_sk = i.i_item_sk AND i.i_manufact_id = 128 AND d.d_moy = 11 GROUP BY d.d_year, i.i_brand, i.i_brand_id ORDER BY d.d_year, sum_agg DESC, i.i_brand_id LIMIT 100",
+   "answer": "d_year,i_brand_id,i_brand,sum_agg\n1998,2001001,amalgimporto #1,179086.36\n1998,3002001,importoexporti #1,167274.89\n1998,5003001,exportischolar #1,135802.01\n1998,3004001,edu packexporti #1,110895.75\n1998,2002002,importoimporto #2,99381.00\n1998,2004001,edu packimporto #1,88180.11\n1998,3003001,exportiexporti #1,85659.82\n1998,4002001,importoedu pack #1,85607.58\n1998,10012015,importoamalgamalg #15,81393.33\n1998,1003001,exportiamalg #1,67162.58\n1998,6003007,exporticorp #7,64828.31\n1998,2004002,edu packimporto #2,62932.99\n1998,1001002,amalgamalg #2,60908.77\n1998,1004001,edu packamalg #1,58665.38\n1998,6003004,exporticorp #4,58254.58\n1998,7013004,exportinameless #4,57325.62\n1998,5001001,amalgscholar #1,53965.59\n1998,5002002,importoscholar #2,48689.31\n1998,10003008,exportiunivamalg #8,48443.66\n1998,7008010,namelessbrand #10,47586.83\n1998,8009007,maxinameless #7,46759.94\n1998,10010006,univamalgamalg #6,43635.57\n1998,10007014,brandunivamalg #14,43104.52\n1998,9005009,scholarmaxi #9,43027.43\n1998,4003002,exportiedu pack #2,42797.21\n1998,5004001,edu packscholar #1,41566.41\n1998,4004002,edu packedu pack #2,38775.46\n1998,1004002,edu packamalg #2,38516.57\n1998,10016004,corpamalgamalg #4,37143.52\n1998,7002008,importobrand #8,37061.51\n1998,9004003,edu packmaxi #3,36286.63\n1998,7003002,exportibrand #2,35835.85\n1998,5002001,importoscholar #1,35264.35\n1998,7007010,brandbrand #10,34941.94\n1998,8011009,amalgmaxi #9,34828.87\n1998,7009008,maxibrand #8,33945.35\n1998,9016008,corpunivamalg #8,33491.64\n1998,2003001,exportiimporto #1,33303.34\n1998,7003009,exportibrand #9,33131.74\n1998,6004008,edu packcorp #8,31593.41\n1998,9007009,brandmaxi #9,30906.46\n1998,7014007,edu packnameless #7,30396.30\n1998,9001005,amalgmaxi #5,29473.51\n1998,1001001,amalgamalg #1,28777.82\n1998,2003002,exportiimporto #2,28718.30\n1998,6010003,univbrand #3,28451.85\n1998,8002005,importonameless #5,28062.02\n1998,6009002,maxicorp #2,26976.92\n1998,10010002,univamalgamalg #2,26807.31\n1998,6010002,univbrand #2,25494.88\n1998,8013008,exportimaxi #8,24955.85\n1998,9009003,maximaxi #3,24861.43\n1998,6015001,scholarbrand #1,24738.69\n1998,1003002,exportiamalg #2,24578.74\n1998,6011001,amalgbrand #1,24455.52\n1998,4003001,exportiedu pack #1,23695.86\n1998,10001002,amalgunivamalg #2,23455.86\n1998,3001001,amalgexporti #1,23374.40\n1998,3001002,amalgexporti #2,22650.43\n1998,6012005,importobrand #5,20853.43\n1998,10006004,corpunivamalg #4,20307.00\n1998,10010014,univamalgamalg #14,20068.18\n1998,4002002,importoedu pack #2,19660.94\n1998,3003002,exportiexporti #2,18390.26\n1998,6014001,edu packbrand #1,17752.35\n1998,10007004,brandunivamalg #4,17291.48\n1998,7008005,namelessbrand #5,13739.90\n1998,5003002,exportischolar #2,13655.74\n1998,8001009,amalgnameless #9,12187.19\n1998,10001013,amalgunivamalg #13,9362.13\n1999,2001001,amalgimporto #1,193927.70\n1999,5003001,exportischolar #1,188755.86\n1999,3003001,exportiexporti #1,107881.14\n1999,2002002,importoimporto #2,103679.12\n1999,3002001,importoexporti #1,102273.20\n1999,5002002,importoscholar #2,90882.08\n1999,3004001,edu packexporti #1,87358.74\n1999,9004003,edu packmaxi #3,82961.65\n1999,2004002,edu packimporto #2,78665.38\n1999,2004001,edu packimporto #1,66618.29\n1999,1004001,edu packamalg #1,65963.80\n1999,1003001,exportiamalg #1,62578.45\n1999,5004001,edu packscholar #1,60498.29\n1999,9016008,corpunivamalg #8,52524.48\n1999,1003002,exportiamalg #2,50459.45\n1999,2003002,exportiimporto #2,47478.01\n1999,7007010,brandbrand #10,47163.62\n1999,6004008,edu packcorp #8,46705.49\n1999,8013008,exportimaxi #8,45397.85\n1999,4002001,importoedu pack #1,44675.87\n1999,6009002,maxicorp #2,43076.05\n1999,1004002,edu packamalg #2,41552.37\n1999,6012005,importobrand #5,41268.59\n1999,6003007,exporticorp #7,40196.69\n1999,6003004,exporticorp #4,39473.34\n1999,1001002,amalgamalg #2,39197.43\n1999,9007009,brandmaxi #9,38946.47\n1999,10006004,corpunivamalg #4,38867.63\n1999,5002001,importoscholar #1,38531.96\n1999,8001009,amalgnameless #9,38481.37\n",
+   "duckdb_ms": 83.0
+  },
+  {
+   "id": "ds04",
+   "set": "analyst",
+   "tags": [
+    "star",
+    "4dims",
+    "string-filter"
+   ],
+   "sql": "SELECT i.i_category, count(*) AS n, sum(ss.ss_net_profit) AS profit FROM {ds.store_sales} ss JOIN {ds.date_dim} d ON ss.ss_sold_date_sk = d.d_date_sk JOIN {ds.store} s ON ss.ss_store_sk = s.s_store_sk JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk JOIN {ds.household_demographics} hd ON ss.ss_hdemo_sk = hd.hd_demo_sk WHERE hd.hd_dep_count = 4 AND d.d_year = 2000 AND s.s_state = 'TN' GROUP BY i.i_category ORDER BY i.i_category",
+   "answer": "i_category,n,profit\nBooks,18513,-15088951.09\nChildren,19252,-15782225.72\nElectronics,19141,-15556030.70\nHome,18782,-15213740.96\nJewelry,18464,-15065175.56\nMen,18581,-15482231.97\nMusic,18811,-15654471.26\nShoes,18918,-15688875.65\nSports,18795,-15920870.67\nWomen,18930,-15746477.36\nNULL,460,-507429.59\n",
+   "duckdb_ms": 107.2
+  },
+  {
+   "id": "ds05",
+   "set": "analyst",
+   "tags": [
+    "star",
+    "avg",
+    "decimal",
+    "or-dim"
+   ],
+   "sql": "SELECT i.i_item_id, avg(ss.ss_quantity) AS agg1, avg(ss.ss_list_price) AS agg2, avg(ss.ss_coupon_amt) AS agg3, avg(ss.ss_sales_price) AS agg4 FROM {ds.store_sales} ss JOIN {ds.customer_demographics} cd ON ss.ss_cdemo_sk = cd.cd_demo_sk JOIN {ds.date_dim} d ON ss.ss_sold_date_sk = d.d_date_sk JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk JOIN {ds.promotion} p ON ss.ss_promo_sk = p.p_promo_sk WHERE cd.cd_gender = 'M' AND cd.cd_marital_status = 'S' AND cd.cd_education_status = 'College' AND (p.p_channel_email = 'N' OR p.p_channel_event = 'N') AND d.d_year = 2000 GROUP BY i.i_item_id ORDER BY i.i_item_id LIMIT 100",
+   "answer": "i_item_id,agg1,agg2,agg3,agg4\nAAAAAAAAAAAABAAA,68.5,102.78,0.0,34.52\nAAAAAAAAAAABAAAA,40.4,98.254,75.816,45.23\nAAAAAAAAAAABBAAA,67.0,18.18,0.0,0.54\nAAAAAAAAAAADBAAA,73.0,38.29,0.0,32.54\nAAAAAAAAAAAEAAAA,77.0,99.89,452.0,11.98\nAAAAAAAAAAAFAAAA,9.0,34.36,0.0,0.34\nAAAAAAAAAAAGBAAA,61.0,73.945,0.0,61.235\nAAAAAAAAAAAHAAAA,33.333333333333336,116.37,0.0,41.97\nAAAAAAAAAAAHBAAA,79.5,87.675,3041.645,47.645\nAAAAAAAAAAAIAAAA,67.0,114.55,0.0,108.82\nAAAAAAAAAAAKAAAA,32.333333333333336,100.82,0.0,38.583333333333336\nAAAAAAAAAAALAAAA,89.0,104.28,0.0,87.59\nAAAAAAAAAAANAAAA,48.0,48.29,0.0,6.27\nAAAAAAAAAAAOAAAA,47.333333333333336,26.456666666666667,329.12,11.836666666666666\nAAAAAAAAAABAAAAA,58.5,57.825,0.0,11.65\nAAAAAAAAAABABAAA,26.0,39.17,0.0,22.71\nAAAAAAAAAABBAAAA,33.0,46.3,141.94,7.05\nAAAAAAAAAABCBAAA,38.75,78.055,0.0,34.2375\nAAAAAAAAAABDAAAA,20.666666666666668,43.58,0.0,26.47\nAAAAAAAAAABDBAAA,6.0,63.47,0.0,10.15\nAAAAAAAAAABFBAAA,23.0,31.34,89.93,30.08\nAAAAAAAAAABGAAAA,84.0,65.0,0.0,14.3\nAAAAAAAAAABGBAAA,2.0,25.6,0.0,17.92\nAAAAAAAAAABHAAAA,52.0,22.72,0.0,21.58\nAAAAAAAAAABIBAAA,72.0,71.505,0.0,18.765\nAAAAAAAAAABJAAAA,48.0,48.38,0.0,45.96\nAAAAAAAAAABKAAAA,38.0,145.29,0.0,132.21\nAAAAAAAAAABNAAAA,90.0,63.02,0.0,48.52\nAAAAAAAAAABPAAAA,26.0,76.65333333333334,0.0,21.523333333333333\nAAAAAAAAAACAAAAA,59.5,100.675,0.0,87.885\nAAAAAAAAAACBBAAA,41.8,52.156,137.688,43.478\nAAAAAAAAAACCBAAA,86.0,69.09,0.0,5.52\nAAAAAAAAAACDAAAA,35.666666666666664,94.06,3.546666666666667,37.24\nAAAAAAAAAACEBAAA,56.0,28.84,193.06,6.63\nAAAAAAAAAACFAAAA,27.5,135.13,425.51,113.165\nAAAAAAAAAACHBAAA,46.666666666666664,83.30333333333333,0.0,39.56\nAAAAAAAAAACIAAAA,32.0,11.05,0.0,2.58\nAAAAAAAAAACIBAAA,79.33333333333333,39.79666666666667,0.0,8.59\nAAAAAAAAAACJAAAA,48.0,58.06,0.0,25.8\nAAAAAAAAAACLAAAA,28.0,82.11,0.0,29.55\nAAAAAAAAAACOAAAA,21.0,101.12,449.5,73.81\nAAAAAAAAAADABAAA,77.0,163.5,0.0,68.67\nAAAAAAAAAADBBAAA,34.0,NULL,249.9,NULL\nAAAAAAAAAADCAAAA,31.0,102.04,0.0,26.53\nAAAAAAAAAADEBAAA,72.8,77.996,267.34,50.336\nAAAAAAAAAADGBAAA,37.5,102.48,0.0,6.215\nAAAAAAAAAADHAAAA,64.66666666666667,105.72333333333333,1057.2133333333334,59.78333333333333\nAAAAAAAAAADHBAAA,89.0,92.58,0.0,55.145\nAAAAAAAAAADNAAAA,9.0,91.4,0.0,15.53\nAAAAAAAAAADOAAAA,51.0,95.765,29.663333333333334,16.36\nAAAAAAAAAAEAAAAA,37.0,51.65,14.33,12.91\nAAAAAAAAAAEABAAA,62.0,46.315,0.0,25.31\nAAAAAAAAAAECBAAA,7.0,30.36,0.0,21.55\nAAAAAAAAAAEDAAAA,86.0,157.86,3636.79,74.19\nAAAAAAAAAAEEAAAA,46.5,67.615,0.0,22.77\nAAAAAAAAAAEFBAAA,68.33333333333333,96.84,1070.12,32.08\nAAAAAAAAAAEHAAAA,13.0,28.5,0.0,19.95\nAAAAAAAAAAEIBAAA,41.0,45.53,24.035,17.655\nAAAAAAAAAAEJAAAA,58.0,27.37,0.0,7.11\nAAAAAAAAAAEKAAAA,27.0,22.77,115.87,9.33\nAAAAAAAAAAEMAAAA,54.0,98.59666666666666,0.0,26.036666666666665\nAAAAAAAAAAENAAAA,91.0,137.98,0.0,93.82\nAAAAAAAAAAEPAAAA,78.0,28.58,0.0,10.45\nAAAAAAAAAAFAAAAA,8.0,50.49,0.0,15.14\nAAAAAAAAAAFBBAAA,61.5,45.125,31.3,2.17\nAAAAAAAAAAFCAAAA,3.0,130.08,0.0,113.16\nAAAAAAAAAAFCBAAA,67.0,12.173333333333334,0.0,6.73\nAAAAAAAAAAFFBAAA,41.5,56.145,0.0,40.435\nAAAAAAAAAAFGAAAA,63.0,65.3,0.0,34.6\nAAAAAAAAAAFHBAAA,36.0,100.51,1452.6133333333332,70.26\nAAAAAAAAAAFIAAAA,75.0,44.053333333333335,20.82,19.366666666666667\nAAAAAAAAAAFIBAAA,61.5,51.125,0.0,31.67\nAAAAAAAAAAFJAAAA,98.0,17.17,0.0,10.81\nAAAAAAAAAAFMAAAA,41.5,99.49,1286.465,47.675\nAAAAAAAAAAFOAAAA,25.0,58.19,0.0,33.75\nAAAAAAAAAAFPAAAA,56.0,47.31,0.0,25.07\nAAAAAAAAAAGABAAA,53.0,30.3925,19.995,13.35\nAAAAAAAAAAGBBAAA,48.4,103.446,0.0,68.616\nAAAAAAAAAAGCAAAA,28.5,72.4,0.0,51.695\nAAAAAAAAAAGEBAAA,36.0,104.37,111.21,77.23\nAAAAAAAAAAGFAAAA,98.0,84.53,0.0,38.88\nAAAAAAAAAAGGBAAA,98.0,2.68,0.0,1.28\nAAAAAAAAAAGHAAAA,30.333333333333332,73.90666666666667,0.0,36.156666666666666\nAAAAAAAAAAGIAAAA,66.2,81.174,0.0,49.626\nAAAAAAAAAAGKAAAA,45.333333333333336,78.14333333333333,146.63666666666666,37.346666666666664\nAAAAAAAAAAGNAAAA,75.0,84.56333333333333,17.686666666666667,42.473333333333336\nAAAAAAAAAAGOAAAA,16.5,99.315,8.845,22.79\nAAAAAAAAAAHAAAAA,40.5,74.965,0.0,24.85\nAAAAAAAAAAHABAAA,30.0,71.6,0.0,48.68\nAAAAAAAAAAHBAAAA,2.0,87.77,0.0,6.14\nAAAAAAAAAAHCBAAA,89.5,121.8,469.455,78.055\nAAAAAAAAAAHDAAAA,31.0,140.68,0.0,46.13\nAAAAAAAAAAHDBAAA,33.0,69.71333333333334,0.0,44.87\nAAAAAAAAAAHEAAAA,29.0,127.76,0.0,123.92\nAAAAAAAAAAHGAAAA,60.333333333333336,68.53666666666666,562.62,51.013333333333335\nAAAAAAAAAAHJAAAA,9.0,136.55,0.0,80.56\nAAAAAAAAAAHKAAAA,34.333333333333336,82.88333333333334,162.08333333333334,12.65\nAAAAAAAAAAHMAAAA,84.0,37.0,0.0,14.06\nAAAAAAAAAAHNAAAA,86.5,15.3,120.245,4.585\nAAAAAAAAAAHPAAAA,68.0,117.05,452.33,49.35\n",
+   "duckdb_ms": 137.5
+  },
+  {
+   "id": "ds06",
+   "set": "analyst",
+   "tags": [
+    "left",
+    "groupby-dim",
+    "nulls"
+   ],
+   "sql": "SELECT p.p_channel_tv, count(*) AS n, sum(ss.ss_net_paid) AS paid FROM {ds.store_sales} ss LEFT JOIN {ds.promotion} p ON ss.ss_promo_sk = p.p_promo_sk GROUP BY p.p_channel_tv ORDER BY p.p_channel_tv NULLS FIRST",
+   "answer": "p_channel_tv,n,paid\nNULL,1734708,1853211465.88\nN,27066283,45510884436.96\n",
+   "duckdb_ms": 85.2
+  },
+  {
+   "id": "ds07",
+   "set": "analyst",
+   "tags": [
+    "left",
+    "composite-key",
+    "star"
+   ],
+   "sql": "SELECT i.i_category, count(*) AS sold, count(sr.sr_ticket_number) AS returned, count(sr.sr_ticket_number) * 1.0 / count(*) AS return_rate FROM {ds.store_sales} ss LEFT JOIN {ds.store_returns} sr ON ss.ss_ticket_number = sr.sr_ticket_number AND ss.ss_item_sk = sr.sr_item_sk JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk GROUP BY i.i_category ORDER BY return_rate DESC",
+   "answer": "i_category,sold,returned,return_rate\nMusic,2894100,289834,0.10014650495836357\nChildren,2865779,286832,0.1000886669907205\nBooks,2814827,281684,0.10007151416410316\nHome,2871232,287118,0.0999981889307447\nWomen,2880556,287606,0.09984391902118897\nJewelry,2843990,283800,0.09978938041273\nShoes,2901368,289423,0.09975397812342315\nSports,2903270,289283,0.09964040547382778\nMen,2864369,285348,0.09961984646531226\nElectronics,2894237,287921,0.0994807958021406\nNULL,67263,6583,0.09786955681429613\n",
+   "duckdb_ms": 180.3
+  },
+  {
+   "id": "ds08",
+   "set": "analyst",
+   "tags": [
+    "semi",
+    "in",
+    "distinct"
+   ],
+   "sql": "SELECT count(DISTINCT ss_customer_sk) AS cross_channel_customers FROM {ds.store_sales} WHERE ss_customer_sk IN (SELECT ws_bill_customer_sk FROM {ds.web_sales}) AND ss_sold_date_sk IN (SELECT d_date_sk FROM {ds.date_dim} WHERE d_year = 2001)",
+   "answer": "cross_channel_customers\n215821\n",
+   "duckdb_ms": 121.8
+  },
+  {
+   "id": "ds09",
+   "set": "analyst",
+   "tags": [
+    "anti",
+    "notin"
+   ],
+   "sql": "SELECT count(*) AS never_sold_on_web FROM {ds.item} WHERE i_item_sk NOT IN (SELECT ws_item_sk FROM {ds.web_sales} WHERE ws_item_sk IS NOT NULL)",
+   "answer": "never_sold_on_web\n0\n",
+   "duckdb_ms": 61.5
+  },
+  {
+   "id": "ds10",
+   "set": "analyst",
+   "tags": [
+    "semi",
+    "anti",
+    "exists",
+    "correlated"
+   ],
+   "sql": "SELECT count(*) AS store_only_customers FROM {ds.customer} c WHERE EXISTS (SELECT 1 FROM {ds.store_sales} ss WHERE ss.ss_customer_sk = c.c_customer_sk) AND NOT EXISTS (SELECT 1 FROM {ds.catalog_sales} cs WHERE cs.cs_bill_customer_sk = c.c_customer_sk)",
+   "answer": "store_only_customers\n20365\n",
+   "duckdb_ms": 77.9
+  },
+  {
+   "id": "ds11",
+   "set": "analyst",
+   "tags": [
+    "rows",
+    "inner",
+    "string-filter",
+    "orderby"
+   ],
+   "sql": "SELECT c.c_customer_id, c.c_first_name, c.c_last_name, ca.ca_city FROM {ds.customer} c JOIN {ds.customer_address} ca ON c.c_current_addr_sk = ca.ca_address_sk WHERE ca.ca_state = 'CA' AND c.c_birth_year = 1980 ORDER BY c.c_customer_id LIMIT 20",
+   "answer": "c_customer_id,c_first_name,c_last_name,ca_city\nAAAAAAAAACCIAAAA,Jeff,Baker,Stringtown\nAAAAAAAAACGAEAAA,Richard,Labbe,Spring Hill\nAAAAAAAAADPKBAAA,Claire,Wallis,Unionville\nAAAAAAAAAFKNFAAA,Ida,Smith,Woodland\nAAAAAAAAAGPIEAAA,Sharon,Jones,Pleasant Valley\nAAAAAAAAAHDOAAAA,Merle,Williams,White Oak\nAAAAAAAAAKDJDAAA,Vanessa,Sandoval,Midway\nAAAAAAAAALIBAAAA,Michael,Price,Mount Olive\nAAAAAAAAANKMBAAA,Shannon,Beaudry,Midway\nAAAAAAAAANOHEAAA,Javier,Shields,Red Hill\nAAAAAAAAAOGJBAAA,Sylvia,James,NULL\nAAAAAAAAAPIMAAAA,Ralph,Hudson,Marion\nAAAAAAAABDNPGAAA,Josephine,Mayo,Jamestown\nAAAAAAAABGLKEAAA,Marty,Tackett,Hamilton\nAAAAAAAABNFJDAAA,Delores,Dyer,Mount Vernon\nAAAAAAAABODFFAAA,Francisco,Lee,Jamestown\nAAAAAAAABOIJDAAA,Herbert,Vazquez,Baldwin\nAAAAAAAABOMHBAAA,Shelly,Combs,Riverview\nAAAAAAAABPKEDAAA,Donnie,King,Oak Grove\nAAAAAAAACAANFAAA,Kimberly,Turner,Lincoln\n",
+   "duckdb_ms": 33.6
+  },
+  {
+   "id": "ds12",
+   "set": "analyst",
+   "tags": [
+    "rows",
+    "inner",
+    "decimal"
+   ],
+   "sql": "SELECT ss.ss_ticket_number, i.i_item_id, ss.ss_quantity, ss.ss_net_paid FROM {ds.store_sales} ss JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk WHERE ss.ss_ticket_number = 1234567 ORDER BY i.i_item_id",
+   "answer": "ss_ticket_number,i_item_id,ss_quantity,ss_net_paid\n1234567,AAAAAAAAAPGGBAAA,13,1272.31\n1234567,AAAAAAAABHFIBAAA,27,629.45\n1234567,AAAAAAAABIOEBAAA,56,395.36\n1234567,AAAAAAAABMGMAAAA,13,73.58\n1234567,AAAAAAAABNCCBAAA,72,2519.28\n1234567,AAAAAAAADOOGAAAA,97,3015.73\n1234567,AAAAAAAAEPDABAAA,88,3083.52\n1234567,AAAAAAAAKMJJAAAA,3,73.92\n1234567,AAAAAAAAPMOCAAAA,90,1098.90\n",
+   "duckdb_ms": 34.9
+  },
+  {
+   "id": "ds13",
+   "set": "analyst",
+   "tags": [
+    "role-playing-dims",
+    "date-expr"
+   ],
+   "sql": "SELECT d1.d_year, avg(d2.d_date - d1.d_date) AS avg_ship_days, count(*) AS n FROM {ds.catalog_sales} cs JOIN {ds.date_dim} d1 ON cs.cs_sold_date_sk = d1.d_date_sk JOIN {ds.date_dim} d2 ON cs.cs_ship_date_sk = d2.d_date_sk GROUP BY d1.d_year ORDER BY d1.d_year",
+   "answer": "d_year,avg_ship_days,n\n1998,46.00539233490985,2844037\n1999,45.995744980106785,2843935\n2000,45.97817055267446,2860219\n2001,45.99869193805789,2845431\n2002,46.03121413558446,2842302\n2003,45.9745774500939,57508\n",
+   "duckdb_ms": 55.5
+  },
+  {
+   "id": "ds14",
+   "set": "analyst",
+   "tags": [
+    "star",
+    "case-in-agg",
+    "expr-substr",
+    "topk"
+   ],
+   "sql": "SELECT substr(w.w_warehouse_name, 1, 20) AS wh, sm.sm_type, cc.cc_name, sum(CASE WHEN cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 30 THEN 1 ELSE 0 END) AS d30, sum(CASE WHEN cs.cs_ship_date_sk - cs.cs_sold_date_sk > 30 AND cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 60 THEN 1 ELSE 0 END) AS d60, sum(CASE WHEN cs.cs_ship_date_sk - cs.cs_sold_date_sk > 60 THEN 1 ELSE 0 END) AS d60plus FROM {ds.catalog_sales} cs JOIN {ds.warehouse} w ON cs.cs_warehouse_sk = w.w_warehouse_sk JOIN {ds.ship_mode} sm ON cs.cs_ship_mode_sk = sm.sm_ship_mode_sk JOIN {ds.call_center} cc ON cs.cs_call_center_sk = cc.cc_call_center_sk GROUP BY wh, sm.sm_type, cc.cc_name ORDER BY wh, sm.sm_type, cc.cc_name LIMIT 100",
+   "answer": "wh,sm_type,cc_name,d30,d60,d60plus\nBad cards must make.,EXPRESS,California,7743,7965,7913\nBad cards must make.,EXPRESS,California_1,7634,8088,8030\nBad cards must make.,EXPRESS,Hawaii/Alaska,7667,7934,7956\nBad cards must make.,EXPRESS,Hawaii/Alaska_1,7799,8085,8093\nBad cards must make.,EXPRESS,Mid Atlantic,7676,7952,7767\nBad cards must make.,EXPRESS,Mid Atlantic_1,7744,8065,8041\nBad cards must make.,EXPRESS,NY Metro,7615,7858,7775\nBad cards must make.,EXPRESS,NY Metro_1,7771,8102,8038\nBad cards must make.,EXPRESS,North Midwest,7668,7965,8054\nBad cards must make.,EXPRESS,North Midwest_1,7765,7929,7919\nBad cards must make.,EXPRESS,Pacific Northwest,7808,7994,8087\nBad cards must make.,EXPRESS,Pacific Northwest_1,7723,7888,7943\nBad cards must make.,LIBRARY,California,5834,5984,5904\nBad cards must make.,LIBRARY,California_1,5854,6077,6083\nBad cards must make.,LIBRARY,Hawaii/Alaska,5843,6069,5992\nBad cards must make.,LIBRARY,Hawaii/Alaska_1,5782,5840,5932\nBad cards must make.,LIBRARY,Mid Atlantic,5793,5796,5976\nBad cards must make.,LIBRARY,Mid Atlantic_1,5753,5952,5937\nBad cards must make.,LIBRARY,NY Metro,5720,6120,6106\nBad cards must make.,LIBRARY,NY Metro_1,5785,6076,6024\nBad cards must make.,LIBRARY,North Midwest,5908,5930,6087\nBad cards must make.,LIBRARY,North Midwest_1,5945,5955,6104\nBad cards must make.,LIBRARY,Pacific Northwest,5950,6015,5971\nBad cards must make.,LIBRARY,Pacific Northwest_1,5821,6134,5908\nBad cards must make.,NEXT DAY,California,7723,8030,8103\nBad cards must make.,NEXT DAY,California_1,7753,7981,8150\nBad cards must make.,NEXT DAY,Hawaii/Alaska,7575,7767,8221\nBad cards must make.,NEXT DAY,Hawaii/Alaska_1,7644,8113,8247\nBad cards must make.,NEXT DAY,Mid Atlantic,7760,7930,8025\nBad cards must make.,NEXT DAY,Mid Atlantic_1,7782,7910,7989\nBad cards must make.,NEXT DAY,NY Metro,7762,7806,8077\nBad cards must make.,NEXT DAY,NY Metro_1,7973,7869,8031\nBad cards must make.,NEXT DAY,North Midwest,7707,7899,7889\nBad cards must make.,NEXT DAY,North Midwest_1,7717,7889,7900\nBad cards must make.,NEXT DAY,Pacific Northwest,7669,7819,8165\nBad cards must make.,NEXT DAY,Pacific Northwest_1,7499,7837,7985\nBad cards must make.,OVERNIGHT,California,5699,6011,6035\nBad cards must make.,OVERNIGHT,California_1,5825,5930,5957\nBad cards must make.,OVERNIGHT,Hawaii/Alaska,5765,6033,6033\nBad cards must make.,OVERNIGHT,Hawaii/Alaska_1,5717,6005,6075\nBad cards must make.,OVERNIGHT,Mid Atlantic,5924,5938,6028\nBad cards must make.,OVERNIGHT,Mid Atlantic_1,5712,6010,6055\nBad cards must make.,OVERNIGHT,NY Metro,5798,5878,5982\nBad cards must make.,OVERNIGHT,NY Metro_1,5869,6065,6064\nBad cards must make.,OVERNIGHT,North Midwest,5902,6097,5874\nBad cards must make.,OVERNIGHT,North Midwest_1,5824,5983,6048\nBad cards must make.,OVERNIGHT,Pacific Northwest,5794,6039,6031\nBad cards must make.,OVERNIGHT,Pacific Northwest_1,5862,5934,5959\nBad cards must make.,REGULAR,California,5745,5934,6032\nBad cards must make.,REGULAR,California_1,5932,6074,5925\nBad cards must make.,REGULAR,Hawaii/Alaska,5795,5880,5978\nBad cards must make.,REGULAR,Hawaii/Alaska_1,5913,6053,6100\nBad cards must make.,REGULAR,Mid Atlantic,5847,6026,5972\nBad cards must make.,REGULAR,Mid Atlantic_1,5803,6040,6025\nBad cards must make.,REGULAR,NY Metro,5702,6047,5938\nBad cards must make.,REGULAR,NY Metro_1,5793,5981,6104\nBad cards must make.,REGULAR,North Midwest,5677,6016,5948\nBad cards must make.,REGULAR,North Midwest_1,5880,5986,5997\nBad cards must make.,REGULAR,Pacific Northwest,5846,5918,6139\nBad cards must make.,REGULAR,Pacific Northwest_1,5858,5970,5972\nBad cards must make.,TWO DAY,California,5700,6067,6067\nBad cards must make.,TWO DAY,California_1,5736,5951,5998\nBad cards must make.,TWO DAY,Hawaii/Alaska,5843,5962,5887\nBad cards must make.,TWO DAY,Hawaii/Alaska_1,5927,5849,5929\nBad cards must make.,TWO DAY,Mid Atlantic,5777,6141,5977\nBad cards must make.,TWO DAY,Mid Atlantic_1,5832,5967,6060\nBad cards must make.,TWO DAY,NY Metro,5827,6127,5873\nBad cards must make.,TWO DAY,NY Metro_1,6039,6045,6028\nBad cards must make.,TWO DAY,North Midwest,5763,5980,6173\nBad cards must make.,TWO DAY,North Midwest_1,5971,5960,6146\nBad cards must make.,TWO DAY,Pacific Northwest,5810,5929,6078\nBad cards must make.,TWO DAY,Pacific Northwest_1,5709,6028,6082\nConventional childr,EXPRESS,California,7652,7974,7960\nConventional childr,EXPRESS,California_1,7741,8204,7940\nConventional childr,EXPRESS,Hawaii/Alaska,7655,7822,8003\nConventional childr,EXPRESS,Hawaii/Alaska_1,7761,8031,7950\nConventional childr,EXPRESS,Mid Atlantic,7565,8014,8019\nConventional childr,EXPRESS,Mid Atlantic_1,7798,7926,8112\nConventional childr,EXPRESS,NY Metro,7835,8042,8084\nConventional childr,EXPRESS,NY Metro_1,7524,7916,8026\nConventional childr,EXPRESS,North Midwest,7720,8106,8093\nConventional childr,EXPRESS,North Midwest_1,7693,8063,7957\nConventional childr,EXPRESS,Pacific Northwest,7910,8091,8091\nConventional childr,EXPRESS,Pacific Northwest_1,7620,7958,7815\nConventional childr,LIBRARY,California,5850,6024,5931\nConventional childr,LIBRARY,California_1,5792,6089,6119\nConventional childr,LIBRARY,Hawaii/Alaska,5717,5987,5896\nConventional childr,LIBRARY,Hawaii/Alaska_1,5863,6277,6024\nConventional childr,LIBRARY,Mid Atlantic,5812,6045,6035\nConventional childr,LIBRARY,Mid Atlantic_1,5779,5899,5862\nConventional childr,LIBRARY,NY Metro,5802,6008,6028\nConventional childr,LIBRARY,NY Metro_1,5913,6136,6010\nConventional childr,LIBRARY,North Midwest,5824,6000,5982\nConventional childr,LIBRARY,North Midwest_1,5962,6111,5997\nConventional childr,LIBRARY,Pacific Northwest,5971,5941,5926\nConventional childr,LIBRARY,Pacific Northwest_1,5876,5957,5825\nConventional childr,NEXT DAY,California,7736,7963,8114\nConventional childr,NEXT DAY,California_1,7726,8017,8056\nConventional childr,NEXT DAY,Hawaii/Alaska,7700,7960,8051\nConventional childr,NEXT DAY,Hawaii/Alaska_1,7743,8081,8058\n",
+   "duckdb_ms": 100.9
+  },
+  {
+   "id": "ds15",
+   "set": "analyst",
+   "tags": [
+    "star",
+    "groupby-two-dims"
+   ],
+   "sql": "SELECT w.w_warehouse_name, d.d_moy, avg(inv.inv_quantity_on_hand) AS avg_qoh FROM {ds.inventory} inv JOIN {ds.date_dim} d ON inv.inv_date_sk = d.d_date_sk JOIN {ds.warehouse} w ON inv.inv_warehouse_sk = w.w_warehouse_sk WHERE d.d_year = 2001 GROUP BY w.w_warehouse_name, d.d_moy ORDER BY w.w_warehouse_name, d.d_moy",
+   "answer": "w_warehouse_name,d_moy,avg_qoh\nBad cards must make.,1,500.5113444987447\nBad cards must make.,2,499.6627972966001\nBad cards must make.,3,499.8422251474175\nBad cards must make.,4,499.7633100358238\nBad cards must make.,5,499.67734094838795\nBad cards must make.,6,500.2861324192899\nBad cards must make.,7,499.14334263303647\nBad cards must make.,8,499.86336349345845\nBad cards must make.,9,499.1833653270584\nBad cards must make.,10,500.72081320450883\nBad cards must make.,11,500.0559523956902\nBad cards must make.,12,499.9929447346147\nConventional childr,1,499.86341903705807\nConventional childr,2,500.2951336892873\nConventional childr,3,500.00115233544113\nConventional childr,4,499.91805723249024\nConventional childr,5,500.75818611733536\nConventional childr,6,501.20162346704075\nConventional childr,7,500.31189833430545\nConventional childr,8,499.31864803980625\nConventional childr,9,500.59501091427006\nConventional childr,10,499.46212660946424\nConventional childr,11,499.5568458497371\nConventional childr,12,500.2031355630441\nDoors canno,1,499.4933966647736\nDoors canno,2,498.4161138957573\nDoors canno,3,499.418840298452\nDoors canno,4,500.39870094331343\nDoors canno,5,499.5530228030228\nDoors canno,6,499.91594089239277\nDoors canno,7,500.1965100629612\nDoors canno,8,500.6243424909786\nDoors canno,9,499.0514023268161\nDoors canno,10,500.8178842311247\nDoors canno,11,500.1823856528901\nDoors canno,12,500.5403209152486\nImportant issues liv,1,499.6331459225254\nImportant issues liv,2,499.4324092936899\nImportant issues liv,3,500.04153664536796\nImportant issues liv,4,500.0340529804741\nImportant issues liv,5,499.90257979019856\nImportant issues liv,6,500.4605740407287\nImportant issues liv,7,499.50481719431326\nImportant issues liv,8,499.2597336065574\nImportant issues liv,9,499.96105329386404\nImportant issues liv,10,499.88074601454883\nImportant issues liv,11,499.00595373264355\nImportant issues liv,12,500.71378146497307\n\"Local, mass universi\",1,499.67470401386083\n\"Local, mass universi\",2,500.4347911355168\n\"Local, mass universi\",3,501.16392040877867\n\"Local, mass universi\",4,500.15514145979074\n\"Local, mass universi\",5,501.0479722923994\n\"Local, mass universi\",6,499.97742339897536\n\"Local, mass universi\",7,499.12581755860356\n\"Local, mass universi\",8,499.8179908460964\n\"Local, mass universi\",9,500.82094514367134\n\"Local, mass universi\",10,499.40479409639795\n\"Local, mass universi\",11,500.0445378670788\n\"Local, mass universi\",12,500.93178110480125\n\"National, comple\",1,498.8573255831945\n\"National, comple\",2,498.6260236437849\n\"National, comple\",3,499.7261174625449\n\"National, comple\",4,500.3502520522783\n\"National, comple\",5,500.46967433645847\n\"National, comple\",6,499.4052840240352\n\"National, comple\",7,499.8111079538116\n\"National, comple\",8,498.8775596090291\n\"National, comple\",9,500.6014704593381\n\"National, comple\",10,501.12473750741685\n\"National, comple\",11,500.1309814317036\n\"National, comple\",12,500.8929992927536\n\"Plain, reluctant\",1,499.274258728807\n\"Plain, reluctant\",2,500.65151140125613\n\"Plain, reluctant\",3,500.32284751808186\n\"Plain, reluctant\",4,500.69256767216024\n\"Plain, reluctant\",5,499.49706868881066\n\"Plain, reluctant\",6,500.08876276958\n\"Plain, reluctant\",7,499.8836599553035\n\"Plain, reluctant\",8,499.233947093616\n\"Plain, reluctant\",9,501.7782481209218\n\"Plain, reluctant\",10,500.2966422633594\n\"Plain, reluctant\",11,498.54438558753463\n\"Plain, reluctant\",12,500.1945516856948\nQuite effectiv,1,500.04708892626104\nQuite effectiv,2,499.3450696591631\nQuite effectiv,3,500.2210195761257\nQuite effectiv,4,500.207905170947\nQuite effectiv,5,499.69090796558766\nQuite effectiv,6,499.9284070860374\nQuite effectiv,7,500.2840328589562\nQuite effectiv,8,499.54730011434424\nQuite effectiv,9,500.79362053825093\nQuite effectiv,10,498.93879951708266\nQuite effectiv,11,499.4138601116433\nQuite effectiv,12,501.30524300107356\nRooms cook ,1,500.2777150342167\nRooms cook ,2,500.8094792512136\nRooms cook ,3,500.6224424077285\nRooms cook ,4,500.00837014407796\nRooms cook ,5,501.0892975070167\nRooms cook ,6,499.87511097805213\nRooms cook ,7,500.93451828475963\nRooms cook ,8,499.73698618824454\nRooms cook ,9,500.4045352714659\nRooms cook ,10,500.3502235700029\nRooms cook ,11,500.0218063264759\nRooms cook ,12,499.62565821707625\nNULL,1,499.270198019291\nNULL,2,500.0824837430447\nNULL,3,500.0541423098517\nNULL,4,499.215404134175\nNULL,5,499.5534301989598\nNULL,6,499.86633201087545\nNULL,7,501.0840369965109\nNULL,8,499.1154369668872\nNULL,9,499.74724056117185\nNULL,10,500.5199165862295\nNULL,11,499.6344585863673\nNULL,12,499.5063558229037\n",
+   "duckdb_ms": 83.8
+  },
+  {
+   "id": "ds16",
+   "set": "analyst",
+   "tags": [
+    "having",
+    "topk",
+    "string-key-group"
+   ],
+   "sql": "SELECT i.i_item_id, sum(ss.ss_net_paid) AS revenue FROM {ds.store_sales} ss JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk GROUP BY i.i_item_id HAVING sum(ss.ss_net_paid) > 1100000 ORDER BY revenue DESC LIMIT 20",
+   "answer": "i_item_id,revenue\nAAAAAAAANAMPAAAA,1206731.19\nAAAAAAAAOBMNAAAA,1195902.07\nAAAAAAAALINCAAAA,1194167.96\nAAAAAAAAAIFGAAAA,1192407.46\nAAAAAAAAIAKBAAAA,1183405.76\nAAAAAAAACDCCBAAA,1181150.64\nAAAAAAAAOLAMAAAA,1178454.07\nAAAAAAAAJNHFAAAA,1175285.73\nAAAAAAAAACELAAAA,1174339.37\nAAAAAAAAFJGCAAAA,1173902.37\nAAAAAAAAGFPLAAAA,1172757.81\nAAAAAAAAAJGCAAAA,1172015.31\nAAAAAAAAFKIIAAAA,1167082.95\nAAAAAAAAGIMLAAAA,1165993.69\nAAAAAAAAKFABAAAA,1165297.90\nAAAAAAAAMLJDAAAA,1162991.82\nAAAAAAAAILAAAAAA,1162587.55\nAAAAAAAAALADAAAA,1162464.74\nAAAAAAAAHMJPAAAA,1161270.65\nAAAAAAAAGHLHBAAA,1161174.01\n",
+   "duckdb_ms": 221.1
+  },
+  {
+   "id": "ds17",
+   "set": "analyst",
+   "tags": [
+    "distinct",
+    "rows"
+   ],
+   "sql": "SELECT DISTINCT i.i_category, i.i_class FROM {ds.store_sales} ss JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk WHERE ss.ss_sold_date_sk = 2451545 ORDER BY i.i_category, i.i_class",
+   "answer": "i_category,i_class\nBooks,arts\nBooks,business\nBooks,computers\nBooks,cooking\nBooks,entertainments\nBooks,fiction\nBooks,history\nBooks,home repair\nBooks,mystery\nBooks,parenting\nBooks,reference\nBooks,romance\nBooks,science\nBooks,self-help\nBooks,sports\nBooks,travel\nChildren,infants\nChildren,newborn\nChildren,school-uniforms\nChildren,toddlers\nChildren,NULL\nElectronics,audio\nElectronics,automotive\nElectronics,camcorders\nElectronics,cameras\nElectronics,disk drives\nElectronics,dvd/vcr players\nElectronics,karoke\nElectronics,memory\nElectronics,monitors\nElectronics,musical\nElectronics,personal\nElectronics,portable\nElectronics,scanners\nElectronics,stereo\nElectronics,televisions\nElectronics,wireless\nElectronics,NULL\nHome,accent\nHome,bathroom\nHome,bedding\nHome,blinds/shades\nHome,curtains/drapes\nHome,decor\nHome,flatware\nHome,furniture\nHome,glassware\nHome,kids\nHome,lighting\nHome,mattresses\nHome,paint\nHome,rugs\nHome,tables\nHome,wallpaper\nHome,NULL\nJewelry,birdal\nJewelry,bracelets\nJewelry,consignment\nJewelry,costume\nJewelry,custom\nJewelry,diamonds\nJewelry,earings\nJewelry,estate\nJewelry,gold\nJewelry,jewelry boxes\nJewelry,loose stones\nJewelry,mens watch\nJewelry,pendants\nJewelry,rings\nJewelry,semi-precious\nJewelry,womens watch\nJewelry,NULL\nMen,accessories\nMen,pants\nMen,shirts\nMen,sports-apparel\nMen,NULL\nMusic,classical\nMusic,country\nMusic,pop\nMusic,rock\nMusic,NULL\nShoes,athletic\nShoes,kids\nShoes,mens\nShoes,womens\nShoes,NULL\nSports,archery\nSports,athletic shoes\nSports,baseball\nSports,basketball\nSports,camping\nSports,fishing\nSports,fitness\nSports,football\nSports,golf\nSports,guns\nSports,hockey\nSports,optics\nSports,outdoor\nSports,pools\nSports,sailing\nSports,tennis\nSports,NULL\nWomen,dresses\nWomen,fragrances\nWomen,maternity\nWomen,swimwear\nWomen,NULL\nNULL,accessories\nNULL,archery\nNULL,athletic\nNULL,baseball\nNULL,basketball\nNULL,bracelets\nNULL,camping\nNULL,classical\nNULL,country\nNULL,diamonds\nNULL,dresses\nNULL,flatware\nNULL,fragrances\nNULL,guns\nNULL,history\nNULL,infants\nNULL,maternity\nNULL,memory\nNULL,musical\nNULL,mystery\nNULL,outdoor\nNULL,pants\nNULL,portable\nNULL,rock\nNULL,rugs\nNULL,science\nNULL,shirts\nNULL,swimwear\nNULL,toddlers\nNULL,womens\nNULL,NULL\n",
+   "duckdb_ms": 67.7
+  },
+  {
+   "id": "ds18",
+   "set": "analyst",
+   "tags": [
+    "snowflake",
+    "count-distinct"
+   ],
+   "sql": "SELECT ca.ca_state, count(DISTINCT ss.ss_customer_sk) AS customers FROM {ds.store_sales} ss JOIN {ds.customer} c ON ss.ss_customer_sk = c.c_customer_sk JOIN {ds.customer_address} ca ON c.c_current_addr_sk = ca.ca_address_sk GROUP BY ca.ca_state ORDER BY customers DESC LIMIT 10",
+   "answer": "ca_state,customers\nTX,39422\nGA,24206\nVA,21161\nKY,18128\nMO,16676\nKS,16473\nIL,15769\nIA,15575\nNC,15462\nNULL,15065\n",
+   "duckdb_ms": 115.0
+  },
+  {
+   "id": "ds19",
+   "set": "analyst",
+   "tags": [
+    "snowflake",
+    "hierarchy"
+   ],
+   "sql": "SELECT ib.ib_lower_bound, ib.ib_upper_bound, count(*) AS n, avg(ss.ss_net_paid) AS avg_paid FROM {ds.store_sales} ss JOIN {ds.household_demographics} hd ON ss.ss_hdemo_sk = hd.hd_demo_sk JOIN {ds.income_band} ib ON hd.hd_income_band_sk = ib.ib_income_band_sk GROUP BY ib.ib_lower_bound, ib.ib_upper_bound ORDER BY ib.ib_lower_bound",
+   "answer": "ib_lower_bound,ib_upper_bound,n,avg_paid\n0,10000,1371797,1722.6458463509011\n10001,20000,1373556,1720.1205759667118\n20001,30000,1371800,1720.090126650778\n30001,40000,1375761,1723.229362771192\n40001,50000,1376964,1724.2681558413349\n50001,60000,1373247,1723.6757572180015\n60001,70000,1380297,1722.5996216615724\n70001,80000,1369663,1719.0319952199375\n80001,90000,1371286,1724.2431896167957\n90001,100000,1374131,1721.4767144709776\n100001,110000,1374990,1722.6186581808538\n110001,120000,1370868,1718.4191668547007\n120001,130000,1374738,1723.7270671515762\n130001,140000,1376102,1722.6732315153463\n140001,150000,1381022,1723.3937781288241\n150001,160000,1379287,1723.147450805268\n160001,170000,1377523,1721.523940645332\n170001,180000,1380237,1720.8134469628394\n180001,190000,1371070,1725.4126915276968\n190001,200000,1380494,1719.8064783289315\n",
+   "duckdb_ms": 82.9
+  },
+  {
+   "id": "ds20",
+   "set": "analyst",
+   "tags": [
+    "cte",
+    "join-agg-to-dim",
+    "topk"
+   ],
+   "sql": "WITH yearly AS ( SELECT ss.ss_customer_sk, sum(ss.ss_net_paid) AS total FROM {ds.store_sales} ss JOIN {ds.date_dim} d ON ss.ss_sold_date_sk = d.d_date_sk WHERE d.d_year = 2001 GROUP BY ss.ss_customer_sk) SELECT c.c_birth_country, avg(y.total) AS avg_total, count(*) AS customers FROM yearly y JOIN {ds.customer} c ON y.ss_customer_sk = c.c_customer_sk GROUP BY c.c_birth_country ORDER BY avg_total DESC LIMIT 10",
+   "answer": "c_birth_country,avg_total,customers\nKAZAKHSTAN,30963.78593974175,1394\nANTARCTICA,30920.389257101237,1373\nROMANIA,30843.189760869565,1380\nDOMINICA,30816.16298307475,1418\nKIRIBATI,30520.750109329445,1372\n\"KOREA, REPUBLIC OF\",30500.38373004354,1378\nKYRGYZSTAN,30491.602611377657,1459\nTONGA,30438.68034975018,1401\nZIMBABWE,30348.05401037806,1349\nCAYMAN ISLANDS,30336.062965034966,1430\n",
+   "duckdb_ms": 89.7
+  },
+  {
+   "id": "ds21",
+   "set": "analyst",
+   "tags": [
+    "derived",
+    "join-agg-to-dim"
+   ],
+   "sql": "SELECT s.s_store_name, x.cnt FROM (SELECT ss_store_sk, count(*) AS cnt FROM {ds.store_sales} GROUP BY ss_store_sk) x JOIN {ds.store} s ON x.ss_store_sk = s.s_store_sk ORDER BY x.cnt DESC, s.s_store_name",
+   "answer": "s_store_name,cnt\neing,545024\nable,543621\nbar,543296\nbar,542897\nese,542864\neing,542005\neing,541997\nbar,541887\nese,541538\nable,541477\nought,541379\nn st,541356\nable,541263\ncally,541057\npri,540948\nable,540735\nbar,540260\nanti,540201\ncally,539991\neing,539877\nought,539863\nese,539858\nn st,539838\neing,539641\nese,539526\npri,539469\ncally,538995\nese,538722\nbar,538718\nn st,538708\ncally,538705\nanti,538551\neing,538476\nese,538252\nese,538206\nable,538022\nation,537739\nbar,537683\nation,537681\nable,537481\nable,537330\nbar,537280\nation,536921\nought,536919\ncally,536897\nation,536665\nought,536343\neing,536264\ncally,536000\nanti,534896\npri,531531\n",
+   "duckdb_ms": 55.2
+  },
+  {
+   "id": "ds22",
+   "set": "analyst",
+   "tags": [
+    "decimal-build-filter",
+    "groupby-dim"
+   ],
+   "sql": "SELECT i.i_category, sum(ss.ss_ext_sales_price) AS sales FROM {ds.store_sales} ss JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk WHERE i.i_current_price > 50.00 GROUP BY i.i_category ORDER BY i.i_category",
+   "answer": "i_category,sales\nBooks,284538621.47\nChildren,274692786.30\nElectronics,301841548.01\nHome,281226797.94\nJewelry,294434943.49\nMen,286968270.46\nMusic,303627876.04\nShoes,280707378.46\nSports,316566193.73\nWomen,273262165.82\nNULL,1486190.63\n",
+   "duckdb_ms": 76.2
+  },
+  {
+   "id": "ds23",
+   "set": "analyst",
+   "tags": [
+    "decimal-cross-compare"
+   ],
+   "sql": "SELECT count(*) AS sold_above_list FROM {ds.store_sales} ss JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk WHERE ss.ss_sales_price > i.i_current_price",
+   "answer": "sold_above_list\n22545356\n",
+   "duckdb_ms": 122.3
+  },
+  {
+   "id": "ds24",
+   "set": "analyst",
+   "tags": [
+    "expr-over-joined",
+    "decimal"
+   ],
+   "sql": "SELECT i.i_category, sum(ss.ss_quantity * i.i_current_price) AS at_list, sum(ss.ss_ext_sales_price) AS actual FROM {ds.store_sales} ss JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk GROUP BY i.i_category ORDER BY i.i_category",
+   "answer": "i_category,at_list,actual\nBooks,1268959957.75,5143817873.52\nChildren,1247900870.08,5235611972.61\nElectronics,1290379010.07,5289627001.22\nHome,1267226116.74,5247738668.13\nJewelry,1286773448.94,5195756123.12\nMen,1289098552.22,5231485203.56\nMusic,1305917436.01,5289301320.36\nShoes,1304825793.98,5300680088.68\nSports,1342577645.46,5295274688.78\nWomen,1250347011.21,5263406985.73\nNULL,9595383.21,123284368.62\n",
+   "duckdb_ms": 140.5
+  },
+  {
+   "id": "ds25",
+   "set": "analyst",
+   "tags": [
+    "date-build-filter",
+    "groupby-date"
+   ],
+   "sql": "SELECT d.d_date, count(*) AS n, sum(ss.ss_net_paid) AS paid FROM {ds.store_sales} ss JOIN {ds.date_dim} d ON ss.ss_sold_date_sk = d.d_date_sk WHERE d.d_date BETWEEN DATE '2000-01-01' AND DATE '2000-01-31' GROUP BY d.d_date ORDER BY d.d_date",
+   "answer": "d_date,n,paid\n2000-01-01,29399,49709003.16\n2000-01-02,38948,65241127.78\n2000-01-03,7795,13291113.60\n2000-01-04,8765,15185617.78\n2000-01-05,8920,14932633.14\n2000-01-06,8853,15095674.66\n2000-01-07,8935,14991116.46\n2000-01-08,8808,14644025.58\n2000-01-09,8183,13561244.91\n2000-01-10,8891,14912086.80\n2000-01-11,9075,15513893.96\n2000-01-12,8534,14632436.48\n2000-01-13,9029,15027285.72\n2000-01-14,8097,13618466.28\n2000-01-15,8428,14242899.88\n2000-01-16,8266,13606090.20\n2000-01-17,8888,14779258.03\n2000-01-18,8302,14073323.79\n2000-01-19,8442,14195155.34\n2000-01-20,8717,14902862.31\n2000-01-21,8826,15153466.21\n2000-01-22,8662,14354109.78\n2000-01-23,8430,14181413.80\n2000-01-24,8561,14820980.78\n2000-01-25,8790,14548804.21\n2000-01-26,8552,14288720.42\n2000-01-27,8482,14205568.84\n2000-01-28,8701,14617338.60\n2000-01-29,8283,14006973.68\n2000-01-30,9210,15445542.66\n2000-01-31,8667,14460717.38\n",
+   "duckdb_ms": 59.0
+  },
+  {
+   "id": "ds26",
+   "set": "analyst",
+   "tags": [
+    "star",
+    "or-across-sides"
+   ],
+   "sql": "SELECT count(*) AS n, sum(ss.ss_net_paid) AS paid FROM {ds.store_sales} ss JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk JOIN {ds.date_dim} d ON ss.ss_sold_date_sk = d.d_date_sk WHERE (i.i_category = 'Books' AND d.d_moy = 12) OR (i.i_category = 'Music' AND d.d_moy = 6)",
+   "answer": "n,paid\n585215,984469540.66\n",
+   "duckdb_ms": 95.6
+  },
+  {
+   "id": "ds27",
+   "set": "analyst",
+   "tags": [
+    "left",
+    "on-filter"
+   ],
+   "sql": "SELECT count(*) AS n, count(p.p_promo_sk) AS dmail_promo FROM {ds.store_sales} ss LEFT JOIN {ds.promotion} p ON ss.ss_promo_sk = p.p_promo_sk AND p.p_channel_dmail = 'Y' WHERE ss.ss_sold_date_sk BETWEEN 2451180 AND 2451269",
+   "answer": "n,dmail_promo\n833270,408499\n",
+   "duckdb_ms": 55.3
+  },
+  {
+   "id": "ds28",
+   "set": "analyst",
+   "tags": [
+    "left",
+    "null-fk",
+    "groupby-dim"
+   ],
+   "sql": "SELECT c.c_preferred_cust_flag, count(*) AS n, sum(ss.ss_net_paid) AS paid FROM {ds.store_sales} ss LEFT JOIN {ds.customer} c ON ss.ss_customer_sk = c.c_customer_sk GROUP BY c.c_preferred_cust_flag ORDER BY c.c_preferred_cust_flag NULLS FIRST",
+   "answer": "c_preferred_cust_flag,n,paid\nNULL,2251190,2717855288.74\nN,13542586,22781701108.16\nY,13007215,21864539505.94\n",
+   "duckdb_ms": 138.6
+  },
+  {
+   "id": "ds29",
+   "set": "analyst",
+   "tags": [
+    "inner",
+    "groupby-dim"
+   ],
+   "sql": "SELECT d.d_year, d.d_qoy, sum(ws.ws_net_paid) AS web_revenue FROM {ds.web_sales} ws JOIN {ds.date_dim} d ON ws.ws_sold_date_sk = d.d_date_sk GROUP BY d.d_year, d.d_qoy ORDER BY d.d_year, d.d_qoy",
+   "answer": "d_year,d_qoy,web_revenue\n1998,1,462454532.75\n1998,2,477353541.75\n1998,3,870547089.98\n1998,4,1449585139.61\n1999,1,500476658.99\n1999,2,478444604.31\n1999,3,872093098.60\n1999,4,1446722182.52\n2000,1,502174112.44\n2000,2,479141825.82\n2000,3,880909725.65\n2000,4,1457009642.49\n2001,1,475554264.24\n2001,2,485758772.42\n2001,3,879532168.81\n2001,4,1444877806.21\n2002,1,491703318.36\n2002,2,474746407.65\n2002,3,880189465.04\n2002,4,1455825734.28\n2003,1,36879701.13\n",
+   "duckdb_ms": 42.1
+  },
+  {
+   "id": "ds30",
+   "set": "analyst",
+   "tags": [
+    "star",
+    "3dims"
+   ],
+   "sql": "SELECT web.web_name, wp.wp_type, count(*) AS n, sum(ws.ws_net_profit) AS profit FROM {ds.web_sales} ws JOIN {ds.web_site} web ON ws.ws_web_site_sk = web.web_site_sk JOIN {ds.web_page} wp ON ws.ws_web_page_sk = wp.wp_web_page_sk JOIN {ds.date_dim} d ON ws.ws_sold_date_sk = d.d_date_sk WHERE d.d_year = 2002 GROUP BY web.web_name, wp.wp_type ORDER BY web.web_name, wp.wp_type",
+   "answer": "web_name,wp_type,n,profit\nsite_0,ad,42742,-11143762.86\nsite_0,dynamic,30364,-7656461.15\nsite_0,feedback,26503,-6615007.99\nsite_0,general,28353,-7186566.76\nsite_0,order,24402,-6444907.19\nsite_0,protected,22225,-5728180.76\nsite_0,welcome,30566,-8146072.65\nsite_1,ad,42652,-10327619.10\nsite_1,dynamic,30600,-7262679.85\nsite_1,feedback,26305,-6692611.18\nsite_1,general,28478,-7003594.71\nsite_1,order,24525,-5938992.09\nsite_1,protected,22419,-5678419.16\nsite_1,welcome,30329,-7822523.55\nsite_2,ad,42524,-11536585.21\nsite_2,dynamic,30536,-7850660.15\nsite_2,feedback,26164,-6256016.52\nsite_2,general,28470,-6988711.22\nsite_2,order,24493,-6793767.85\nsite_2,protected,22318,-5102291.08\nsite_2,welcome,31085,-8005543.63\nsite_3,ad,43036,-10979871.62\nsite_3,dynamic,30635,-7763993.28\nsite_3,feedback,26152,-6974744.21\nsite_3,general,28721,-6798969.25\nsite_3,order,24472,-6262506.49\nsite_3,protected,22237,-5536531.45\nsite_3,welcome,30494,-8595212.96\nsite_4,ad,42724,-11211385.32\nsite_4,dynamic,30816,-8078228.76\nsite_4,feedback,26280,-6663133.00\nsite_4,general,28668,-7997248.60\nsite_4,order,24283,-6835649.01\nsite_4,protected,22272,-5702535.92\nsite_4,welcome,30383,-7146160.51\nsite_5,ad,42758,-11447318.18\nsite_5,dynamic,30140,-7642034.51\nsite_5,feedback,26715,-6175126.53\nsite_5,general,28297,-7249942.61\nsite_5,order,24424,-6908430.58\nsite_5,protected,22381,-5092434.84\nsite_5,welcome,30704,-8430517.61\nsite_6,ad,42666,-10638646.50\nsite_6,dynamic,30607,-7934815.76\nsite_6,feedback,26381,-6942133.40\nsite_6,general,28539,-7495507.50\nsite_6,order,24247,-6252074.35\nsite_6,protected,22563,-5553039.24\nsite_6,welcome,30929,-7528698.98\n",
+   "duckdb_ms": 44.6
+  },
+  {
+   "id": "ds31",
+   "set": "analyst",
+   "tags": [
+    "inner",
+    "topk",
+    "string-group"
+   ],
+   "sql": "SELECT r.r_reason_desc, sum(cr.cr_return_amount) AS returned, count(*) AS n FROM {ds.catalog_returns} cr JOIN {ds.reason} r ON cr.cr_reason_sk = r.r_reason_sk GROUP BY r.r_reason_desc ORDER BY returned DESC LIMIT 10",
+   "answer": "r_reason_desc,returned,n\nreason 39,24918680.86,19027\nreason 54,24823503.91,18889\nreason 69,24818639.42,18799\nGift exchange,24801807.74,19092\nreason 56,24712745.95,18912\nParts missing,24668184.17,18710\nLost my job,24651130.91,19103\nreason 40,24642276.48,19137\nreason 45,24640617.82,18984\nreason 49,24630320.79,18878\n",
+   "duckdb_ms": 30.2
+  },
+  {
+   "id": "ds32",
+   "set": "analyst",
+   "tags": [
+    "composite-key",
+    "star"
+   ],
+   "sql": "SELECT r.r_reason_desc, sum(sr.sr_net_loss) AS loss, sum(ss.ss_net_paid) AS originally_paid FROM {ds.store_returns} sr JOIN {ds.store_sales} ss ON sr.sr_ticket_number = ss.ss_ticket_number AND sr.sr_item_sk = ss.ss_item_sk JOIN {ds.reason} r ON sr.sr_reason_sk = r.r_reason_sk GROUP BY r.r_reason_desc ORDER BY loss DESC LIMIT 10",
+   "answer": "r_reason_desc,loss,originally_paid\nreason 64,21518576.73,61305175.41\nWrong size,21503166.99,61345916.48\nreason 32,21403321.46,61408805.55\nreason 37,21374392.08,61146642.57\nreason 44,21371233.67,60761870.98\nreason 62,21360162.53,60882082.13\nreason 72,21352050.86,61095830.86\nDid not like the model,21347842.31,61180091.92\nreason 45,21346530.94,61529302.06\nreason 33,21343160.08,61201902.40\n",
+   "duckdb_ms": 162.4
+  },
+  {
+   "id": "ds33",
+   "set": "analyst",
+   "tags": [
+    "inner",
+    "groupby-dim",
+    "time"
+   ],
+   "sql": "SELECT t.t_hour, count(*) AS n, sum(ss.ss_net_paid) AS paid FROM {ds.store_sales} ss JOIN {ds.time_dim} t ON ss.ss_sold_time_sk = t.t_time_sk GROUP BY t.t_hour ORDER BY t.t_hour",
+   "answer": "t_hour,n,paid\n8,1098725,1850525284.50\n9,2206373,3714284391.98\n10,3303081,5552888147.31\n11,1914382,3220671615.88\n12,2201853,3700240199.73\n13,2471390,4158346796.07\n14,3299183,5541152978.48\n15,1095852,1839169640.83\n16,1102882,1853060339.92\n17,3305241,5558128338.06\n18,2199536,3699162864.09\n19,2204121,3706023903.37\n20,1102149,1854324091.93\n",
+   "duckdb_ms": 79.5
+  },
+  {
+   "id": "ds34",
+   "set": "analyst",
+   "tags": [
+    "star",
+    "scalar"
+   ],
+   "sql": "SELECT count(*) AS n FROM {ds.store_sales} ss JOIN {ds.household_demographics} hd ON ss.ss_hdemo_sk = hd.hd_demo_sk JOIN {ds.time_dim} t ON ss.ss_sold_time_sk = t.t_time_sk JOIN {ds.store} s ON ss.ss_store_sk = s.s_store_sk WHERE t.t_hour = 20 AND t.t_minute >= 30 AND hd.hd_dep_count = 7 AND s.s_store_name = 'ese'",
+   "answer": "n\n7061\n",
+   "duckdb_ms": 65.1
+  },
+  {
+   "id": "ds35",
+   "set": "analyst",
+   "tags": [
+    "topk",
+    "groupby-names"
+   ],
+   "sql": "SELECT c.c_last_name, c.c_first_name, sum(ss.ss_net_paid) AS spent FROM {ds.store_sales} ss JOIN {ds.customer} c ON ss.ss_customer_sk = c.c_customer_sk GROUP BY c.c_customer_sk, c.c_last_name, c.c_first_name ORDER BY spent DESC LIMIT 10",
+   "answer": "c_last_name,c_first_name,spent\nValadez,Nicholas,404662.00\nLindsey,Kelle,388898.92\nThompson,Phyllis,379054.80\nReynolds,Jess,377508.29\nMalone,Elizabeth,365873.96\nPacheco,Esther,362987.26\nNULL,Teresa,357739.73\nSaunders,Rhonda,357085.71\nRodriguez,Edwin,356833.90\nShearer,Eric,346042.58\n",
+   "duckdb_ms": 130.0
+  },
+  {
+   "id": "ds36",
+   "set": "analyst",
+   "tags": [
+    "semi",
+    "in",
+    "like"
+   ],
+   "sql": "SELECT ss_store_sk, count(*) AS n, sum(ss_net_paid) AS paid FROM {ds.store_sales} WHERE ss_item_sk IN (SELECT i_item_sk FROM {ds.item} WHERE i_category = 'Electronics' AND i_brand LIKE '%amalg%') GROUP BY ss_store_sk ORDER BY ss_store_sk NULLS FIRST",
+   "answer": "ss_store_sk,n,paid\nNULL,130569,112810773.48\n1,53824,90764351.43\n2,54288,91167101.92\n4,54780,92068864.91\n7,53983,90369978.96\n8,54388,91290388.33\n10,54424,92233775.87\n13,54301,91137390.37\n14,54318,90665402.34\n16,54124,91128515.23\n19,54251,91816556.23\n20,54233,91671480.24\n22,54526,91185399.54\n25,53868,91702021.25\n26,54030,90998695.17\n28,54023,90792610.07\n31,53627,90635477.75\n32,53640,90268609.36\n34,54128,91169759.84\n37,53699,90044411.74\n38,54397,90225925.66\n40,54824,91458622.10\n43,53209,89982604.40\n44,53839,90407308.70\n46,54278,91938097.26\n49,54060,89792064.08\n50,54023,91518360.50\n52,54277,91040719.46\n55,53813,91012774.26\n56,53848,90157229.91\n58,54742,91768282.63\n61,53774,90065042.95\n62,54000,91260266.50\n64,54366,92149207.13\n67,53671,90906966.68\n68,54275,92345410.80\n70,54025,90534486.22\n73,54451,91599595.08\n74,54323,91181880.94\n76,54228,91131971.22\n79,54170,90107607.55\n80,54237,90906481.19\n82,54399,91523904.89\n85,54356,91794124.95\n86,53915,90506523.16\n88,53586,91129850.28\n91,54774,92014198.61\n92,54064,90451767.30\n94,54357,91325429.55\n97,54102,91237155.72\n98,54190,91159007.41\n100,53973,91157133.23\n",
+   "duckdb_ms": 87.4
+  },
+  {
+   "id": "ds37",
+   "set": "analyst",
+   "tags": [
+    "anti",
+    "notin",
+    "null-trap"
+   ],
+   "sql": "SELECT count(*) AS n FROM {ds.store_returns} WHERE sr_customer_sk NOT IN (SELECT ss_customer_sk FROM {ds.store_sales} WHERE ss_sold_date_sk = 2451545)",
+   "answer": "n\n0\n",
+   "duckdb_ms": 58.5
+  },
+  {
+   "id": "ds38",
+   "set": "analyst",
+   "tags": [
+    "inner",
+    "groupby-dim",
+    "string"
+   ],
+   "sql": "SELECT cd.cd_gender, cd.cd_education_status, avg(cs.cs_net_profit) AS avg_profit, count(*) AS n FROM {ds.catalog_sales} cs JOIN {ds.customer_demographics} cd ON cs.cs_bill_cdemo_sk = cd.cd_demo_sk GROUP BY cd.cd_gender, cd.cd_education_status ORDER BY cd.cd_gender, cd.cd_education_status",
+   "answer": "cd_gender,cd_education_status,avg_profit,n\nF,2 yr Degree,-259.06553106116206,1020551\nF,4 yr Degree,-257.52783389190273,1028222\nF,Advanced Degree,-259.84791537936417,1025400\nF,College,-252.75076236620924,1026790\nF,Primary,-259.25988240815025,1027112\nF,Secondary,-255.0153023859007,1026321\nF,Unknown,-251.6931965016499,1019452\nM,2 yr Degree,-259.0679349219898,1026276\nM,4 yr Degree,-258.24365148456167,1025791\nM,Advanced Degree,-253.03789441621785,1022676\nM,College,-253.44561308798583,1021028\nM,Primary,-252.40733369850986,1020511\nM,Secondary,-260.95560975896245,1021625\nM,Unknown,-254.98173793393556,1017461\n",
+   "duckdb_ms": 109.8
+  },
+  {
+   "id": "ds39",
+   "set": "analyst",
+   "tags": [
+    "star",
+    "topk"
+   ],
+   "sql": "SELECT d.d_year, i.i_category_id, i.i_category, sum(ss.ss_ext_sales_price) AS sales FROM {ds.date_dim} d, {ds.store_sales} ss, {ds.item} i WHERE d.d_date_sk = ss.ss_sold_date_sk AND ss.ss_item_sk = i.i_item_sk AND i.i_manager_id = 1 AND d.d_moy = 11 AND d.d_year = 2000 GROUP BY d.d_year, i.i_category_id, i.i_category ORDER BY sales DESC, d.d_year, i.i_category_id, i.i_category LIMIT 100",
+   "answer": "d_year,i_category_id,i_category,sales\n2000,10,Electronics,3636066.85\n2000,1,Women,3457932.74\n2000,3,Children,3194121.54\n2000,2,Men,3187204.89\n2000,7,Home,2988728.25\n2000,4,Shoes,2921421.32\n2000,6,Jewelry,2807719.18\n2000,8,Sports,2713893.02\n2000,5,Music,2669476.26\n2000,9,Books,2497671.85\n2000,NULL,NULL,52725.45\n",
+   "duckdb_ms": 81.7
+  },
+  {
+   "id": "ds40",
+   "set": "analyst",
+   "tags": [
+    "star",
+    "case-pivot"
+   ],
+   "sql": "SELECT s.s_store_name, s.s_store_id, sum(CASE WHEN d.d_day_name = 'Sunday' THEN ss.ss_sales_price ELSE NULL END) AS sun_sales, sum(CASE WHEN d.d_day_name = 'Monday' THEN ss.ss_sales_price ELSE NULL END) AS mon_sales, sum(CASE WHEN d.d_day_name = 'Saturday' THEN ss.ss_sales_price ELSE NULL END) AS sat_sales FROM {ds.date_dim} d, {ds.store_sales} ss, {ds.store} s WHERE d.d_date_sk = ss.ss_sold_date_sk AND s.s_store_sk = ss.ss_store_sk AND s.s_gmt_offset = -5 AND d.d_year = 2000 GROUP BY s.s_store_name, s.s_store_id ORDER BY s.s_store_name, s.s_store_id LIMIT 100",
+   "answer": "s_store_name,s_store_id,sun_sales,mon_sales,sat_sales\nable,AAAAAAAAMFAAAAAA,615663.38,588579.59,572406.67\nanti,AAAAAAAAFFAAAAAA,594491.08,535731.38,599242.18\nation,AAAAAAAABGAAAAAA,585255.92,564997.85,600114.00\nation,AAAAAAAADEAAAAAA,593154.88,535004.30,596600.89\nation,AAAAAAAAFCAAAAAA,579926.41,560008.91,557196.44\nbar,AAAAAAAAKAAAAAAA,592558.75,524388.51,560449.29\ncally,AAAAAAAAGFAAAAAA,583619.09,556342.70,568376.66\ncally,AAAAAAAAMEAAAAAA,603821.71,526879.56,588057.52\ncally,AAAAAAAAOCAAAAAA,571384.89,553345.96,603179.16\neing,AAAAAAAACGAAAAAA,607792.92,566553.90,564736.10\neing,AAAAAAAAEEAAAAAA,583824.28,539547.66,559974.73\neing,AAAAAAAAKDAAAAAA,584585.52,565661.09,598781.36\nese,AAAAAAAAEAAAAAAA,582395.10,552170.48,565314.49\nn st,AAAAAAAABDAAAAAA,564242.01,544004.89,609696.98\nought,AAAAAAAALFAAAAAA,572216.75,561057.82,574237.85\nought,AAAAAAAANDAAAAAA,587595.80,565878.87,568983.24\nought,AAAAAAAAPBAAAAAA,600584.47,529873.05,586868.50\n",
+   "duckdb_ms": 79.7
+  },
+  {
+   "id": "ds41",
+   "set": "analyst",
+   "tags": [
+    "semi",
+    "inner",
+    "mixed"
+   ],
+   "sql": "SELECT count(*) AS birthday_month_purchases FROM {ds.store_sales} ss JOIN {ds.customer} c ON ss.ss_customer_sk = c.c_customer_sk WHERE c.c_birth_month = 12 AND ss.ss_sold_date_sk IN (SELECT d_date_sk FROM {ds.date_dim} WHERE d_moy = 12)",
+   "answer": "birthday_month_purchases\n373088\n",
+   "duckdb_ms": 64.1
+  },
+  {
+   "id": "ds42",
+   "set": "analyst",
+   "tags": [
+    "role-playing-dims",
+    "shared-name"
+   ],
+   "sql": "SELECT count(*) AS bought_away_from_home FROM {ds.store_sales} ss JOIN {ds.customer_address} ca ON ss.ss_addr_sk = ca.ca_address_sk JOIN {ds.customer} c ON ss.ss_customer_sk = c.c_customer_sk JOIN {ds.customer_address} cur ON c.c_current_addr_sk = cur.ca_address_sk WHERE ca.ca_city <> cur.ca_city",
+   "answer": "bought_away_from_home\n25061333\n",
+   "duckdb_ms": 144.7
+  },
+  {
+   "id": "ds43",
+   "set": "analyst",
+   "tags": [
+    "semi",
+    "exists",
+    "composite-correlated"
+   ],
+   "sql": "SELECT count(*) AS returned_lines FROM {ds.store_sales} ss WHERE EXISTS (SELECT 1 FROM {ds.store_returns} sr WHERE sr.sr_ticket_number = ss.ss_ticket_number AND sr.sr_item_sk = ss.ss_item_sk)",
+   "answer": "returned_lines\n2875432\n",
+   "duckdb_ms": 147.7
+  },
+  {
+   "id": "ds44",
+   "set": "analyst",
+   "tags": [
+    "rows",
+    "star",
+    "where-both"
+   ],
+   "sql": "SELECT d.d_date, s.s_store_name, i.i_product_name, ss.ss_quantity, ss.ss_net_paid FROM {ds.store_sales} ss JOIN {ds.date_dim} d ON ss.ss_sold_date_sk = d.d_date_sk JOIN {ds.store} s ON ss.ss_store_sk = s.s_store_sk JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk WHERE ss.ss_net_paid > 19000 AND d.d_year = 2002 ORDER BY ss.ss_net_paid DESC, d.d_date LIMIT 25",
+   "answer": "d_date,s_store_name,i_product_name,ss_quantity,ss_net_paid\n2002-09-20,n st,ablebareingationation,99,19562.40\n2002-12-21,able,priesebarbarn st,99,19524.78\n2002-09-09,bar,callyesebareingn st,99,19374.30\n2002-08-09,bar,bareseeingantiese,100,19212.00\n2002-05-31,cally,oughtableantin stese,100,19204.00\n2002-05-01,ought,ationoughtoughtn stcally,100,19151.00\n2002-11-05,able,callyeingpriationn st,98,19123.72\n2002-11-22,ation,n steingoughtoughtn st,98,19113.92\n2002-11-19,ese,n stn stpricallyn st,100,19080.00\n2002-04-17,ese,barableprieinganti,100,19012.00\n",
+   "duckdb_ms": 44.3
+  },
+  {
+   "id": "tl01",
+   "set": "analyst",
+   "tags": [
+    "inner",
+    "groupby-dim",
+    "int32-vs-int64",
+    "glob"
+   ],
+   "sql": "SELECT z.Borough, count(*) AS trips, avg(t.fare_amount) AS avg_fare FROM {tlc.yellow} t JOIN {tlc.zones} z ON t.PULocationID = z.LocationID GROUP BY z.Borough ORDER BY trips DESC",
+   "answer": "Borough,trips,avg_fare\nManhattan,18108209,15.532754333680733\nQueens,1831264,49.84236921601673\nBrooklyn,253557,27.97557160717326\nUnknown,65678,20.66953272024119\nBronx,58865,31.63020045867666\nN/A,11307,81.32260900327225\nEWR,2539,84.49889326506498\nStaten Island,674,34.72084569732939\n",
+   "duckdb_ms": 77.6,
+   "answer_tlc_single": "Borough,trips,avg_fare\nManhattan,2646948,14.711081226379239\nQueens,273128,49.842061597492716\nBrooklyn,25258,28.501266133502227\nUnknown,10360,21.228284749034763\nBronx,6905,32.44282548877627\nN/A,1658,82.33112786489745\nEWR,295,88.1771186440678\nStaten Island,72,43.75208333333334\n"
+  },
+  {
+   "id": "tl02",
+   "set": "analyst",
+   "tags": [
+    "role-playing-dims",
+    "shared-name"
+   ],
+   "sql": "SELECT pu.Borough AS from_borough, dz.Borough AS to_borough, count(*) AS trips FROM {tlc.yellow} t JOIN {tlc.zones} pu ON t.PULocationID = pu.LocationID JOIN {tlc.zones} dz ON t.DOLocationID = dz.LocationID GROUP BY pu.Borough, dz.Borough ORDER BY trips DESC LIMIT 15",
+   "answer": "from_borough,to_borough,trips\nManhattan,Manhattan,17016326\nQueens,Manhattan,1036113\nManhattan,Queens,540522\nQueens,Queens,435681\nManhattan,Brooklyn,369390\nQueens,Brooklyn,261991\nBrooklyn,Brooklyn,132861\nBrooklyn,Manhattan,84112\nManhattan,Bronx,56913\nManhattan,Unknown,53822\nQueens,N/A,50544\nManhattan,EWR,47880\nUnknown,Unknown,41576\nQueens,Bronx,38462\nBrooklyn,Queens,29780\n",
+   "duckdb_ms": 96.6,
+   "answer_tlc_single": "from_borough,to_borough,trips\nManhattan,Manhattan,2492571\nQueens,Manhattan,150203\nManhattan,Queens,76535\nQueens,Queens,66343\nManhattan,Brooklyn,52145\nQueens,Brooklyn,41086\nBrooklyn,Brooklyn,13126\nManhattan,Bronx,8262\nBrooklyn,Manhattan,8219\nManhattan,Unknown,7885\nQueens,N/A,7849\nUnknown,Unknown,7381\nManhattan,EWR,6462\nQueens,Bronx,6237\nBrooklyn,Queens,3124\n"
+  },
+  {
+   "id": "tl03",
+   "set": "analyst",
+   "tags": [
+    "topk",
+    "where-dim",
+    "string"
+   ],
+   "sql": "SELECT z.Zone, sum(t.total_amount) AS revenue, count(*) AS trips FROM {tlc.yellow} t JOIN {tlc.zones} z ON t.PULocationID = z.LocationID WHERE z.Borough = 'Manhattan' GROUP BY z.Zone ORDER BY revenue DESC LIMIT 10",
+   "answer": "Zone,revenue,trips\nMidtown Center,23179951.659999352,954881\nUpper East Side South,19036114.84999943,947084\nTimes Sq/Theatre District,18899950.67999907,688122\nUpper East Side North,18182769.28999974,879902\nMidtown East,16656776.819999639,701960\nPenn Station/Madison Sq West,16147127.369999768,657213\nLincoln Square East,14346956.410000063,665249\nMidtown North,14055907.879999828,584028\nMurray Hill,13716979.929999823,581945\nEast Chelsea,13635465.529999845,541457\n",
+   "duckdb_ms": 62.8,
+   "answer_tlc_single": "Zone,revenue,trips\nMidtown Center,3369045.009999964,143471\nTimes Sq/Theatre District,2793051.6799999666,106324\nUpper East Side South,2776195.3199999486,142708\nUpper East Side North,2729558.5699999505,136465\nPenn Station/Madison Sq West,2471023.659999987,104523\nMidtown East,2441727.649999975,106717\nLincoln Square East,2185565.809999981,104080\nMidtown North,1980376.5999999861,85692\nEast Chelsea,1889640.5499999886,77686\nMurray Hill,1881099.0700000017,83064\n"
+  },
+  {
+   "id": "tl04",
+   "set": "analyst",
+   "tags": [
+    "where-dim",
+    "like",
+    "groupby-both"
+   ],
+   "sql": "SELECT z.Zone, t.payment_type, count(*) AS trips, avg(t.tip_amount) AS avg_tip FROM {tlc.yellow} t JOIN {tlc.zones} z ON t.DOLocationID = z.LocationID WHERE z.Zone LIKE '%Airport%' GROUP BY z.Zone, t.payment_type ORDER BY z.Zone, t.payment_type NULLS FIRST",
+   "answer": "Zone,payment_type,trips,avg_tip\nJFK Airport,0,15167,10.255120327025764\nJFK Airport,1,148764,13.691783227125256\nJFK Airport,2,45299,0.01019757610543279\nJFK Airport,3,6718,0.026625483774933015\nJFK Airport,4,11886,0.06837119300016828\nLaGuardia Airport,0,22523,6.702302535186243\nLaGuardia Airport,1,181845,11.072994748274613\nLaGuardia Airport,2,23309,0.00938950619932215\nLaGuardia Airport,3,2678,0.03287154592979836\nLaGuardia Airport,4,4287,0.11566596687660369\nNewark Airport,0,3123,12.647297470381046\nNewark Airport,1,42022,18.224930274618014\nNewark Airport,2,6341,0.040714398359880145\nNewark Airport,3,308,0.13967532467532467\nNewark Airport,4,995,0.2937587939698493\n",
+   "duckdb_ms": 55.5,
+   "answer_tlc_single": "Zone,payment_type,trips,avg_tip\nJFK Airport,0,2001,9.780754622688656\nJFK Airport,1,19726,13.459691270404855\nJFK Airport,2,7005,0.008708065667380442\nJFK Airport,3,1080,0.022222222222222223\nJFK Airport,4,1495,0.05296321070234113\nLaGuardia Airport,0,3029,6.530848464839895\nLaGuardia Airport,1,24073,10.848587213891115\nLaGuardia Airport,2,3488,0.008116399082568808\nLaGuardia Airport,3,323,0.0\nLaGuardia Airport,4,543,0.13303867403314917\nNewark Airport,0,441,12.938730158730152\nNewark Airport,1,5542,17.861198123421136\nNewark Airport,2,1035,0.020618357487922706\nNewark Airport,3,44,0.0\nNewark Airport,4,114,0.08771929824561403\n"
+  },
+  {
+   "id": "tl05",
+   "set": "analyst",
+   "tags": [
+    "expr-key",
+    "timestamp-to-date"
+   ],
+   "sql": "SELECT w.prcp_tenth_mm > 0 AS rainy, count(*) AS trips, avg(t.tip_amount) AS avg_tip FROM {tlc.yellow} t JOIN {tlc.weather} w ON CAST(t.tpep_pickup_datetime AS DATE) = w.obs_date GROUP BY rainy ORDER BY rainy",
+   "answer": "rainy,trips,avg_tip\nfalse,12397014,3.2959611016012915\ntrue,7935055,3.2296396319871254\n",
+   "duckdb_ms": 99.7,
+   "answer_tlc_single": "rainy,trips,avg_tip\nfalse,1457013,3.3168879481509346\ntrue,1507606,3.3542261373323567\n"
+  },
+  {
+   "id": "tl06",
+   "set": "analyst",
+   "tags": [
+    "cte",
+    "date-key",
+    "rows"
+   ],
+   "sql": "WITH daily AS ( SELECT CAST(tpep_pickup_datetime AS DATE) AS d, count(*) AS n FROM {tlc.yellow} GROUP BY 1) SELECT daily.d, daily.n, w.snow_mm FROM daily JOIN {tlc.weather} w ON daily.d = w.obs_date WHERE w.snow_mm > 0 ORDER BY daily.d",
+   "answer": "d,n,snow_mm\n2024-01-06,97117,5\n2024-01-15,77033,10\n2024-01-16,93057,33\n2024-01-19,95951,10\n2024-02-13,69067,81\n2024-02-17,105811,51\n",
+   "duckdb_ms": 74.7,
+   "answer_tlc_single": "d,n,snow_mm\n2024-01-06,97117,5\n2024-01-15,77033,10\n2024-01-16,93057,33\n2024-01-19,95951,10\n"
+  },
+  {
+   "id": "tl07",
+   "set": "analyst",
+   "tags": [
+    "left",
+    "groupby-dim"
+   ],
+   "sql": "SELECT z.service_zone, count(*) AS trips FROM {tlc.yellow} t LEFT JOIN {tlc.zones} z ON t.PULocationID = z.LocationID GROUP BY z.service_zone ORDER BY z.service_zone NULLS FIRST",
+   "answer": "service_zone,trips\nAirports,1555554\nBoro Zone,1025925\nEWR,2539\nN/A,76985\nYellow Zone,17671090\n",
+   "duckdb_ms": 87.5,
+   "answer_tlc_single": "service_zone,trips\nAirports,234773\nBoro Zone,125840\nEWR,295\nN/A,12018\nYellow Zone,2591698\n"
+  },
+  {
+   "id": "tl08",
+   "set": "analyst",
+   "tags": [
+    "anti",
+    "notin",
+    "rows"
+   ],
+   "sql": "SELECT Zone, Borough FROM {tlc.zones} WHERE LocationID NOT IN (SELECT PULocationID FROM {tlc.green}) ORDER BY Zone, Borough",
+   "answer": "Zone,Borough\nArden Heights,Staten Island\nArrochar/Fort Wadsworth,Staten Island\nBroad Channel,Queens\nCharleston/Tottenville,Staten Island\n\"Eltingville/Annadale/Prince's Bay\",Staten Island\nFreshkills Park,Staten Island\n\"Governor's Island/Ellis Island/Liberty Island\",Manhattan\n\"Governor's Island/Ellis Island/Liberty Island\",Manhattan\n\"Governor's Island/Ellis Island/Liberty Island\",Manhattan\nGreat Kills Park,Staten Island\nGreen-Wood Cemetery,Brooklyn\nJamaica Bay,Queens\nNew Dorp/Midland Beach,Staten Island\nOakwood,Staten Island\nRikers Island,Bronx\nSouth Beach/Dongan Hills,Staten Island\n",
+   "duckdb_ms": 27.7,
+   "answer_tlc_single": "Zone,Borough\nAlphabet City,Manhattan\nArden Heights,Staten Island\nArrochar/Fort Wadsworth,Staten Island\nAstoria Park,Queens\nBattery Park,Manhattan\nBattery Park City,Manhattan\nBroad Channel,Queens\nCharleston/Tottenville,Staten Island\nCity Island,Bronx\nClinton West,Manhattan\nCountry Club,Bronx\nCrotona Park,Bronx\nEast Chelsea,Manhattan\nEast Village,Manhattan\n\"Eltingville/Annadale/Prince's Bay\",Staten Island\nFlatiron,Manhattan\nFreshkills Park,Staten Island\nGarment District,Manhattan\n\"Governor's Island/Ellis Island/Liberty Island\",Manhattan\n\"Governor's Island/Ellis Island/Liberty Island\",Manhattan\n\"Governor's Island/Ellis Island/Liberty Island\",Manhattan\nGramercy,Manhattan\nGreat Kills,Staten Island\nGreat Kills Park,Staten Island\nGreen-Wood Cemetery,Brooklyn\nGreenwich Village North,Manhattan\nGreenwich Village South,Manhattan\nGrymes Hill/Clifton,Staten Island\nJamaica Bay,Queens\nLenox Hill West,Manhattan\nLittle Italy/NoLiTa,Manhattan\nLower East Side,Manhattan\nMariners Harbor,Staten Island\nMeatpacking/West Village West,Manhattan\nMidtown Center,Manhattan\nMidtown North,Manhattan\nMidtown South,Manhattan\nMurray Hill,Manhattan\nNew Dorp/Midland Beach,Staten Island\nOakwood,Staten Island\nPenn Station/Madison Sq West,Manhattan\nPort Richmond,Staten Island\nRikers Island,Bronx\nRossville/Woodrow,Staten Island\nSoHo,Manhattan\nSouth Beach/Dongan Hills,Staten Island\nStuy Town/Peter Cooper Village,Manhattan\nUN/Turtle Bay South,Manhattan\nUnion Sq,Manhattan\nWest Brighton,Staten Island\nWest Chelsea/Hudson Yards,Manhattan\nWest Village,Manhattan\nWesterleigh,Staten Island\nWorld Trade Center,Manhattan\n"
+  },
+  {
+   "id": "tl09",
+   "set": "analyst",
+   "tags": [
+    "semi",
+    "in"
+   ],
+   "sql": "SELECT count(*) AS trips, avg(trip_distance) AS avg_miles FROM {tlc.yellow} WHERE PULocationID IN (SELECT LocationID FROM {tlc.zones} WHERE Borough = 'Brooklyn')",
+   "answer": "trips,avg_miles\n253557,22.423458472848356\n",
+   "duckdb_ms": 46.8,
+   "answer_tlc_single": "trips,avg_miles\n25258,13.106556734499968\n"
+  },
+  {
+   "id": "tl10",
+   "set": "analyst",
+   "tags": [
+    "inner",
+    "groupby-both",
+    "string-probe"
+   ],
+   "sql": "SELECT f.hvfhs_license_num, z.Borough, count(*) AS trips, avg(f.driver_pay) AS avg_pay FROM {tlc.fhvhv} f JOIN {tlc.zones} z ON f.PULocationID = z.LocationID GROUP BY f.hvfhs_license_num, z.Borough ORDER BY f.hvfhs_license_num, z.Borough",
+   "answer": "hvfhs_license_num,Borough,trips,avg_pay\nHV0003,Bronx,1804014,15.653470610537072\nHV0003,Brooklyn,3671417,16.753113650671747\nHV0003,EWR,1,51.02\nHV0003,Manhattan,5874148,18.976698809778757\nHV0003,N/A,446,21.46697309417041\nHV0003,Queens,2894779,21.721736184354047\nHV0003,Staten Island,187950,17.704623942538888\nHV0005,Bronx,564678,14.68547216289302\nHV0005,Brooklyn,1437049,15.615455875204514\nHV0005,Manhattan,1989524,18.776296063785708\nHV0005,N/A,319,16.2435736677116\nHV0005,Queens,1145839,19.488789088174684\nHV0005,Staten Island,93766,14.737215941812769\n",
+   "duckdb_ms": 87.9
+  },
+  {
+   "id": "tl11",
+   "set": "analyst",
+   "tags": [
+    "topk"
+   ],
+   "sql": "SELECT z.Zone, sum(f.tips) AS tips FROM {tlc.fhvhv} f JOIN {tlc.zones} z ON f.DOLocationID = z.LocationID GROUP BY z.Zone ORDER BY tips DESC LIMIT 10",
+   "answer": "Zone,tips\nOutside of NYC,2595506.5200000536\nLaGuardia Airport,1201332.439999992\nJFK Airport,1118425.1999999965\nNewark Airport,591705.7199999979\nTimes Sq/Theatre District,431122.5899999991\nMidtown Center,342620.63999999984\nEast Chelsea,317418.1\nPark Slope,260947.5200000003\nWest Chelsea/Hudson Yards,254427.18000000046\nMidtown East,251558.15000000075\n",
+   "duckdb_ms": 70.9
+  },
+  {
+   "id": "tl12",
+   "set": "analyst",
+   "tags": [
+    "having"
+   ],
+   "sql": "SELECT z.Zone, count(*) AS trips, avg(t.fare_amount) AS avg_fare FROM {tlc.yellow} t JOIN {tlc.zones} z ON t.PULocationID = z.LocationID GROUP BY z.Zone HAVING count(*) > 300000 ORDER BY trips DESC",
+   "answer": "Zone,trips,avg_fare\nMidtown Center,954881,15.993987271712388\nUpper East Side South,947084,12.787191991418133\nJFK Airport,916784,59.722906267996954\nUpper East Side North,879902,13.370998929426557\nMidtown East,701960,15.570929240982363\nTimes Sq/Theatre District,688122,18.617498641229233\nLincoln Square East,665249,14.026762896298843\nPenn Station/Madison Sq West,657213,16.665611331486133\nLaGuardia Airport,638770,42.61581694506642\nMidtown North,584028,15.915112374749265\nUpper West Side South,583602,14.090865538500557\nMurray Hill,581945,15.645489590940727\nUnion Sq,543501,14.538720057552705\nEast Chelsea,541457,17.137419536546684\nClinton East,517033,15.543197088000154\nEast Village,484921,15.04346732766777\nWest Village,477585,14.945603819215341\nLenox Hill West,468114,13.267088935601123\nMidtown South,458781,16.007377506915073\nGramercy,411880,14.421073589394863\nUpper West Side North,407199,14.186776269096832\nLenox Hill East,405855,15.281903832649535\nYorkville West,387986,14.476362703808762\nSutton Place/Turtle Bay North,365396,14.143950180078555\nWest Chelsea/Hudson Yards,352185,16.352350440819357\nFlatiron,325452,14.73423967282417\nCentral Park,321149,14.893500088743846\nGarment District,310926,16.23211127406525\n",
+   "duckdb_ms": 68.9,
+   "answer_tlc_single": "Zone,trips,avg_fare\n"
+  },
+  {
+   "id": "tl13",
+   "set": "analyst",
+   "tags": [
+    "rows",
+    "orderby-limit"
+   ],
+   "sql": "SELECT t.tpep_pickup_datetime, z.Zone, t.trip_distance, t.total_amount FROM {tlc.yellow01} t JOIN {tlc.zones} z ON t.PULocationID = z.LocationID ORDER BY t.trip_distance DESC LIMIT 10",
+   "answer": "tpep_pickup_datetime,Zone,trip_distance,total_amount\n2024-01-30 06:37:00,Manhattan Valley,312722.3,22.15\n2024-01-25 08:39:00,Alphabet City,97793.92,36.31\n2024-01-20 08:01:00,Carroll Gardens,82015.45,21.56\n2024-01-21 11:58:00,Seaport,72975.97,20.04\n2024-01-17 08:41:00,Brooklyn Heights,71752.26,49.57\n2024-01-05 15:46:00,East Harlem North,59282.45,33.52\n2024-01-09 07:13:00,Lenox Hill West,59076.43,23.17\n2024-01-24 12:26:00,Manhattan Valley,58298.51,18.63\n2024-01-12 05:16:00,Upper West Side North,51619.36,24.2\n2024-01-12 07:18:00,UN/Turtle Bay South,44018.64,52.43\n",
+   "duckdb_ms": 53.7
+  },
+  {
+   "id": "tl14",
+   "set": "analyst",
+   "tags": [
+    "timestamp-expr",
+    "groupby-both"
+   ],
+   "sql": "SELECT z.Borough, EXTRACT(HOUR FROM t.tpep_pickup_datetime) AS hr, count(*) AS trips FROM {tlc.yellow01} t JOIN {tlc.zones} z ON t.PULocationID = z.LocationID WHERE z.Borough IN ('Manhattan', 'Brooklyn') GROUP BY z.Borough, hr ORDER BY z.Borough, hr",
+   "answer": "Borough,hr,trips\nBrooklyn,0,913\nBrooklyn,1,743\nBrooklyn,2,612\nBrooklyn,3,538\nBrooklyn,4,637\nBrooklyn,5,893\nBrooklyn,6,1501\nBrooklyn,7,1771\nBrooklyn,8,1922\nBrooklyn,9,1648\nBrooklyn,10,1406\nBrooklyn,11,1319\nBrooklyn,12,1360\nBrooklyn,13,1189\nBrooklyn,14,1067\nBrooklyn,15,1100\nBrooklyn,16,981\nBrooklyn,17,964\nBrooklyn,18,922\nBrooklyn,19,681\nBrooklyn,20,610\nBrooklyn,21,586\nBrooklyn,22,930\nBrooklyn,23,965\nManhattan,0,68309\nManhattan,1,49123\nManhattan,2,35123\nManhattan,3,22919\nManhattan,4,14554\nManhattan,5,13930\nManhattan,6,33434\nManhattan,7,73482\nManhattan,8,105843\nManhattan,9,115679\nManhattan,10,124477\nManhattan,11,137635\nManhattan,12,149802\nManhattan,13,153821\nManhattan,14,163315\nManhattan,15,169587\nManhattan,16,168264\nManhattan,17,186657\nManhattan,18,194356\nManhattan,19,164369\nManhattan,20,141872\nManhattan,21,143367\nManhattan,22,124846\nManhattan,23,92184\n",
+   "duckdb_ms": 49.1
+  },
+  {
+   "id": "tl15",
+   "set": "analyst",
+   "tags": [
+    "cte",
+    "two-aggs-joined"
+   ],
+   "sql": "WITH y AS (SELECT PULocationID, count(*) AS n FROM {tlc.yellow} GROUP BY PULocationID), g AS (SELECT PULocationID, count(*) AS n FROM {tlc.green} GROUP BY PULocationID) SELECT z.Zone, y.n AS yellow_trips, g.n AS green_trips FROM {tlc.zones} z JOIN y ON y.PULocationID = z.LocationID JOIN g ON g.PULocationID = z.LocationID ORDER BY green_trips DESC LIMIT 10",
+   "answer": "Zone,yellow_trips,green_trips\nEast Harlem North,52724,74589\nEast Harlem South,130833,47799\nMorningside Heights,103366,17733\nForest Hills,4670,17241\nCentral Park,321149,16412\nElmhurst,4256,16110\nCentral Harlem,58468,15513\nFort Greene,10963,11017\nDowntown Brooklyn/MetroTech,14484,10065\nAstoria,13737,7706\n",
+   "duckdb_ms": 41.3,
+   "answer_tlc_single": "Zone,yellow_trips,green_trips\nEast Harlem North,6144,12141\nEast Harlem South,18255,8458\nForest Hills,544,2915\nCentral Park,48279,2765\nMorningside Heights,13806,2649\nElmhurst,531,2623\nCentral Harlem,6832,2589\nFort Greene,1134,1898\nDowntown Brooklyn/MetroTech,1393,1624\nAstoria,1811,1521\n"
+  },
+  {
+   "id": "tl16",
+   "set": "analyst",
+   "tags": [
+    "expr-over-joined",
+    "nullif"
+   ],
+   "sql": "SELECT z.service_zone, avg(t.total_amount / NULLIF(t.trip_distance, 0)) AS per_mile FROM {tlc.yellow} t JOIN {tlc.zones} z ON t.PULocationID = z.LocationID WHERE t.trip_distance > 0 GROUP BY z.service_zone ORDER BY z.service_zone",
+   "answer": "service_zone,per_mile\nAirports,16.706671911849437\nBoro Zone,19.864362985777568\nEWR,2239.049363394137\nN/A,62.821788821863265\nYellow Zone,15.99433761233305\n",
+   "duckdb_ms": 93.5,
+   "answer_tlc_single": "service_zone,per_mile\nAirports,15.178126415042374\nBoro Zone,21.81528133917117\nEWR,2346.848605932192\nN/A,65.98113592794532\nYellow Zone,15.806940635120283\n"
+  },
+  {
+   "id": "tl17",
+   "set": "analyst",
+   "tags": [
+    "distinct",
+    "rows"
+   ],
+   "sql": "SELECT DISTINCT z.Borough FROM {tlc.green} g JOIN {tlc.zones} z ON g.DOLocationID = z.LocationID WHERE g.payment_type = 3 ORDER BY z.Borough",
+   "answer": "Borough\nBronx\nBrooklyn\nManhattan\nN/A\nQueens\nUnknown\n",
+   "duckdb_ms": 26.6,
+   "answer_tlc_single": "Borough\nBronx\nBrooklyn\nManhattan\nQueens\nUnknown\n"
+  },
+  {
+   "id": "tl18",
+   "set": "analyst",
+   "tags": [
+    "semi",
+    "expr-probe",
+    "date"
+   ],
+   "sql": "SELECT count(*) AS freezing_day_trips FROM {tlc.yellow} WHERE CAST(tpep_pickup_datetime AS DATE) IN (SELECT obs_date FROM {tlc.weather} WHERE tmax_tenth_c < 0)",
+   "answer": "freezing_day_trips\n380668\n",
+   "duckdb_ms": 66.0,
+   "answer_tlc_single": "freezing_day_trips\n380668\n"
+  },
+  {
+   "id": "tl19",
+   "set": "analyst",
+   "tags": [
+    "role-playing-dims",
+    "expr-cross"
+   ],
+   "sql": "SELECT count(*) AS same_borough_trips FROM {tlc.yellow01} t JOIN {tlc.zones} pu ON t.PULocationID = pu.LocationID JOIN {tlc.zones} dz ON t.DOLocationID = dz.LocationID WHERE pu.Borough = dz.Borough",
+   "answer": "same_borough_trips\n2583465\n",
+   "duckdb_ms": 44.7
+  },
+  {
+   "id": "tl20",
+   "set": "analyst",
+   "tags": [
+    "where-both",
+    "timestamp",
+    "topk"
+   ],
+   "sql": "SELECT z.Zone, count(*) AS trips FROM {tlc.yellow} t JOIN {tlc.zones} z ON t.PULocationID = z.LocationID WHERE z.Borough = 'Queens' AND t.passenger_count >= 3 AND t.tpep_pickup_datetime >= TIMESTAMP '2024-03-01 00:00:00' GROUP BY z.Zone ORDER BY trips DESC LIMIT 5",
+   "answer": "Zone,trips\nJFK Airport,59995\nLaGuardia Airport,30284\nEast Elmhurst,4634\nSunnyside,715\nLong Island City/Hunters Point,557\n",
+   "duckdb_ms": 76.0,
+   "answer_tlc_single": "Zone,trips\n"
+  },
+  {
+   "id": "tl21",
+   "set": "analyst",
+   "tags": [
+    "inner",
+    "groupby-dim",
+    "green"
+   ],
+   "sql": "SELECT z.Borough, count(*) AS trips, sum(g.total_amount) AS revenue FROM {tlc.green} g JOIN {tlc.zones} z ON g.PULocationID = z.LocationID GROUP BY z.Borough ORDER BY z.Borough",
+   "answer": "Borough,trips,revenue\nBronx,4826,149660.73999999993\nBrooklyn,47854,1371245.5000000035\nEWR,12,1771.71\nManhattan,199255,4298025.189999999\nN/A,233,17097.199999999997\nQueens,86916,2120980.190000008\nStaten Island,19,751.6200000000001\nUnknown,692,15601.060000000001\n",
+   "duckdb_ms": 26.1,
+   "answer_tlc_single": "Borough,trips,revenue\nBronx,870,23585.080000000013\nBrooklyn,7748,207077.58000000115\nEWR,3,362.97\nManhattan,32847,691672.1299999988\nN/A,29,1806.1200000000001\nQueens,14937,339524.7199999996\nStaten Island,5,269.67\nUnknown,112,2624.32\n"
+  },
+  {
+   "id": "tl22",
+   "set": "analyst",
+   "tags": [
+    "semi",
+    "notin",
+    "nulls-in-probe"
+   ],
+   "sql": "SELECT payment_type, count(*) AS trips FROM {tlc.green} WHERE DOLocationID NOT IN (SELECT LocationID FROM {tlc.zones} WHERE Borough = 'Manhattan') GROUP BY payment_type ORDER BY payment_type NULLS FIRST",
+   "answer": "payment_type,trips\nNULL,7812\n1,81817\n2,47752\n3,1354\n4,316\n5,6\n",
+   "duckdb_ms": 26.1,
+   "answer_tlc_single": "payment_type,trips\nNULL,2049\n1,12699\n2,8425\n3,247\n4,42\n"
+  },
+  {
+   "id": "lh01",
+   "set": "analyst",
+   "tags": [
+    "string-key",
+    "topk",
+    "groupby-names"
+   ],
+   "sql": "SELECT p.nameFirst, p.nameLast, sum(b.HR) AS career_hr FROM {lh.batting} b JOIN {lh.people} p ON b.playerID = p.playerID GROUP BY p.playerID, p.nameFirst, p.nameLast ORDER BY career_hr DESC LIMIT 10",
+   "answer": "nameFirst,nameLast,career_hr\nBarry,Bonds,762\nHank,Aaron,755\nBabe,Ruth,714\nAlex,Rodriguez,696\nAlbert,Pujols,679\nWillie,Mays,660\nKen,Griffey,630\nJim,Thome,612\nSammy,Sosa,609\nFrank,Robinson,586\n",
+   "duckdb_ms": 30.9
+  },
+  {
+   "id": "lh02",
+   "set": "analyst",
+   "tags": [
+    "string-key",
+    "topk"
+   ],
+   "sql": "SELECT f.franchName, sum(t.W) AS wins FROM {lh.teams} t JOIN {lh.teamsfranchises} f ON t.franchID = f.franchID GROUP BY f.franchName ORDER BY wins DESC LIMIT 10",
+   "answer": "franchName,wins\nSan Francisco Giants,11301\nLos Angeles Dodgers,11123\nChicago Cubs,11087\nSt. Louis Cardinals,11038\nCincinnati Reds,10838\nAtlanta Braves,10820\nPittsburgh Pirates,10625\nNew York Yankees,10621\nBaltimore Orioles,9978\nPhiladelphia Phillies,9935\n",
+   "duckdb_ms": 24.7
+  },
+  {
+   "id": "lh03",
+   "set": "analyst",
+   "tags": [
+    "composite-key",
+    "string"
+   ],
+   "sql": "SELECT t.name, sum(b.HR) AS hr FROM {lh.batting} b JOIN {lh.teams} t ON b.yearID = t.yearID AND b.teamID = t.teamID AND b.lgID = t.lgID WHERE b.yearID = 2016 GROUP BY t.name ORDER BY hr DESC, t.name",
+   "answer": "name,hr\nBaltimore Orioles,253\nSt. Louis Cardinals,225\nSeattle Mariners,223\nToronto Blue Jays,221\nNew York Mets,218\nTampa Bay Rays,216\nTexas Rangers,215\nDetroit Tigers,211\nBoston Red Sox,208\nColorado Rockies,204\nWashington Nationals,203\nMinnesota Twins,200\nChicago Cubs,199\nHouston Astros,198\nMilwaukee Brewers,194\nArizona Diamondbacks,190\nLos Angeles Dodgers,189\nCleveland Indians,185\nNew York Yankees,183\nSan Diego Padres,177\nOakland Athletics,169\nChicago White Sox,168\nCincinnati Reds,164\nPhiladelphia Phillies,161\nLos Angeles Angels of Anaheim,156\nPittsburgh Pirates,153\nKansas City Royals,147\nSan Francisco Giants,130\nMiami Marlins,128\nAtlanta Braves,122\n",
+   "duckdb_ms": 25.3
+  },
+  {
+   "id": "lh04",
+   "set": "analyst",
+   "tags": [
+    "hierarchy",
+    "string-key",
+    "composite"
+   ],
+   "sql": "SELECT f.franchName, sum(b.H) AS hits FROM {lh.batting} b JOIN {lh.teams} t ON b.yearID = t.yearID AND b.teamID = t.teamID JOIN {lh.teamsfranchises} f ON t.franchID = f.franchID WHERE f.active = 'Y' GROUP BY f.franchName ORDER BY hits DESC LIMIT 10",
+   "answer": "franchName,hits\nChicago Cubs,195449\nSt. Louis Cardinals,194750\nAtlanta Braves,193317\nPittsburgh Pirates,192841\nSan Francisco Giants,191231\nCincinnati Reds,190044\nPhiladelphia Phillies,188655\nLos Angeles Dodgers,188375\nBoston Red Sox,172018\nNew York Yankees,170856\n",
+   "duckdb_ms": 28.3
+  },
+  {
+   "id": "lh05",
+   "set": "analyst",
+   "tags": [
+    "rows",
+    "composite-key",
+    "string"
+   ],
+   "sql": "SELECT s.yearID, t.name AS winner, s.wins, s.losses FROM {lh.seriespost} s JOIN {lh.teams} t ON s.yearID = t.yearID AND s.teamIDwinner = t.teamID WHERE s.round = 'WS' ORDER BY s.yearID DESC LIMIT 10",
+   "answer": "yearID,winner,wins,losses\n2021,Atlanta Braves,4,2\n2020,Los Angeles Dodgers,4,2\n2019,Washington Nationals,4,3\n2018,Boston Red Sox,4,1\n2017,Houston Astros,4,3\n2016,Chicago Cubs,4,3\n2015,Kansas City Royals,4,1\n2014,San Francisco Giants,4,3\n2013,Boston Red Sox,4,3\n2012,San Francisco Giants,4,0\n",
+   "duckdb_ms": 24.6
+  },
+  {
+   "id": "lh06",
+   "set": "analyst",
+   "tags": [
+    "semi",
+    "in",
+    "string-key"
+   ],
+   "sql": "SELECT count(*) AS allstars FROM {lh.people} WHERE playerID IN (SELECT playerID FROM {lh.allstarfull})",
+   "answer": "allstars\n1907\n",
+   "duckdb_ms": 24.8
+  },
+  {
+   "id": "lh07",
+   "set": "analyst",
+   "tags": [
+    "anti",
+    "notin",
+    "string-key"
+   ],
+   "sql": "SELECT count(DISTINCT playerID) AS never_batted FROM {lh.pitching} WHERE playerID NOT IN (SELECT playerID FROM {lh.batting} WHERE AB > 0)",
+   "answer": "never_batted\n2220\n",
+   "duckdb_ms": 30.7
+  },
+  {
+   "id": "lh08",
+   "set": "analyst",
+   "tags": [
+    "semi",
+    "exists",
+    "string-key"
+   ],
+   "sql": "SELECT count(DISTINCT m.playerID) AS player_managers FROM {lh.managers} m WHERE EXISTS (SELECT 1 FROM {lh.appearances} a WHERE a.playerID = m.playerID)",
+   "answer": "player_managers\n606\n",
+   "duckdb_ms": 25.1
+  },
+  {
+   "id": "lh09",
+   "set": "analyst",
+   "tags": [
+    "left",
+    "1-to-n",
+    "count-distinct",
+    "string-key"
+   ],
+   "sql": "SELECT p.birthCountry, count(DISTINCT p.playerID) AS players, count(DISTINCT a.playerID) AS allstars FROM {lh.people} p LEFT JOIN {lh.allstarfull} a ON p.playerID = a.playerID GROUP BY p.birthCountry ORDER BY players DESC LIMIT 10",
+   "answer": "birthCountry,players,allstars\nUSA,17820,1587\nD.R.,859,100\nVenezuela,461,55\nP.R.,281,46\nCAN,262,22\nCuba,232,34\nMexico,145,12\nJapan,73,14\nPanama,68,7\nNULL,59,0\n",
+   "duckdb_ms": 27.7
+  },
+  {
+   "id": "lh10",
+   "set": "analyst",
+   "tags": [
+    "having",
+    "expr-over-aggs",
+    "string-key"
+   ],
+   "sql": "SELECT p.birthCountry, sum(b.H) * 1.0 / sum(b.AB) AS avg FROM {lh.batting} b JOIN {lh.people} p ON b.playerID = p.playerID WHERE b.yearID >= 2000 GROUP BY p.birthCountry HAVING sum(b.AB) > 10000 ORDER BY avg DESC",
+   "answer": "birthCountry,avg\nJapan,0.2737367506028826\nColombia,0.26795464090718185\nD.R.,0.2649869495663888\nCuba,0.2648171173971609\nP.R.,0.2640596162551799\nVenezuela,0.2635287363611179\nCAN,0.26175173835793725\nPanama,0.26171929015902284\nUSA,0.25645003998801386\nCuracao,0.25515510948905107\nSouth Korea,0.25113350125944583\nMexico,0.2345548632379343\n",
+   "duckdb_ms": 30.2
+  },
+  {
+   "id": "lh11",
+   "set": "analyst",
+   "tags": [
+    "cte",
+    "composite-key",
+    "self-agg",
+    "rows"
+   ],
+   "sql": "WITH s AS (SELECT yearID, playerID, sum(HR) AS hr FROM {lh.batting} GROUP BY yearID, playerID), m AS (SELECT yearID, max(hr) AS mhr FROM s GROUP BY yearID) SELECT s.yearID, p.nameLast, s.hr FROM s JOIN m ON s.yearID = m.yearID AND s.hr = m.mhr JOIN {lh.people} p ON p.playerID = s.playerID WHERE s.yearID >= 2010 ORDER BY s.yearID, p.nameLast",
+   "answer": "yearID,nameLast,hr\n2010,Bautista,54\n2011,Bautista,43\n2012,Cabrera,44\n2013,Davis,53\n2014,Cruz,40\n2015,Davis,47\n2016,Trumbo,47\n2017,Stanton,59\n2018,Davis,48\n2019,Alonso,53\n2020,Voit,22\n2021,Guerrero,48\n2021,Perez,48\n",
+   "duckdb_ms": 26.7
+  },
+  {
+   "id": "lh12",
+   "set": "analyst",
+   "tags": [
+    "string-key",
+    "dotted-names"
+   ],
+   "sql": "SELECT pk.state, sum(h.attendance) AS attendance FROM {lh.homegames} h JOIN {lh.parks} pk ON h.\"park.key\" = pk.\"park.key\" WHERE h.\"year.key\" >= 2010 GROUP BY pk.state ORDER BY attendance DESC LIMIT 10",
+   "answer": "state,attendance\nCA,146832380\nNY,61337416\nMO,56520352\nIL,51464574\nTX,50926806\nPA,49343527\nOH,40303421\nMA,31104359\nFL,30593150\nCO,29900369\n",
+   "duckdb_ms": 24.3
+  },
+  {
+   "id": "lh13",
+   "set": "analyst",
+   "tags": [
+    "composite-key",
+    "avg"
+   ],
+   "sql": "SELECT t.name, avg(p.ERA) AS avg_era, sum(p.SO) AS strikeouts FROM {lh.pitching} p JOIN {lh.teams} t ON p.yearID = t.yearID AND p.teamID = t.teamID WHERE t.yearID = 2019 GROUP BY t.name ORDER BY avg_era",
+   "answer": "name,avg_era,strikeouts\nCleveland Indians,3.902666666666667,1508\nTampa Bay Rays,4.097878787878788,1621\nCincinnati Reds,4.311538461538461,1552\nLos Angeles Dodgers,4.445600000000001,1519\nChicago Cubs,4.546060606060607,1444\nSan Francisco Giants,4.616666666666666,1368\nOakland Athletics,4.635714285714285,1299\nMiami Marlins,4.790384615384616,1378\nArizona Diamondbacks,4.88962962962963,1427\nLos Angeles Angels of Anaheim,4.8950000000000005,1404\nSt. Louis Cardinals,4.926521739130435,1399\nPhiladelphia Phillies,5.030882352941177,1392\nNew York Mets,5.105862068965517,1520\nAtlanta Braves,5.155806451612903,1393\nChicago White Sox,5.194444444444445,1312\nHouston Astros,5.388461538461538,1671\nSan Diego Padres,5.668529411764705,1475\nBoston Red Sox,5.782222222222223,1633\nPittsburgh Pirates,5.842647058823529,1443\nDetroit Tigers,6.300625000000001,1368\nNew York Yankees,6.4065625,1534\nMinnesota Twins,6.585666666666669,1463\nMilwaukee Brewers,6.594666666666665,1497\nToronto Blue Jays,7.012820512820513,1332\nColorado Rockies,7.129032258064517,1264\nKansas City Royals,7.264333333333334,1230\nSeattle Mariners,7.403333333333336,1239\nBaltimore Orioles,7.829736842105264,1248\nTexas Rangers,8.757499999999999,1379\nWashington Nationals,13.633000000000001,1511\n",
+   "duckdb_ms": 25.1
+  },
+  {
+   "id": "lh14",
+   "set": "analyst",
+   "tags": [
+    "distinct",
+    "composite-key"
+   ],
+   "sql": "SELECT DISTINCT t.name FROM {lh.managers} m JOIN {lh.teams} t ON m.yearID = t.yearID AND m.teamID = t.teamID WHERE m.plyrMgr = 'Y' AND t.yearID > 1950 ORDER BY t.name",
+   "answer": "name\nBoston Braves\nBoston Red Sox\nChicago Cubs\nChicago White Sox\nCincinnati Reds\nCleveland Indians\nDetroit Tigers\nKansas City Athletics\nNew York Mets\nPhiladelphia Athletics\nSt. Louis Browns\nSt. Louis Cardinals\n",
+   "duckdb_ms": 24.2
+  },
+  {
+   "id": "lh15",
+   "set": "analyst",
+   "tags": [
+    "expr-cross",
+    "date"
+   ],
+   "sql": "SELECT b.yearID, count(*) AS rookies, sum(b.HR) AS rookie_hr FROM {lh.batting} b JOIN {lh.people} p ON b.playerID = p.playerID WHERE EXTRACT(YEAR FROM p.debut) = b.yearID AND b.yearID >= 2010 GROUP BY b.yearID ORDER BY b.yearID",
+   "answer": "yearID,rookies,rookie_hr\n2010,208,239\n2011,246,188\n2012,211,212\n2013,236,272\n2014,236,247\n2015,261,360\n2016,268,338\n2017,269,321\n2018,257,376\n2019,276,569\n2020,210,115\n2021,285,250\n",
+   "duckdb_ms": 26.5
+  },
+  {
+   "id": "lh16",
+   "set": "analyst",
+   "tags": [
+    "composite-key",
+    "topk"
+   ],
+   "sql": "SELECT t.name, count(*) AS allstars FROM {lh.allstarfull} a JOIN {lh.teams} t ON a.yearID = t.yearID AND a.teamID = t.teamID AND a.lgID = t.lgID WHERE a.yearID = 2019 GROUP BY t.name ORDER BY allstars DESC, t.name LIMIT 5",
+   "answer": "name,allstars\nHouston Astros,6\nLos Angeles Dodgers,5\nMilwaukee Brewers,5\nNew York Yankees,5\nCleveland Indians,4\n",
+   "duckdb_ms": 25.1
+  },
+  {
+   "id": "lh17",
+   "set": "analyst",
+   "tags": [
+    "string-key",
+    "topk"
+   ],
+   "sql": "SELECT p.nameFirst, p.nameLast, sum(bp.HR) AS post_hr FROM {lh.battingpost} bp JOIN {lh.people} p ON bp.playerID = p.playerID GROUP BY p.playerID, p.nameFirst, p.nameLast ORDER BY post_hr DESC, p.nameLast LIMIT 5",
+   "answer": "nameFirst,nameLast,post_hr\nManny,Ramirez,29\nJose,Altuve,23\nBernie,Williams,22\nDerek,Jeter,20\nAlbert,Pujols,19\n",
+   "duckdb_ms": 27.2
+  },
+  {
+   "id": "lh18",
+   "set": "analyst",
+   "tags": [
+    "self-join",
+    "expr-key",
+    "rows"
+   ],
+   "sql": "SELECT t1.name, t1.W - t0.W AS improvement FROM {lh.teams} t1 JOIN {lh.teams} t0 ON t1.teamID = t0.teamID AND t1.yearID = t0.yearID + 1 WHERE t1.yearID = 2019 ORDER BY improvement DESC, t1.name LIMIT 5",
+   "answer": "name,improvement\nMinnesota Twins,23\nLos Angeles Dodgers,14\nTexas Rangers,11\nWashington Nationals,11\nChicago White Sox,10\n",
+   "duckdb_ms": 24.4
+  },
+  {
+   "id": "ch01",
+   "set": "analyst",
+   "tags": [
+    "inner",
+    "groupby-dim",
+    "decimal"
+   ],
+   "sql": "SELECT c.Country, sum(i.Total) AS revenue, count(*) AS invoices FROM {ch.invoice} i JOIN {ch.customer} c ON i.CustomerId = c.CustomerId GROUP BY c.Country ORDER BY revenue DESC, c.Country",
+   "answer": "Country,revenue,invoices\nUSA,523.06,91\nCanada,303.96,56\nFrance,195.10,35\nBrazil,190.10,35\nGermany,156.48,28\nUnited Kingdom,112.86,21\nCzech Republic,90.24,14\nPortugal,77.24,14\nIndia,75.26,13\nChile,46.62,7\nHungary,45.62,7\nIreland,45.62,7\nAustria,42.62,7\nFinland,41.62,7\nNetherlands,40.62,7\nNorway,39.62,7\nSweden,38.62,7\nArgentina,37.62,7\nAustralia,37.62,7\nBelgium,37.62,7\nDenmark,37.62,7\nItaly,37.62,7\nPoland,37.62,7\nSpain,37.62,7\n",
+   "duckdb_ms": 24.6
+  },
+  {
+   "id": "ch02",
+   "set": "analyst",
+   "tags": [
+    "snowflake",
+    "expr-decimal",
+    "shared-name"
+   ],
+   "sql": "SELECT g.Name AS genre, sum(il.UnitPrice * il.Quantity) AS revenue FROM {ch.invoiceline} il JOIN {ch.track} t ON il.TrackId = t.TrackId JOIN {ch.genre} g ON t.GenreId = g.GenreId GROUP BY g.Name ORDER BY revenue DESC, genre",
+   "answer": "genre,revenue\nRock,826.65\nLatin,382.14\nMetal,261.36\nAlternative & Punk,241.56\nTV Shows,93.53\nJazz,79.20\nBlues,60.39\nDrama,57.71\nClassical,40.59\nR&B/Soul,40.59\nSci Fi & Fantasy,39.80\nReggae,29.70\nPop,27.72\nSoundtrack,19.80\nComedy,17.91\nHip Hop/Rap,16.83\nBossa Nova,14.85\nAlternative,13.86\nWorld,12.87\nScience Fiction,11.94\nElectronica/Dance,11.88\nHeavy Metal,11.88\nEasy Listening,9.90\nRock And Roll,5.94\n",
+   "duckdb_ms": 24.6
+  },
+  {
+   "id": "ch03",
+   "set": "analyst",
+   "tags": [
+    "chain-3",
+    "topk",
+    "shared-name"
+   ],
+   "sql": "SELECT ar.Name AS artist, sum(il.UnitPrice * il.Quantity) AS revenue FROM {ch.invoiceline} il JOIN {ch.track} t ON il.TrackId = t.TrackId JOIN {ch.album} al ON t.AlbumId = al.AlbumId JOIN {ch.artist} ar ON al.ArtistId = ar.ArtistId GROUP BY ar.Name ORDER BY revenue DESC, artist LIMIT 10",
+   "answer": "artist,revenue\nIron Maiden,138.60\nU2,105.93\nMetallica,90.09\nLed Zeppelin,86.13\nLost,81.59\nThe Office,49.75\nOs Paralamas Do Sucesso,44.55\nDeep Purple,43.56\nFaith No More,41.58\nEric Clapton,39.60\n",
+   "duckdb_ms": 25.6
+  },
+  {
+   "id": "ch04",
+   "set": "analyst",
+   "tags": [
+    "self-join",
+    "left",
+    "rows",
+    "hierarchy"
+   ],
+   "sql": "SELECT e.EmployeeId, e.FirstName, e.LastName, m.FirstName AS manager_first, m.LastName AS manager_last FROM {ch.employee} e LEFT JOIN {ch.employee} m ON e.ReportsTo = m.EmployeeId ORDER BY e.EmployeeId",
+   "answer": "EmployeeId,FirstName,LastName,manager_first,manager_last\n1,Andrew,Adams,NULL,NULL\n2,Nancy,Edwards,Andrew,Adams\n3,Jane,Peacock,Nancy,Edwards\n4,Margaret,Park,Nancy,Edwards\n5,Steve,Johnson,Nancy,Edwards\n6,Michael,Mitchell,Andrew,Adams\n7,Robert,King,Michael,Mitchell\n8,Laura,Callahan,Michael,Mitchell\n",
+   "duckdb_ms": 25.3
+  },
+  {
+   "id": "ch05",
+   "set": "analyst",
+   "tags": [
+    "chain",
+    "groupby-dim"
+   ],
+   "sql": "SELECT e.LastName, e.FirstName, sum(i.Total) AS sales, count(*) AS invoices FROM {ch.invoice} i JOIN {ch.customer} c ON i.CustomerId = c.CustomerId JOIN {ch.employee} e ON c.SupportRepId = e.EmployeeId GROUP BY e.LastName, e.FirstName ORDER BY sales DESC",
+   "answer": "LastName,FirstName,sales,invoices\nPeacock,Jane,833.04,146\nPark,Margaret,775.40,140\nJohnson,Steve,720.16,126\n",
+   "duckdb_ms": 24.8
+  },
+  {
+   "id": "ch06",
+   "set": "analyst",
+   "tags": [
+    "anti",
+    "notin"
+   ],
+   "sql": "SELECT count(*) AS never_bought FROM {ch.track} WHERE TrackId NOT IN (SELECT TrackId FROM {ch.invoiceline})",
+   "answer": "never_bought\n1519\n",
+   "duckdb_ms": 24.0
+  },
+  {
+   "id": "ch07",
+   "set": "analyst",
+   "tags": [
+    "semi",
+    "nested",
+    "scalar-subquery"
+   ],
+   "sql": "SELECT count(DISTINCT CustomerId) AS jazz_buyers FROM {ch.invoice} WHERE InvoiceId IN (SELECT InvoiceId FROM {ch.invoiceline} WHERE TrackId IN (SELECT TrackId FROM {ch.track} WHERE GenreId = (SELECT GenreId FROM {ch.genre} WHERE Name = 'Jazz')))",
+   "answer": "jazz_buyers\n32\n",
+   "duckdb_ms": 25.4
+  },
+  {
+   "id": "ch08",
+   "set": "analyst",
+   "tags": [
+    "many-to-many",
+    "shared-name"
+   ],
+   "sql": "SELECT pl.Name AS playlist, count(*) AS tracks, sum(t.Milliseconds) / 3600000.0 AS hours FROM {ch.playlisttrack} pt JOIN {ch.playlist} pl ON pt.PlaylistId = pl.PlaylistId JOIN {ch.track} t ON pt.TrackId = t.TrackId GROUP BY pl.Name ORDER BY tracks DESC, playlist",
+   "answer": "playlist,tracks,hours\nMusic,6580,487.6017127777778\n\"90’s Music\",1477,110.75143138888889\nTV Shows,426,278.3860872222222\nClassical,75,6.047386666666666\nBrazilian Music,39,2.635155277777778\nHeavy Metal Classic,26,2.279531111111111\nClassical 101 - Deep Cuts,25,1.8765916666666667\nClassical 101 - Next Steps,25,2.1041808333333334\nClassical 101 - The Basics,25,2.0666141666666666\nGrunge,15,1.145005\nMusic Videos,1,0.08174833333333334\nOn-The-Go 1,1,0.05484972222222222\n",
+   "duckdb_ms": 24.6
+  },
+  {
+   "id": "ch09",
+   "set": "analyst",
+   "tags": [
+    "timestamp-expr",
+    "groupby-both"
+   ],
+   "sql": "SELECT EXTRACT(YEAR FROM i.InvoiceDate) AS yr, EXTRACT(MONTH FROM i.InvoiceDate) AS mo, sum(i.Total) AS revenue FROM {ch.invoice} i JOIN {ch.customer} c ON i.CustomerId = c.CustomerId WHERE c.Country = 'USA' GROUP BY yr, mo ORDER BY yr, mo",
+   "answer": "yr,mo,revenue\n2009,1,13.86\n2009,2,0.99\n2009,3,13.86\n2009,4,13.86\n2009,6,18.81\n2009,9,14.85\n2009,10,0.99\n2009,11,3.96\n2009,12,22.77\n2010,1,0.99\n2010,2,7.92\n2010,3,15.86\n2010,4,0.99\n2010,5,13.86\n2010,6,13.86\n2010,8,20.79\n2010,9,13.86\n2010,11,14.85\n2011,1,2.97\n2011,2,8.91\n2011,4,8.91\n2011,5,27.77\n2011,7,14.85\n2011,8,13.86\n2011,10,11.88\n2011,12,13.86\n2012,1,14.85\n2012,3,2.97\n2012,4,8.91\n2012,6,8.91\n2012,7,10.91\n2012,8,23.86\n2012,9,29.85\n2012,11,13.86\n2012,12,13.86\n2013,2,13.86\n2013,4,18.81\n2013,5,0.99\n2013,7,14.85\n2013,8,0.99\n2013,9,3.96\n2013,10,22.77\n2013,11,0.99\n2013,12,7.92\n",
+   "duckdb_ms": 24.7
+  },
+  {
+   "id": "ch10",
+   "set": "analyst",
+   "tags": [
+    "rows",
+    "string-filter"
+   ],
+   "sql": "SELECT i.InvoiceId, i.InvoiceDate, i.Total FROM {ch.invoice} i JOIN {ch.customer} c ON i.CustomerId = c.CustomerId WHERE c.Email = 'luisg@embraer.com.br' ORDER BY i.InvoiceId",
+   "answer": "InvoiceId,InvoiceDate,Total\n98,2010-03-11 00:00:00,3.98\n121,2010-06-13 00:00:00,3.96\n143,2010-09-15 00:00:00,5.94\n195,2011-05-06 00:00:00,0.99\n316,2012-10-27 00:00:00,1.98\n327,2012-12-07 00:00:00,13.86\n382,2013-08-07 00:00:00,8.91\n",
+   "duckdb_ms": 24.3
+  },
+  {
+   "id": "ch11",
+   "set": "analyst",
+   "tags": [
+    "chain",
+    "timestamp-expr-dim"
+   ],
+   "sql": "SELECT EXTRACT(YEAR FROM e.HireDate) AS hire_year, avg(i.Total) AS avg_invoice FROM {ch.invoice} i JOIN {ch.customer} c ON i.CustomerId = c.CustomerId JOIN {ch.employee} e ON c.SupportRepId = e.EmployeeId GROUP BY hire_year ORDER BY hire_year",
+   "answer": "hire_year,avg_invoice\n2002,5.7057534246575345\n2003,5.622406015037594\n",
+   "duckdb_ms": 26.5
+  },
+  {
+   "id": "ch12",
+   "set": "analyst",
+   "tags": [
+    "snowflake",
+    "shared-name"
+   ],
+   "sql": "SELECT mt.Name AS media, sum(il.Quantity) AS units FROM {ch.invoiceline} il JOIN {ch.track} t ON il.TrackId = t.TrackId JOIN {ch.mediatype} mt ON t.MediaTypeId = mt.MediaTypeId GROUP BY mt.Name ORDER BY units DESC",
+   "answer": "media,units\nMPEG audio file,1976\nProtected AAC audio file,146\nProtected MPEG-4 video file,111\nPurchased AAC audio file,4\nAAC audio file,3\n",
+   "duckdb_ms": 24.1
+  },
+  {
+   "id": "ch13",
+   "set": "analyst",
+   "tags": [
+    "having",
+    "groupby-names",
+    "decimal"
+   ],
+   "sql": "SELECT c.FirstName, c.LastName, sum(i.Total) AS spent FROM {ch.invoice} i JOIN {ch.customer} c ON i.CustomerId = c.CustomerId GROUP BY c.CustomerId, c.FirstName, c.LastName HAVING sum(i.Total) > 45 ORDER BY spent DESC, c.LastName",
+   "answer": "FirstName,LastName,spent\nHelena,\"Holý\",49.62\nRichard,Cunningham,47.62\nLuis,Rojas,46.62\nLadislav,\"Kovács\",45.62\nHugh,\"O'Reilly\",45.62\n",
+   "duckdb_ms": 25.4
+  },
+  {
+   "id": "ch14",
+   "set": "analyst",
+   "tags": [
+    "decimal-cross-compare",
+    "shared-name"
+   ],
+   "sql": "SELECT count(*) AS repriced_lines FROM {ch.invoiceline} il JOIN {ch.track} t ON il.TrackId = t.TrackId WHERE il.UnitPrice <> t.UnitPrice",
+   "answer": "repriced_lines\n0\n",
+   "duckdb_ms": 24.3
+  },
+  {
+   "id": "ch15",
+   "set": "analyst",
+   "tags": [
+    "distinct",
+    "rows"
+   ],
+   "sql": "SELECT DISTINCT a.Title FROM {ch.track} t JOIN {ch.album} a ON t.AlbumId = a.AlbumId WHERE t.Milliseconds > 1500000 ORDER BY a.Title",
+   "answer": "Title\nAquaman\n\"Battlestar Galactica (Classic), Season 1\"\n\"Battlestar Galactica, Season 3\"\nBattlestar Galactica: The Story So Far\n\"Heroes, Season 1\"\n\"LOST, Season 4\"\n\"Lost, Season 1\"\n\"Lost, Season 2\"\n\"Lost, Season 3\"\n\"The Office, Season 2\"\n\"The Office, Season 3\"\nThe Song Remains The Same (Disc 1)\n",
+   "duckdb_ms": 24.3
+  },
+  {
+   "id": "ch16",
+   "set": "analyst",
+   "tags": [
+    "anti",
+    "notexists"
+   ],
+   "sql": "SELECT count(*) AS artists_without_albums FROM {ch.artist} ar WHERE NOT EXISTS (SELECT 1 FROM {ch.album} al WHERE al.ArtistId = ar.ArtistId)",
+   "answer": "artists_without_albums\n71\n",
+   "duckdb_ms": 23.6
+  },
+  {
+   "id": "ch17",
+   "set": "analyst",
+   "tags": [
+    "cte",
+    "using"
+   ],
+   "sql": "WITH t AS (SELECT CustomerId, sum(Total) AS s FROM {ch.invoice} GROUP BY CustomerId) SELECT c.Country, avg(t.s) AS avg_customer_spend, count(*) AS customers FROM t JOIN {ch.customer} c USING (CustomerId) GROUP BY c.Country ORDER BY avg_customer_spend DESC, c.Country",
+   "answer": "Country,avg_customer_spend,customers\nChile,46.62,1\nHungary,45.62,1\nIreland,45.62,1\nCzech Republic,45.12,2\nAustria,42.62,1\nFinland,41.62,1\nNetherlands,40.62,1\nUSA,40.23538461538462,13\nNorway,39.62,1\nGermany,39.12,4\nFrance,39.02,5\nPortugal,38.62,2\nSweden,38.62,1\nBrazil,38.02,5\nCanada,37.995,8\nIndia,37.63,2\nArgentina,37.62,1\nAustralia,37.62,1\nBelgium,37.62,1\nDenmark,37.62,1\nItaly,37.62,1\nPoland,37.62,1\nSpain,37.62,1\nUnited Kingdom,37.62,3\n",
+   "duckdb_ms": 25.5
+  },
+  {
+   "id": "ch18",
+   "set": "analyst",
+   "tags": [
+    "chain",
+    "topk",
+    "shared-name"
+   ],
+   "sql": "SELECT t.Name AS track, al.Title AS album, sum(il.Quantity) AS units FROM {ch.invoiceline} il JOIN {ch.track} t ON il.TrackId = t.TrackId JOIN {ch.album} al ON t.AlbumId = al.AlbumId GROUP BY t.TrackId, t.Name, al.Title ORDER BY units DESC, track, album LIMIT 5",
+   "answer": "track,album,units\nA Cor Do Sol,\"Acústico MTV [Live]\",2\nA Melhor Forma,\"Acústico\",2\nA Novidade (Live),Quanta Gente Veio Ver (Live),2\n\"Abraham, Martin And John\",Seek And Shall Find: More Of The Best (1963-1981),2\nAces High,Powerslave,2\n",
+   "duckdb_ms": 25.8
+  },
+  {
+   "id": "ch19",
+   "set": "analyst",
+   "tags": [
+    "expr-cross",
+    "shared-name"
+   ],
+   "sql": "SELECT count(*) AS same_city FROM {ch.customer} c JOIN {ch.employee} e ON c.SupportRepId = e.EmployeeId WHERE c.City = e.City",
+   "answer": "same_city\n0\n",
+   "duckdb_ms": 24.1
+  },
+  {
+   "id": "ch20",
+   "set": "analyst",
+   "tags": [
+    "timestamp-filter",
+    "topk"
+   ],
+   "sql": "SELECT c.Country, sum(i.Total) AS revenue FROM {ch.invoice} i JOIN {ch.customer} c ON i.CustomerId = c.CustomerId WHERE i.InvoiceDate >= TIMESTAMP '2012-01-01 00:00:00' AND i.InvoiceDate < TIMESTAMP '2013-01-01 00:00:00' GROUP BY c.Country ORDER BY revenue DESC, c.Country LIMIT 5",
+   "answer": "Country,revenue\nUSA,127.98\nBrazil,53.46\nCanada,42.57\nFrance,36.66\nPortugal,24.77\n",
+   "duckdb_ms": 24.4
+  },
+  {
+   "id": "w-ds04",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "star"
+   ],
+   "sql": "SELECT i.i_category, count(*) AS n, sum(ss.ss_net_profit) AS profit FROM {ds.store_sales} ss JOIN {ds.date_dim} d ON ss.ss_sold_date_sk = d.d_date_sk JOIN {ds.store} s ON ss.ss_store_sk = s.s_store_sk JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk JOIN {ds.household_demographics} hd ON ss.ss_hdemo_sk = hd.hd_demo_sk WHERE hd.hd_dep_count = 4 AND d.d_year = 2000 AND s.s_state = 'TN' AND i.i_category IS NOT NULL GROUP BY i.i_category ORDER BY i.i_category",
+   "answer": "i_category,n,profit\nBooks,18513,-15088951.09\nChildren,19252,-15782225.72\nElectronics,19141,-15556030.70\nHome,18782,-15213740.96\nJewelry,18464,-15065175.56\nMen,18581,-15482231.97\nMusic,18811,-15654471.26\nShoes,18918,-15688875.65\nSports,18795,-15920870.67\nWomen,18930,-15746477.36\n",
+   "duckdb_ms": 111.9
+  },
+  {
+   "id": "w-ds06",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "left"
+   ],
+   "sql": "SELECT p.p_channel_tv, count(*) AS n, sum(ss.ss_net_paid) AS paid FROM {ds.store_sales} ss LEFT JOIN {ds.promotion} p ON ss.ss_promo_sk = p.p_promo_sk WHERE p.p_channel_tv IS NOT NULL GROUP BY p.p_channel_tv ORDER BY p.p_channel_tv",
+   "answer": "p_channel_tv,n,paid\nN,27066283,45510884436.96\n",
+   "duckdb_ms": 71.4
+  },
+  {
+   "id": "w-ds15",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "star"
+   ],
+   "sql": "SELECT w.w_warehouse_name, d.d_moy, avg(inv.inv_quantity_on_hand) AS avg_qoh FROM {ds.inventory} inv JOIN {ds.date_dim} d ON inv.inv_date_sk = d.d_date_sk JOIN {ds.warehouse} w ON inv.inv_warehouse_sk = w.w_warehouse_sk WHERE d.d_year = 2001 AND w.w_warehouse_name IS NOT NULL GROUP BY w.w_warehouse_name, d.d_moy ORDER BY w.w_warehouse_name, d.d_moy",
+   "answer": "w_warehouse_name,d_moy,avg_qoh\nBad cards must make.,1,500.5113444987447\nBad cards must make.,2,499.6627972966001\nBad cards must make.,3,499.8422251474175\nBad cards must make.,4,499.7633100358238\nBad cards must make.,5,499.67734094838795\nBad cards must make.,6,500.2861324192899\nBad cards must make.,7,499.14334263303647\nBad cards must make.,8,499.86336349345845\nBad cards must make.,9,499.1833653270584\nBad cards must make.,10,500.72081320450883\nBad cards must make.,11,500.0559523956902\nBad cards must make.,12,499.9929447346147\nConventional childr,1,499.86341903705807\nConventional childr,2,500.2951336892873\nConventional childr,3,500.00115233544113\nConventional childr,4,499.91805723249024\nConventional childr,5,500.75818611733536\nConventional childr,6,501.20162346704075\nConventional childr,7,500.31189833430545\nConventional childr,8,499.31864803980625\nConventional childr,9,500.59501091427006\nConventional childr,10,499.46212660946424\nConventional childr,11,499.5568458497371\nConventional childr,12,500.2031355630441\nDoors canno,1,499.4933966647736\nDoors canno,2,498.4161138957573\nDoors canno,3,499.418840298452\nDoors canno,4,500.39870094331343\nDoors canno,5,499.5530228030228\nDoors canno,6,499.91594089239277\nDoors canno,7,500.1965100629612\nDoors canno,8,500.6243424909786\nDoors canno,9,499.0514023268161\nDoors canno,10,500.8178842311247\nDoors canno,11,500.1823856528901\nDoors canno,12,500.5403209152486\nImportant issues liv,1,499.6331459225254\nImportant issues liv,2,499.4324092936899\nImportant issues liv,3,500.04153664536796\nImportant issues liv,4,500.0340529804741\nImportant issues liv,5,499.90257979019856\nImportant issues liv,6,500.4605740407287\nImportant issues liv,7,499.50481719431326\nImportant issues liv,8,499.2597336065574\nImportant issues liv,9,499.96105329386404\nImportant issues liv,10,499.88074601454883\nImportant issues liv,11,499.00595373264355\nImportant issues liv,12,500.71378146497307\n\"Local, mass universi\",1,499.67470401386083\n\"Local, mass universi\",2,500.4347911355168\n\"Local, mass universi\",3,501.16392040877867\n\"Local, mass universi\",4,500.15514145979074\n\"Local, mass universi\",5,501.0479722923994\n\"Local, mass universi\",6,499.97742339897536\n\"Local, mass universi\",7,499.12581755860356\n\"Local, mass universi\",8,499.8179908460964\n\"Local, mass universi\",9,500.82094514367134\n\"Local, mass universi\",10,499.40479409639795\n\"Local, mass universi\",11,500.0445378670788\n\"Local, mass universi\",12,500.93178110480125\n\"National, comple\",1,498.8573255831945\n\"National, comple\",2,498.6260236437849\n\"National, comple\",3,499.7261174625449\n\"National, comple\",4,500.3502520522783\n\"National, comple\",5,500.46967433645847\n\"National, comple\",6,499.4052840240352\n\"National, comple\",7,499.8111079538116\n\"National, comple\",8,498.8775596090291\n\"National, comple\",9,500.6014704593381\n\"National, comple\",10,501.12473750741685\n\"National, comple\",11,500.1309814317036\n\"National, comple\",12,500.8929992927536\n\"Plain, reluctant\",1,499.274258728807\n\"Plain, reluctant\",2,500.65151140125613\n\"Plain, reluctant\",3,500.32284751808186\n\"Plain, reluctant\",4,500.69256767216024\n\"Plain, reluctant\",5,499.49706868881066\n\"Plain, reluctant\",6,500.08876276958\n\"Plain, reluctant\",7,499.8836599553035\n\"Plain, reluctant\",8,499.233947093616\n\"Plain, reluctant\",9,501.7782481209218\n\"Plain, reluctant\",10,500.2966422633594\n\"Plain, reluctant\",11,498.54438558753463\n\"Plain, reluctant\",12,500.1945516856948\nQuite effectiv,1,500.04708892626104\nQuite effectiv,2,499.3450696591631\nQuite effectiv,3,500.2210195761257\nQuite effectiv,4,500.207905170947\nQuite effectiv,5,499.69090796558766\nQuite effectiv,6,499.9284070860374\nQuite effectiv,7,500.2840328589562\nQuite effectiv,8,499.54730011434424\nQuite effectiv,9,500.79362053825093\nQuite effectiv,10,498.93879951708266\nQuite effectiv,11,499.4138601116433\nQuite effectiv,12,501.30524300107356\nRooms cook ,1,500.2777150342167\nRooms cook ,2,500.8094792512136\nRooms cook ,3,500.6224424077285\nRooms cook ,4,500.00837014407796\nRooms cook ,5,501.0892975070167\nRooms cook ,6,499.87511097805213\nRooms cook ,7,500.93451828475963\nRooms cook ,8,499.73698618824454\nRooms cook ,9,500.4045352714659\nRooms cook ,10,500.3502235700029\nRooms cook ,11,500.0218063264759\nRooms cook ,12,499.62565821707625\n",
+   "duckdb_ms": 78.6
+  },
+  {
+   "id": "w-ds17",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "distinct",
+    "rows"
+   ],
+   "sql": "SELECT DISTINCT i.i_category, i.i_class FROM {ds.store_sales} ss JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk WHERE ss.ss_sold_date_sk = 2451545 AND i.i_category IS NOT NULL AND i.i_class IS NOT NULL ORDER BY i.i_category, i.i_class",
+   "answer": "i_category,i_class\nBooks,arts\nBooks,business\nBooks,computers\nBooks,cooking\nBooks,entertainments\nBooks,fiction\nBooks,history\nBooks,home repair\nBooks,mystery\nBooks,parenting\nBooks,reference\nBooks,romance\nBooks,science\nBooks,self-help\nBooks,sports\nBooks,travel\nChildren,infants\nChildren,newborn\nChildren,school-uniforms\nChildren,toddlers\nElectronics,audio\nElectronics,automotive\nElectronics,camcorders\nElectronics,cameras\nElectronics,disk drives\nElectronics,dvd/vcr players\nElectronics,karoke\nElectronics,memory\nElectronics,monitors\nElectronics,musical\nElectronics,personal\nElectronics,portable\nElectronics,scanners\nElectronics,stereo\nElectronics,televisions\nElectronics,wireless\nHome,accent\nHome,bathroom\nHome,bedding\nHome,blinds/shades\nHome,curtains/drapes\nHome,decor\nHome,flatware\nHome,furniture\nHome,glassware\nHome,kids\nHome,lighting\nHome,mattresses\nHome,paint\nHome,rugs\nHome,tables\nHome,wallpaper\nJewelry,birdal\nJewelry,bracelets\nJewelry,consignment\nJewelry,costume\nJewelry,custom\nJewelry,diamonds\nJewelry,earings\nJewelry,estate\nJewelry,gold\nJewelry,jewelry boxes\nJewelry,loose stones\nJewelry,mens watch\nJewelry,pendants\nJewelry,rings\nJewelry,semi-precious\nJewelry,womens watch\nMen,accessories\nMen,pants\nMen,shirts\nMen,sports-apparel\nMusic,classical\nMusic,country\nMusic,pop\nMusic,rock\nShoes,athletic\nShoes,kids\nShoes,mens\nShoes,womens\nSports,archery\nSports,athletic shoes\nSports,baseball\nSports,basketball\nSports,camping\nSports,fishing\nSports,fitness\nSports,football\nSports,golf\nSports,guns\nSports,hockey\nSports,optics\nSports,outdoor\nSports,pools\nSports,sailing\nSports,tennis\nWomen,dresses\nWomen,fragrances\nWomen,maternity\nWomen,swimwear\n",
+   "duckdb_ms": 69.7
+  },
+  {
+   "id": "w-ds18",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "snowflake",
+    "count-distinct"
+   ],
+   "sql": "SELECT ca.ca_state, count(DISTINCT ss.ss_customer_sk) AS customers FROM {ds.store_sales} ss JOIN {ds.customer} c ON ss.ss_customer_sk = c.c_customer_sk JOIN {ds.customer_address} ca ON c.c_current_addr_sk = ca.ca_address_sk WHERE ca.ca_state IS NOT NULL GROUP BY ca.ca_state ORDER BY customers DESC LIMIT 10",
+   "answer": "ca_state,customers\nTX,39422\nGA,24206\nVA,21161\nKY,18128\nMO,16676\nKS,16473\nIL,15769\nIA,15575\nNC,15462\nNE,14788\n",
+   "duckdb_ms": 115.2
+  },
+  {
+   "id": "w-ds22",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "decimal-build-filter"
+   ],
+   "sql": "SELECT i.i_category, sum(ss.ss_ext_sales_price) AS sales FROM {ds.store_sales} ss JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk WHERE i.i_current_price > 50.00 AND i.i_category IS NOT NULL GROUP BY i.i_category ORDER BY i.i_category",
+   "answer": "i_category,sales\nBooks,284538621.47\nChildren,274692786.30\nElectronics,301841548.01\nHome,281226797.94\nJewelry,294434943.49\nMen,286968270.46\nMusic,303627876.04\nShoes,280707378.46\nSports,316566193.73\nWomen,273262165.82\n",
+   "duckdb_ms": 76.1
+  },
+  {
+   "id": "w-ds23",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "decimal-cross-compare"
+   ],
+   "sql": "SELECT count(*) AS sold_above_list FROM {ds.store_sales} ss JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk WHERE ss.ss_sales_price > i.i_current_price AND i.i_current_price IS NOT NULL",
+   "answer": "sold_above_list\n22545356\n",
+   "duckdb_ms": 120.2
+  },
+  {
+   "id": "w-ds24",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "expr-over-joined",
+    "decimal"
+   ],
+   "sql": "SELECT i.i_category, sum(ss.ss_quantity * i.i_current_price) AS at_list, sum(ss.ss_ext_sales_price) AS actual FROM {ds.store_sales} ss JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk WHERE i.i_category IS NOT NULL AND i.i_current_price IS NOT NULL GROUP BY i.i_category ORDER BY i.i_category",
+   "answer": "i_category,at_list,actual\nBooks,1268959957.75,5135417333.15\nChildren,1247900870.08,5227237588.77\nElectronics,1290379010.07,5283965005.90\nHome,1267226116.74,5240486213.66\nJewelry,1286773448.94,5187048225.99\nMen,1289098552.22,5225005835.17\nMusic,1305917436.01,5279823996.09\nShoes,1304825793.98,5292495004.30\nSports,1342577645.46,5286762505.46\nWomen,1250347011.21,5258050966.16\n",
+   "duckdb_ms": 145.9
+  },
+  {
+   "id": "w-ds26",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "or-across-sides"
+   ],
+   "sql": "SELECT count(*) AS n, sum(ss.ss_net_paid) AS paid FROM {ds.store_sales} ss JOIN {ds.item} i ON ss.ss_item_sk = i.i_item_sk JOIN {ds.date_dim} d ON ss.ss_sold_date_sk = d.d_date_sk WHERE ((i.i_category = 'Books' AND d.d_moy = 12) OR (i.i_category = 'Music' AND d.d_moy = 6)) AND i.i_category IS NOT NULL",
+   "answer": "n,paid\n585215,984469540.66\n",
+   "duckdb_ms": 94.6
+  },
+  {
+   "id": "w-ds28",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "left",
+    "null-fk"
+   ],
+   "sql": "SELECT c.c_preferred_cust_flag, count(*) AS n, sum(ss.ss_net_paid) AS paid FROM {ds.store_sales} ss LEFT JOIN {ds.customer} c ON ss.ss_customer_sk = c.c_customer_sk WHERE c.c_preferred_cust_flag IS NOT NULL GROUP BY c.c_preferred_cust_flag ORDER BY c.c_preferred_cust_flag",
+   "answer": "c_preferred_cust_flag,n,paid\nN,13542586,22781701108.16\nY,13007215,21864539505.94\n",
+   "duckdb_ms": 107.4
+  },
+  {
+   "id": "w-ds30",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "star",
+    "3dims"
+   ],
+   "sql": "SELECT web.web_name, wp.wp_type, count(*) AS n, sum(ws.ws_net_profit) AS profit FROM {ds.web_sales} ws JOIN {ds.web_site} web ON ws.ws_web_site_sk = web.web_site_sk JOIN {ds.web_page} wp ON ws.ws_web_page_sk = wp.wp_web_page_sk JOIN {ds.date_dim} d ON ws.ws_sold_date_sk = d.d_date_sk WHERE d.d_year = 2002 AND web.web_name IS NOT NULL AND wp.wp_type IS NOT NULL GROUP BY web.web_name, wp.wp_type ORDER BY web.web_name, wp.wp_type",
+   "answer": "web_name,wp_type,n,profit\nsite_0,ad,42742,-11143762.86\nsite_0,dynamic,30364,-7656461.15\nsite_0,feedback,26503,-6615007.99\nsite_0,general,28353,-7186566.76\nsite_0,order,24402,-6444907.19\nsite_0,protected,22225,-5728180.76\nsite_0,welcome,30566,-8146072.65\nsite_1,ad,42652,-10327619.10\nsite_1,dynamic,30600,-7262679.85\nsite_1,feedback,26305,-6692611.18\nsite_1,general,28478,-7003594.71\nsite_1,order,24525,-5938992.09\nsite_1,protected,22419,-5678419.16\nsite_1,welcome,30329,-7822523.55\nsite_2,ad,42524,-11536585.21\nsite_2,dynamic,30536,-7850660.15\nsite_2,feedback,26164,-6256016.52\nsite_2,general,28470,-6988711.22\nsite_2,order,24493,-6793767.85\nsite_2,protected,22318,-5102291.08\nsite_2,welcome,31085,-8005543.63\nsite_3,ad,43036,-10979871.62\nsite_3,dynamic,30635,-7763993.28\nsite_3,feedback,26152,-6974744.21\nsite_3,general,28721,-6798969.25\nsite_3,order,24472,-6262506.49\nsite_3,protected,22237,-5536531.45\nsite_3,welcome,30494,-8595212.96\nsite_4,ad,42724,-11211385.32\nsite_4,dynamic,30816,-8078228.76\nsite_4,feedback,26280,-6663133.00\nsite_4,general,28668,-7997248.60\nsite_4,order,24283,-6835649.01\nsite_4,protected,22272,-5702535.92\nsite_4,welcome,30383,-7146160.51\nsite_5,ad,42758,-11447318.18\nsite_5,dynamic,30140,-7642034.51\nsite_5,feedback,26715,-6175126.53\nsite_5,general,28297,-7249942.61\nsite_5,order,24424,-6908430.58\nsite_5,protected,22381,-5092434.84\nsite_5,welcome,30704,-8430517.61\nsite_6,ad,42666,-10638646.50\nsite_6,dynamic,30607,-7934815.76\nsite_6,feedback,26381,-6942133.40\nsite_6,general,28539,-7495507.50\nsite_6,order,24247,-6252074.35\nsite_6,protected,22563,-5553039.24\nsite_6,welcome,30929,-7528698.98\n",
+   "duckdb_ms": 46.4
+  },
+  {
+   "id": "w-ds35",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "topk",
+    "groupby-names"
+   ],
+   "sql": "SELECT c.c_last_name, c.c_first_name, sum(ss.ss_net_paid) AS spent FROM {ds.store_sales} ss JOIN {ds.customer} c ON ss.ss_customer_sk = c.c_customer_sk WHERE c.c_last_name IS NOT NULL AND c.c_first_name IS NOT NULL GROUP BY c.c_customer_sk, c.c_last_name, c.c_first_name ORDER BY spent DESC LIMIT 10",
+   "answer": "c_last_name,c_first_name,spent\nValadez,Nicholas,404662.00\nLindsey,Kelle,388898.92\nThompson,Phyllis,379054.80\nReynolds,Jess,377508.29\nMalone,Elizabeth,365873.96\nPacheco,Esther,362987.26\nSaunders,Rhonda,357085.71\nRodriguez,Edwin,356833.90\nShearer,Eric,346042.58\nLopez,Martha,345593.21\n",
+   "duckdb_ms": 168.9
+  },
+  {
+   "id": "w-ds39",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "star",
+    "topk"
+   ],
+   "sql": "SELECT d.d_year, i.i_category_id, i.i_category, sum(ss.ss_ext_sales_price) AS sales FROM {ds.date_dim} d, {ds.store_sales} ss, {ds.item} i WHERE d.d_date_sk = ss.ss_sold_date_sk AND ss.ss_item_sk = i.i_item_sk AND i.i_manager_id = 1 AND d.d_moy = 11 AND d.d_year = 2000 AND i.i_category_id IS NOT NULL AND i.i_category IS NOT NULL GROUP BY d.d_year, i.i_category_id, i.i_category ORDER BY sales DESC, d.d_year, i.i_category_id, i.i_category LIMIT 100",
+   "answer": "d_year,i_category_id,i_category,sales\n2000,10,Electronics,3636066.85\n2000,1,Women,3457932.74\n2000,3,Children,3194121.54\n2000,2,Men,3187204.89\n2000,7,Home,2988728.25\n2000,4,Shoes,2921421.32\n2000,6,Jewelry,2807719.18\n2000,8,Sports,2713893.02\n2000,5,Music,2669476.26\n2000,9,Books,2497671.85\n",
+   "duckdb_ms": 82.3
+  },
+  {
+   "id": "w-ds11",
+   "set": "workaround",
+   "tags": [
+    "isnotnull",
+    "rows-as-groupby"
+   ],
+   "sql": "SELECT c.c_customer_id, c.c_first_name, c.c_last_name, ca.ca_city FROM {ds.customer} c JOIN {ds.customer_address} ca ON c.c_current_addr_sk = ca.ca_address_sk WHERE ca.ca_state = 'CA' AND c.c_birth_year = 1980 AND c.c_first_name IS NOT NULL AND c.c_last_name IS NOT NULL AND ca.ca_city IS NOT NULL GROUP BY c.c_customer_id, c.c_first_name, c.c_last_name, ca.ca_city ORDER BY c.c_customer_id LIMIT 20",
+   "answer": "c_customer_id,c_first_name,c_last_name,ca_city\nAAAAAAAAACCIAAAA,Jeff,Baker,Stringtown\nAAAAAAAAACGAEAAA,Richard,Labbe,Spring Hill\nAAAAAAAAADPKBAAA,Claire,Wallis,Unionville\nAAAAAAAAAFKNFAAA,Ida,Smith,Woodland\nAAAAAAAAAGPIEAAA,Sharon,Jones,Pleasant Valley\nAAAAAAAAAHDOAAAA,Merle,Williams,White Oak\nAAAAAAAAAKDJDAAA,Vanessa,Sandoval,Midway\nAAAAAAAAALIBAAAA,Michael,Price,Mount Olive\nAAAAAAAAANKMBAAA,Shannon,Beaudry,Midway\nAAAAAAAAANOHEAAA,Javier,Shields,Red Hill\nAAAAAAAAAPIMAAAA,Ralph,Hudson,Marion\nAAAAAAAABDNPGAAA,Josephine,Mayo,Jamestown\nAAAAAAAABGLKEAAA,Marty,Tackett,Hamilton\nAAAAAAAABNFJDAAA,Delores,Dyer,Mount Vernon\nAAAAAAAABODFFAAA,Francisco,Lee,Jamestown\nAAAAAAAABOIJDAAA,Herbert,Vazquez,Baldwin\nAAAAAAAABOMHBAAA,Shelly,Combs,Riverview\nAAAAAAAABPKEDAAA,Donnie,King,Oak Grove\nAAAAAAAACAANFAAA,Kimberly,Turner,Lincoln\nAAAAAAAACBOBDAAA,Brian,Tracy,Ashland\n",
+   "duckdb_ms": 34.0
+  },
+  {
+   "id": "w-tl14",
+   "set": "workaround",
+   "tags": [
+    "hour-fn",
+    "timestamp-expr"
+   ],
+   "sql": "SELECT z.Borough, hour(t.tpep_pickup_datetime) AS hr, count(*) AS trips FROM {tlc.yellow01} t JOIN {tlc.zones} z ON t.PULocationID = z.LocationID WHERE z.Borough IN ('Manhattan', 'Brooklyn') GROUP BY z.Borough, hr ORDER BY z.Borough, hr",
+   "answer": "Borough,hr,trips\nBrooklyn,0,913\nBrooklyn,1,743\nBrooklyn,2,612\nBrooklyn,3,538\nBrooklyn,4,637\nBrooklyn,5,893\nBrooklyn,6,1501\nBrooklyn,7,1771\nBrooklyn,8,1922\nBrooklyn,9,1648\nBrooklyn,10,1406\nBrooklyn,11,1319\nBrooklyn,12,1360\nBrooklyn,13,1189\nBrooklyn,14,1067\nBrooklyn,15,1100\nBrooklyn,16,981\nBrooklyn,17,964\nBrooklyn,18,922\nBrooklyn,19,681\nBrooklyn,20,610\nBrooklyn,21,586\nBrooklyn,22,930\nBrooklyn,23,965\nManhattan,0,68309\nManhattan,1,49123\nManhattan,2,35123\nManhattan,3,22919\nManhattan,4,14554\nManhattan,5,13930\nManhattan,6,33434\nManhattan,7,73482\nManhattan,8,105843\nManhattan,9,115679\nManhattan,10,124477\nManhattan,11,137635\nManhattan,12,149802\nManhattan,13,153821\nManhattan,14,163315\nManhattan,15,169587\nManhattan,16,168264\nManhattan,17,186657\nManhattan,18,194356\nManhattan,19,164369\nManhattan,20,141872\nManhattan,21,143367\nManhattan,22,124846\nManhattan,23,92184\n",
+   "duckdb_ms": 52.0
+  },
+  {
+   "id": "w-ch09",
+   "set": "workaround",
+   "tags": [
+    "year-fn",
+    "timestamp-expr"
+   ],
+   "sql": "SELECT year(i.InvoiceDate) AS yr, month(i.InvoiceDate) AS mo, sum(i.Total) AS revenue FROM {ch.invoice} i JOIN {ch.customer} c ON i.CustomerId = c.CustomerId WHERE c.Country = 'USA' GROUP BY yr, mo ORDER BY yr, mo",
+   "answer": "yr,mo,revenue\n2009,1,13.86\n2009,2,0.99\n2009,3,13.86\n2009,4,13.86\n2009,6,18.81\n2009,9,14.85\n2009,10,0.99\n2009,11,3.96\n2009,12,22.77\n2010,1,0.99\n2010,2,7.92\n2010,3,15.86\n2010,4,0.99\n2010,5,13.86\n2010,6,13.86\n2010,8,20.79\n2010,9,13.86\n2010,11,14.85\n2011,1,2.97\n2011,2,8.91\n2011,4,8.91\n2011,5,27.77\n2011,7,14.85\n2011,8,13.86\n2011,10,11.88\n2011,12,13.86\n2012,1,14.85\n2012,3,2.97\n2012,4,8.91\n2012,6,8.91\n2012,7,10.91\n2012,8,23.86\n2012,9,29.85\n2012,11,13.86\n2012,12,13.86\n2013,2,13.86\n2013,4,18.81\n2013,5,0.99\n2013,7,14.85\n2013,8,0.99\n2013,9,3.96\n2013,10,22.77\n2013,11,0.99\n2013,12,7.92\n",
+   "duckdb_ms": 24.0
+  },
+  {
+   "id": "w-ch11",
+   "set": "workaround",
+   "tags": [
+    "year-fn",
+    "timestamp-expr-dim"
+   ],
+   "sql": "SELECT year(e.HireDate) AS hire_year, avg(i.Total) AS avg_invoice FROM {ch.invoice} i JOIN {ch.customer} c ON i.CustomerId = c.CustomerId JOIN {ch.employee} e ON c.SupportRepId = e.EmployeeId GROUP BY hire_year ORDER BY hire_year",
+   "answer": "hire_year,avg_invoice\n2002,5.7057534246575345\n2003,5.622406015037594\n",
+   "duckdb_ms": 25.2
+  },
+  {
+   "id": "w-ds10",
+   "set": "workaround",
+   "tags": [
+    "in",
+    "notin"
+   ],
+   "sql": "SELECT count(*) AS store_only_customers FROM {ds.customer} WHERE c_customer_sk IN (SELECT ss_customer_sk FROM {ds.store_sales}) AND c_customer_sk NOT IN (SELECT cs_bill_customer_sk FROM {ds.catalog_sales} WHERE cs_bill_customer_sk IS NOT NULL)",
+   "answer": "store_only_customers\n20365\n",
+   "duckdb_ms": 144.7
+  },
+  {
+   "id": "w-ch16",
+   "set": "workaround",
+   "tags": [
+    "notin"
+   ],
+   "sql": "SELECT count(*) AS artists_without_albums FROM {ch.artist} WHERE ArtistId NOT IN (SELECT ArtistId FROM {ch.album})",
+   "answer": "artists_without_albums\n71\n",
+   "duckdb_ms": 23.3
+  },
+  {
+   "id": "w-ch07",
+   "set": "workaround",
+   "tags": [
+    "nested",
+    "in"
+   ],
+   "sql": "SELECT count(DISTINCT CustomerId) AS jazz_buyers FROM {ch.invoice} WHERE InvoiceId IN (SELECT InvoiceId FROM {ch.invoiceline} WHERE TrackId IN (SELECT TrackId FROM {ch.track} WHERE GenreId IN (SELECT GenreId FROM {ch.genre} WHERE Name = 'Jazz')))",
+   "answer": "jazz_buyers\n32\n",
+   "duckdb_ms": 24.8
+  },
+  {
+   "id": "w-ch10",
+   "set": "workaround",
+   "tags": [
+    "rows-as-groupby"
+   ],
+   "sql": "SELECT i.InvoiceId, i.InvoiceDate, i.Total FROM {ch.invoice} i JOIN {ch.customer} c ON i.CustomerId = c.CustomerId WHERE c.Email = 'luisg@embraer.com.br' GROUP BY i.InvoiceId, i.InvoiceDate, i.Total ORDER BY i.InvoiceId",
+   "answer": "InvoiceId,InvoiceDate,Total\n98,2010-03-11 00:00:00,3.98\n121,2010-06-13 00:00:00,3.96\n143,2010-09-15 00:00:00,5.94\n195,2011-05-06 00:00:00,0.99\n316,2012-10-27 00:00:00,1.98\n327,2012-12-07 00:00:00,13.86\n382,2013-08-07 00:00:00,8.91\n",
+   "duckdb_ms": 24.0
+  },
+  {
+   "id": "w-ds21",
+   "set": "workaround",
+   "tags": [
+    "groupby-dim"
+   ],
+   "sql": "SELECT s.s_store_name, count(*) AS cnt FROM {ds.store_sales} ss JOIN {ds.store} s ON ss.ss_store_sk = s.s_store_sk GROUP BY s.s_store_sk, s.s_store_name ORDER BY cnt DESC, s.s_store_name",
+   "answer": "s_store_name,cnt\neing,545024\nable,543621\nbar,543296\nbar,542897\nese,542864\neing,542005\neing,541997\nbar,541887\nese,541538\nable,541477\nought,541379\nn st,541356\nable,541263\ncally,541057\npri,540948\nable,540735\nbar,540260\nanti,540201\ncally,539991\neing,539877\nought,539863\nese,539858\nn st,539838\neing,539641\nese,539526\npri,539469\ncally,538995\nese,538722\nbar,538718\nn st,538708\ncally,538705\nanti,538551\neing,538476\nese,538252\nese,538206\nable,538022\nation,537739\nbar,537683\nation,537681\nable,537481\nable,537330\nbar,537280\nation,536921\nought,536919\ncally,536897\nation,536665\nought,536343\neing,536264\ncally,536000\nanti,534896\npri,531531\n",
+   "duckdb_ms": 63.4
+  },
+  {
+   "id": "w-ds13",
+   "set": "workaround",
+   "tags": [
+    "sk-arith"
+   ],
+   "sql": "SELECT d1.d_year, avg(cs.cs_ship_date_sk - cs.cs_sold_date_sk) AS avg_ship_days, count(*) AS n FROM {ds.catalog_sales} cs JOIN {ds.date_dim} d1 ON cs.cs_sold_date_sk = d1.d_date_sk WHERE cs.cs_ship_date_sk IS NOT NULL GROUP BY d1.d_year ORDER BY d1.d_year",
+   "answer": "d_year,avg_ship_days,n\n1998,46.00539233490985,2844037\n1999,45.995744980106785,2843935\n2000,45.97817055267446,2860219\n2001,45.99869193805789,2845431\n2002,46.03121413558446,2842302\n2003,45.9745774500939,57508\n",
+   "duckdb_ms": 54.4
+  },
+  {
+   "id": "w-ds14",
+   "set": "workaround",
+   "tags": [
+    "filter-agg"
+   ],
+   "sql": "SELECT w.w_warehouse_name, sm.sm_type, cc.cc_name, count(*) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 30) AS d30, count(*) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk > 30 AND cs.cs_ship_date_sk - cs.cs_sold_date_sk <= 60) AS d60, count(*) FILTER (WHERE cs.cs_ship_date_sk - cs.cs_sold_date_sk > 60) AS d60plus FROM {ds.catalog_sales} cs JOIN {ds.warehouse} w ON cs.cs_warehouse_sk = w.w_warehouse_sk JOIN {ds.ship_mode} sm ON cs.cs_ship_mode_sk = sm.sm_ship_mode_sk JOIN {ds.call_center} cc ON cs.cs_call_center_sk = cc.cc_call_center_sk WHERE w.w_warehouse_name IS NOT NULL AND sm.sm_type IS NOT NULL AND cc.cc_name IS NOT NULL GROUP BY w.w_warehouse_name, sm.sm_type, cc.cc_name ORDER BY w.w_warehouse_name, sm.sm_type, cc.cc_name LIMIT 100",
+   "answer": "w_warehouse_name,sm_type,cc_name,d30,d60,d60plus\nBad cards must make.,EXPRESS,California,7743,7965,7913\nBad cards must make.,EXPRESS,California_1,7634,8088,8030\nBad cards must make.,EXPRESS,Hawaii/Alaska,7667,7934,7956\nBad cards must make.,EXPRESS,Hawaii/Alaska_1,7799,8085,8093\nBad cards must make.,EXPRESS,Mid Atlantic,7676,7952,7767\nBad cards must make.,EXPRESS,Mid Atlantic_1,7744,8065,8041\nBad cards must make.,EXPRESS,NY Metro,7615,7858,7775\nBad cards must make.,EXPRESS,NY Metro_1,7771,8102,8038\nBad cards must make.,EXPRESS,North Midwest,7668,7965,8054\nBad cards must make.,EXPRESS,North Midwest_1,7765,7929,7919\nBad cards must make.,EXPRESS,Pacific Northwest,7808,7994,8087\nBad cards must make.,EXPRESS,Pacific Northwest_1,7723,7888,7943\nBad cards must make.,LIBRARY,California,5834,5984,5904\nBad cards must make.,LIBRARY,California_1,5854,6077,6083\nBad cards must make.,LIBRARY,Hawaii/Alaska,5843,6069,5992\nBad cards must make.,LIBRARY,Hawaii/Alaska_1,5782,5840,5932\nBad cards must make.,LIBRARY,Mid Atlantic,5793,5796,5976\nBad cards must make.,LIBRARY,Mid Atlantic_1,5753,5952,5937\nBad cards must make.,LIBRARY,NY Metro,5720,6120,6106\nBad cards must make.,LIBRARY,NY Metro_1,5785,6076,6024\nBad cards must make.,LIBRARY,North Midwest,5908,5930,6087\nBad cards must make.,LIBRARY,North Midwest_1,5945,5955,6104\nBad cards must make.,LIBRARY,Pacific Northwest,5950,6015,5971\nBad cards must make.,LIBRARY,Pacific Northwest_1,5821,6134,5908\nBad cards must make.,NEXT DAY,California,7723,8030,8103\nBad cards must make.,NEXT DAY,California_1,7753,7981,8150\nBad cards must make.,NEXT DAY,Hawaii/Alaska,7575,7767,8221\nBad cards must make.,NEXT DAY,Hawaii/Alaska_1,7644,8113,8247\nBad cards must make.,NEXT DAY,Mid Atlantic,7760,7930,8025\nBad cards must make.,NEXT DAY,Mid Atlantic_1,7782,7910,7989\nBad cards must make.,NEXT DAY,NY Metro,7762,7806,8077\nBad cards must make.,NEXT DAY,NY Metro_1,7973,7869,8031\nBad cards must make.,NEXT DAY,North Midwest,7707,7899,7889\nBad cards must make.,NEXT DAY,North Midwest_1,7717,7889,7900\nBad cards must make.,NEXT DAY,Pacific Northwest,7669,7819,8165\nBad cards must make.,NEXT DAY,Pacific Northwest_1,7499,7837,7985\nBad cards must make.,OVERNIGHT,California,5699,6011,6035\nBad cards must make.,OVERNIGHT,California_1,5825,5930,5957\nBad cards must make.,OVERNIGHT,Hawaii/Alaska,5765,6033,6033\nBad cards must make.,OVERNIGHT,Hawaii/Alaska_1,5717,6005,6075\nBad cards must make.,OVERNIGHT,Mid Atlantic,5924,5938,6028\nBad cards must make.,OVERNIGHT,Mid Atlantic_1,5712,6010,6055\nBad cards must make.,OVERNIGHT,NY Metro,5798,5878,5982\nBad cards must make.,OVERNIGHT,NY Metro_1,5869,6065,6064\nBad cards must make.,OVERNIGHT,North Midwest,5902,6097,5874\nBad cards must make.,OVERNIGHT,North Midwest_1,5824,5983,6048\nBad cards must make.,OVERNIGHT,Pacific Northwest,5794,6039,6031\nBad cards must make.,OVERNIGHT,Pacific Northwest_1,5862,5934,5959\nBad cards must make.,REGULAR,California,5745,5934,6032\nBad cards must make.,REGULAR,California_1,5932,6074,5925\nBad cards must make.,REGULAR,Hawaii/Alaska,5795,5880,5978\nBad cards must make.,REGULAR,Hawaii/Alaska_1,5913,6053,6100\nBad cards must make.,REGULAR,Mid Atlantic,5847,6026,5972\nBad cards must make.,REGULAR,Mid Atlantic_1,5803,6040,6025\nBad cards must make.,REGULAR,NY Metro,5702,6047,5938\nBad cards must make.,REGULAR,NY Metro_1,5793,5981,6104\nBad cards must make.,REGULAR,North Midwest,5677,6016,5948\nBad cards must make.,REGULAR,North Midwest_1,5880,5986,5997\nBad cards must make.,REGULAR,Pacific Northwest,5846,5918,6139\nBad cards must make.,REGULAR,Pacific Northwest_1,5858,5970,5972\nBad cards must make.,TWO DAY,California,5700,6067,6067\nBad cards must make.,TWO DAY,California_1,5736,5951,5998\nBad cards must make.,TWO DAY,Hawaii/Alaska,5843,5962,5887\nBad cards must make.,TWO DAY,Hawaii/Alaska_1,5927,5849,5929\nBad cards must make.,TWO DAY,Mid Atlantic,5777,6141,5977\nBad cards must make.,TWO DAY,Mid Atlantic_1,5832,5967,6060\nBad cards must make.,TWO DAY,NY Metro,5827,6127,5873\nBad cards must make.,TWO DAY,NY Metro_1,6039,6045,6028\nBad cards must make.,TWO DAY,North Midwest,5763,5980,6173\nBad cards must make.,TWO DAY,North Midwest_1,5971,5960,6146\nBad cards must make.,TWO DAY,Pacific Northwest,5810,5929,6078\nBad cards must make.,TWO DAY,Pacific Northwest_1,5709,6028,6082\nConventional childr,EXPRESS,California,7652,7974,7960\nConventional childr,EXPRESS,California_1,7741,8204,7940\nConventional childr,EXPRESS,Hawaii/Alaska,7655,7822,8003\nConventional childr,EXPRESS,Hawaii/Alaska_1,7761,8031,7950\nConventional childr,EXPRESS,Mid Atlantic,7565,8014,8019\nConventional childr,EXPRESS,Mid Atlantic_1,7798,7926,8112\nConventional childr,EXPRESS,NY Metro,7835,8042,8084\nConventional childr,EXPRESS,NY Metro_1,7524,7916,8026\nConventional childr,EXPRESS,North Midwest,7720,8106,8093\nConventional childr,EXPRESS,North Midwest_1,7693,8063,7957\nConventional childr,EXPRESS,Pacific Northwest,7910,8091,8091\nConventional childr,EXPRESS,Pacific Northwest_1,7620,7958,7815\nConventional childr,LIBRARY,California,5850,6024,5931\nConventional childr,LIBRARY,California_1,5792,6089,6119\nConventional childr,LIBRARY,Hawaii/Alaska,5717,5987,5896\nConventional childr,LIBRARY,Hawaii/Alaska_1,5863,6277,6024\nConventional childr,LIBRARY,Mid Atlantic,5812,6045,6035\nConventional childr,LIBRARY,Mid Atlantic_1,5779,5899,5862\nConventional childr,LIBRARY,NY Metro,5802,6008,6028\nConventional childr,LIBRARY,NY Metro_1,5913,6136,6010\nConventional childr,LIBRARY,North Midwest,5824,6000,5982\nConventional childr,LIBRARY,North Midwest_1,5962,6111,5997\nConventional childr,LIBRARY,Pacific Northwest,5971,5941,5926\nConventional childr,LIBRARY,Pacific Northwest_1,5876,5957,5825\nConventional childr,NEXT DAY,California,7736,7963,8114\nConventional childr,NEXT DAY,California_1,7726,8017,8056\nConventional childr,NEXT DAY,Hawaii/Alaska,7700,7960,8051\nConventional childr,NEXT DAY,Hawaii/Alaska_1,7743,8081,8058\n",
+   "duckdb_ms": 107.4
+  }
+ ]
+}

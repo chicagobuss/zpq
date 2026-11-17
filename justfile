@@ -116,6 +116,17 @@ idle seed="1234" queries="600":
     zig build -Doptimize=ReleaseSafe cli
     {{python}} tools/agg_ab_fuzz.py --zpq zig-out/bin/zpq --seed {{seed}} --queries {{queries}}
 
+# The joins suite (tools/joins_suite): 104 analyst join queries over s3://zpq-public-data against DuckDB's answers,
+# local and over S3, one score line. Needs ZPQ_TEST_PARQUET_DIR (or --data) and S3_* credentials. No gate runs it.
+joins-suite *args="":
+    zig build -Doptimize=ReleaseFast cli
+    {{python}} tools/joins_suite/suite.py --zpq zig-out/bin/zpq {{args}}
+
+# The randomized join differential against DuckDB 2.0.0 (tools/joins_suite/differential.py). No gate runs it.
+joins-diff seeds="1-12" queries="40" *args="":
+    zig build -Doptimize=ReleaseFast cli
+    {{python}} tools/joins_suite/differential.py --zpq zig-out/bin/zpq --seeds {{seeds}} --queries {{queries}} {{args}}
+
 # Coverage-guided fuzzing; the seed corpus also runs in `test`.
 fuzz filter="fuzz:":
     zig build fuzz -Dtest-filter={{filter}} --fuzz

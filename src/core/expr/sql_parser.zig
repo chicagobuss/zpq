@@ -1212,7 +1212,9 @@ pub fn parseSqlJoinPlan(allocator: std.mem.Allocator, sql: []const u8, schemas: 
     var report: literals.Report = .{};
     const folded = try fold(allocator, sql, &report);
     const markers = report.markers;
-    const z = try allocator.dupeSentinel(u8, folded, 0);
+    const positioned = try positionAsStrpos(allocator, folded);
+    const extracted = try extractAsDatePart(allocator, positioned);
+    const z = try substringKeywords(allocator, extracted);
     const paths = (try sql_join.tables(allocator, z)) orelse return null;
     const first = try resolveJoin(allocator, z, paths, schemas, markers, false);
     // A probe query that still holds `IN (SELECT ...)` semi-joins the probe itself.

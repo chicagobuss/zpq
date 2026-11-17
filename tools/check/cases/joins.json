@@ -1,6 +1,10 @@
 {
  "fixtures": [
   {
+   "name": "extract_fact",
+   "copy": "COPY (SELECT i % 2 + 1 AS fk, CASE WHEN i % 2 = 0 THEN TIMESTAMP '2024-01-01 01:00:00' ELSE TIMESTAMP '2024-01-01 02:00:00' END AS ts FROM range(0, 1000) t(i)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
    "name": "fact",
    "copy": "COPY (SELECT i AS id, (CASE WHEN i % 23 = 0 THEN NULL ELSE i % 997 END)::BIGINT AS fk, (i * 1.25)::DOUBLE AS amt, (i % 7)::BIGINT AS q, (i % 997)::BIGINT * 100003 AS sfk, ((i % 1000) * 0.01)::DECIMAL(12, 2) AS dec FROM range(1, 20000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 4096)"
   },
@@ -118,6 +122,15 @@
   }
  ],
  "cases": [
+  {
+   "id": "join:extract:hour",
+   "fixture": "extract_fact",
+   "sql": "SELECT EXTRACT(hour FROM f.ts) AS h, count(*) AS n FROM '{fixture:extract_fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk GROUP BY h ORDER BY h",
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT EXTRACT(hour FROM f.ts) AS h, count(*) AS n FROM '{fixture:extract_fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk GROUP BY h ORDER BY h"
+   }
+  },
   {
    "id": "join:late:path-parity",
    "fixture": "fact",

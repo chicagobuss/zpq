@@ -45,9 +45,11 @@ def _ceq(a, b, notes):
     fa, fb = float(a[1]), float(b[1])
     if abs(fa - fb) <= 1e-9 * max(abs(fa), abs(fb), 1e-300):
         return True  # summation order
-    # zpq's avg over DECIMAL(p,s) is DECIMAL(q, s+q-p), printed at that scale (6 places); DuckDB's is DOUBLE.
-    e = max(a[1].as_tuple().exponent, b[1].as_tuple().exponent)
-    if e <= -6 and abs(fa - fb) <= 0.5 * 10.0 ** e * (1 + 1e-9):
+    # zpq's avg over DECIMAL(p,s) is DECIMAL(q, s+q-p) with q = min(38, p+4), and DECIMAL(38,s) stays DECIMAL(38,s):
+    # it prints at that fixed scale, while DuckDB's avg is a DOUBLE. Accept zpq's value (b) when it has 1-6 fractional
+    # digits, DuckDB's (a) is a full-precision double (12+ digits), and they agree to half a unit of zpq's last place.
+    sb = -b[1].as_tuple().exponent
+    if 1 <= sb <= 6 and len(a[1].as_tuple().digits) >= 12 and abs(fa - fb) <= 0.5 * 10.0 ** -sb * (1 + 1e-9):
         notes.add('DECIMAL avg at its own scale')
         return True
     return False

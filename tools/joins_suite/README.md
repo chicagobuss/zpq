@@ -32,7 +32,7 @@ joins-suite analyst (104) zpq 0.5.2 (c16bb54764b3): local 28 correct, 73 refused
 
 | class | meaning |
 |---|---|
-| **correct** | Equals DuckDB's answer. Rows are compared in order when the outer query has ORDER BY, and as multisets otherwise. Floats must agree to 1e-9 relative. zpq's DECIMAL `avg` is accepted at its own 6-digit scale. |
+| **correct** | Equals DuckDB's answer. Rows are compared in order when the outer query has ORDER BY, and as multisets otherwise. Floats must agree to 1e-9 relative. zpq's DECIMAL `avg` is accepted at its own fixed scale (6 places, or the input's for DECIMAL(38,s)) when it is DuckDB's DOUBLE rounded there. |
 | **refused, named** | zpq exits 1 or 2 with a message that names the missing feature. |
 | **refused, unnamed** | zpq exits 1 or 2, but the message names no feature: a bare error name such as `FileNotFound` or `UnsupportedFromClause`, "unknown column referenced in expression", "\`\` is an expression", or "column is ambiguous". The patterns are `common.UNNAMED`. |
 | **wrong** | zpq answers, and the answer differs from DuckDB's. This includes the same rows in another order under ORDER BY. |

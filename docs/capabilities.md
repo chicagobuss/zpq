@@ -94,8 +94,10 @@ column the outer query never reads is still an error (DuckDB skips it), and an o
 by name: `WITH RECURSIVE` (`CteRecursive`), two CTEs of one name (`CteDuplicate`), a CTE that reads itself (`CteCircular`),
 `LATERAL` and a subquery in FROM that qualifies a column of a table to its left, which DuckDB runs as LATERAL
 (`LateralNotSupported`), and a WITH list or alias that does not parse (`SqlParseError`). A join over CTEs is a join of files,
-under its rules (a join must aggregate in this release: one whose rows would be the answer, or a projection with an
-`IN (SELECT ...)`, is `JoinRowsNotSupported`). `--explain` is not available, the in-process SQL requests do not carry them
+under its rules. A join's plain rows (or a projection's with an `IN (SELECT ...)`) run as their groups, each shown as often
+as it occurs, and are held in memory: rows past `--max-memory` are `JoinRowsExceedBudget`, a FLOAT or DOUBLE column among
+them `JoinRowsFloat` (a group's float key is not a row's value), and `SELECT *` or an expression without `AS`
+`JoinRowsShape`. `--explain` is not available, the in-process SQL requests do not carry them
 yet, a refusal of the query after its CTEs ran exits 1, and `--summary=json` describes the last query.
 
 **More scalar functions.** A column of the query's one table may be written `t.g` (its alias, else the file's own name).

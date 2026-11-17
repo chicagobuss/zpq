@@ -501,7 +501,9 @@ fn executeAggregateOver(
     // A group-join's partials draw from the ledger too: their refusal is the ledger's.
     var r = scan.runMultiAggregate(ctx.gpa, arena, scan_args) catch |err| {
         if (reader) |rd| rd.reportFailure(err, args.diag);
-        return if (args.join) |j| j.refusal(err) else err;
+        const refusal = if (args.join) |j| j.refusal(err) else err;
+        // A join's rows are held as their groups: too many to hold is that limit, by name.
+        return if (refusal == error.ExceededMemoryBudget and args.result_order.repeat != null) error.JoinRowsExceedBudget else refusal;
     };
     if (args.join) |j| if (try j.takeRows(ctx.gpa)) |rows| {
         // The group-join's answer stands in for the empty one the group tables gave (`GroupJoin.rows`).
@@ -589,11 +591,15 @@ pub fn answerAggregate(
         .calls = r.state.agg_calls,
         .sources = r.state.agg_sources,
         .workers = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env),
+        .budget = ledger,
     };
+    // Only rows repeat: an answer in another form would show each group once, which is not the join's rows.
+    if (args.result_order.repeat != null and !grouped) return error.JoinRowsNotSupported;
     var tail_start = if (trace_tail) nowMonoNs() else 0;
     const late = try fetchBeforeCut(ctx.gpa, &r.output, program);
     if (trace_tail) tail_start = traceTail("fetch before cut", tail_start);
-    try program.finish(ctx.gpa, &r.output, &r.state.group_col_types);
+    program.finish(ctx.gpa, &r.output, &r.state.group_col_types) catch |err|
+        return if (err == error.ExceededMemoryBudget) error.JoinRowsExceedBudget else err;
     if (trace_tail) tail_start = traceTail("result program", tail_start);
     if (late) try fetchAfterCut(ctx.gpa, &r.output, program);
     if (args.join) |j| try j.intact();
@@ -715,8 +721,10 @@ inline fn aggregateScanArgs(
         .select_cols = args.select_cols,
         .result_order = order,
         .result_width = if (args.result_order.post) args.select_cols.?.len + args.result_order.hidden.len else 0,
-        .typed_answer = args.typed_answer and args.output != null,
-        .record_answer = (args.text_output != null or args.aggregate_sink != null) and args.output == null,
+        // Rows that repeat (`ResultOrder.repeat`) are repeated as rows: no typed columns, no stream.
+        .typed_answer = args.typed_answer and args.output != null and args.result_order.repeat == null,
+        .record_answer = (args.text_output != null or args.aggregate_sink != null) and args.output == null and
+            args.result_order.repeat == null,
         .integer_records = !envDisables(ctx.env, "ZPQ_INTEGER_RECORDS"),
         .sorted_count_stream = !envDisables(ctx.env, "ZPQ_SORTED_COUNT_STREAM"),
         .msd_records = !envDisables(ctx.env, "ZPQ_MSD_RECORDS"),

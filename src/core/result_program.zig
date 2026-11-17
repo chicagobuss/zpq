@@ -16,6 +16,8 @@ const scan = @import("scan.zig");
 const schema = @import("schema.zig");
 const expr_ast = @import("expr/ast.zig");
 const expr_agg = @import("expr/agg.zig");
+const core_memory = @import("memory.zig");
+const BorrowedSpan = @import("scan/types.zig").BorrowedSpan;
 
 pub const Error = error{
     OutOfMemory,
@@ -33,6 +35,8 @@ pub const Error = error{
     /// The arithmetic reads a value whose SQL type zpq does not resolve (the min or max of an expression or of a FLOAT
     /// column): refused rather than computed in a type DuckDB would not use.
     PostAggTypeUnknown,
+    /// The rows a repeat makes (`ResultOrder.repeat`) do not fit the query's ledger.
+    ExceededMemoryBudget,
 };
 
 pub const ResultProgram = struct {
@@ -50,6 +54,8 @@ pub const ResultProgram = struct {
     grouped: bool = false,
     /// Threads the per-row passes over a large answer (`widen`, `project`) may run on.
     workers: usize = 1,
+    /// The query's ledger, which the rows a repeat makes draw from (`repeatRows`).
+    budget: ?*core_memory.SharedBudget = null,
 
     /// The order the strategies before this stage may cut by. A cut ranks groups before HAVING has dropped any, so
     /// under HAVING it would keep the top rows of the wrong set and underfill the answer: the limit is masked there,
@@ -86,12 +92,91 @@ pub const ResultProgram = struct {
     ) Error!void {
         if (self.order.post) return self.finishPost(gpa, out, col_types);
         if (self.order.having) |h| try applyHaving(gpa, out, h.*);
-        try out.applyResultOrder(gpa, self.order);
+        const copies = try self.rank(gpa, out);
+        defer if (copies) |c| gpa.free(c);
         if (out.group_rows == null) return self.projectScalar(gpa, out);
         try project(self.visible, self.workers, gpa, out, col_types);
+        // After the hidden columns are gone: a copy holds only what is shown.
+        if (copies) |c| try self.repeatRows(gpa, out, c);
         // A cut leaves few of the rows the slab was built for: release the rest. Only memory is at stake, so a
         // refused allocation keeps the larger slab rather than fail an answer already final.
         out.compactRows(gpa) catch {};
+    }
+
+    /// ORDER BY, OFFSET and LIMIT. Rows that repeat (`ResultOrder.repeat`) are ranked and cut as groups: the first
+    /// OFFSET + LIMIT rows lie in as many groups, each standing for one row at least. Returned for them, on `gpa`: how
+    /// often each ranked group's row is shown once OFFSET and LIMIT have counted rows (`repeatRows`).
+    fn rank(self: ResultProgram, gpa: std.mem.Allocator, out: *scan.AggOutput) Error!?[]usize {
+        const count = self.order.repeat orelse {
+            try out.applyResultOrder(gpa, self.order);
+            return null;
+        };
+        var groups = self.order;
+        groups.offset = 0;
+        if (self.order.limit) |n| groups.limit = self.order.offset +| n;
+        try out.applyResultOrder(gpa, groups);
+        const rows = out.group_rows orelse return null;
+        const copies = try gpa.alloc(usize, rows.len);
+        errdefer gpa.free(copies);
+        var skip: u64 = self.order.offset;
+        var room: u64 = self.order.limit orelse std.math.maxInt(u64);
+        for (rows, copies) |row, *n| {
+            var c: u64 = switch (row[count]) {
+                .i => |x| std.math.cast(u64, x) orelse return error.TypeMismatch,
+                else => return error.TypeMismatch,
+            };
+            const skipped = @min(skip, c);
+            skip -= skipped;
+            c = @min(c - skipped, room);
+            room -= c;
+            n.* = std.math.cast(usize, c) orelse return error.ExceededMemoryBudget;
+        }
+        return copies;
+    }
+
+    /// Row `i` as `copies[i]` rows: a group's row becomes the rows it stands for, in one new slab drawn from the ledger
+    /// and allocated whole before a row changes hands, so a refusal leaves `out` as it was. A row shown more than once
+    /// shares its strings among its copies: the answer takes them over, as it holds the strings it fetched, and no
+    /// copy owns one.
+    fn repeatRows(self: ResultProgram, gpa: std.mem.Allocator, out: *scan.AggOutput, copies: []const usize) Error!void {
+        const rows = out.group_rows.?;
+        const width = out.group_cols.?.len;
+        var total: usize = 0;
+        for (copies) |n| total = std.math.add(usize, total, n) catch return error.ExceededMemoryBudget;
+        const bytes = std.math.mul(usize, total, width * @sizeOf(scan.AggValue) + @sizeOf([]const scan.AggValue)) catch
+            return error.ExceededMemoryBudget;
+        if (self.budget) |b| _ = b.drawExact(bytes) orelse return error.ExceededMemoryBudget;
+        errdefer if (self.budget) |b| b.release(bytes);
+        var shared: std.ArrayList([]u8) = .empty;
+        defer shared.deinit(gpa);
+        for (rows, copies) |row, n| if (n > 1) for (row) |v| {
+            if (v == .s and v.s.len != 0 and !BorrowedSpan.contains(out.borrowed_strings, v.s)) try shared.append(gpa, @constCast(v.s));
+        };
+        const slab = try gpa.alloc(scan.AggValue, total * width);
+        errdefer gpa.free(slab);
+        const views = try gpa.alloc([]const scan.AggValue, total);
+        errdefer gpa.free(views);
+        out.adoptFetched(gpa, shared.items) catch return error.OutOfMemory;
+        var at: usize = 0;
+        for (rows, copies) |row, n| {
+            for (0..n) |_| {
+                const cells = slab[at * width ..][0..width];
+                @memcpy(cells, row);
+                views[at] = cells;
+                at += 1;
+            }
+            // A row shown once hands its strings to its one copy; one never shown frees them.
+            if (n == 0) out.releaseRow(gpa, row) else out.releaseRowSlice(gpa, row);
+        }
+        gpa.free(rows);
+        gpa.free(out.slab);
+        out.slab = slab;
+        out.group_rows = views;
+        // The answer holds the draw as it holds its string arenas': released with it.
+        if (self.budget) |b| if (out.arena_ledger == null or out.arena_ledger == b) {
+            out.arena_ledger = b;
+            out.arena_credit += bytes;
+        };
     }
 
     /// Drop each row's columns past the first `visible`, building the narrowed rows in one new slab before anything
@@ -307,8 +392,10 @@ pub const ResultProgram = struct {
         }
         @memset(wanted, true);
         try computeDerived(out.group_rows.?, programs, wanted, computed, self.workers);
-        try out.applyResultOrder(gpa, self.order);
+        const copies = try self.rank(gpa, out);
+        defer if (copies) |c| gpa.free(c);
         try project(self.select.len, self.workers, gpa, out, col_types);
+        if (copies) |c| try self.repeatRows(gpa, out, c);
         out.compactRows(gpa) catch {};
     }
 
@@ -1113,6 +1200,94 @@ test "finish ranks by hidden columns, cuts once, then drops them" {
         try std.testing.expectEqual(@as(usize, 1), row.len);
         try std.testing.expectEqualStrings(want, row[0].s);
     }
+}
+
+/// Rows (k, hidden n) whose strings the rows own: a x1, b x3, c x0, d x2.
+fn testRepeatRows(gpa: std.mem.Allocator) !scan.AggOutput {
+    var out: scan.AggOutput = .{};
+    errdefer out.deinit(gpa);
+    const ks = [_][]const u8{ "d", "b", "a", "c" };
+    const ns = [_]i128{ 2, 3, 1, 0 };
+    const rows = try gpa.alloc([]const scan.AggValue, ks.len);
+    @memset(rows, &.{});
+    out.group_rows = rows;
+    for (rows, ks, ns) |*row, k, n| {
+        const r = try gpa.alloc(scan.AggValue, 2);
+        r[0] = .null_val;
+        r[1] = .{ .i = n };
+        row.* = r;
+        const owned = try gpa.dupe(u8, k);
+        r[0] = .{ .s = owned };
+    }
+    const cols = try gpa.alloc([]const u8, 2);
+    @memset(cols, "");
+    out.group_cols = cols;
+    cols[0] = try gpa.dupe(u8, "k");
+    cols[1] = try gpa.dupe(u8, "");
+    return out;
+}
+
+test "finish shows each row as often as its hidden count says; OFFSET and LIMIT count the rows shown" {
+    const gpa = std.testing.allocator;
+    const types = [_]scan.GroupColType{ .{ .lane = .string, .nullable = true }, .{ .lane = .i64, .nullable = false } };
+    const by_k = [_]expr_ast.OrderKey{.{ .column = 0, .descending = false }};
+    // Ranked a, b, b, b, d, d: every cut of it, inside a group and across groups.
+    const all = [_][]const u8{ "a", "b", "b", "b", "d", "d" };
+    for ([_][2]u64{ .{ 0, 99 }, .{ 2, 3 }, .{ 0, 1 }, .{ 1, 1 }, .{ 3, 2 }, .{ 5, 9 }, .{ 6, 2 }, .{ 0, 0 }, .{ 4, 0 } }) |cut| {
+        var out = try testRepeatRows(gpa);
+        defer out.deinit(gpa);
+        var col_types: ?[]const scan.GroupColType = &types;
+        var budget: core_memory.SharedBudget = .{ .limit = 1 << 20 };
+        const program: ResultProgram = .{
+            .order = .{ .keys = &by_k, .offset = cut[0], .limit = cut[1], .repeat = 1 },
+            .visible = 1,
+            .budget = &budget,
+        };
+        try program.finish(gpa, &out, &col_types);
+        const lo: usize = @intCast(@min(cut[0], all.len));
+        const want = all[lo..@min(all.len, lo + cut[1])];
+        const got = out.group_rows.?;
+        try std.testing.expectEqual(want.len, got.len);
+        try std.testing.expectEqual(@as(usize, 1), out.group_cols.?.len);
+        for (got, want) |row, k| {
+            try std.testing.expectEqual(@as(usize, 1), row.len);
+            try std.testing.expectEqualStrings(k, row[0].s);
+        }
+        // What the copies hold is drawn from the ledger and goes back with the answer.
+        try std.testing.expect(want.len == 0 or budget.used.load(.monotonic) != 0);
+        out.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 0), budget.used.load(.monotonic));
+    }
+    // No limit: every row. And rows the ledger cannot hold refuse, the groups left ranked and whole.
+    var out = try testRepeatRows(gpa);
+    defer out.deinit(gpa);
+    var col_types: ?[]const scan.GroupColType = &types;
+    var tight: core_memory.SharedBudget = .{ .limit = 64 };
+    const program: ResultProgram = .{ .order = .{ .keys = &by_k, .repeat = 1 }, .visible = 1, .budget = &tight };
+    try std.testing.expectError(error.ExceededMemoryBudget, program.finish(gpa, &out, &col_types));
+    try std.testing.expectEqual(@as(usize, 4), out.group_rows.?.len);
+    try std.testing.expectEqual(@as(usize, 0), tight.used.load(.monotonic));
+    const roomy: ResultProgram = .{ .order = .{ .keys = &by_k, .repeat = 1 }, .visible = 1 };
+    // Already ranked and projected by the refused run: repeating is all that is left to do.
+    try roomy.repeatRows(gpa, &out, &.{ 1, 3, 0, 2 });
+    try std.testing.expectEqual(@as(usize, 6), out.group_rows.?.len);
+}
+
+test "a repeat that runs out of memory leaks nothing and frees no string twice" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var out = try testRepeatRows(gpa);
+            defer out.deinit(gpa);
+            const types = [_]scan.GroupColType{ .{ .lane = .string, .nullable = true }, .{ .lane = .i64, .nullable = false } };
+            var col_types: ?[]const scan.GroupColType = &types;
+            const program: ResultProgram = .{
+                .order = .{ .keys = &.{.{ .column = 0, .descending = true }}, .offset = 1, .limit = 4, .repeat = 1 },
+                .visible = 1,
+            };
+            try program.finish(gpa, &out, &col_types);
+            try std.testing.expectEqual(@as(usize, 4), out.group_rows.?.len);
+        }
+    }.run, .{});
 }
 
 test "finish leaves the answer whole when it runs out of memory" {

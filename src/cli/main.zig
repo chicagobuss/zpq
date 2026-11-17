@@ -1317,7 +1317,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "TemporalOutOfRange",          "ConstantTooDeep",       "IlikePatternNotAscii",         "PostAggNotSupported",         "UpdateWithoutWhere",         "UnparseError",
         "SetOperationAll",             "SetOperationByName",    "SetOperationOrder",            "SetOperationNesting",         "SetOperationColumns",        "SetOperationTypes",
         "SetOperationNullability",     "GroupingSetsKey",       "GroupingSetsDistinct",         "GroupingSetsNesting",         "GroupingSetsGrouping",       "GroupingSetsTooMany",
-        "CteRecursive",                "CteDuplicate",          "CteCircular",                  "LateralNotSupported",         "JoinRowsNotSupported",
+        "CteRecursive",                "CteDuplicate",          "CteCircular",                  "LateralNotSupported",         "JoinRowsNotSupported",       "JoinRowsShape",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

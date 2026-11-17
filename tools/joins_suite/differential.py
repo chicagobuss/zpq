@@ -225,7 +225,8 @@ def queries(seed, p, T, count, shapes):
                 sql = (f'SELECT g.egrp, count(*) AS n FROM {E} e JOIN {E} m ON e.boss = m.eid JOIN {E} g ON m.boss = g.eid '
                        f'GROUP BY g.egrp ORDER BY g.egrp')
         elif shape == 'rows':
-            form = r.choice(['probe-cols', 'build-cols', 'distinct', 'left', 'semi', 'group-offset'])
+            form = r.choice(['probe-cols', 'build-cols', 'distinct', 'left', 'semi', 'group-offset',
+                             'hidden-order', 'anti', 'expr', 'unordered', 'star', 'strings'])
             frm = f'{F} f JOIN {D} d ON f.fk = d.pk'
             L, O = lim(), r.choice([0, 0, 1, 5, 40])
             if form == 'probe-cols':
@@ -240,6 +241,21 @@ def queries(seed, p, T, count, shapes):
             elif form == 'semi':
                 w.append(f'f.fk IN (SELECT pk FROM {D} WHERE grp = {r.randint(0, 3)})')
                 sql = f'SELECT f.dup, f.q FROM {F} f{wh()} ORDER BY f.dup, f.q LIMIT {L} OFFSET {O}'
+            elif form == 'hidden-order':   # ranked by a column the rows do not show
+                sql = f'SELECT f.dup, d.grp FROM {frm}{wh()} ORDER BY f.q {r.choice(["", "DESC"])}, f.dup, d.grp LIMIT {L} OFFSET {O}'
+            elif form == 'anti':
+                w.append(r.choice([f'f.fk NOT IN (SELECT pk FROM {D} WHERE grp = {r.randint(0, 3)})',
+                                   f'NOT EXISTS (SELECT 1 FROM {D} d WHERE d.pk = f.fk AND d.grp <> {r.randint(0, 3)})']))
+                sql = f'SELECT f.dup, f.q FROM {F} f{wh()} ORDER BY f.dup, f.q LIMIT {L} OFFSET {O}'
+            elif form == 'expr':
+                sql = f'SELECT f.dup + 1 AS a, d.grp * 2 AS b, upper(d.name) AS nm FROM {frm}{wh()} ORDER BY a, b DESC, nm LIMIT {L} OFFSET {O}'
+            elif form == 'unordered':   # no ORDER BY: the whole multiset
+                sql = f'SELECT f.dup, d.grp, f.q FROM {frm}{wh()}'
+            elif form == 'star':
+                w += ['f.fk = d.pk', 'f.fk2 = s.pk3']
+                sql = f'SELECT f.dup, d.grp, s.g3 FROM {F} f, {D} d, {S} s{wh()} ORDER BY 1, 2, 3 LIMIT {L} OFFSET {O}'
+            elif form == 'strings':   # a build's strings under a LIMIT, which are fetched after the cut
+                sql = f'SELECT f.dup, d.name FROM {frm}{wh()} ORDER BY f.dup, d.name LIMIT {L} OFFSET {O}'
             else:
                 sql = f'SELECT d.grp, f.dup, count(*) AS n FROM {frm}{wh()} GROUP BY d.grp, f.dup ORDER BY n, d.grp, f.dup LIMIT {L} OFFSET {O}'
         else:  # exists

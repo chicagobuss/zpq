@@ -1108,6 +1108,10 @@ pub const ResultOrder = struct {
     /// ORDER BY over plain rows (no aggregate), by expressions of the input row, selected or not; `keys` is then
     /// empty. The engine sorts the rows by these keys, ties by input position, keeping OFFSET + LIMIT when limited.
     rows: []const RowKey = &.{},
+    /// A join's rows, run as their groups (`sql_parser.rowsAsGroups`): the result row column (a hidden `count(*)`)
+    /// that says how many rows each group stands for. Each is shown that often, in rank order, and OFFSET and LIMIT
+    /// count the rows shown, not the groups.
+    repeat: ?usize = null,
 };
 
 /// One ORDER BY key over plain rows: an expression of the input row as SQL writes it, bound by the engine.

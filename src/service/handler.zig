@@ -1480,17 +1480,23 @@ test "regression: an unknown output_codec is refused, and an SQL error names no 
     try std.testing.expect(std.mem.indexOf(u8, message, "no/such/file.parquet") != null);
 }
 
-test "regression: an SQL request whose rows are a join's or an IN (SELECT ...)'s is refused, not answered without it" {
+test "regression: an SQL request whose rows are a join's or an IN (SELECT ...)'s answers with it, not without it" {
     const a = std.testing.allocator;
     const fixture = "ci/fixtures/parquet/nullable_mix.parquet";
     std.Io.Dir.cwd().access(std.testing.io, fixture, .{}) catch return error.SkipZigTest;
     var pool: PersistentPool = .sized(256 << 20);
     defer pool.deinit();
-    // The row path ran the probe alone: every row came back, as if the IN were not there.
-    const rows = "{\"sql\":\"SELECT id FROM '" ++ fixture ++ "' WHERE a IN (SELECT id FROM '" ++ fixture ++ "' WHERE id > 3)\"}";
-    const refused = try handle(std.testing.io, a, .empty, rows, &pool, null);
+    // The row path ran the probe alone: every row came back, as if the IN were not there. The rows run as their
+    // groups now, where the IN binds: two of the six.
+    const rows = "{\"sql\":\"SELECT id FROM '" ++ fixture ++ "' WHERE a IN (SELECT id FROM '" ++ fixture ++ "' WHERE id > 3) ORDER BY id\"}";
+    const answered = try handle(std.testing.io, a, .empty, rows, &pool, null);
+    defer a.free(answered);
+    try std.testing.expect(std.mem.startsWith(u8, answered, "{\"ok\":true,\"ndjson\":\"{\\\"id\\\":4}\\n{\\\"id\\\":6}\\n\""));
+    // What the lowering does not run still refuses by name.
+    const star = "{\"sql\":\"SELECT * FROM '" ++ fixture ++ "' WHERE a IN (SELECT id FROM '" ++ fixture ++ "' WHERE id > 3)\"}";
+    const refused = try handle(std.testing.io, a, .empty, star, &pool, null);
     defer a.free(refused);
-    try std.testing.expect(std.mem.indexOf(u8, refused, "JoinRowsNotSupported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "JoinRowsShape") != null);
     const counted = "{\"sql\":\"SELECT count(*) AS n FROM '" ++ fixture ++ "' WHERE a IN (SELECT id FROM '" ++ fixture ++ "' WHERE id > 3)\"}";
     const answer = try handle(std.testing.io, a, .empty, counted, &pool, null);
     defer a.free(answer);

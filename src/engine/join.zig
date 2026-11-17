@@ -248,6 +248,14 @@ pub const Prepared = struct {
             // Row output of a join is not in this release.
             .projection => return error.JoinRowsNotSupported,
         };
+        // A join's rows run as their groups (`ResultOrder.repeat`), and a group's FLOAT or DOUBLE key is no row's value:
+        // -0.0 groups with 0.0, every NaN with every other, and a FLOAT is held as a DOUBLE.
+        if (self.order.repeat != null) for (a.keys orelse &.{}) |k| if (k.typeOf() == .f64) {
+            if (k == .col_ref) if (try metadata.leafPathSegments(arena, meta, k.col_ref.col_idx)) |path| {
+                Diag.setColumn(diag, path[path.len - 1]);
+            };
+            return error.JoinRowsFloat;
+        };
         // Conditions on build columns come out of the probe's filter: they narrow after the lookups (`Residual`).
         const residual = try self.splitResidual(arena, &a.filter);
         for (self.semis) |s| a.filter = try withLookup(arena, a.filter, try leafOf(arena, meta, s, diag));

@@ -190,7 +190,10 @@
   },
   {"name": "alias_fact", "copy": "COPY (SELECT * FROM (VALUES (NULL::BIGINT), (1), (2), (3)) t(fk)) TO '{path}' (FORMAT PARQUET)"},
   {"name": "alias_dim", "copy": "COPY (SELECT * FROM (VALUES (1::BIGINT), (NULL)) t(pk)) TO '{path}' (FORMAT PARQUET)"},
-  {"name": "column_order", "path": "ci/fixtures/parquet/column_order.parquet"}
+  {"name": "column_order", "path": "ci/fixtures/parquet/column_order.parquet"},
+  {"name": "p0_fact", "copy": "COPY (SELECT * FROM (VALUES (1,10,1.5),(2,20,2.5),(3,10,3.5),(4,30,4.5)) t(id,cid,amt)) TO '{path}' (FORMAT PARQUET)"},
+  {"name": "p0_dim", "copy": "COPY (SELECT * FROM (VALUES (10,'a@x'),(20,'b@x'),(30,'c@x')) t(cid,email)) TO '{path}' (FORMAT PARQUET)"},
+  {"name": "p0_emp", "copy": "COPY (SELECT * FROM (VALUES (1,'Ann',NULL),(2,'Bob',1),(3,'Cy',2)) t(eid,name,boss)) TO '{path}' (FORMAT PARQUET)"}
  ],
  "cases": [
   {
@@ -5073,6 +5076,1031 @@
    "refuse": {
     "error": "exit 1",
     "diag": "a condition outside a LEFT JOIN's ON reads its table"
+   }
+  },
+  {
+   "id": "join:rows:p0-inner-filtered-build",
+   "fixture": "p0_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id FROM '{fixture:p0_fact}' f JOIN '{fixture:p0_dim}' d ON f.cid = d.cid WHERE d.email = 'a@x'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "tied_rows",
+    "sql": "SELECT f.id FROM '{fixture:p0_fact}' f JOIN '{fixture:p0_dim}' d ON f.cid = d.cid WHERE d.email = 'a@x'"
+   }
+  },
+  {
+   "id": "join:rows:p0-in",
+   "fixture": "p0_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id FROM '{fixture:p0_fact}' WHERE cid IN (SELECT cid FROM '{fixture:p0_dim}' WHERE email = 'a@x')"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "tied_rows",
+    "sql": "SELECT id FROM '{fixture:p0_fact}' WHERE cid IN (SELECT cid FROM '{fixture:p0_dim}' WHERE email = 'a@x')"
+   }
+  },
+  {
+   "id": "join:rows:p0-not-in",
+   "fixture": "p0_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id FROM '{fixture:p0_fact}' WHERE cid NOT IN (SELECT cid FROM '{fixture:p0_dim}' WHERE email = 'a@x')"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "tied_rows",
+    "sql": "SELECT id FROM '{fixture:p0_fact}' WHERE cid NOT IN (SELECT cid FROM '{fixture:p0_dim}' WHERE email = 'a@x')"
+   }
+  },
+  {
+   "id": "join:rows:p0-build-columns",
+   "fixture": "p0_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.email, f.amt, f.id FROM '{fixture:p0_fact}' f JOIN '{fixture:p0_dim}' d ON f.cid = d.cid ORDER BY f.id DESC"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.email, f.amt, f.id FROM '{fixture:p0_fact}' f JOIN '{fixture:p0_dim}' d ON f.cid = d.cid ORDER BY f.id DESC"
+   }
+  },
+  {
+   "id": "join:rows:probe-and-build-columns",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id, f.q, d.kind, d.w, f.dec FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 200 ORDER BY f.id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.id, f.q, d.kind, d.w, f.dec FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 200 ORDER BY f.id"
+   }
+  },
+  {
+   "id": "join:rows:duplicates-cut-inside-a-group",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY f.q, d.grp LIMIT 17 OFFSET 2990"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY f.q, d.grp LIMIT 17 OFFSET 2990"
+   }
+  },
+  {
+   "id": "join:rows:duplicates-first-rows",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY d.grp DESC, f.q LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY d.grp DESC, f.q LIMIT 5"
+   }
+  },
+  {
+   "id": "join:rows:duplicates-offset-only",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 300 ORDER BY d.grp LIMIT 100000 OFFSET 190"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 300 ORDER BY d.grp LIMIT 100000 OFFSET 190"
+   }
+  },
+  {
+   "id": "join:rows:offset-past-the-end",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY f.q, d.grp LIMIT 5 OFFSET 99999"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY f.q, d.grp LIMIT 5 OFFSET 99999"
+   }
+  },
+  {
+   "id": "join:rows:limit-zero",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY f.q LIMIT 0"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY f.q LIMIT 0"
+   }
+  },
+  {
+   "id": "join:rows:no-rows",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 0 ORDER BY f.q"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 0 ORDER BY f.q"
+   }
+  },
+  {
+   "id": "join:rows:all-rows-unordered",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, d.grp, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 3000"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "tied_rows",
+    "sql": "SELECT f.q, d.grp, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 3000"
+   }
+  },
+  {
+   "id": "join:rows:limit-without-order",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk LIMIT 10"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "tied_rows",
+    "sql": "SELECT f.q, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk LIMIT 10"
+   }
+  },
+  {
+   "id": "join:rows:order-by-unselected-column",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 500 ORDER BY f.id DESC LIMIT 20"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 500 ORDER BY f.id DESC LIMIT 20"
+   }
+  },
+  {
+   "id": "join:rows:order-by-unselected-expression",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 400 ORDER BY f.q + d.grp DESC, f.id LIMIT 25 OFFSET 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.id, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 400 ORDER BY f.q + d.grp DESC, f.id LIMIT 25 OFFSET 3"
+   }
+  },
+  {
+   "id": "join:rows:order-by-position-and-alias",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q AS a, d.grp AS b, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 900 ORDER BY 2 DESC, a, d.kind LIMIT 30 OFFSET 100"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q AS a, d.grp AS b, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 900 ORDER BY 2 DESC, a, d.kind LIMIT 30 OFFSET 100"
+   }
+  },
+  {
+   "id": "join:rows:aliased-expressions",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id + 1 AS n, upper(d.kind) AS k, f.dec * 2 AS d2 FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 50 ORDER BY n"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.id + 1 AS n, upper(d.kind) AS k, f.dec * 2 AS d2 FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 50 ORDER BY n"
+   }
+  },
+  {
+   "id": "join:rows:left-misses-are-null",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id, d.kind, d.w FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 60 OR f.id > 19990 ORDER BY f.id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.id, d.kind, d.w FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 60 OR f.id > 19990 ORDER BY f.id"
+   }
+  },
+  {
+   "id": "join:rows:left-duplicates-nulls-first",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, d.grp FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY d.grp NULLS FIRST, f.q DESC LIMIT 40 OFFSET 1100"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q, d.grp FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY d.grp NULLS FIRST, f.q DESC LIMIT 40 OFFSET 1100"
+   }
+  },
+  {
+   "id": "join:rows:semi",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, q FROM '{fixture:fact}' WHERE fk IN (SELECT pk FROM '{fixture:dim}' WHERE grp = 1) ORDER BY id LIMIT 30 OFFSET 10"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id, q FROM '{fixture:fact}' WHERE fk IN (SELECT pk FROM '{fixture:dim}' WHERE grp = 1) ORDER BY id LIMIT 30 OFFSET 10"
+   }
+  },
+  {
+   "id": "join:rows:anti-not-exists",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, f.dec FROM '{fixture:fact}' f WHERE NOT EXISTS (SELECT 1 FROM '{fixture:dim}' d WHERE d.pk = f.fk AND d.grp < 4) ORDER BY f.q, f.dec LIMIT 50 OFFSET 7"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q, f.dec FROM '{fixture:fact}' f WHERE NOT EXISTS (SELECT 1 FROM '{fixture:dim}' d WHERE d.pk = f.fk AND d.grp < 4) ORDER BY f.q, f.dec LIMIT 50 OFFSET 7"
+   }
+  },
+  {
+   "id": "join:rows:anti-not-in-null-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id FROM '{fixture:fact}' WHERE fk NOT IN (SELECT pk FROM '{fixture:dim_nullkey}') ORDER BY id LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id FROM '{fixture:fact}' WHERE fk NOT IN (SELECT pk FROM '{fixture:dim_nullkey}') ORDER BY id LIMIT 5"
+   }
+  },
+  {
+   "id": "join:rows:semi-duplicate-build-keys",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q FROM '{fixture:fact}' f WHERE EXISTS (SELECT 1 FROM '{fixture:dim_dup}' x WHERE x.pk = f.fk AND x.grp = 2) ORDER BY f.q LIMIT 8 OFFSET 500"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q FROM '{fixture:fact}' f WHERE EXISTS (SELECT 1 FROM '{fixture:dim_dup}' x WHERE x.pk = f.fk AND x.grp = 2) ORDER BY f.q LIMIT 8 OFFSET 500"
+   }
+  },
+  {
+   "id": "join:rows:snowflake",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id, d.kind, g.gname FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.id < 100 ORDER BY f.id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.id, d.kind, g.gname FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.id < 100 ORDER BY f.id"
+   }
+  },
+  {
+   "id": "join:rows:star-duplicates",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, z.w FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk LEFT JOIN '{fixture:dim_nullkey}' z ON f.q = z.pk ORDER BY d.grp, z.w NULLS FIRST LIMIT 20 OFFSET 4000"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, z.w FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk LEFT JOIN '{fixture:dim_nullkey}' z ON f.q = z.pk ORDER BY d.grp, z.w NULLS FIRST LIMIT 20 OFFSET 4000"
+   }
+  },
+  {
+   "id": "join:rows:decimals",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.dec, x.ddec, x.d18, x.d38, x.d38s FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk AND f.id < 150 ORDER BY f.id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.dec, x.ddec, x.d18, x.d38, x.d38s FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk AND f.id < 150 ORDER BY f.id"
+   }
+  },
+  {
+   "id": "join:rows:late-strings",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, p.uname, p.ukind FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk ORDER BY p.uname, f.q LIMIT 9 OFFSET 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q, p.uname, p.ukind FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk ORDER BY p.uname, f.q LIMIT 9 OFFSET 3"
+   }
+  },
+  {
+   "id": "join:rows:late-strings-repeated",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT p.ukind FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk ORDER BY p.ukind DESC LIMIT 12 OFFSET 1500"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT p.ukind FROM '{fixture:fact}' f, '{fixture:plain_dim}' p WHERE f.fk = p.pk ORDER BY p.ukind DESC LIMIT 12 OFFSET 1500"
+   }
+  },
+  {
+   "id": "join:rows:fk-and-build-column",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY f.fk, d.kind LIMIT 30 OFFSET 25"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY f.fk, d.kind LIMIT 30 OFFSET 25"
+   }
+  },
+  {
+   "id": "join:rows:fk-and-build-column-ranked-by-build",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, d.w FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY d.w DESC, f.fk LIMIT 45"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, d.w FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY d.w DESC, f.fk LIMIT 45"
+   }
+  },
+  {
+   "id": "join:rows:glob-probe",
+   "fixture": "group_glob",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, d.grp FROM '{fixture:group_glob}' f JOIN '{fixture:group_dim}' d ON f.fk = d.pk ORDER BY f.fk, d.grp LIMIT 11 OFFSET 900"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, d.grp FROM '{fixture:group_glob}' f JOIN '{fixture:group_dim}' d ON f.fk = d.pk ORDER BY f.fk, d.grp LIMIT 11 OFFSET 900"
+   }
+  },
+  {
+   "id": "join:rows:glob-probe-ranked-by-probe",
+   "fixture": "group_glob",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, f.v FROM '{fixture:group_glob}' f JOIN '{fixture:group_dim}' d ON f.fk = d.pk ORDER BY f.v DESC, d.grp LIMIT 14"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, f.v FROM '{fixture:group_glob}' f JOIN '{fixture:group_dim}' d ON f.fk = d.pk ORDER BY f.v DESC, d.grp LIMIT 14"
+   }
+  },
+  {
+   "id": "join:rows:distinct-is-not-repeated",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT DISTINCT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY 1, 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT DISTINCT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY 1, 2"
+   }
+  },
+  {
+   "id": "join:rows:written-parquet",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id, f.q, d.kind, d.w, f.dec FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 700",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT f.id, f.q, d.kind, d.w, f.dec FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.id < 700"
+   }
+  },
+  {
+   "id": "join:rows:written-parquet-duplicates",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, d.grp, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT f.q, d.grp, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk"
+   }
+  },
+  {
+   "id": "join:rows:refuse-double",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id, f.amt FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY f.id LIMIT 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "do not show a FLOAT or DOUBLE column in this release (amt)"
+   }
+  },
+  {
+   "id": "join:rows:refuse-double-order-only",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk ORDER BY f.amt LIMIT 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "do not show a FLOAT or DOUBLE column in this release (amt)"
+   }
+  },
+  {
+   "id": "join:rows:refuse-star",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT * FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "the rows of a join name their columns"
+   }
+  },
+  {
+   "id": "join:rows:refuse-unaliased-expression",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id + 1 FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "the rows of a join name their columns"
+   }
+  },
+  {
+   "id": "join:rows:refuse-rows-past-the-ledger",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, d.grp FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk",
+    "--max-memory",
+    "512K"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "held in memory in this release"
+   }
+  },
+  {
+   "id": "join:rows:refuse-groups-past-the-ledger",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id, d.kind FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk",
+    "--max-memory",
+    "512K"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "held in memory in this release"
+   }
+  },
+  {
+   "id": "join:rows:refuse-self-join-same-names",
+   "fixture": "p0_emp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT e.name, m.name AS boss FROM '{fixture:p0_emp}' e LEFT JOIN '{fixture:p0_emp}' m ON e.boss = m.eid"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "name"
    }
   },
   {

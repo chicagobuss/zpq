@@ -3131,24 +3131,30 @@
     "--summary=json"
    ],
    "refuse": {
-    "error": "JoinRowsNotSupported",
-    "diag": "must aggregate",
+    "error": "JoinRowsFloat",
+    "diag": "do not show a FLOAT or DOUBLE column",
     "exit": 1
    }
   },
   {
-   "id": "sql_cte:refuse:row-in-subquery",
+   "id": "sql_cte:rows:in-subquery",
    "fixture": "cf",
    "cli": [
     "query",
     "--query",
-    "SELECT id FROM '{fixture:cf}' WHERE g IN (SELECT pk FROM '{fixture:cd}' WHERE pk > 2)",
-    "--summary=json"
+    "SELECT id FROM '{fixture:cf}' WHERE g IN (SELECT pk FROM '{fixture:cd}' WHERE pk > 2) ORDER BY id LIMIT 40 OFFSET 5"
    ],
-   "refuse": {
-    "error": "JoinRowsNotSupported",
-    "diag": "must aggregate",
-    "exit": 2
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT id FROM '{fixture:cf}' WHERE g IN (SELECT pk FROM '{fixture:cd}' WHERE pk > 2) ORDER BY id LIMIT 40 OFFSET 5"
    }
   },
   {

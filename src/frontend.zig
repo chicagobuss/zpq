@@ -346,6 +346,16 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
                 "  aggregate, GROUP BY, HAVING or LIMIT\n",
             .{},
         ),
+        error.JoinRowsFloat => diagnosticPrint(
+            "zpq query: the rows of a join do not show a FLOAT or DOUBLE column in this release ({s}):\n" ++
+                "  that needs rows grouped by a float's exact bits. Aggregate it, CAST it to a DECIMAL, or leave it out\n",
+            .{diag.column.get()},
+        ),
+        error.JoinRowsExceedBudget => diagnosticPrint(
+            "zpq query: the rows of a join are held in memory in this release, and these do not fit --max-memory;\n" ++
+                "  add a filter or a LIMIT, or aggregate\n",
+            .{},
+        ),
         error.JoinKeyType => diagnosticPrint(
             "zpq query: the join's key {s} is not an integer, DATE, TIME or TIMESTAMP column stored as INT32 or INT64,\n" ++
                 "  nor a string\n",

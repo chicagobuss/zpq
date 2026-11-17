@@ -203,6 +203,57 @@ fn distinctAsGroupBy(root: *c.LpNode, lp_arena: *c.arena_t) !void {
     sel.distinct = 0;
 }
 
+/// A join's plain rows as the groups the aggregate path runs, which is where a join binds: `SELECT a, b FROM <join>` is
+/// `SELECT a, b ... GROUP BY a, b` with each group shown as often as it occurs, the join's exact multiset of rows (a
+/// DISTINCT's groups, repeated). Every select item becomes a key; so does an ORDER BY term no item gives, which ranks
+/// the rows and is not shown; and a `count(*)` ranked last carries each group's size, for the caller to take out of
+/// the ranking again (`ResultOrder.repeat`). False for a query that groups or aggregates already.
+fn rowsAsGroups(root: *c.LpNode, lp_arena: *c.arena_t) !bool {
+    const sel = &root.*.u.select;
+    if (sel.group_by.count != 0 or sel.having != null) return false;
+    const n: usize = @intCast(sel.result_columns.count);
+    for (0..n) |i| {
+        const expr = selectExpr(sel.*, i) orelse return error.SqlParseError;
+        if (analyzeExpr(expr).has_agg) return false;
+    }
+    for (0..n) |i| {
+        const rc = sel.result_columns.items[i] orelse return error.SqlParseError;
+        const expr = selectExpr(sel.*, i) orelse return error.SqlParseError;
+        // A key is named as it is written and a row's computed column as DuckDB names it: only an alias is both.
+        const aliased = rc.*.kind == c.LP_RESULT_COLUMN and rc.*.u.result_column.alias != null;
+        if (expr.kind == c.LP_EXPR_STAR or (expr.kind != c.LP_EXPR_COLUMN_REF and !aliased)) {
+            diagnosticPrint("sql: the rows of a join name their columns: SELECT * is not supported there, and an expression needs AS\n", .{});
+            return error.JoinRowsShape;
+        }
+        try pushGroupTerm(sel, lp_arena, expr);
+    }
+    for (0..@intCast(sel.order_by.count)) |t| {
+        const term = sel.order_by.items[t] orelse continue;
+        const expr: *c.LpNode = term.*.u.order_term.expr orelse continue;
+        // A position or a SELECT alias is that item, already a key.
+        if (expr.kind == c.LP_EXPR_LITERAL_INT) continue;
+        if (expr.kind == c.LP_EXPR_COLUMN_REF and expr.u.column_ref.table == null) {
+            const name = std.mem.span(expr.u.column_ref.column);
+            const is_alias = for (0..n) |i| {
+                const rc = sel.result_columns.items[i] orelse continue;
+                if (rc.*.kind != c.LP_RESULT_COLUMN) continue;
+                const alias = rc.*.u.result_column.alias orelse continue;
+                if (std.ascii.eqlIgnoreCase(std.mem.span(alias), name)) break true;
+            } else false;
+            if (is_alias) continue;
+        }
+        try pushGroupTerm(sel, lp_arena, expr);
+    }
+    // The grammar's own `ORDER BY count(*)` term, taken from a statement parsed for it.
+    var msg: [*c]const u8 = null;
+    const stmts = c.lp_parse_all("SELECT 1 FROM t ORDER BY count(*)", lp_arena, &msg);
+    if (stmts == null or stmts.*.count != 1) return error.SqlParseError;
+    const counted = stmts.*.items[0] orelse return error.SqlParseError;
+    if (counted.*.u.select.order_by.count != 1) return error.SqlParseError;
+    c.lp_list_push(lp_arena, &sel.order_by, counted.*.u.select.order_by.items[0]);
+    return true;
+}
+
 /// Whether two unparsed expressions are written alike: names and keywords without regard to case, but the contents
 /// of a string literal byte for byte (`'a'` and `'A'` are two values).
 fn sameExprText(a: []const u8, b: []const u8) bool {
@@ -1223,7 +1274,7 @@ pub fn parseSqlJoinPlanRoot(allocator: std.mem.Allocator, sql: []const u8, schem
     const first = try resolveJoin(allocator, z, paths, schemas, markers, false, root_path, true);
     // A probe query that still holds `IN (SELECT ...)` semi-joins the probe itself, beside its NOT EXISTS joins.
     const peeled = try peelSemis(allocator, first.probe_sql, schemas, markers, first.reduced);
-    var pq = try parseFolded(true, allocator, peeled.rest, markers);
+    var pq = try parseFolded(true, allocator, peeled.rest, markers, true);
     const q = try allocator.create(syntax.Query);
     q.* = pq.syntax.?.*;
     const semis = try std.mem.concat(allocator, syntax.Semi, &.{ first.semis, peeled.semis });
@@ -1309,7 +1360,7 @@ fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, columns
     const text = try std.fmt.allocPrint(a, "SELECT count(*) FROM '{s}' WHERE {s}", .{ path, w });
     const peeled = try peelSemis(a, text, schemas, markers, unique);
     build.semis = try std.mem.concat(a, syntax.Semi, &.{ build.semis, peeled.semis });
-    build.filter = (try parseFolded(true, a, peeled.rest, markers)).syntax.?.filter;
+    build.filter = (try parseFolded(true, a, peeled.rest, markers, false)).syntax.?.filter;
     return build;
 }
 
@@ -1412,7 +1463,7 @@ pub fn parseSqlUpdate(allocator: std.mem.Allocator, sql: []const u8) !?ParsedUpd
 /// A predicate of an UPDATE as filter text: read as the WHERE of a SELECT, under that SELECT's rules.
 fn updatePredicate(allocator: std.mem.Allocator, predicate: []const u8, markers: literals.Markers) !syntax.Predicate {
     const select = try std.fmt.allocPrint(allocator, "SELECT * FROM 'update_target' WHERE {s}", .{predicate});
-    const pq = try parseFolded(true, allocator, select, markers);
+    const pq = try parseFolded(true, allocator, select, markers, false);
     return pq.syntax.?.filter orelse error.SqlParseError;
 }
 
@@ -1424,7 +1475,7 @@ fn parseSql(comptime structured: bool, allocator: std.mem.Allocator, sql: []cons
     var literal_report: literals.Report = .{};
     const folded_sql = try fold(allocator, sql, &literal_report);
     defer allocator.free(folded_sql);
-    return parseFolded(structured, allocator, folded_sql, literal_report.markers);
+    return parseFolded(structured, allocator, folded_sql, literal_report.markers, false);
 }
 
 /// `sql` with each comment written over by spaces (newlines kept, so every position stays where it was). DuckDB's block
@@ -1593,7 +1644,8 @@ pub fn parserText(allocator: std.mem.Allocator, sql: []const u8) !?[:0]u8 {
 }
 
 /// A query `fold` rewrote, read with the markers it chose: a join's probe and build queries are its pieces.
-fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_sql: []const u8, markers: literals.Markers) !ParsedQuery {
+/// `join_rows`: the query is a join's probe, whose plain rows run as groups (`rowsAsGroups`).
+fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_sql: []const u8, markers: literals.Markers, join_rows: bool) !ParsedQuery {
     const lp_arena = c.arena_create(64 * 1024) orelse return error.OutOfMemory;
     defer c.arena_destroy(lp_arena);
 
@@ -1631,6 +1683,7 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
     };
     try distinctAsGroupBy(root, lp_arena);
     try groupByAll(root, lp_arena, markers.groupAll());
+    const repeated = join_rows and try rowsAsGroups(root, lp_arena);
     // Reject clauses we'd otherwise silently drop → wrong answers.
     try rejectUnsupportedClauses(root.*.u.select);
     boolLiterals(root);
@@ -1742,6 +1795,14 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
     };
     var result_order = try resultOrder(allocator, sel, lp_arena, select_cols, is_aggregate, has_group_by, &hidden, lowering, &post);
     errdefer freeResultOrder(allocator, result_order);
+    if (repeated) {
+        // The count `rowsAsGroups` ranked last ranks nothing: it is how often each group's row is shown.
+        const keys = result_order.keys;
+        const ranked = try allocator.dupe(ast.OrderKey, keys[0 .. keys.len - 1]);
+        result_order.repeat = keys[keys.len - 1].column;
+        result_order.keys = ranked;
+        allocator.free(keys);
+    }
     if (sel.having) |having| {
         if (!is_aggregate) {
             diagnosticPrint("sql: HAVING needs an aggregate or GROUP BY\n", .{});
@@ -3429,4 +3490,38 @@ test "syntax: owned SQL releases partial nodes and result-order storage on alloc
         try std.testing.expect(failing.has_induced_failure);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
+}
+
+test "a join's plain rows parse as their groups, with a hidden count to repeat by" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const markers: literals.Markers = .{};
+    const q = try parseFolded(true, a, "SELECT q, kind AS k FROM 't' WHERE q > 1 ORDER BY id DESC, k LIMIT 5 OFFSET 2", markers, true);
+    try std.testing.expect(q.is_aggregate);
+    // Keys: the two items and the ORDER BY term no item gives. Hidden: that term, then the count.
+    try std.testing.expectEqual(@as(usize, 3), q.syntax.?.keys.?.len);
+    try std.testing.expectEqual(@as(usize, 2), q.result_order.hidden.len);
+    try std.testing.expectEqual(ast.SelectColumn.Role.key, q.result_order.hidden[0].role);
+    try std.testing.expectEqual(ast.SelectColumn.Role.agg, q.result_order.hidden[1].role);
+    try std.testing.expectEqual(@as(?usize, 3), q.result_order.repeat);
+    // The count ranks nothing: the ORDER BY is the query's own.
+    try std.testing.expectEqual(@as(usize, 2), q.result_order.keys.len);
+    try std.testing.expectEqual(@as(usize, 2), q.result_order.keys[0].column);
+    try std.testing.expect(q.result_order.keys[0].descending);
+    try std.testing.expectEqual(@as(usize, 1), q.result_order.keys[1].column);
+    try std.testing.expectEqual(@as(?u64, 5), q.result_order.limit);
+    try std.testing.expectEqual(@as(u64, 2), q.result_order.offset);
+    // Without an ORDER BY the count is the only hidden term, and nothing is ranked.
+    const plain = try parseFolded(true, a, "SELECT q FROM 't'", markers, true);
+    try std.testing.expectEqual(@as(?usize, 1), plain.result_order.repeat);
+    try std.testing.expectEqual(@as(usize, 0), plain.result_order.keys.len);
+    // A query that groups, aggregates or is DISTINCT already is as it was; so is any query that is no join's.
+    for ([_][]const u8{ "SELECT q, count(*) AS n FROM 't' GROUP BY q", "SELECT count(*) AS n FROM 't'", "SELECT DISTINCT q FROM 't'" }) |sql| {
+        try std.testing.expectEqual(@as(?usize, null), (try parseFolded(true, a, sql, markers, true)).result_order.repeat);
+    }
+    const single = try parseFolded(true, a, "SELECT q FROM 't'", markers, false);
+    try std.testing.expect(!single.is_aggregate);
+    try std.testing.expectError(error.JoinRowsShape, parseFolded(true, a, "SELECT * FROM 't'", markers, true));
+    try std.testing.expectError(error.JoinRowsShape, parseFolded(true, a, "SELECT q + 1 FROM 't'", markers, true));
 }

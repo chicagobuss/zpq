@@ -191,7 +191,10 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             ),
             else => diagnosticPrint("zpq query: a nested column is selected where a value is wanted\n", .{}),
         },
-        error.ExpressionInPredicate => diagnosticPrint(
+        error.ExpressionInPredicate => if (diag.column.len > 0) diagnosticPrint(
+            "zpq query: `{s}` is an expression; a predicate compares a column with a literal\n",
+            .{diag.column.get()},
+        ) else diagnosticPrint(
             "zpq query: a predicate comparison over an expression is not supported; compare a column with a literal\n",
             .{},
         ),
@@ -275,7 +278,7 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             .{},
         ),
         error.JoinKeyNotFound => diagnosticPrint(
-            "zpq query: a join needs a column-to-column key equality; expression join keys are not supported\n",
+            "zpq query: a join needs one key equality between its tables; expression join keys are not supported\n",
             .{},
         ),
         error.JoinMultiFileBuild => diagnosticPrint(

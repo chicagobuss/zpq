@@ -68,6 +68,8 @@ pub fn build(b: *std.Build) void {
         .revision = b.option([]const u8, "revision", "Revision recorded in the artifact manifest") orelse
             @import("tools/build_revision.zig").current(b),
         .test_filters = test_filters,
+        .duckdb = b.option([]const u8, "duckdb", "DuckDB 2.0 CLI (the oracle)") orelse
+            b.fmt("{s}/.cache/zpq-duckdb2/bin-2.0.0/duckdb", .{b.graph.environ_map.get("HOME") orelse ""}),
     };
     generateTestRoots(b);
     const a = artifacts(b, cfg, optimize);
@@ -183,6 +185,7 @@ const Config = struct {
     strip: bool,
     revision: []const u8,
     test_filters: []const []const u8,
+    duckdb: []const u8,
 };
 
 const UnitTest = struct { exe: *std.Build.Step.Compile, bin: []const u8, stage: []const u8 };
@@ -323,7 +326,7 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
     const fanout_opts = b.addOptions();
     fanout_opts.addOptionPath("lambda_bin", lambda.getEmittedBin());
     fanout_opts.addOptionPath("cli_bin", cli.getEmittedBin());
-    fanout_opts.addOption([]const u8, "duckdb", b.fmt("{s}/.cache/zpq-duckdb2/bin-2.0.0/duckdb", .{b.graph.environ_map.get("HOME") orelse ""}));
+    fanout_opts.addOption([]const u8, "duckdb", cfg.duckdb);
     const fanout_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/fanout.zig"),
@@ -364,8 +367,7 @@ fn addTiers(b: *std.Build, cfg: Config) void {
     const tier = b.option(Tier, "tier", "Gate to run with `check`: edit, commit (default) or full") orelse .commit;
     const shard = b.option([]const u8, "shard", "Run one full-tier shard of tools/check/shards.json");
     const home = b.graph.environ_map.get("HOME") orelse "";
-    const duckdb = b.option([]const u8, "duckdb", "DuckDB 2.0 CLI (the oracle)") orelse
-        b.fmt("{s}/.cache/zpq-duckdb2/bin-2.0.0/duckdb", .{home});
+    const duckdb = cfg.duckdb;
     const python = b.option([]const u8, "python", "Python with PyArrow (readback, contracts)") orelse
         ".venv/bin/python";
     const oracle_cache = b.option([]const u8, "oracle-cache", "Override the correctness oracle's writable cache directory");
@@ -437,7 +439,7 @@ fn addTiers(b: *std.Build, cfg: Config) void {
     };
     // The shipped Macs still compile (nothing runs): the Linux gate is where a Linux-only std call must fail.
     if (tier != .edit) if (add(b, &stages, wanted, runner, dir, tier_name, "cross-macos", "plain", 900)) |r| {
-        r.addArgs(&.{ "--", b.graph.zig_exe, "build", "cross-macos", "-j8" });
+        r.addArgs(&.{ "--", b.graph.zig_exe, "build", "cross-macos", "-j2" });
     };
     const Cases = struct { name: []const u8, files: []const []const u8, fresh: bool, timeout: u32, data: ?[]const u8 = null };
     const case_stages: []const Cases = switch (tier) {

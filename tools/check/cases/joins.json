@@ -128,7 +128,7 @@
   {
    "id": "join:glob:probe",
    "fixture": "glob_probe",
-   "sql": "SELECT d.grp, count(*) AS n FROM '{fixture:glob_probe}' f JOIN '{fixture:dim}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY d.grp",
+   "cli": ["query", "--query", "SELECT d.grp, count(*) AS n FROM '{fixture:glob_probe}' f JOIN '{fixture:dim}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY d.grp"],
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT d.grp, count(*) AS n FROM '{fixture:glob_probe}' f JOIN '{fixture:dim}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY d.grp"

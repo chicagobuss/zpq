@@ -1,5 +1,6 @@
 {
  "fixtures": [
+  {"name": "reroot_both", "copy": "COPY (SELECT i % 100 AS k FROM range(0, 1000) t(i)) TO '{path}' (FORMAT PARQUET)"},
   {"name": "reroot_unique", "copy": "COPY (SELECT i AS k, i % 7 AS g FROM range(0, 1000) t(i)) TO '{path}' (FORMAT PARQUET)"},
   {"name": "reroot_repeated", "copy": "COPY (SELECT i % 100 AS fk, i AS v FROM range(0, 500) t(i)) TO '{path}' (FORMAT PARQUET)"},
   {"name": "using_fact", "copy": "COPY (SELECT i % 5 AS k, i AS v FROM range(0, 1000) t(i)) TO '{path}' (FORMAT PARQUET)"},
@@ -129,6 +130,18 @@
   }
  ],
  "cases": [
+  {
+   "id": "join:reroot:many-to-many",
+   "fixture": "reroot_both",
+   "cli": ["query", "--query", "SELECT count(*) AS n FROM '{fixture:reroot_both}' u JOIN '{fixture:reroot_repeated}' f ON u.k = f.fk"],
+   "refuse": {"error": "exit 1", "diag": "many-to-many joins are not supported", "exit": 1, "no_output": true}
+  },
+  {
+   "id": "join:reroot:left-pinned",
+   "fixture": "reroot_unique",
+   "cli": ["query", "--query", "SELECT count(*) AS n FROM '{fixture:reroot_unique}' u LEFT JOIN '{fixture:reroot_repeated}' f ON u.k = f.fk"],
+   "refuse": {"error": "exit 1", "diag": "joins N:1 only", "exit": 1, "no_output": true}
+  },
   {
    "id": "join:reroot:duplicate-build",
    "fixture": "reroot_unique",

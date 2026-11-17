@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Joins carry DECIMAL dimension columns.** A DECIMAL column from a join's dimension side keeps its scale through filters, GROUP BY, aggregates and comparisons.
+
 - **Joins carry dimension strings to the result cut, compare numeric dictionary codes across files, and probe dense keys in one pass.** Only the rows that survive LIMIT fetch their dimension strings, a numeric comparison reads each side's own dictionary, and a dense INNER or SEMI probe captures slots and narrows the selection together. An expression over two copies of a self-joined table's same-named column is refused by name.
 
 - **An unordered GROUP BY … LIMIT builds only the groups it returns.** Without ORDER BY or HAVING, a dense GROUP BY with LIMIT n [OFFSET m] keeps the first n+m groups in first-appearance order straight from its lanes instead of building them all.

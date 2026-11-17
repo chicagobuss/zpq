@@ -13,7 +13,8 @@
 //! per key in the surviving domain, a rank per 64 bits) when it costs fewer bytes than a hash table, else an
 //! open-addressing table. A key seen twice refuses the join (N:1 only). A NULL foreign key matches nothing, as in SQL.
 //! Slots are a function of the keys alone (rank order, or (row group, row) order for the hash table), so nothing
-//! downstream depends on `-j`.
+//! downstream depends on `-j`. A build column's NULL is a bit of its slot (`Payload.nulls`), and reads as a LEFT
+//! join's miss does.
 const std = @import("std");
 const schema = @import("../schema.zig");
 const filter_ast = @import("../filter/ast.zig");
@@ -69,6 +70,13 @@ pub const Payload = struct {
 
     /// A dependent string key: values wait at their source rows until the result cut.
     deferred: ?Deferred = null,
+    /// A bit per slot, set where the build row holds NULL here; null for a column with none among the build's rows,
+    /// which keeps a REQUIRED leaf (`extend`). A NULL slot's code is a placeholder nothing reads.
+    nulls: ?[]u64 = null,
+
+    pub fn isNull(p: Payload, s: u32) bool {
+        return if (p.nulls) |bits| bitAt(bits, s) else false;
+    }
 
     pub const Locator = struct { rg: u32, row: u32 };
     pub const Deferred = struct {
@@ -143,6 +151,19 @@ pub const Codes = union(enum) {
 };
 
 const EMPTY: u32 = std.math.maxInt(u32);
+
+fn bitAt(bits: []const u64, i: usize) bool {
+    return bits[i >> 6] & (@as(u64, 1) << @intCast(i & 63)) != 0;
+}
+
+/// Set bit `i` of the `n` in `bits`, allocated zeroed on `a` at its first set bit.
+fn markBit(a: std.mem.Allocator, bits: *[]u64, n: usize, i: usize) !void {
+    if (bits.len == 0) {
+        bits.* = try a.alloc(u64, n / 64 + 1);
+        @memset(bits.*, 0);
+    }
+    bits.*[i >> 6] |= @as(u64, 1) << @intCast(i & 63);
+}
 
 /// Surviving keys over their verified domain `[lo, lo + 64 * bits.len)`: a set bit is a key, its rank its slot.
 const Dense = struct {
@@ -252,8 +273,9 @@ pub const Join = struct {
     }
 };
 
-/// Extend a probe footer with one top-level REQUIRED leaf per build column, after its own leaves: what the query
-/// binds the build columns to. Row groups keep their own chunks only, so every decode path sees a virtual leaf as a
+/// Extend a probe footer with one top-level leaf per build column, after its own leaves: what the query binds the
+/// build columns to. A leaf is OPTIONAL only where a row can read NULL (a LEFT join's miss, a build row's own NULL).
+/// Row groups keep their own chunks only, so every decode path sees a virtual leaf as a
 /// column it has no chunk for, and the scan publishes it from the lookup instead (`column`). Every probe file must
 /// have the same leaf count, so the virtual leaves have one index.
 pub fn extend(j: *Join, a: std.mem.Allocator, meta: *schema.FileMetaData) !void {
@@ -266,8 +288,7 @@ pub fn extend(j: *Join, a: std.mem.Allocator, meta: *schema.FileMetaData) !void 
     meta.schema = try meta.schema.clone(a);
     for (j.payloads) |p| {
         var e = p.element;
-        // A LEFT join's miss reads NULL.
-        e.repetition_type = if (j.kind == .left) .OPTIONAL else .REQUIRED;
+        e.repetition_type = if (j.kind == .left or p.nulls != null) .OPTIONAL else .REQUIRED;
         e.name = p.name;
         try meta.schema.append(a, e);
     }
@@ -414,17 +435,19 @@ fn narrowDense(d: Dense, c: anytype, sel: *selection.SelectionVector, capture: ?
 }
 
 /// Payload `p` as a coded column over the rows `sel` keeps, from their slots (every one has a match, the lookup
-/// conjunct having run first, except under LEFT, where a miss is NULL). Rows outside `sel` take code 0; no consumer
-/// reads them. With `values`, values are materialized beside the codes for the consumers that read values.
+/// conjunct having run first, except under LEFT, where a miss is NULL, as a build row's own NULL is). Rows outside
+/// `sel` take code 0; no consumer reads them. With `values`, values are materialized beside the codes for the
+/// consumers that read values.
 pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.SelectionVector, a: std.mem.Allocator, values: bool) !filter_eval.Batch.Column {
     const payload = j.payloads[p];
     const codes = try a.alloc(u32, sel.len);
     @memset(codes, 0);
     var def: ?[]u32 = null;
+    const max_def: u32 = @intFromBool(j.kind == .left or payload.nulls != null);
     var it = sel.iterator();
     while (it.next()) |r| {
-        if (at[r] == EMPTY) {
-            if (j.kind != .left) return error.LookupWithoutMatch;
+        if (at[r] == EMPTY or payload.isNull(at[r])) {
+            if (at[r] == EMPTY and j.kind != .left) return error.LookupWithoutMatch;
             if (def == null) {
                 def = try a.alloc(u32, sel.len);
                 @memset(def.?, 1);
@@ -447,7 +470,7 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
             gate.clearAll();
             var kept = sel.iterator();
             while (kept.next()) |r| {
-                if (at[r] != EMPTY and d.rows[codes[r]].rg == ri) gate.set(d.rows[codes[r]].row, true);
+                if (!nullAt(def, r) and d.rows[codes[r]].rg == ri) gate.set(d.rows[codes[r]].row, true);
             }
             if (gate.count() == 0) continue;
             const cm = rg.columns.items[d.leaf].meta_data orelse return error.ColumnMetaMissing;
@@ -456,11 +479,11 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
             const decoded = try @import("../consumer/column.zig").decodeColumnTWithOptions([]const u8, sa, try chunkOf(d.bytes, cm), cm.codec, levels, gate.len, opts);
             kept = sel.iterator();
             while (kept.next()) |r| {
-                if (at[r] != EMPTY and d.rows[codes[r]].rg == ri)
+                if (!nullAt(def, r) and d.rows[codes[r]].rg == ri)
                     vals[r] = try a.dupe(u8, decoded.values[d.rows[codes[r]].row]);
             }
         }
-        return .{ .string = .{ .values = vals, .def_levels = def, .max_def = if (j.kind == .left) 1 else 0, .has_nulls = def != null } };
+        return .{ .string = .{ .values = vals, .def_levels = def, .max_def = max_def, .has_nulls = def != null } };
     }
     // A DECIMAL reads as the scan decodes one (`decimal.decodeColumnExact`): its f64 view beside its exact integers.
     if (decimal.kindFromSchema(&payload.element)) |k| switch (payload.dict) {
@@ -475,7 +498,7 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
                 .values = vals,
                 .unscaled = @unionInit(filter_eval.Exact, @typeName(@TypeOf(dict[0])), exact),
                 .def_levels = def,
-                .max_def = if (j.kind == .left) 1 else 0,
+                .max_def = max_def,
                 .has_nulls = def != null,
             } };
         },
@@ -491,7 +514,7 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
             break :blk @unionInit(filter_eval.Batch.Column, @tagName(tag), .{
                 .values = vals,
                 .def_levels = def,
-                .max_def = if (j.kind == .left) 1 else 0,
+                .max_def = max_def,
                 .has_nulls = def != null,
             });
         },
@@ -511,11 +534,15 @@ pub fn column(j: *const Join, p: usize, at: []const u32, sel: *const selection.S
                 .codes = codes,
                 .dict = dict,
                 .def_levels = def,
-                .max_def = if (j.kind == .left) 1 else 0,
+                .max_def = max_def,
                 .has_nulls = def != null,
             });
         },
     };
+}
+
+fn nullAt(def: ?[]const u32, r: usize) bool {
+    return if (def) |d| d[r] == 0 else false;
 }
 
 // ---------------------------------------------------------------- build
@@ -595,6 +622,8 @@ const Local = struct {
     global: []u32 = &.{},
     /// A plain payload's (`Payload.plain`): the bytes of its strings, a value per survivor in `dict`.
     bytes: usize = 0,
+    /// A bit per survivor, set where its value is NULL (its code a placeholder, 0); empty when none is.
+    nulls: []u64 = &.{},
 
     const empty: Local = .{ .codes = .{ .u32 = &.{} }, .dict = .{ .i64 = &.{} } };
 
@@ -646,7 +675,7 @@ const Ctx = struct {
             },
             inline else => |d, tag| @unionInit(Dict, @tagName(tag), try a.dupe(@TypeOf(d[0]), d)),
         };
-        return .{ .codes = codes, .dict = dict };
+        return .{ .codes = codes, .dict = dict, .nulls = try a.dupe(u64, l.nulls) };
     }
 };
 
@@ -691,8 +720,13 @@ fn localDict(comptime T: type, a: std.mem.Allocator, c: filter_eval.ColumnT(T), 
     defer map.deinit(a);
     var dict: std.ArrayList(T) = .empty;
     const codes = try a.alloc(u32, rows.len);
-    for (rows, codes) |r, *code| {
-        if (c.def_levels) |dl| if (dl[r] < c.max_def) return error.JoinPayloadType; // NULL payloads: not in this prototype
+    var nulls: []u64 = &.{};
+    for (rows, codes, 0..) |r, *code, i| {
+        if (c.def_levels) |dl| if (dl[r] < c.max_def) {
+            code.* = 0;
+            try markBit(a, &nulls, rows.len, i);
+            continue;
+        };
         const v = c.values[r];
         const gop = try map.getOrPut(a, v);
         if (!gop.found_existing) {
@@ -709,7 +743,7 @@ fn localDict(comptime T: type, a: std.mem.Allocator, c: filter_eval.ColumnT(T), 
         []const u8 => .{ .string = dict.items },
         else => unreachable,
     };
-    return .{ .codes = .{ .u32 = codes }, .dict = d };
+    return .{ .codes = .{ .u32 = codes }, .dict = d, .nulls = nulls };
 }
 
 /// A DECIMAL's exact unscaled integers (`decodeValues`), which its payload holds; any other column as it is.
@@ -731,9 +765,13 @@ fn codedLocal(comptime T: type, a: std.mem.Allocator, bytes: []const u8, meta: *
         .codes => |x| x,
         .values => return null,
     };
-    if (coded.has_nulls) return null;
     const codes = try a.alloc(u32, keep.len);
+    // A NULL row's code is 0 (`readPageCodes`).
     for (keep, codes) |row, *code| code.* = coded.codes[row];
+    var nulls: []u64 = &.{};
+    if (coded.has_nulls) for (keep, 0..) |row, i| {
+        if (coded.def_levels.?[row] < levels.max_def) try markBit(a, &nulls, keep.len, i);
+    };
     const d: Dict = switch (T) {
         i32 => .{ .i32 = coded.dict },
         i64 => .{ .i64 = coded.dict },
@@ -741,7 +779,7 @@ fn codedLocal(comptime T: type, a: std.mem.Allocator, bytes: []const u8, meta: *
         []const u8 => .{ .string = coded.dict },
         else => unreachable,
     };
-    return .{ .codes = .{ .u32 = codes }, .dict = d };
+    return .{ .codes = .{ .u32 = codes }, .dict = d, .nulls = nulls };
 }
 
 /// A payload's local dictionary over the `keep` rows: the chunk's own when it is dictionary-coded throughout and no
@@ -855,9 +893,11 @@ const LateLocal = struct {
             const cm = rg.columns.items[c.spec.payload[pi]].meta_data orelse return error.ColumnMetaMissing;
             const levels = c.meta.getColumnLevels(cm.path_in_schema.items);
             var reader = column_mod.ColumnChunkReader([]const u8).initWithOptions(try chunkOf(c.bytes, cm), cm.codec, levels, sa, column_mod.chunkOptions(.{}, c.meta, cm), null);
+            // A deferred payload reads no value here, only which survivors hold NULL.
             if (try reader.readAllLevels(@intCast(rg.num_rows))) |validity| {
-                if (validity.def_levels) |dl| for (keep) |r| {
-                    if (dl[r] < levels.max_def) return error.JoinPayloadType;
+                const nulls = &part.local[pi].nulls;
+                if (validity.def_levels) |dl| for (keep, 0..) |r, at| {
+                    if (dl[r] < levels.max_def) try markBit(c.arena(rg_index, 1 + pi), nulls, keep.len, at);
                 };
             }
             return;
@@ -879,12 +919,18 @@ fn plainLocal(a: std.mem.Allocator, col: filter_eval.Batch.Column, keep: []const
         inline .i32, .i64, .i128, .f64, .string => |cc, tag| blk: {
             const values = try a.alloc(@TypeOf(cc.values[0]), keep.len);
             var bytes: usize = 0;
-            for (keep, values) |r, *v| {
-                if (cc.def_levels) |dl| if (dl[r] < cc.max_def) return error.JoinPayloadType;
+            var nulls: []u64 = &.{};
+            for (keep, values, 0..) |r, *v, i| {
+                if (cc.def_levels) |dl| if (dl[r] < cc.max_def) {
+                    v.* = if (tag == .string) "" else 0;
+                    try markBit(a, &nulls, keep.len, i);
+                    continue;
+                };
                 v.* = cc.values[r];
                 if (tag == .string) bytes += v.len;
             }
-            break :blk .{ .codes = .{ .identity = keep.len }, .dict = @unionInit(Dict, @tagName(tag), values), .bytes = bytes };
+            const dict = @unionInit(Dict, @tagName(tag), values);
+            break :blk .{ .codes = .{ .identity = keep.len }, .dict = dict, .bytes = bytes, .nulls = nulls };
         },
         else => error.JoinPayloadType,
     };
@@ -1104,6 +1150,11 @@ const FillCodes = struct {
                     source_row += 1;
                 }
                 for (c.codes, part.local, c.plain, cursor, 0..) |dst, l, pl, *at, pi| {
+                    // Slots of several parts share a word.
+                    if (l.nulls.len != 0 and bitAt(l.nulls, row)) {
+                        const word = &c.j.payloads[pi].nulls.?[s >> 6];
+                        _ = @atomicRmw(u64, word, .Or, @as(u64, 1) << @intCast(s & 63), .monotonic);
+                    }
                     if (pi < c.deferred.len and c.deferred[pi]) continue;
                     if (!pl.on) {
                         dst.set(s, l.globalOf(row));
@@ -1323,6 +1374,11 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
         out.* = .{ .name = element.name, .element = element, .codes = cs.*, .dict = u.dict };
     }
     try parallel(spec.payload.len, spec.threads, un, Unify.copy);
+    for (payloads, 0..) |*out, pi| for (parts) |part| if (part.local[pi].nulls.len != 0) {
+        out.nulls = try a.alloc(u64, n / 64 + 1);
+        @memset(out.nulls.?, 0);
+        break;
+    };
     j.payloads = payloads;
     if (trace) t = lap("unify dictionaries", t);
     try parallel(parts.len, spec.threads, FillCodes{ .j = j, .gpa = gpa, .parts = parts, .codes = codes, .plain = fill_plain, .deferred = spec.deferred, .locators = locators }, FillCodes.run);
@@ -1352,12 +1408,14 @@ pub fn chain(a: std.mem.Allocator, j: *Join, fk: usize, inner: *const Join) !voi
     @memcpy(out[0..j.payloads.len], j.payloads);
     for (inner.payloads, out[j.payloads.len..], 0..) |ip, *op, ip_index| {
         const codes: Codes = try .init(a, j.n, if (ip.deferred) |d| d.rows.len else ip.dict.len());
+        var nulls: []u64 = &.{};
         for (0..j.n) |s| {
             const at = by_code[f.codes.get(@intCast(s))];
             if (at == EMPTY) return error.LookupWithoutMatch;
             codes.set(@intCast(s), ip.codes.get(at));
+            if (ip.isNull(at)) try markBit(a, &nulls, j.n, s);
         }
-        op.* = .{ .name = ip.name, .element = ip.element, .codes = codes, .dict = ip.dict, .plain = ip.plain, .deferred = ip.deferred, .via = .{ .fk = fk, .inner = inner, .p = ip_index } };
+        op.* = .{ .name = ip.name, .element = ip.element, .codes = codes, .dict = ip.dict, .plain = ip.plain, .deferred = ip.deferred, .via = .{ .fk = fk, .inner = inner, .p = ip_index }, .nulls = if (nulls.len != 0) nulls else null };
     }
     j.payloads = out;
 }
@@ -1367,6 +1425,7 @@ pub fn fetch(ctx: *const anyopaque, p: usize, key: i64, a: std.mem.Allocator) an
     const j: *const Join = @ptrCast(@alignCast(ctx));
     const s = j.slot(key) orelse return null;
     const payload = j.payloads[p];
+    if (payload.isNull(s)) return null;
     const code = payload.codes.get(s);
     if (payload.deferred) |d| {
         var scratch: std.heap.ArenaAllocator = .init(d.scratch);
@@ -1534,10 +1593,6 @@ pub const GroupJoin = struct {
 
     fn reached(g: *const GroupJoin, s: u32) bool {
         return bitAt(g.seen, s);
-    }
-
-    fn bitAt(bits: []const u64, s: u32) bool {
-        return bits[s >> 6] & (@as(u64, 1) << @intCast(s & 63)) != 0;
     }
 
     /// Free every partial still waiting for an earlier row group, unapplied: what a replay or an aborted scan left.
@@ -1894,6 +1949,7 @@ pub const GroupJoin = struct {
             .key => |k| {
                 const leaf = g.keys[k];
                 const p = j.virtualPayload(leaf) orelse return .{ .i = keyOfSlot(j, s) };
+                if (j.payloads[p].isNull(s)) return .null_val;
                 const code = j.payloads[p].codes.get(s);
                 if (decimal.kindFromSchema(&j.payloads[p].element)) |dk| return .{ .dec = .{
                     .v = switch (j.payloads[p].dict) {
@@ -2137,7 +2193,7 @@ pub fn fetchBatch(ctx: *const anyopaque, p: usize, keys: []const ?i64, a: std.me
     var sel = try selection.SelectionVector.init(a, keys.len);
     for (keys, slots, 0..) |key, *slot, i| {
         slot.* = if (key) |k| j.slot(k) orelse EMPTY else EMPTY;
-        if (slot.* == EMPTY) sel.set(i, false);
+        if (slot.* == EMPTY or j.payloads[p].isNull(slot.*)) sel.set(i, false);
     }
     const col = try column(j, p, slots, &sel, a, true);
     var it = sel.iterator();

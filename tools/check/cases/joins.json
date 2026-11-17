@@ -131,6 +131,18 @@
   {
    "name": "plain_dec",
    "copy": "COPY (SELECT k AS pk, ((k % 200) * 0.02 - 1.5)::DECIMAL(9, 2) AS ddec, ((k % 97) * 1.0625 - 40)::DECIMAL(18, 4) AS d18, ((k % 13) * 0.5)::DECIMAL(4, 1) AS d4, (CASE WHEN k % 3 = 0 THEN 99999999999999999999999999999999999999 WHEN k % 3 = 1 THEN -99999999999999999999999999999999999999 ELSE k - 400 END)::DECIMAL(38, 0) AS d38, ((k % 50) * -0.0000001234)::DECIMAL(38, 10) AS d38s FROM range(0, 1001) t(k) WHERE k % 9 <> 4) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 300, DICTIONARY_SIZE_LIMIT 1)"
+  },
+  {
+   "name": "dim_nulls",
+   "copy": "COPY (SELECT k AS npk, (CASE WHEN k % 7 = 0 THEN NULL ELSE 'kind' || (k % 13) END) AS nkind, (CASE WHEN k % 11 = 0 THEN NULL ELSE k % 5 END)::BIGINT AS ngrp, (CASE WHEN k % 3 = 0 THEN NULL ELSE k * 10 END)::INTEGER AS nw, (CASE WHEN k % 4 = 1 THEN NULL ELSE k * 0.5 END)::DOUBLE AS nprice, (CASE WHEN k % 6 = 2 THEN NULL ELSE (k % 200) * 0.02 - 1.5 END)::DECIMAL(9, 2) AS ndec, NULL::INTEGER AS allnull, (CASE WHEN k <= 256 THEN NULL ELSE 'late' || (k % 9) END) AS nrg, (CASE WHEN k % 5 = 0 THEN NULL ELSE k % 4 END)::BIGINT AS nk FROM range(1, 801) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 256)"
+  },
+  {
+   "name": "plain_nulls",
+   "copy": "COPY (SELECT k AS ppk, (CASE WHEN k % 9 = 0 THEN NULL ELSE 'u' || k || repeat('x', (k % 7)::INT) END) AS puname, (CASE WHEN k % 4 = 0 THEN NULL ELSE 'kind' || (k % 13) END) AS pukind, (CASE WHEN k % 5 = 0 THEN NULL ELSE k * 3 END)::INTEGER AS pw, (CASE WHEN k % 6 = 0 THEN NULL ELSE k * 0.25 END)::DOUBLE AS pd, (CASE WHEN k % 8 = 0 THEN NULL ELSE (k % 97) * 1.0625 - 40 END)::DECIMAL(18, 4) AS pdec FROM range(1, 8001) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048, DICTIONARY_SIZE_LIMIT 1)"
+  },
+  {
+   "name": "snow_nulls",
+   "copy": "COPY (SELECT g AS sgk, (CASE WHEN g % 2 = 1 THEN NULL ELSE 'g' || g END) AS sgname, (CASE WHEN g = 2 THEN NULL ELSE g * 7 END)::INTEGER AS sgw FROM range(0, 4) t(g)) TO '{path}' (FORMAT PARQUET)"
   }
  ],
  "cases": [
@@ -7376,6 +7388,1061 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT f.fk, x.ddec, sum(x.d18) AS s, sum(x.d18) / count(*) AS m FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk GROUP BY f.fk, x.ddec HAVING sum(x.ddec) > 10 ORDER BY m DESC, f.fk LIMIT 5"
+   }
+  },
+  {
+   "id": "join:nullpay:group-by-string",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT nkind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY nkind ORDER BY nkind NULLS FIRST"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT nkind, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY nkind ORDER BY nkind NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:nullpay:group-by-two-columns",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT ngrp, allnull, count(*) AS n, sum(nw) AS sw, avg(nprice) AS ap, min(nkind) AS lo, max(nkind) AS hi, count(nw) AS cw FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY ngrp, allnull ORDER BY ngrp NULLS FIRST"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT ngrp, allnull, count(*) AS n, sum(nw) AS sw, avg(nprice) AS ap, min(nkind) AS lo, max(nkind) AS hi, count(nw) AS cw FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY ngrp, allnull ORDER BY ngrp NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:nullpay:group-by-decimal",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT ndec, count(*) AS n, sum(nw) AS sw FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY ndec ORDER BY ndec NULLS FIRST LIMIT 8"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT ndec, count(*) AS n, sum(nw) AS sw FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY ndec ORDER BY ndec NULLS FIRST LIMIT 8"
+   }
+  },
+  {
+   "id": "join:nullpay:group-by-all-null-row-group",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT nrg, count(*) AS n, count(nrg) AS c FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY nrg ORDER BY nrg NULLS FIRST"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT nrg, count(*) AS n, count(nrg) AS c FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY nrg ORDER BY nrg NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:nullpay:aggregates",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, count(nkind) AS ck, count(nw) AS cw, sum(nw) AS sw, min(nw) AS lo, max(nw) AS hi, avg(nw) AS aw, sum(nprice) AS sp, sum(ndec) AS sd, avg(ndec) AS ad, count(allnull) AS ca, sum(allnull) AS sa, min(nrg) AS lr FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, count(nkind) AS ck, count(nw) AS cw, sum(nw) AS sw, min(nw) AS lo, max(nw) AS hi, avg(nw) AS aw, sum(nprice) AS sp, sum(ndec) AS sd, avg(ndec) AS ad, count(allnull) AS ca, sum(allnull) AS sa, min(nrg) AS lr FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk"
+   }
+  },
+  {
+   "id": "join:nullpay:case-and-coalesce",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(CASE WHEN nkind LIKE 'kind1%' THEN amt ELSE 0 END) AS a, sum(CASE WHEN nw IS NULL THEN 1 ELSE 0 END) AS z, sum(coalesce(nw, 7)) AS c FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sum(CASE WHEN nkind LIKE 'kind1%' THEN amt ELSE 0 END) AS a, sum(CASE WHEN nw IS NULL THEN 1 ELSE 0 END) AS z, sum(coalesce(nw, 7)) AS c FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk"
+   }
+  },
+  {
+   "id": "join:nullpay:residual-greater",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND f.q > d.ngrp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND f.q > d.ngrp"
+   }
+  },
+  {
+   "id": "join:nullpay:residual-not",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND NOT (f.q > d.ngrp)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND NOT (f.q > d.ngrp)"
+   }
+  },
+  {
+   "id": "join:nullpay:residual-or",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND (f.q > d.ngrp OR f.q = 1)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND (f.q > d.ngrp OR f.q = 1)"
+   }
+  },
+  {
+   "id": "join:nullpay:residual-is-null",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.q, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND (d.ngrp IS NULL OR f.q = d.ngrp) GROUP BY f.q ORDER BY f.q"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.q, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND (d.ngrp IS NULL OR f.q = d.ngrp) GROUP BY f.q ORDER BY f.q"
+   }
+  },
+  {
+   "id": "join:nullpay:residual-decimal",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(f.dec) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND f.dec > d.ndec"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(f.dec) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND f.dec > d.ndec"
+   }
+  },
+  {
+   "id": "join:nullpay:build-filter-is-null",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT nkind, count(*) AS n, count(nw) AS cw FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND d.nw IS NULL GROUP BY nkind ORDER BY nkind NULLS FIRST"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT nkind, count(*) AS n, count(nw) AS cw FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND d.nw IS NULL GROUP BY nkind ORDER BY nkind NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:nullpay:build-filter-compare",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(nw) AS sw, count(nprice) AS cp FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND d.nw > 4000 AND d.nkind <> 'kind3'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(nw) AS sw, count(nprice) AS cp FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk AND d.nw > 4000 AND d.nkind <> 'kind3'"
+   }
+  },
+  {
+   "id": "join:nullpay:left-null-or-miss",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, count(d.npk) AS m, count(d.nw) AS cw, count(d.nkind) AS ck, sum(d.nw) AS sw FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim_nulls}' d ON f.fk = d.npk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, count(d.npk) AS m, count(d.nw) AS cw, count(d.nkind) AS ck, sum(d.nw) AS sw FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim_nulls}' d ON f.fk = d.npk"
+   }
+  },
+  {
+   "id": "join:nullpay:left-group",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.nkind, count(*) AS n, count(d.npk) AS m FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim_nulls}' d ON f.fk = d.npk AND d.ngrp < 2 GROUP BY d.nkind ORDER BY d.nkind NULLS FIRST"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.nkind, count(*) AS n, count(d.npk) AS m FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim_nulls}' d ON f.fk = d.npk AND d.ngrp < 2 GROUP BY d.nkind ORDER BY d.nkind NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:nullpay:group-join-keys",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, nkind, nw, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY f.fk, nkind, nw ORDER BY s DESC, f.fk LIMIT 9"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, nkind, nw, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY f.fk, nkind, nw ORDER BY s DESC, f.fk LIMIT 9"
+   }
+  },
+  {
+   "id": "join:nullpay:group-join-ranked-by-null",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, nkind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY f.fk, nkind ORDER BY nkind NULLS FIRST, f.fk LIMIT 9"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, nkind, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY f.fk, nkind ORDER BY nkind NULLS FIRST, f.fk LIMIT 9"
+   }
+  },
+  {
+   "id": "join:nullpay:group-join-having",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, nw, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY f.fk, nw HAVING nw > 7000 ORDER BY f.fk LIMIT 9"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, nw, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY f.fk, nw HAVING nw > 7000 ORDER BY f.fk LIMIT 9"
+   }
+  },
+  {
+   "id": "join:nullpay:fetched-keys",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, nkind, nrg, ndec, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY f.fk, nkind, nrg, ndec ORDER BY dq DESC, f.fk LIMIT 12"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, nkind, nrg, ndec, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY f.fk, nkind, nrg, ndec ORDER BY dq DESC, f.fk LIMIT 12"
+   }
+  },
+  {
+   "id": "join:nullpay:fetched-ranked-by-null",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, nrg, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY f.fk, nrg ORDER BY nrg NULLS FIRST, f.fk LIMIT 6 OFFSET 250"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, nrg, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY f.fk, nrg ORDER BY nrg NULLS FIRST, f.fk LIMIT 6 OFFSET 250"
+   }
+  },
+  {
+   "id": "join:nullpay:snowflake-null-fk",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT gname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d, '{fixture:snow_grp}' g WHERE f.fk = d.npk AND d.nk = g.gk GROUP BY gname ORDER BY gname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT gname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d, '{fixture:snow_grp}' g WHERE f.fk = d.npk AND d.nk = g.gk GROUP BY gname ORDER BY gname"
+   }
+  },
+  {
+   "id": "join:nullpay:snowflake-inner-nulls",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.nk, sgname, sgw, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d, '{fixture:snow_nulls}' g WHERE f.fk = d.npk AND d.nk = g.sgk GROUP BY d.nk, sgname, sgw ORDER BY d.nk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.nk, sgname, sgw, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d, '{fixture:snow_nulls}' g WHERE f.fk = d.npk AND d.nk = g.sgk GROUP BY d.nk, sgname, sgw ORDER BY d.nk"
+   }
+  },
+  {
+   "id": "join:nullpay:snowflake-late",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.nk, sgname, count(DISTINCT q) AS dq, round(sum(amt), 2) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d, '{fixture:snow_nulls}' g WHERE f.fk = d.npk AND d.nk = g.sgk GROUP BY d.nk, sgname ORDER BY s DESC LIMIT 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.nk, sgname, count(DISTINCT q) AS dq, round(sum(amt), 2) AS s FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d, '{fixture:snow_nulls}' g WHERE f.fk = d.npk AND d.nk = g.sgk GROUP BY d.nk, sgname ORDER BY s DESC LIMIT 3"
+   }
+  },
+  {
+   "id": "join:nullpay:star-second-dimension",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, sgname, count(*) AS n, sum(sgw) AS sw FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_nulls}' g WHERE f.fk = d.pk AND f.q = g.sgk GROUP BY d.grp, sgname ORDER BY d.grp, sgname NULLS FIRST"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, sgname, count(*) AS n, sum(sgw) AS sw FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_nulls}' g WHERE f.fk = d.pk AND f.q = g.sgk GROUP BY d.grp, sgname ORDER BY d.grp, sgname NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:nullpay:plain-group",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT pukind, count(*) AS n, sum(pw) AS sw, sum(pd) AS sd, sum(pdec) AS sx, min(puname) AS lo, count(puname) AS cu FROM '{fixture:fact}' f, '{fixture:plain_nulls}' p WHERE f.fk = p.ppk GROUP BY pukind ORDER BY pukind NULLS FIRST"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT pukind, count(*) AS n, sum(pw) AS sw, sum(pd) AS sd, sum(pdec) AS sx, min(puname) AS lo, count(puname) AS cu FROM '{fixture:fact}' f, '{fixture:plain_nulls}' p WHERE f.fk = p.ppk GROUP BY pukind ORDER BY pukind NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:nullpay:plain-group-join",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, puname, pw, pdec, count(*) AS n FROM '{fixture:fact}' f, '{fixture:plain_nulls}' p WHERE f.fk = p.ppk GROUP BY f.fk, puname, pw, pdec ORDER BY n DESC, f.fk LIMIT 10"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, puname, pw, pdec, count(*) AS n FROM '{fixture:fact}' f, '{fixture:plain_nulls}' p WHERE f.fk = p.ppk GROUP BY f.fk, puname, pw, pdec ORDER BY n DESC, f.fk LIMIT 10"
+   }
+  },
+  {
+   "id": "join:nullpay:plain-late-through-a-chain",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.w, puname, pukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_nulls}' p WHERE f.fk = d.pk AND d.w = p.ppk GROUP BY d.w, puname, pukind ORDER BY s DESC, d.w LIMIT 12"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.w, puname, pukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_nulls}' p WHERE f.fk = d.pk AND d.w = p.ppk GROUP BY d.w, puname, pukind ORDER BY s DESC, d.w LIMIT 12"
+   }
+  },
+  {
+   "id": "join:nullpay:plain-late-ranked-by-null",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.w, puname, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_nulls}' p WHERE f.fk = d.pk AND d.w = p.ppk GROUP BY d.w, puname ORDER BY puname NULLS FIRST, d.w LIMIT 7"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.w, puname, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_nulls}' p WHERE f.fk = d.pk AND d.w = p.ppk GROUP BY d.w, puname ORDER BY puname NULLS FIRST, d.w LIMIT 7"
+   }
+  },
+  {
+   "id": "join:nullpay:plain-build-filter",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, count(puname) AS cu, sum(pw) AS sw FROM '{fixture:fact}' f, '{fixture:plain_nulls}' p WHERE f.fk = p.ppk AND (p.puname IS NULL OR p.puname LIKE 'u1%')"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, count(puname) AS cu, sum(pw) AS sw FROM '{fixture:fact}' f, '{fixture:plain_nulls}' p WHERE f.fk = p.ppk AND (p.puname IS NULL OR p.puname LIKE 'u1%')"
+   }
+  },
+  {
+   "id": "join:nullpay:written",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT nkind, nw, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY nkind, nw ORDER BY nkind NULLS FIRST, nw NULLS FIRST",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "written_as",
+    "sql": "SELECT nkind, nw, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY nkind, nw ORDER BY nkind NULLS FIRST, nw NULLS FIRST"
    }
   }
  ]

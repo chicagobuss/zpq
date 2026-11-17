@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Joins accept more of the queries people write.** A glob or several files can be a join's probe table, EXTRACT works inside a join, USING joins two tables on one column, and a build side that isn't unique on its key no longer refuses when the other side is. Every join refusal now names the feature it lacks.
+
 - **Joins carry DECIMAL dimension columns.** A DECIMAL column from a join's dimension side keeps its scale through filters, GROUP BY, aggregates and comparisons.
 
 - **Joins carry dimension strings to the result cut, compare numeric dictionary codes across files, and probe dense keys in one pass.** Only the rows that survive LIMIT fetch their dimension strings, a numeric comparison reads each side's own dictionary, and a dense INNER or SEMI probe captures slots and narrows the selection together. An expression over two copies of a self-joined table's same-named column is refused by name.

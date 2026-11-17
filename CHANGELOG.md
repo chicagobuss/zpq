@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **EXISTS and NOT EXISTS subqueries run as joins.** A correlated EXISTS becomes a semi join and NOT EXISTS an anti join, with SQL's NULL rules: NOT EXISTS ignores NULL keys where NOT IN does not.
+
 - **Joins read NULLs in a dimension's columns, and join on string keys.** A build-side column holding NULLs answers as DuckDB does, and a join on a VARCHAR key matches by bytes. A fetched DATE or TIMESTAMP key keeps its type in CSV and Parquet output.
 
 - **Joins run over S3.** Tables on S3, or a mix of local and S3 tables, join as local ones do, with the same answers. A build side larger than the query's memory budget is refused by name.

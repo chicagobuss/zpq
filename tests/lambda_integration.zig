@@ -329,6 +329,12 @@ pub const FakeS3 = struct {
     fn respond(self: *FakeS3, fd: linux.fd_t, head: []const u8) !void {
         _ = self.requests.fetchAdd(1, .monotonic);
         const first_line = head[0 .. std.mem.indexOf(u8, head, "\r\n") orelse head.len];
+        if (std.mem.indexOf(u8, first_line, "list-type=2") != null) {
+            const body = "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>fact.parquet</Key><Size>1</Size></Contents></ListBucketResult>";
+            var list_header: [128]u8 = undefined;
+            try writeAllFd(fd, try std.fmt.bufPrint(&list_header, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{body.len}));
+            return writeAllFd(fd, body);
+        }
         const dimension = std.mem.indexOf(u8, first_line, "/dimension.parquet") != null;
         const small = std.mem.indexOf(u8, first_line, "/small.parquet") != null;
         const obj = if (dimension) self.secondary orelse self.object else if (small) self.tertiary orelse self.object else self.object;

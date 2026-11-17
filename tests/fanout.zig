@@ -729,3 +729,40 @@ test "fanout aligned joins: boundaries, both sides split, oversized source, smal
     }
     try std.testing.expect(store.matched_requests.load(.acquire) > 0);
 }
+
+test "fanout fixture: CLI joins S3 and local tables and an S3 glob" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const fact = try zpq.test_scratch.filePath(scratch, "zig-out/wp3-fact.parquet");
+    const dim = try zpq.test_scratch.filePath(scratch, "zig-out/wp3-dim.parquet");
+    defer std.Io.Dir.cwd().deleteFile(io, fact) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, dim) catch {};
+    _ = try duckdb(scratch, try std.fmt.allocPrint(scratch, "COPY (SELECT i::BIGINT AS id, (i%3)::BIGINT AS fk FROM range(100) t(i)) TO '{s}' (FORMAT PARQUET); COPY (SELECT i::BIGINT AS pk FROM range(3) t(i)) TO '{s}' (FORMAT PARQUET);", .{ fact, dim }));
+    const fact_bytes = try std.Io.Dir.cwd().readFileAlloc(io, fact, scratch, .limited(64 << 20));
+    const dim_bytes = try std.Io.Dir.cwd().readFileAlloc(io, dim, scratch, .limited(64 << 20));
+    var store: fake.FakeS3 = undefined;
+    try store.startPair(fact_bytes, dim_bytes, 0);
+    defer store.deinit();
+    var env_map: std.process.Environ.Map = .{ .allocator = scratch, .array_hash_map = .empty };
+    defer env_map.deinit();
+    try env_map.put("S3_ENDPOINT_URL", try std.fmt.allocPrint(scratch, "http://127.0.0.1:{d}", .{store.port}));
+    try env_map.put("S3_ACCESS_KEY_ID", "fake");
+    try env_map.put("S3_SECRET_ACCESS_KEY", "fake");
+    try env_map.put("S3_REGION", "us-east-1");
+    try env_map.put("PATH", "/usr/bin:/bin");
+    const expected_sql = try std.fmt.allocPrint(scratch, "SELECT count(*) AS n, sum(f.id) AS s FROM '{s}' f JOIN '{s}' d ON f.fk=d.pk", .{ fact, dim });
+    const expected = (try zpq.engine.fanout.parse(scratch, try duckdb(scratch, expected_sql))).array.items[0];
+    for ([_][]const u8{ "s3://test/fact.parquet", fact, "s3://test/fact*.parquet" }) |probe| {
+        const sql = try std.fmt.allocPrint(scratch, "SELECT count(*) AS n, sum(f.id) AS s FROM '{s}' f JOIN 's3://test/dimension.parquet' d ON f.fk=d.pk", .{probe});
+        const result = try std.process.run(scratch, io, .{ .argv = &.{ opts.cli_bin, "query", "--query", sql }, .environ_map = &env_map });
+        if (result.term != .exited or result.term.exited != 0) {
+            std.debug.print("CLI join: {s}\n", .{result.stderr});
+            return error.CliFailed;
+        }
+        if (!same(try zpq.engine.fanout.parse(scratch, result.stdout), expected)) {
+            std.debug.print("probe {s}: expected {s}; got {s}\n", .{ probe, try std.json.Stringify.valueAlloc(scratch, expected, .{}), result.stdout });
+            return error.AnswerMismatch;
+        }
+    }
+}

@@ -221,6 +221,7 @@ const scan_census = @import("census.zig");
 const streamProbeBytes = scan_census.streamProbeBytes;
 const WinnerCharge = scan_census.WinnerCharge;
 const denseLimit = scan_census.denseLimit;
+const denseFirst = scan_census.denseFirst;
 const certifiedTopK = scan_census.certifiedTopK;
 const firstAppearanceCut = scan_census.firstAppearanceCut;
 const owner_support = @import("owner_support.zig");
@@ -1948,7 +1949,7 @@ fn prepareAggregateWithMetas(
                 dense_direct = merged.lanes;
                 dense_ranges = merged.ranges;
             }
-        } else try agg_dense.intoTable(gpa, arena, dense_lanes, dense_keys, dense_table, dense_lookup, n_workers, cut);
+        } else try agg_dense.intoTable(gpa, arena, dense_lanes, dense_keys, dense_table, dense_lookup, n_workers, cut, denseFirst(args, group_outputs));
         if (prof != null) profile.record(
             prof,
             .dense_fold,

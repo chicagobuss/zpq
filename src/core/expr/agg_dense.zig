@@ -1225,7 +1225,8 @@ pub const Lanes = struct {
 /// Merge every worker's lanes by id into `table`, one group per id some row reached, at the least position any worker
 /// saw it. `table` must be empty and use the scan's key image (`fixed_stride`), so its groups are the ones the merged
 /// worker tables would hold, and every later stage reads it as a single table. Groups go in by id, not by position:
-/// every reader of a table orders its groups by `first` (as one worker's table, filled in code order, needs).
+/// every reader of a table orders its groups by `first` (as one worker's table, filled in code order, needs). `cut`
+/// keeps a count or sum rank's top groups; `first` the groups a LIMIT without ORDER BY keeps, the least positions.
 pub fn intoTable(
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -1235,12 +1236,13 @@ pub fn intoTable(
     lookup_len: usize,
     n_threads: usize,
     cut: ?usize,
+    first: ?usize,
 ) !void {
     std.debug.assert(table.groupCount() == 0);
     const into = (try merge(gpa, arena, lanes, n_threads)) orelse return;
     const domain = into.domain;
     const calls = into.calls;
-    const selected = try reached(gpa, into, cut);
+    const selected = if (first) |k| try reachedFirst(gpa, into, k) else try reached(gpa, into, cut);
     defer gpa.free(selected);
     const groups = selected.len;
     if (table.fixed_stride != 0) try table.reserveFixed(groups, calls.len);
@@ -1376,6 +1378,26 @@ pub fn reached(gpa: std.mem.Allocator, into: *const Lanes, cut: ?usize) ![]u32 {
         };
     }
     return ids;
+}
+
+/// The `k` reached IDs of least position: the groups a LIMIT without ORDER BY keeps. Their lanes are complete.
+pub fn reachedFirst(gpa: std.mem.Allocator, into: *const Lanes, k: usize) ![]u32 {
+    var heap: std.PriorityQueue(u32, *const Lanes, laterPosition) = .initContext(into);
+    defer heap.deinit(gpa);
+    try heap.ensureTotalCapacityPrecise(gpa, @min(k, into.groupCount()));
+    if (k > 0) for (0..into.domain.ids()) |id| if (into.seen(id)) {
+        const candidate: u32 = @intCast(id);
+        if (heap.count() == k) {
+            if (into.position(candidate) >= into.position(heap.peek().?)) continue;
+            _ = heap.pop();
+        }
+        try heap.push(gpa, candidate);
+    };
+    return gpa.dupe(u32, heap.items);
+}
+
+fn laterPosition(lanes: *const Lanes, a: u32, b: u32) std.math.Order {
+    return std.math.order(lanes.position(b), lanes.position(a));
 }
 
 const RankHeap = std.PriorityQueue(u32, *const Lanes, rankOrder);
@@ -1722,7 +1744,7 @@ fn testNumericLanes(a: std.mem.Allocator, floating: bool) !void {
     }
     var got = agg.GroupTable.init(a, 1 << 24);
     defer got.deinit();
-    try intoTable(a, ra, &lanes, &keys, &got, 2, 4, null);
+    try intoTable(a, ra, &lanes, &keys, &got, 2, 4, null, null);
     try testing.expectEqual(want.groupCount(), got.groupCount());
     for (0..want.groupCount()) |g| {
         const id = got.findKey(want.keyAt(g)) orelse return error.TestExpectedEqual;
@@ -2357,7 +2379,7 @@ fn testCountLanes(a: std.mem.Allocator) !void {
             try testing.expect(try agg_coded.groupedCoded(ra, a, &calls, &.{.{ .col_ref = Fixture.key }}, &want, pos, &b, &lookup, &sel, null, null));
             try testing.expect(try lanes[wi].fold(ra, a, Fixture.key, 0, rg, pos, &b, &lookup, &sel));
         }
-        try intoTable(a, ra, &lanes, &.{.{ .col_ref = Fixture.key }}, &got, lookup.len, 2, null);
+        try intoTable(a, ra, &lanes, &.{.{ .col_ref = Fixture.key }}, &got, lookup.len, 2, null, null);
         try expectSameGroups(&want, &got, calls.len);
         try testing.expectEqual(@as(usize, 4), got.groupCount());
     }
@@ -2386,12 +2408,54 @@ test "dense fold makes the groups and states grouping by code makes, by value ac
         try testing.expect(try agg_coded.groupedCoded(a, testing.allocator, calls, &.{.{ .col_ref = Fixture.key }}, &want, pos, &b, &lookup, &sel, null, null));
         try testing.expect(try lanes[wi].fold(a, testing.allocator, Fixture.key, 0, rg, pos, &b, &lookup, &sel));
     }
-    try intoTable(testing.allocator, a, &lanes, &.{.{ .col_ref = Fixture.key }}, &got, lookup.len, 2, null);
+    try intoTable(testing.allocator, a, &lanes, &.{.{ .col_ref = Fixture.key }}, &got, lookup.len, 2, null, null);
     try expectSameGroups(&want, &got, calls.len);
     // Admission reserves the table beside the lanes (`tableBytes`): it must cover what the table then holds.
     try testing.expect(got.allocated_bytes <= tableBytes(d.ids(), 9, calls.len));
     // 10, 20, 30 and null: 40 sits only in a filtered row.
     try testing.expectEqual(@as(usize, 4), got.groupCount());
+}
+
+test "a first-groups cut builds the groups of least position, as the full table holds them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const calls = &Fixture.calls;
+    const lookup = [_]?usize{ 0, 1 };
+    const d = Fixture.domain();
+    // A merge folds the lanes it is given, so each table is built from lanes of its own.
+    const Build = struct {
+        fn into(ra: std.mem.Allocator, table: *agg.GroupTable, dom: *const Domain, first: ?usize) !void {
+            table.fixed_stride = 9;
+            var lanes = [_]Lanes{ .{ .domain = dom, .calls = calls }, .{ .domain = dom, .calls = calls } };
+            defer for (&lanes) |*l| l.deinit(testing.allocator);
+            for ([_]usize{ 1, 0 }, 0..) |rg, wi| {
+                const b = Fixture.batch(rg);
+                var sel = try Fixture.selection(ra, rg);
+                try testing.expect(try lanes[wi].fold(ra, testing.allocator, Fixture.key, 0, rg, agg.firstPosition(rg, 0), &b, &lookup, &sel));
+            }
+            try intoTable(testing.allocator, ra, &lanes, &.{.{ .col_ref = Fixture.key }}, table, lookup.len, 2, null, first);
+        }
+    };
+    var want = agg.GroupTable.init(testing.allocator, 1 << 20);
+    defer want.deinit();
+    try Build.into(a, &want, &d, null);
+    for ([_]usize{ 0, 1, 2, 3, 4, 9 }) |k| {
+        var got = agg.GroupTable.init(testing.allocator, 1 << 20);
+        defer got.deinit();
+        try Build.into(a, &got, &d, k);
+        try testing.expectEqual(@min(k, want.groupCount()), got.groupCount());
+        // Every group kept is one the full table has, with its state, and no group left out came before one kept.
+        var latest: u64 = 0;
+        for (0..got.groupCount()) |g| {
+            const w = want.findKey(got.keyAt(g)) orelse return error.TestExpectedEqual;
+            try testing.expectEqual(want.first.items[w], got.first.items[g]);
+            for (0..calls.len) |ai| try testing.expect(std.meta.eql(want.readAcc(w, ai, calls.len), got.readAcc(g, ai, calls.len)));
+            latest = @max(latest, got.first.items[g]);
+        }
+        if (got.groupCount() > 0) for (0..want.groupCount()) |w| if (got.findKey(want.keyAt(w)) == null)
+            try testing.expect(want.first.items[w] > latest);
+    }
 }
 
 test "dense fold declines a dictionary the domain did not translate, touching nothing" {
@@ -2436,7 +2500,7 @@ test "dense fold and merge release everything on allocation failure" {
             var got = agg.GroupTable.init(gpa, 1 << 20);
             defer got.deinit();
             got.fixed_stride = 9;
-            try intoTable(gpa, a, &lanes, &.{.{ .col_ref = Fixture.key }}, &got, lookup.len, 1, null);
+            try intoTable(gpa, a, &lanes, &.{.{ .col_ref = Fixture.key }}, &got, lookup.len, 1, null, null);
             try testing.expectEqual(@as(usize, 4), got.groupCount());
         }
     }.run, .{});
@@ -2677,7 +2741,7 @@ fn testProductMode(a: std.mem.Allocator, nullable: bool, with_sum: bool) !void {
             ));
             try testing.expect(try lanes[wi].foldKeys(ra, a, &keys, 0, rg, pos, &batch, &.{ 0, 1, 2 }, &sel));
         }
-        try intoTable(a, ra, &lanes, &keys, &got, 2, 2, cut);
+        try intoTable(a, ra, &lanes, &keys, &got, 2, 2, cut, null);
         try testing.expect(got.allocated_bytes <= domainTableBytes(&domain, domain.ids(), 0, calls.len));
         if (cut) |h| {
             const ids = try ra.alloc(u32, want.groupCount());

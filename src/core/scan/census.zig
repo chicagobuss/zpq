@@ -77,6 +77,15 @@ pub fn denseLimit(args: MultiAggArgs, calls: []const expr_agg.AggCall, outputs: 
     return std.math.cast(usize, std.math.add(u64, order.offset, limit) catch return null);
 }
 
+/// A LIMIT with no ORDER BY or HAVING keeps the first groups the scan saw, so the dense merge builds only those.
+pub fn denseFirst(args: MultiAggArgs, outputs: ?[]const BoundOutputColumn) ?usize {
+    const order = args.result_order;
+    const limit = order.limit orelse return null;
+    if (limit == 0 or order.keys.len != 0 or order.having != null or order.hidden.len != 0) return null;
+    for (outputs orelse return null) |out| if (out.derived != null) return null;
+    return std.math.cast(usize, std.math.add(u64, order.offset, limit) catch return null);
+}
+
 /// Hot membership is sampled; each hot lane is then counted completely and every other row contributes to a
 /// saturating cold bound. The exact residual includes equality at the cut, preserving all secondary ordering.
 fn hotCertificate(

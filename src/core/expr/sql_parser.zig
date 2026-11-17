@@ -1208,6 +1208,10 @@ pub const Schemas = struct {
 /// (`syntax.Query.join`). Null when `sql` is no join. `allocator` must be an arena: the probe's and every build's
 /// syntax outlive the call. The footers decide only which table owns a column and which side probes.
 pub fn parseSqlJoinPlan(allocator: std.mem.Allocator, sql: []const u8, schemas: Schemas) !?ParsedQuery {
+    return parseSqlJoinPlanRoot(allocator, sql, schemas, null);
+}
+
+pub fn parseSqlJoinPlanRoot(allocator: std.mem.Allocator, sql: []const u8, schemas: Schemas, root_path: ?[]const u8) !?ParsedQuery {
     // The binder reads the query as the single-table parser does, once folded; its pieces parse with the same markers.
     var report: literals.Report = .{};
     const folded = try fold(allocator, sql, &report);
@@ -1216,7 +1220,7 @@ pub fn parseSqlJoinPlan(allocator: std.mem.Allocator, sql: []const u8, schemas: 
     const extracted = try extractAsDatePart(allocator, positioned);
     const z = try substringKeywords(allocator, extracted);
     const paths = (try sql_join.tables(allocator, z)) orelse return null;
-    const first = try resolveJoin(allocator, z, paths, schemas, markers, false);
+    const first = try resolveJoin(allocator, z, paths, schemas, markers, false, root_path);
     // A probe query that still holds `IN (SELECT ...)` semi-joins the probe itself.
     const peeled = try peelSemis(allocator, first.probe_sql, schemas, markers, first.reduced);
     var pq = try parseFolded(true, allocator, peeled.rest, markers);
@@ -1247,7 +1251,7 @@ const Owners = struct {
 };
 
 /// `unique_ins`: the query this one came out of reduced, so every IN in it is a reduction's too.
-fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u8, schemas: Schemas, markers: literals.Markers, unique_ins: bool) anyerror!Resolved {
+fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u8, schemas: Schemas, markers: literals.Markers, unique_ins: bool, root_path: ?[]const u8) anyerror!Resolved {
     const metas = try a.alloc(*const schema.FileMetaData, paths.len);
     const rows = try a.alloc(u64, paths.len);
     for (paths, metas, rows) |path, *m, *r| {
@@ -1255,7 +1259,15 @@ fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u
         r.* = @intCast(m.*.num_rows);
     }
     const owners: Owners = .{ .metas = metas };
-    const p = try sql_join.plan(a, sql, .{ .paths = paths, .has = Owners.has, .rows = rows, .ctx = &owners });
+    var root: ?usize = null;
+    if (root_path) |wanted| {
+        for (paths, 0..) |path, i| if (std.mem.eql(u8, path, wanted)) {
+            if (root != null) return error.UnsupportedJoin;
+            root = i;
+        };
+        if (root == null) return error.UnsupportedJoin;
+    }
+    const p = try sql_join.plan(a, sql, .{ .paths = paths, .has = Owners.has, .rows = rows, .ctx = &owners, .root = root });
     const unique = unique_ins or p.reduced;
     const dims = try resolveDims(a, p.dims, schemas, markers, unique);
     return .{
@@ -1301,7 +1313,7 @@ fn peelSemis(a: std.mem.Allocator, sql: []const u8, schemas: Schemas, markers: l
     while (true) {
         const z = try a.dupeSentinel(u8, rest, 0);
         const inner = (try sql_join.tables(a, z)) orelse break;
-        const r = try resolveJoin(a, z, inner, schemas, markers, unique);
+        const r = try resolveJoin(a, z, inner, schemas, markers, unique, null);
         const anti = r.kind == .anti;
         try semis.append(a, .{ .fk = r.fk, .build = r.build, .unique = unique and !anti, .anti = anti });
         rest = r.probe_sql;

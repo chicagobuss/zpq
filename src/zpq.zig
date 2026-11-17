@@ -30,6 +30,7 @@ pub const core = struct {
         pub const partition = @import("core/filter/partition.zig");
     };
     pub const expr = struct {
+        pub const syntax = @import("core/expr/syntax.zig");
         pub const key_pack = @import("core/expr/key_pack.zig");
         pub const ast = @import("core/expr/ast.zig");
         pub const parser = @import("core/expr/parser.zig");

@@ -72,6 +72,7 @@ pub const Tables = struct {
     has: *const fn (ctx: *const anyopaque, table: usize, name: []const u8) bool,
     rows: []const u64,
     ctx: *const anyopaque,
+    root: ?usize = null,
 };
 
 fn stripQuotes(s: []const u8) []const u8 {
@@ -569,7 +570,10 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         for (conjuncts.items) |node| if ((try all.reads(node, a)) & null_set != 0) return error.LeftJoinWhere;
     }
     // The probe is chosen once, over every table a LEFT JOIN keeps: the reductions that follow take tables out around it.
-    const center = live.items[largest(t, live.items, null_set)];
+    const center = if (t.root) |root| blk: {
+        if (null_set != 0 or std.mem.indexOfScalar(usize, live.items, root) == null) return error.UnsupportedJoin;
+        break :blk root;
+    } else live.items[largest(t, live.items, null_set)];
     while (live.items.len > 2) {
         const sides: Sides = .{ .t = t, .tables = live.items, .aliases = aliases };
         const keep = std.mem.indexOfScalar(usize, live.items, center).?;

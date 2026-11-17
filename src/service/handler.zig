@@ -642,11 +642,44 @@ fn executeSql(
     sql: []const u8,
     diag: *Diag,
 ) ![]u8 {
+    var retry: ?[]const u8 = null;
+    return executeSqlOnce(io, allocator, result_memory, arena, env, pool, options, sql, diag, null, &retry) catch |err| {
+        if (err != error.DuplicateBuildKey or retry == null) return err;
+        const prior = diag.*;
+        const root = retry.?;
+        diag.* = .{};
+        return executeSqlOnce(io, allocator, result_memory, arena, env, pool, options, sql, diag, root, &retry) catch |second| {
+            if (second == error.DuplicateBuildKey) return error.JoinNonUnique;
+            if (second == error.UnsupportedJoin) {
+                diag.* = prior;
+                return err;
+            }
+            return second;
+        };
+    };
+}
+
+fn executeSqlOnce(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    result_memory: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    env: std.process.Environ,
+    pool: *PersistentPool,
+    options: engine.QueryArgs,
+    sql: []const u8,
+    diag: *Diag,
+    root: ?[]const u8,
+    retry: *?[]const u8,
+) ![]u8 {
     var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena } };
     defer schemas.deinit();
     const parser = zpq.core.expr.sql_parser;
-    const pq = (try parser.parseSqlJoinPlan(arena, sql, .{ .ctx = &schemas, .footer = zpq.frontend.JoinSchemas.footer })) orelse
+    const pq = (try parser.parseSqlJoinPlanRoot(arena, sql, .{ .ctx = &schemas, .footer = zpq.frontend.JoinSchemas.footer }, root)) orelse
         try parser.parseSqlPlan(arena, sql);
+    errdefer if (pq.syntax.?.join) |j| {
+        retry.* = zpq.frontend.retryJoinRoot(j, diag.input);
+    };
     const inputs = try zpq.frontend.expandGlob(arena, io, pq.table_name, env, diag);
     if (inputs.len == 0) {
         zpq.frontend.noSqlMatches(pq.table_name);

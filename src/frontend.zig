@@ -4,6 +4,26 @@ const zpq = @import("zpq.zig");
 const local_fs = zpq.local_fs;
 const s3 = zpq.io.s3;
 const Diag = zpq.core.diag.Diag;
+const syntax = @import("core/expr/syntax.zig");
+
+fn buildHasLeft(build: syntax.Build) bool {
+    for (build.dims) |d| if (d.left or buildHasLeft(d.build)) return true;
+    for (build.semis) |s| if (buildHasLeft(s.build)) return true;
+    return false;
+}
+
+/// Retry only a failed direct build and only when no LEFT edge pins the original probe.
+pub fn retryJoinRoot(join: syntax.Join, failed: ?[]const u8) ?[]const u8 {
+    const path = failed orelse return null;
+    if (join.kind != .inner or buildHasLeft(join.build)) return null;
+    for (join.semis) |s| if (buildHasLeft(s.build)) return null;
+    var matches: usize = @intFromBool(std.mem.eql(u8, join.build.path, path));
+    for (join.dims) |d| {
+        if (d.left or buildHasLeft(d.build)) return null;
+        if (std.mem.eql(u8, d.build.path, path)) matches += 1;
+    }
+    return if (matches == 1) path else null;
+}
 
 /// Resolve a table pattern for join planning while keeping the footer mappings alive through binding.
 pub const JoinSchemas = struct {
@@ -264,6 +284,10 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         error.DuplicateBuildKey => diagnosticPrint(
             "zpq query: '{s}' holds a key of {s} twice: this build joins N:1 only\n",
             .{ diag.input orelse "the build", diag.column.get() },
+        ),
+        error.JoinNonUnique => diagnosticPrint(
+            "zpq query: join lookup keys are not unique after re-rooting; many-to-many joins are not supported\n",
+            .{},
         ),
         error.JoinBuildExceedsBudget => diagnosticPrint(
             "zpq query: the join's build of '{s}' on {s} does not fit --max-memory\n",

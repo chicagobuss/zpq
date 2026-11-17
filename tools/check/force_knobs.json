@@ -7,6 +7,13 @@
     "note": "late dimension payload fetch must preserve JSON and Parquet bytes"
   },
   {
+    "name": "ZPQ_JOIN_LATE_PAYLOAD",
+    "off": "0",
+    "cases": ["join:late:locator:path-parity"],
+    "evidence": "unavailable",
+    "note": "dependent dimension strings read at the result cut must preserve JSON and Parquet bytes"
+  },
+  {
     "name": "ZPQ_BYTE_RECORDS",
     "off": "0",
     "cases": [

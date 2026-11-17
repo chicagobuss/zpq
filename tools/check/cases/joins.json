@@ -124,6 +124,15 @@
    }
   },
   {
+   "id": "join:late:locator:path-parity",
+   "fixture": "fact",
+   "sql": "SELECT d.w, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_dim}' p WHERE f.fk = d.pk AND d.w = p.pk GROUP BY d.w, uname, ukind ORDER BY s DESC, d.w LIMIT 7",
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.w, uname, ukind, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:plain_dim}' p WHERE f.fk = d.pk AND d.w = p.pk GROUP BY d.w, uname, ukind ORDER BY s DESC, d.w LIMIT 7"
+   }
+  },
+  {
    "id": "join:inner:comma:scalar",
    "fixture": "fact",
    "cli": [

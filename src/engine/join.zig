@@ -679,6 +679,7 @@ fn build(t: *Task, edge: Edge, build_syntax: syntax.Build, kind: lookup.Kind, al
         Diag.setColumn(diag, b.key);
         return if (p.charge.refusal(err) == error.ExceededMemoryBudget) error.JoinBuildExceedsBudget else err;
     };
+    j.publishAs(b.columns_as);
     // The binder publishes each FK column a snowflake's table reads.
     for (b.dims, dims) |d, inner| {
         const at = try arena.alloc(usize, 1 + d.fk_more.len);
@@ -934,10 +935,12 @@ fn deferredPayloads(a: std.mem.Allocator, query: ?*const syntax.Query, b: syntax
     if (!determines) return &.{};
     const out = try a.alloc(bool, payload.len);
     @memset(out, false);
-    for (b.columns, payload, out) |name, leaf, *deferred| {
+    for (b.columns, payload, out, 0..) |own, leaf, *deferred, i| {
         const e = metadata.leafSchemaElement(meta, leaf) orelse continue;
         if (e.type != .BYTE_ARRAY or e.repetition_type == .REPEATED) continue;
         if ((e.effectiveLogicalType() orelse continue) != .STRING) continue;
+        // The probe query reads the column by the name it is published under; the build's filter by its own.
+        const name = if (i < b.columns_as.len) b.columns_as[i] else own;
         const bare = for (keys) |k| {
             if (k.expr == .column and std.ascii.eqlIgnoreCase(k.expr.column, name)) break true;
         } else false;
@@ -949,7 +952,7 @@ fn deferredPayloads(a: std.mem.Allocator, query: ?*const syntax.Query, b: syntax
         } else false;
         if (chained) continue;
         if (q.filter) |f| if (predicateReads(f, name)) continue;
-        if (b.filter) |f| if (predicateReads(f, name)) continue;
+        if (b.filter) |f| if (predicateReads(f, own)) continue;
         const read = for (q.calls) |c| {
             if (c.arg) |e2| if (exprReads(e2, name)) break true;
             if (c.arg2) |e2| if (exprReads(e2, name)) break true;

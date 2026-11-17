@@ -355,6 +355,11 @@ pub const Join = struct {
         return j.slot(@intCast(j.cols[0].place(v) orelse return null));
     }
 
+    /// Publish the build's first columns under `names` instead of their own (`syntax.Build.columns_as`).
+    pub fn publishAs(j: *Join, names: []const []const u8) void {
+        for (@constCast(j.payloads)[0..names.len], names) |*p, name| p.name = name;
+    }
+
     /// The payload a probe leaf index stands for, or null for a real leaf.
     pub fn virtualPayload(j: *const Join, ci: usize) ?usize {
         if (ci < j.virtual_base or ci >= j.virtual_base + j.payloads.len) return null;

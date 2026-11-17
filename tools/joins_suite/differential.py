@@ -103,7 +103,7 @@ COPY (SELECT ({lo} + k)::{kt} AS eid, {nul(0.15, f'({lo} + (k * 3 % {nd + 3}))')
 
 def queries(seed, p, T, count, shapes):
     r = random.Random(seed * 7919 + 1)
-    F, D, DU, S, DS, DC, E = (f"'{T}/{x}.parquet'" for x in ('f', 'd', 'dup', 's', 'ds', 'dc', 'e'))
+    F, D, DU, S, DS, DC, E, GD = (f"'{T}/{x}.parquet'" for x in ('f', 'd', 'dup', 's', 'ds', 'dc', 'e', 'gdim'))
     pf = ['', 'f.q > 4', 'f.x IS NOT NULL', 'f.v < 300', 'f.id % 64 = 63', 'f.q <> 3 AND f.v > 100']
     lim = lambda: r.choice([1, 3, 7, 50, 100000])
     out = []
@@ -210,7 +210,7 @@ def queries(seed, p, T, count, shapes):
                 w.append(f"{r.choice(['', 'NOT '])}EXISTS (SELECT 1 FROM {DC} dc WHERE {' AND '.join(on)})")
                 sql = f'SELECT count(*) AS n, sum(f.v) AS sv FROM {F} f{wh()}'
         elif shape == 'self':
-            form = r.choice(['parent-group', 'parent-left', 'compare', 'rows', 'two-level'])
+            form = r.choice(['parent-group', 'parent-left', 'compare', 'rows', 'two-level', 'both-copies', 'role', 'role-rows', 'name-in-both'])
             if form == 'parent-group':
                 sql = f'SELECT m.egrp, count(*) AS n FROM {E} e JOIN {E} m ON e.boss = m.eid GROUP BY m.egrp ORDER BY m.egrp'
             elif form == 'parent-left':
@@ -221,6 +221,19 @@ def queries(seed, p, T, count, shapes):
             elif form == 'rows':
                 sql = (f'SELECT e.ename, m.ename AS boss_name FROM {E} e LEFT JOIN {E} m ON e.boss = m.eid '
                        f'ORDER BY e.ename, boss_name NULLS FIRST LIMIT {lim()}')
+            elif form == 'both-copies':   # each copy's column beside the other's: a reference bound to the wrong copy shows
+                sql = (f'SELECT e.egrp, m.egrp AS boss_grp, e.ename, m.ename AS boss_name, count(*) AS n FROM {E} e JOIN {E} m ON e.boss = m.eid '
+                       f'GROUP BY e.egrp, m.egrp, e.ename, m.ename ORDER BY 1, 2, 3, 4 LIMIT {lim()}')
+            elif form == 'role':   # one dimension in two roles
+                cmp = r.choice(['a.w < b.w', 'a.grp = b.grp', 'a.name <> b.name', 'a.w + b.w > 20'])
+                sql = (f'SELECT a.grp AS ag, b.grp AS bg, count(*) AS n, sum(a.w - b.w) AS dw FROM {F} f JOIN {D} a ON f.fk = a.pk '
+                       f'JOIN {D} b ON f.fk2 = b.pk WHERE {cmp} GROUP BY a.grp, b.grp ORDER BY ag, bg')
+            elif form == 'role-rows':
+                sql = (f'SELECT a.grp, b.grp AS bg, b.name AS bn FROM {F} f JOIN {D} a ON f.fk = a.pk JOIN {D} b ON f.fk2 = b.pk{wh()} '
+                       f'ORDER BY a.grp, b.grp, b.name, a.w LIMIT {lim()} OFFSET {r.choice([0, 3, 30])}')
+            elif form == 'name-in-both':   # the probe's column and a build's of one name (the probe is the larger file)
+                sql = (f'SELECT x.grp, count(*) AS n, sum(x.w) AS big, sum(y.w) AS small FROM {D} x JOIN {GD} y ON x.grp = y.pk '
+                       f"WHERE {r.choice(['x.w <> y.w', 'x.name > y.name', 'x.grp = y.grp OR x.w > 3'])} GROUP BY x.grp ORDER BY x.grp")
             else:
                 sql = (f'SELECT g.egrp, count(*) AS n FROM {E} e JOIN {E} m ON e.boss = m.eid JOIN {E} g ON m.boss = g.eid '
                        f'GROUP BY g.egrp ORDER BY g.egrp')

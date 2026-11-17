@@ -95,6 +95,8 @@ pub const Build = struct {
     key_more: []const []const u8 = &.{},
     /// The build columns the query reads, which bind as virtual leaves of the probe.
     columns: []const []const u8 = &.{},
+    /// The names `columns` bind under when not their own, one each, else empty: a column whose name the probe has
+    /// too, or another build publishes, goes by one the frontend chose (`sql_join.publishedName`).
     columns_as: []const []const u8 = &.{},
     /// The build's own conjuncts.
     filter: ?Predicate = null,

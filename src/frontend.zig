@@ -346,6 +346,11 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
                 "  qualified, and no aggregate, GROUP BY, HAVING or LIMIT\n",
             .{},
         ),
+        error.JoinColumnNeedsAlias => diagnosticPrint(
+            "zpq query: a select item computes over a column whose name another table of the join has too;\n" ++
+                "  name the item with AS\n",
+            .{},
+        ),
         error.JoinRowsFloat => diagnosticPrint(
             "zpq query: the rows of a join do not show a FLOAT or DOUBLE column in this release ({s}):\n" ++
                 "  that needs rows grouped by a float's exact bits. Aggregate it, CAST it to a DECIMAL, or leave it out\n",

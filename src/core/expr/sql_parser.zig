@@ -1347,7 +1347,7 @@ fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u
         },
         .fk = p.fk,
         .fk_more = p.fk_more,
-        .build = try resolveBuild(a, p.build_path, p.build_key, p.build_key_more, p.build_columns, p.build_where, p.build_dims, p.build_semis, schemas, markers, unique),
+        .build = try resolveBuild(a, p.build_path, p.build_key, p.build_key_more, p.build_columns, p.build_columns_as, p.build_where, p.build_dims, p.build_semis, schemas, markers, unique),
         .dims = dims,
         .probe_sql = p.probe_sql,
         .reduced = unique,
@@ -1361,7 +1361,7 @@ fn resolveDims(a: std.mem.Allocator, plan_dims: []const sql_join.Dim, schemas: S
     for (plan_dims, dims) |d, *out| out.* = .{
         .fk = d.fk,
         .fk_more = d.fk_more,
-        .build = try resolveBuild(a, d.path, d.key, d.key_more, d.columns, d.where, d.dims, d.semis, schemas, markers, unique),
+        .build = try resolveBuild(a, d.path, d.key, d.key_more, d.columns, d.columns_as, d.where, d.dims, d.semis, schemas, markers, unique),
         .left = d.left,
     };
     return dims;
@@ -1369,9 +1369,9 @@ fn resolveDims(a: std.mem.Allocator, plan_dims: []const sql_join.Dim, schemas: S
 
 /// One build: its own conjuncts, the SEMI joins the binder reduced onto it (tables of a chain) after its NOT EXISTS
 /// joins, and a snowflake's tables under it.
-fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, key_more: []const []const u8, columns: []const []const u8, where: ?[]const u8, plan_dims: []const sql_join.Dim, not_exists: []const sql_join.Exists, schemas: Schemas, markers: literals.Markers, unique: bool) anyerror!syntax.Build {
+fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, key_more: []const []const u8, columns: []const []const u8, columns_as: []const []const u8, where: ?[]const u8, plan_dims: []const sql_join.Dim, not_exists: []const sql_join.Exists, schemas: Schemas, markers: literals.Markers, unique: bool) anyerror!syntax.Build {
     if (std.mem.indexOfScalar(u8, path, '*') != null) return error.JoinMultiFileBuild;
-    var build: syntax.Build = .{ .path = path, .key = key, .key_more = key_more, .columns = columns, .dims = try resolveDims(a, plan_dims, schemas, markers, unique) };
+    var build: syntax.Build = .{ .path = path, .key = key, .key_more = key_more, .columns = columns, .columns_as = columns_as, .dims = try resolveDims(a, plan_dims, schemas, markers, unique) };
     build.semis = try resolveExists(a, not_exists, schemas, markers);
     const w = where orelse return build;
     const text = try std.fmt.allocPrint(a, "SELECT count(*) FROM '{s}' WHERE {s}", .{ path, w });
@@ -1388,7 +1388,7 @@ fn resolveExists(a: std.mem.Allocator, plan_semis: []const sql_join.Exists, sche
     for (plan_semis, semis) |x, *out| out.* = .{
         .fk = x.fk,
         .fk_more = x.fk_more,
-        .build = try resolveBuild(a, x.path, x.key, x.key_more, &.{}, x.where, &.{}, &.{}, schemas, markers, false),
+        .build = try resolveBuild(a, x.path, x.key, x.key_more, &.{}, &.{}, x.where, &.{}, &.{}, schemas, markers, false),
         .anti = x.anti,
         .not_exists = x.anti,
     };

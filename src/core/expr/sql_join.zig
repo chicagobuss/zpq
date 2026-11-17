@@ -22,7 +22,7 @@ pub const Error = error{
     JoinKeyNotFound,
     JoinResidualNotSupported,
     AmbiguousJoinColumn,
-    JoinColumnsShareName,
+    JoinColumnNeedsAlias,
     UsingJoinNotSupported,
     ExistsSubquery,
     LeftJoinOn,
@@ -45,6 +45,8 @@ pub const Plan = struct {
     build_where: ?[]const u8,
     /// Build columns the probe query reads, in first-reference order (never the key: it reads as the FK).
     build_columns: []const []const u8,
+    /// The names those go by in the probe query, when any is not its own (`publishedName`); else empty.
+    build_columns_as: []const []const u8 = &.{},
     /// Every IN of the probe's and the builds' queries is one a reduction wrote (`reduce`): an INNER edge whose keys
     /// must be unique, as any INNER join's are, though no column of its table is read. A query that reduced holds no IN
     /// of its own (its table count would not match).
@@ -70,6 +72,8 @@ pub const Dim = struct {
     key_more: []const []const u8 = &.{},
     where: ?[]const u8,
     columns: []const []const u8,
+    /// The names `columns` go by in the probe query, when any is not its own (`publishedName`); else empty.
+    columns_as: []const []const u8 = &.{},
     /// A LEFT JOIN's: every probe row stays, a miss reading the dimension's columns as NULL.
     left: bool = false,
     /// A snowflake's tables joined to this one by an FK of its own (`fk` a column of this table), INNER, each
@@ -888,6 +892,9 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
     var refs: std.ArrayList(*c.LpNode) = .empty;
     try refs.appendSlice(a, try columnRefs(p.root, a));
     for (residuals.items) |node| try refs.appendSlice(a, try columnRefs(node, a));
+    // Each reference to a build column: its build and its place among that build's columns.
+    const Read = struct { ref: *c.LpNode, d: usize, at: usize };
+    var reads: std.ArrayList(Read) = .empty;
     for (refs.items) |ref| {
         const side = try sides.of(ref);
         ref.*.u.column_ref.table = null;
@@ -900,23 +907,56 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
             d = parent[d];
         }
         if (name.ptr != span(ref.*.u.column_ref.column).ptr) ref.*.u.column_ref.column = (try a.dupeSentinel(u8, name, 0)).ptr;
-        if (d != probe) try addName(a, &columns[d], name);
+        if (d != probe) try reads.append(a, .{ .ref = ref, .d = d, .at = try addName(a, &columns[d], name) });
+    }
+    // A snowflake's table reads its FK off its parent's build: the parent publishes it.
+    for (0..n) |d| if (d != probe and parent[d] != probe) {
+        _ = try addName(a, &columns[parent[d]], fks[d].?);
+        for (fks_more[d].items) |f| _ = try addName(a, &columns[parent[d]], f);
+    };
+    // A build column reaches the probe as a column of its own name. One whose name the probe has too, or another
+    // build publishes (a role-playing dimension's `d1.d_date` and `d2.d_date`, a self join's `e.name` and `m.name`),
+    // would be one ambiguous column there: it goes by a name of its own instead, which its references then read.
+    const published = try a.alloc([]const []const u8, n);
+    var taken: std.ArrayList([]const u8) = .empty;
+    for (0..n) |d| {
+        const names = try a.alloc([]const u8, columns[d].items.len);
+        published[d] = names;
+        for (columns[d].items, names) |name, *as| {
+            const shared = t.has(t.ctx, live.items[probe], name) or for (0..n) |e| {
+                const theirs = e != d and for (columns[e].items) |y| {
+                    if (std.ascii.eqlIgnoreCase(name, y)) break true;
+                } else false;
+                if (theirs) break true;
+            } else false;
+            as.* = name;
+            if (!shared) continue;
+            as.* = try publishedName(a, sql, t, taken.items, aliases[live.items[d]], name);
+            try taken.append(a, as.*);
+        }
+    }
+    var moved: std.ArrayList(*c.LpNode) = .empty;
+    for (reads.items) |r| {
+        const as = published[r.d][r.at];
+        if (as.ptr == columns[r.d].items[r.at].ptr) continue;
+        const ref = &r.ref.*.u.column_ref;
+        ref.column = (try a.dupeSentinel(u8, as, 0)).ptr;
+        ref.quoted &= ~@as(@TypeOf(ref.quoted), c.LP_QUOTED_COLUMN);
+        try moved.append(a, r.ref);
     }
     for (named, 0..) |nm, i| if (nm) |name| {
         const rc = sel.result_columns.items[i];
         if (span(rc.*.u.result_column.expr.*.u.column_ref.column).ptr != name.ptr)
             rc.*.u.result_column.alias = (try a.dupeSentinel(u8, name, 0)).ptr;
     };
-    // A snowflake's table reads its FK off its parent's build: the parent publishes it.
-    for (0..n) |d| if (d != probe and parent[d] != probe) {
-        try addName(a, &columns[parent[d]], fks[d].?);
-        for (fks_more[d].items) |f| try addName(a, &columns[parent[d]], f);
-    };
-    // A build column reaches the probe under its own name: one name two tables publish (a self join's `a.w < b.w`)
-    // would be one ambiguous column there.
-    for (0..n) |d| for (d + 1..n) |e| for (columns[d].items) |x| for (columns[e].items) |y| {
-        if (std.ascii.eqlIgnoreCase(x, y)) return error.JoinColumnsShareName;
-    };
+    // An unaliased expression is named by its text, and a column that goes by another name there would name it by
+    // one the query never wrote: it needs AS.
+    for (0..@intCast(sel.result_columns.count)) |i| {
+        const rc = sel.result_columns.items[i];
+        const e = rc.*.u.result_column.expr orelse continue;
+        if (rc.*.u.result_column.alias != null or e.*.kind == c.LP_EXPR_COLUMN_REF) continue;
+        for (try columnRefs(e, a)) |ref| if (std.mem.indexOfScalar(*c.LpNode, moved.items, ref) != null) return error.JoinColumnNeedsAlias;
+    }
     const probe_from = list.items[live.items[probe]];
     probe_from.*.u.from_table.alias = null;
     sel.from = probe_from;
@@ -943,7 +983,7 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         for (x.fks[1..]) |ref| if ((try sides.at(ref)) != d) return error.ExistsSubquery;
         try semis[d].append(a, try x.planned(a, p));
     }
-    const tree: Tree = .{ .t = t, .p = p, .live = live.items, .probe = probe, .parent = parent, .fks = fks, .keys = keys, .fks_more = fks_more, .keys_more = keys_more, .wheres = wheres, .columns = columns, .left = left, .semis = semis };
+    const tree: Tree = .{ .t = t, .p = p, .live = live.items, .probe = probe, .parent = parent, .fks = fks, .keys = keys, .fks_more = fks_more, .keys_more = keys_more, .wheres = wheres, .columns = columns, .published = published, .left = left, .semis = semis };
     var dims: std.ArrayList(Dim) = .empty;
     for (0..n) |d| if (d != probe and d != main and parent[d] == probe) try dims.append(a, try tree.dim(a, d));
     return .{
@@ -957,6 +997,7 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         .probe_sql = try toSql(a, p, p.root),
         .build_where = try whereSql(a, p, wheres[main].items),
         .build_columns = columns[main].items,
+        .build_columns_as = tree.columnsAs(main),
         .build_dims = try tree.children(a, main),
         .reduced = reduced,
         .semis = semis[probe].items,
@@ -965,9 +1006,31 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
     };
 }
 
-fn addName(a: std.mem.Allocator, list: *std.ArrayList([]const u8), name: []const u8) !void {
-    for (list.items) |b| if (std.mem.eql(u8, b, name)) return;
+/// `name`'s place in `list`, added when new.
+fn addName(a: std.mem.Allocator, list: *std.ArrayList([]const u8), name: []const u8) !usize {
+    for (list.items, 0..) |b, i| if (std.mem.eql(u8, b, name)) return i;
     try list.append(a, try a.dupe(u8, name));
+    return list.items.len - 1;
+}
+
+/// The name a build column goes by in the probe query when its own would be ambiguous there: its table's name and its
+/// own, as one identifier. No table of the join has a column of that name, no other build column goes by it, and the
+/// query spells it nowhere (underscores are added until all three hold), so nothing the query wrote can mean it.
+fn publishedName(a: std.mem.Allocator, sql: []const u8, t: Tables, taken: []const []const u8, table: []const u8, column: []const u8) ![]const u8 {
+    var name: std.ArrayList(u8) = .empty;
+    for ([_][]const u8{ table, "_", column }) |part| for (part) |ch| {
+        try name.append(a, if (std.ascii.isAlphanumeric(ch) or ch == '_') ch else '_');
+    };
+    if (std.ascii.isDigit(name.items[0])) try name.insert(a, 0, '_');
+    while (true) : (try name.append(a, '_')) {
+        if (std.ascii.findIgnoreCase(sql, name.items) != null) continue;
+        const used = for (taken) |other| {
+            if (std.ascii.eqlIgnoreCase(other, name.items)) break true;
+        } else for (0..t.paths.len) |ti| {
+            if (t.has(t.ctx, ti, name.items)) break true;
+        } else false;
+        if (!used) return name.items;
+    }
 }
 
 /// The join tree `plan` resolved, by position in `live`: each table's build, with its own snowflake under it.
@@ -983,8 +1046,16 @@ const Tree = struct {
     keys_more: []const std.ArrayList([]const u8),
     wheres: []const std.ArrayList(*c.LpNode),
     columns: []const std.ArrayList([]const u8),
+    published: []const []const []const u8,
     left: []const bool,
     semis: []const std.ArrayList(Exists),
+
+    /// `d`'s columns' names in the probe query when any is not its own, else none: a plan that renames nothing is
+    /// the plan it was.
+    fn columnsAs(tr: Tree, d: usize) []const []const u8 {
+        for (tr.columns[d].items, tr.published[d]) |name, as| if (name.ptr != as.ptr) return tr.published[d];
+        return &.{};
+    }
 
     fn dim(tr: Tree, a: std.mem.Allocator, d: usize) Error!Dim {
         return .{
@@ -995,6 +1066,7 @@ const Tree = struct {
             .key_more = tr.keys_more[d].items,
             .where = try whereSql(a, tr.p, tr.wheres[d].items),
             .columns = tr.columns[d].items,
+            .columns_as = tr.columnsAs(d),
             .left = tr.left[d],
             .dims = try tr.children(a, d),
             .semis = tr.semis[d].items,
@@ -1283,4 +1355,42 @@ test "every key equality of an edge is its key, in a join's ON, its WHERE and an
     try std.testing.expectEqualStrings("dl", ex.semis[0].key_more[0]);
     // In a join the keys of one EXISTS are one table's.
     try std.testing.expectError(error.ExistsSubquery, plan(a, "SELECT count(*) AS n FROM 'f.parquet' f JOIN 'd.parquet' d ON f.cy = d.dy WHERE EXISTS (SELECT 1 FROM 'g.parquet' g WHERE g.gk = f.cy AND g.gname = d.name)", t2));
+}
+
+test "a column two tables of a join have goes by a name of its own, which the query nowhere spells" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const Cols = struct {
+        const of = [_][]const []const u8{ &.{ "fk", "q", "amt", "w" }, &.{ "pk", "grp", "w", "name" }, &.{ "pk", "grp", "w", "name" } };
+        fn has(_: *const anyopaque, table: usize, name: []const u8) bool {
+            for (of[table]) |col| if (std.mem.eql(u8, col, name)) return true;
+            return false;
+        }
+    };
+    const t: Tables = .{ .paths = &.{ "f.parquet", "d.parquet", "d.parquet" }, .has = Cols.has, .rows = &.{ 1000, 100, 100 }, .ctx = undefined };
+    // A dimension read twice, and a column (`w`) the probe has too: each build column of a shared name is renamed, an
+    // unaliased item keeps the name it was written with, and one name nothing shares stays as it is.
+    const p = try plan(a, "SELECT a.name, b.name AS other, f.w, a.w AS aw, f.amt, count(*) AS n FROM 'f.parquet' f JOIN 'd.parquet' a ON f.fk = a.pk JOIN 'd.parquet' b ON f.q = b.pk WHERE a.grp < b.grp GROUP BY a.name, b.name, f.w, a.w, f.amt", t);
+    try std.testing.expectEqual(@as(usize, 3), p.build_columns.len);
+    for (p.build_columns, p.build_columns_as, [_][]const u8{ "name", "w", "grp" }, [_][]const u8{ "a_name", "a_w", "a_grp" }) |own, as, want_own, want_as| {
+        try std.testing.expectEqualStrings(want_own, own);
+        try std.testing.expectEqualStrings(want_as, as);
+    }
+    try std.testing.expectEqual(@as(usize, 1), p.dims.len);
+    try std.testing.expectEqualStrings("b_name", p.dims[0].columns_as[0]);
+    try std.testing.expectEqualStrings("b_grp", p.dims[0].columns_as[1]);
+    try std.testing.expect(std.mem.startsWith(u8, p.probe_sql, "SELECT a_name AS name, b_name AS other, w, a_w AS aw, amt, count(*) AS n FROM"));
+    try std.testing.expect(std.mem.indexOf(u8, p.probe_sql, "WHERE a_grp < b_grp GROUP BY a_name, b_name, w, a_w, amt") != null);
+    // A plan that renames nothing is the plan it was.
+    const plain = try plan(a, "SELECT a.name, count(*) AS n FROM 'f.parquet' f JOIN 'd.parquet' a ON f.fk = a.pk GROUP BY a.name", .{ .paths = t.paths[0..2], .has = Cols.has, .rows = t.rows[0..2], .ctx = undefined });
+    try std.testing.expectEqual(@as(usize, 0), plain.build_columns_as.len);
+    try std.testing.expect(std.mem.indexOf(u8, plain.probe_sql, "SELECT name, count(*)") != null);
+    // The query spells the obvious names itself: the columns go by ones it does not.
+    const spelled = try plan(a, "SELECT a.w AS a_w, b.w AS b_w_, count(*) AS n FROM 'f.parquet' f JOIN 'd.parquet' a ON f.fk = a.pk JOIN 'd.parquet' b ON f.q = b.pk GROUP BY a.w, b.w", t);
+    try std.testing.expectEqualStrings("a_w_", spelled.build_columns_as[0]);
+    try std.testing.expectEqualStrings("b_w__", spelled.dims[0].columns_as[0]);
+    // An unaliased expression would be named by the name its column goes by; an unqualified shared name is nobody's.
+    try std.testing.expectError(error.JoinColumnNeedsAlias, plan(a, "SELECT sum(a.w), sum(b.w) AS sb FROM 'f.parquet' f JOIN 'd.parquet' a ON f.fk = a.pk JOIN 'd.parquet' b ON f.q = b.pk", t));
+    try std.testing.expectError(error.AmbiguousJoinColumn, plan(a, "SELECT sum(name) AS s FROM 'f.parquet' f JOIN 'd.parquet' a ON f.fk = a.pk JOIN 'd.parquet' b ON f.q = b.pk", t));
 }

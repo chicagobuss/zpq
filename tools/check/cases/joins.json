@@ -199,7 +199,8 @@
   {"name": "comp_mid", "copy": "COPY (SELECT k AS cmpk, (1990 + k % 43)::INTEGER AS cmy, 't' || (k % 23) AS cmt, (k % 4)::BIGINT AS cmg FROM range(1, 801) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 256)"},
   {"name": "wide_fact", "copy": "COPY (SELECT i AS wid, (i % 6000) * 1000003 AS fa, ((i % 6000) * 31 % 7919)::INTEGER AS fb, (i % 3)::BIGINT AS wq FROM range(0, 40000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 8192)"},
   {"name": "wide_dim", "copy": "COPY (SELECT k * 1000003 AS wa, (k * 31 % 7919)::INTEGER AS wb, (k % 9)::BIGINT AS wg FROM range(0, 5000) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 1024)"},
-  {"name": "over_dim", "copy": "COPY (SELECT (CASE WHEN k % 2 = 0 THEN 1 ELSE -1 END) * 4611686018427387904 + k AS wa, (k * 1099511627776)::BIGINT AS ob, k AS og FROM range(0, 64) t(k)) TO '{path}' (FORMAT PARQUET)"}
+  {"name": "over_dim", "copy": "COPY (SELECT (CASE WHEN k % 2 = 0 THEN 1 ELSE -1 END) * 4611686018427387904 + k AS wa, (k * 1099511627776)::BIGINT AS ob, k AS og FROM range(0, 64) t(k)) TO '{path}' (FORMAT PARQUET)"},
+  {"name": "day_dim", "copy": "COPY (SELECT k AS dk, DATE '2024-01-01' + (k * 3 % 500)::INTEGER AS d_date, (2000 + k % 3)::INTEGER AS d_year FROM range(0, 1000) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 256)"}
  ],
  "cases": [
   {
@@ -1631,27 +1632,6 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND f.q = g.gk GROUP BY gname ORDER BY gname"
-   }
-  },
-  {
-   "id": "join:refuse:columns-share-a-name",
-   "fixture": "fact",
-   "cli": [
-    "query",
-    "--query",
-    "SELECT d.w, c.w, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_clash}' c WHERE f.fk = d.pk AND d.grp = c.ck GROUP BY d.w, c.w"
-   ],
-   "axes": [
-    {
-     "jobs": 1
-    },
-    {
-     "jobs": 3
-    }
-   ],
-   "refuse": {
-    "error": "exit 1",
-    "diag": "one column per name"
    }
   },
   {
@@ -3571,36 +3551,6 @@
      "strategy": "plain_hash",
      "record_path": null
     }
-   }
-  },
-  {
-   "id": "review:r8:qualified-collision",
-   "fixture": "review-fact",
-   "cli": [
-    "query",
-    "--query",
-    "SELECT d.grp, sum(d.v) AS s FROM '{fixture:review-fact}' f JOIN '{fixture:review-dim}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY d.grp"
-   ],
-   "axes": [
-    {
-     "jobs": 1
-    },
-    {
-     "jobs": 4
-    },
-    {
-     "jobs": 16
-    },
-    {
-     "jobs": 4,
-     "force": {
-      "ZPQ_DECODE_BATCH_ROWS": "7"
-     }
-    }
-   ],
-   "refuse": {
-    "error": "exit 2",
-    "diag": "ambiguous column name"
    }
   },
   {
@@ -6089,12 +6039,494 @@
    }
   },
   {
-   "id": "join:rows:refuse-self-join-same-names",
+   "id": "join:same-name:role-playing-group",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a.kind AS ka, b.kind AS kb, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk GROUP BY a.kind, b.kind ORDER BY n DESC, ka, kb LIMIT 15"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT a.kind AS ka, b.kind AS kb, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk GROUP BY a.kind, b.kind ORDER BY n DESC, ka, kb LIMIT 15"
+   }
+  },
+  {
+   "id": "join:same-name:role-playing-compare",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(a.w) AS sa, sum(b.w) AS sb FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk WHERE a.grp = b.grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(a.w) AS sa, sum(b.w) AS sb FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk WHERE a.grp = b.grp"
+   }
+  },
+  {
+   "id": "join:same-name:role-playing-residual-or",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' a, '{fixture:dim}' b WHERE f.fk = a.pk AND f.q = b.pk AND (a.w < b.w OR a.kind = b.kind)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' a, '{fixture:dim}' b WHERE f.fk = a.pk AND f.q = b.pk AND (a.w < b.w OR a.kind = b.kind)"
+   }
+  },
+  {
+   "id": "join:same-name:unaliased-keeps-its-name",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a.kind, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk WHERE b.kind <> 'kind3' GROUP BY a.kind ORDER BY a.kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT a.kind, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk WHERE b.kind <> 'kind3' GROUP BY a.kind ORDER BY a.kind"
+   }
+  },
+  {
+   "id": "join:same-name:date-difference",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a.d_year, avg(b.d_date - a.d_date) AS avg_days, min(b.d_date - a.d_date) AS lo, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:day_dim}' a ON f.fk = a.dk JOIN '{fixture:day_dim}' b ON f.q = b.dk GROUP BY a.d_year ORDER BY a.d_year"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT a.d_year, avg(b.d_date - a.d_date) AS avg_days, min(b.d_date - a.d_date) AS lo, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:day_dim}' a ON f.fk = a.dk JOIN '{fixture:day_dim}' b ON f.q = b.dk GROUP BY a.d_year ORDER BY a.d_year"
+   }
+  },
+  {
+   "id": "join:same-name:three-copies-and-a-chain",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' ca ON f.q = ca.pk JOIN '{fixture:dim}' c ON f.fk = c.pk JOIN '{fixture:dim}' cur ON c.grp = cur.pk WHERE ca.kind <> cur.kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' ca ON f.q = ca.pk JOIN '{fixture:dim}' c ON f.fk = c.pk JOIN '{fixture:dim}' cur ON c.grp = cur.pk WHERE ca.kind <> cur.kind"
+   }
+  },
+  {
+   "id": "join:same-name:two-builds-share-a-column",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.w AS dw, c.w AS cw, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_clash}' c WHERE f.fk = d.pk AND d.grp = c.ck GROUP BY d.w, c.w ORDER BY dw, cw LIMIT 20"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.w AS dw, c.w AS cw, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_clash}' c WHERE f.fk = d.pk AND d.grp = c.ck GROUP BY d.w, c.w ORDER BY dw, cw LIMIT 20"
+   }
+  },
+  {
+   "id": "join:same-name:probe-and-build-sum",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, sum(d.v) AS s, sum(f.v) AS fs FROM '{fixture:review-fact}' f JOIN '{fixture:review-dim}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY d.grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, sum(d.v) AS s, sum(f.v) AS fs FROM '{fixture:review-fact}' f JOIN '{fixture:review-dim}' d ON f.fk = d.pk GROUP BY d.grp ORDER BY d.grp"
+   }
+  },
+  {
+   "id": "join:same-name:probe-and-build-compare",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:review-fact}' f JOIN '{fixture:review-dim}' d ON f.fk = d.pk WHERE f.v <> d.v"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:review-fact}' f JOIN '{fixture:review-dim}' d ON f.fk = d.pk WHERE f.v <> d.v"
+   }
+  },
+  {
+   "id": "join:same-name:probe-and-build-group-both",
+   "fixture": "review-fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.v, d.v AS dv, count(*) AS n FROM '{fixture:review-fact}' f JOIN '{fixture:review-dim}' d ON f.fk = d.pk GROUP BY f.v, d.v ORDER BY f.v, dv LIMIT 25"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.v, d.v AS dv, count(*) AS n FROM '{fixture:review-fact}' f JOIN '{fixture:review-dim}' d ON f.fk = d.pk GROUP BY f.v, d.v ORDER BY f.v, dv LIMIT 25"
+   }
+  },
+  {
+   "id": "join:same-name:self-left-rows",
    "fixture": "p0_emp",
    "cli": [
     "query",
     "--query",
-    "SELECT e.name, m.name AS boss FROM '{fixture:p0_emp}' e LEFT JOIN '{fixture:p0_emp}' m ON e.boss = m.eid"
+    "SELECT e.name, m.name AS boss FROM '{fixture:p0_emp}' e LEFT JOIN '{fixture:p0_emp}' m ON e.boss = m.eid ORDER BY e.eid"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT e.name, m.name AS boss FROM '{fixture:p0_emp}' e LEFT JOIN '{fixture:p0_emp}' m ON e.boss = m.eid ORDER BY e.eid"
+   }
+  },
+  {
+   "id": "join:same-name:self-left-key",
+   "fixture": "p0_emp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT e.eid, m.eid AS boss_id, m.name AS boss_name FROM '{fixture:p0_emp}' e LEFT JOIN '{fixture:p0_emp}' m ON e.boss = m.eid ORDER BY e.eid"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT e.eid, m.eid AS boss_id, m.name AS boss_name FROM '{fixture:p0_emp}' e LEFT JOIN '{fixture:p0_emp}' m ON e.boss = m.eid ORDER BY e.eid"
+   }
+  },
+  {
+   "id": "join:same-name:self-two-levels",
+   "fixture": "p0_emp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g.name AS top, m.name AS mid, count(*) AS n FROM '{fixture:p0_emp}' e JOIN '{fixture:p0_emp}' m ON e.boss = m.eid JOIN '{fixture:p0_emp}' g ON m.boss = g.eid GROUP BY g.name, m.name ORDER BY top, mid"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT g.name AS top, m.name AS mid, count(*) AS n FROM '{fixture:p0_emp}' e JOIN '{fixture:p0_emp}' m ON e.boss = m.eid JOIN '{fixture:p0_emp}' g ON m.boss = g.eid GROUP BY g.name, m.name ORDER BY top, mid"
+   }
+  },
+  {
+   "id": "join:same-name:self-compare",
+   "fixture": "p0_emp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:p0_emp}' e JOIN '{fixture:p0_emp}' m ON e.boss = m.eid WHERE e.name > m.name"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:p0_emp}' e JOIN '{fixture:p0_emp}' m ON e.boss = m.eid WHERE e.name > m.name"
+   }
+  },
+  {
+   "id": "join:same-name:self-large",
+   "fixture": "dim",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT b.grp, count(*) AS n, sum(a.w - b.w) AS dw FROM '{fixture:dim}' a JOIN '{fixture:dim}' b ON a.grp = b.pk WHERE a.kind <> b.kind GROUP BY b.grp ORDER BY b.grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT b.grp, count(*) AS n, sum(a.w - b.w) AS dw FROM '{fixture:dim}' a JOIN '{fixture:dim}' b ON a.grp = b.pk WHERE a.kind <> b.kind GROUP BY b.grp ORDER BY b.grp"
+   }
+  },
+  {
+   "id": "join:same-name:rows-ordered-by-the-other-copy",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a.kind, f.id FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk WHERE f.id < 600 ORDER BY b.w DESC, f.id LIMIT 12 OFFSET 30"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT a.kind, f.id FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk WHERE f.id < 600 ORDER BY b.w DESC, f.id LIMIT 12 OFFSET 30"
+   }
+  },
+  {
+   "id": "join:same-name:late-strings-two-copies",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.fk, p.uname, q.uname AS other, count(*) AS n FROM '{fixture:fact}' f, '{fixture:plain_dim}' p, '{fixture:plain_dim}' q WHERE f.fk = p.pk AND f.q = q.pk GROUP BY f.fk, p.uname, q.uname ORDER BY f.fk, other LIMIT 9 OFFSET 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.fk, p.uname, q.uname AS other, count(*) AS n FROM '{fixture:fact}' f, '{fixture:plain_dim}' p, '{fixture:plain_dim}' q WHERE f.fk = p.pk AND f.q = q.pk GROUP BY f.fk, p.uname, q.uname ORDER BY f.fk, other LIMIT 9 OFFSET 2"
+   }
+  },
+  {
+   "id": "join:same-name:query-spells-the-obvious-names",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a.w AS a_w, b.w AS b_w, a.kind AS a_kind_, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk WHERE a.w > b.w GROUP BY a.w, b.w, a.kind ORDER BY a_w, b_w, a_kind_ LIMIT 10"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT a.w AS a_w, b.w AS b_w, a.kind AS a_kind_, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk WHERE a.w > b.w GROUP BY a.w, b.w, a.kind ORDER BY a_w, b_w, a_kind_ LIMIT 10"
+   }
+  },
+  {
+   "id": "join:same-name:explain-published-names",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a.kind AS ka, b.kind AS kb, a.grp, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk GROUP BY a.kind, b.kind, a.grp",
+    "--explain"
+   ],
+   "oracle": {
+    "compare": "plan",
+    "holds": {
+     "join": {
+      "build": {
+       "columns": {
+        "$list": [
+         "a_kind",
+         "grp"
+        ]
+       }
+      },
+      "dims": {
+       "$list": [
+        {
+         "build": {
+          "columns": {
+           "$list": [
+            "b_kind"
+           ]
+          }
+         }
+        }
+       ]
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "join:same-name:refuse-two-unaliased-outputs",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.w, c.w, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_clash}' c WHERE f.fk = d.pk AND d.grp = c.ck GROUP BY d.w, c.w"
    ],
    "axes": [
     {
@@ -6106,7 +6538,97 @@
    ],
    "refuse": {
     "error": "exit 2",
-    "diag": "name"
+    "diag": "defined more than once"
+   }
+  },
+  {
+   "id": "join:same-name:refuse-unaliased-expression",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sum(a.w), sum(b.w) AS sb FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "name the item with AS"
+   }
+  },
+  {
+   "id": "join:same-name:refuse-unqualified",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' a ON f.fk = a.pk JOIN '{fixture:dim}' b ON f.q = b.pk WHERE kind = 'kind1'"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "qualify it"
+   }
+  },
+  {
+   "id": "join:same-name:self-left-null-columns",
+   "fixture": "p0_emp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT e.name, m.name AS boss, m.boss AS boss_boss, g.name AS top FROM '{fixture:p0_emp}' e LEFT JOIN '{fixture:p0_emp}' m ON e.boss = m.eid LEFT JOIN '{fixture:p0_emp}' g ON e.eid = g.boss ORDER BY e.eid"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT e.name, m.name AS boss, m.boss AS boss_boss, g.name AS top FROM '{fixture:p0_emp}' e LEFT JOIN '{fixture:p0_emp}' m ON e.boss = m.eid LEFT JOIN '{fixture:p0_emp}' g ON e.eid = g.boss ORDER BY e.eid"
+   }
+  },
+  {
+   "id": "join:same-name:composite-self",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT a.dname, b.dname AS other, sum(a.dval + b.dval) AS s, count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' a ON f.cy = a.dy AND f.ct = a.dt JOIN '{fixture:comp_dim}' b ON f.ct = b.dt AND f.cy = b.dy WHERE b.dval > 300 GROUP BY a.dname, b.dname ORDER BY a.dname, other LIMIT 12"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT a.dname, b.dname AS other, sum(a.dval + b.dval) AS s, count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' a ON f.cy = a.dy AND f.ct = a.dt JOIN '{fixture:comp_dim}' b ON f.ct = b.dt AND f.cy = b.dy WHERE b.dval > 300 GROUP BY a.dname, b.dname ORDER BY a.dname, other LIMIT 12"
    }
   },
   {
@@ -9133,27 +9655,6 @@
    "oracle": {
     "compare": "ordered",
     "sql": "SELECT f.fk, d.w, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d WHERE f.fk = d.pk GROUP BY f.fk, d.w ORDER BY n DESC, f.fk LIMIT 5"
-   }
-  },
-  {
-   "id": "join:refuse:self-join-shared-name",
-   "fixture": "fact",
-   "cli": [
-    "query",
-    "--query",
-    "SELECT count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' a, '{fixture:dim}' b WHERE f.fk = a.pk AND f.q = b.pk AND a.w < b.w"
-   ],
-   "axes": [
-    {
-     "jobs": 1
-    },
-    {
-     "jobs": 3
-    }
-   ],
-   "refuse": {
-    "error": "exit 1",
-    "diag": "one column per name"
    }
   },
   {

@@ -2846,7 +2846,7 @@
    ],
    "refuse": {
     "error": "exit 1",
-    "diag": "twice: this build joins N:1 only"
+    "diag": "many-to-many joins are not supported"
    }
   },
   {

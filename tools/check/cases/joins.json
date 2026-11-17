@@ -143,6 +143,42 @@
   {
    "name": "snow_nulls",
    "copy": "COPY (SELECT g AS sgk, (CASE WHEN g % 2 = 1 THEN NULL ELSE 'g' || g END) AS sgname, (CASE WHEN g = 2 THEN NULL ELSE g * 7 END)::INTEGER AS sgw FROM range(0, 4) t(g)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
+   "name": "str_fact",
+   "copy": "COPY (SELECT i AS sid, (CASE WHEN i % 19 = 0 THEN NULL WHEN i % 501 = 0 THEN '' WHEN i % 503 = 0 THEN 'ключ' WHEN i % 507 = 0 THEN 'KEY7' WHEN i % 509 = 0 THEN 'key7 ' WHEN i % 511 = 0 THEN 'Key7' ELSE 'key' || (i % 1500) END) AS sk, (i * 0.5)::DOUBLE AS samt, (i % 7)::BIGINT AS sq FROM range(1, 20000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 4096)"
+  },
+  {
+   "name": "str_dim",
+   "copy": "COPY (SELECT 'key' || k AS skey, 'name' || (k % 17) AS sname, (k % 6)::BIGINT AS sgrp, (CASE WHEN k % 4 = 0 THEN NULL ELSE k END)::INTEGER AS sval, 'm' || (k % 5) AS smode FROM range(0, 1200) t(k) WHERE k % 9 <> 4 UNION ALL SELECT * FROM (VALUES ('', 'empty', 99, 1, 'm0'), ('ключ', 'cyrillic', 99, 2, 'm1'), ('日本語', 'cjk', 99, 3, 'm2'), ('key7 ', 'space', 99, 4, 'm3'), ('KEY7', 'upper', 99, NULL, 'm9'))) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 256)"
+  },
+  {
+   "name": "str_dim_plain",
+   "copy": "COPY (SELECT 'key' || k AS pkey, 'name' || (k % 17) AS pname, (k % 6)::BIGINT AS pgrp2, (CASE WHEN k % 4 = 0 THEN NULL ELSE k END)::INTEGER AS pval, 'm' || (k % 5) AS pmode FROM range(0, 1200) t(k) WHERE k % 9 <> 4 UNION ALL SELECT * FROM (VALUES ('', 'empty', 99, 1, 'm0'), ('ключ', 'cyrillic', 99, 2, 'm1'), ('日本語', 'cjk', 99, 3, 'm2'), ('key7 ', 'space', 99, 4, 'm3'), ('KEY7', 'upper', 99, NULL, 'm9'))) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 256, DICTIONARY_SIZE_LIMIT 1)"
+  },
+  {
+   "name": "str_fact_plain",
+   "copy": "COPY (SELECT i AS pid, 'key' || (i * 7 % 1500) AS psk, (i % 5)::BIGINT AS pq FROM range(1, 9000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048, DICTIONARY_SIZE_LIMIT 1)"
+  },
+  {
+   "name": "str_dup",
+   "copy": "COPY (SELECT (CASE WHEN k = 450 THEN NULL ELSE 'key' || (k % 300) END) AS dkey, (k % 3)::BIGINT AS dg FROM range(0, 900) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 128)"
+  },
+  {
+   "name": "mode_dim",
+   "copy": "COPY (SELECT 'm' || k AS mk, 'mode' || k AS mname, (k * 11)::INTEGER AS mw FROM range(0, 4) t(k)) TO '{path}' (FORMAT PARQUET)"
+  },
+  {
+   "name": "mid_dim",
+   "copy": "COPY (SELECT k AS mpk, 'm' || (k % 5) AS mmode, (k % 3)::BIGINT AS mg FROM range(1, 8001) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)"
+  },
+  {
+   "name": "blob_fact",
+   "copy": "COPY (SELECT i AS bid, ('key' || (i % 60))::BLOB AS bk, (i % 4)::BIGINT AS bq FROM range(0, 3000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 1024)"
+  },
+  {
+   "name": "blob_dim",
+   "copy": "COPY (SELECT ('key' || k)::BLOB AS bkey, (k % 3)::BIGINT AS bg FROM range(0, 50) t(k)) TO '{path}' (FORMAT PARQUET)"
   }
  ],
  "cases": [
@@ -8443,6 +8479,828 @@
    "oracle": {
     "compare": "written_as",
     "sql": "SELECT nkind, nw, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim_nulls}' d WHERE f.fk = d.npk GROUP BY nkind, nw ORDER BY nkind NULLS FIRST, nw NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:strkey:group-by-dimension",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sgrp, count(*) AS n, sum(samt) AS s, sum(sval) AS v FROM '{fixture:str_fact}' f JOIN '{fixture:str_dim}' d ON f.sk = d.skey GROUP BY sgrp ORDER BY sgrp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sgrp, count(*) AS n, sum(samt) AS s, sum(sval) AS v FROM '{fixture:str_fact}' f JOIN '{fixture:str_dim}' d ON f.sk = d.skey GROUP BY sgrp ORDER BY sgrp"
+   }
+  },
+  {
+   "id": "join:strkey:bytes-equality",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.skey, sname, count(*) AS n FROM '{fixture:str_fact}' f JOIN '{fixture:str_dim}' d ON f.sk = d.skey WHERE d.sgrp = 99 GROUP BY d.skey, sname ORDER BY d.skey"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.skey, sname, count(*) AS n FROM '{fixture:str_fact}' f JOIN '{fixture:str_dim}' d ON f.sk = d.skey WHERE d.sgrp = 99 GROUP BY d.skey, sname ORDER BY d.skey"
+   }
+  },
+  {
+   "id": "join:strkey:group-by-build-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.skey, sname, sum(samt) AS s FROM '{fixture:str_fact}' f JOIN '{fixture:str_dim}' d ON f.sk = d.skey GROUP BY d.skey, sname ORDER BY s DESC, d.skey LIMIT 10"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.skey, sname, sum(samt) AS s FROM '{fixture:str_fact}' f JOIN '{fixture:str_dim}' d ON f.sk = d.skey GROUP BY d.skey, sname ORDER BY s DESC, d.skey LIMIT 10"
+   }
+  },
+  {
+   "id": "join:strkey:group-by-fk",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.sk, sname, sval, count(*) AS n FROM '{fixture:str_fact}' f JOIN '{fixture:str_dim}' d ON f.sk = d.skey GROUP BY f.sk, sname, sval ORDER BY n DESC, f.sk LIMIT 10"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.sk, sname, sval, count(*) AS n FROM '{fixture:str_fact}' f JOIN '{fixture:str_dim}' d ON f.sk = d.skey GROUP BY f.sk, sname, sval ORDER BY n DESC, f.sk LIMIT 10"
+   }
+  },
+  {
+   "id": "join:strkey:where-comma",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sname, count(*) AS n FROM '{fixture:str_fact}' f, '{fixture:str_dim}' d WHERE f.sk = d.skey AND f.sq > 2 AND d.sname LIKE 'name1%' GROUP BY sname ORDER BY sname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sname, count(*) AS n FROM '{fixture:str_fact}' f, '{fixture:str_dim}' d WHERE f.sk = d.skey AND f.sq > 2 AND d.sname LIKE 'name1%' GROUP BY sname ORDER BY sname"
+   }
+  },
+  {
+   "id": "join:strkey:residual",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(samt) AS s FROM '{fixture:str_fact}' f, '{fixture:str_dim}' d WHERE f.sk = d.skey AND (f.sq > d.sgrp OR d.sval IS NULL)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(samt) AS s FROM '{fixture:str_fact}' f, '{fixture:str_dim}' d WHERE f.sk = d.skey AND (f.sq > d.sgrp OR d.sval IS NULL)"
+   }
+  },
+  {
+   "id": "join:strkey:left",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, count(d.skey) AS m, count(d.sval) AS nn, sum(d.sval) AS s FROM '{fixture:str_fact}' f LEFT JOIN '{fixture:str_dim}' d ON f.sk = d.skey"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, count(d.skey) AS m, count(d.sval) AS nn, sum(d.sval) AS s FROM '{fixture:str_fact}' f LEFT JOIN '{fixture:str_dim}' d ON f.sk = d.skey"
+   }
+  },
+  {
+   "id": "join:strkey:left-group",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sname, count(*) AS n FROM '{fixture:str_fact}' f LEFT JOIN '{fixture:str_dim}' d ON f.sk = d.skey AND d.sgrp < 3 GROUP BY sname ORDER BY sname NULLS FIRST"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sname, count(*) AS n FROM '{fixture:str_fact}' f LEFT JOIN '{fixture:str_dim}' d ON f.sk = d.skey AND d.sgrp < 3 GROUP BY sname ORDER BY sname NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:strkey:in",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(samt) AS s FROM '{fixture:str_fact}' WHERE sk IN (SELECT skey FROM '{fixture:str_dim}' WHERE sgrp < 3)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(samt) AS s FROM '{fixture:str_fact}' WHERE sk IN (SELECT skey FROM '{fixture:str_dim}' WHERE sgrp < 3)"
+   }
+  },
+  {
+   "id": "join:strkey:in-duplicates",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sq, count(*) AS n FROM '{fixture:str_fact}' WHERE sk IN (SELECT dkey FROM '{fixture:str_dup}' WHERE dg = 1) GROUP BY sq ORDER BY sq"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sq, count(*) AS n FROM '{fixture:str_fact}' WHERE sk IN (SELECT dkey FROM '{fixture:str_dup}' WHERE dg = 1) GROUP BY sq ORDER BY sq"
+   }
+  },
+  {
+   "id": "join:strkey:not-in",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, count(DISTINCT sk) AS k FROM '{fixture:str_fact}' WHERE sk NOT IN (SELECT skey FROM '{fixture:str_dim}' WHERE sgrp > 1)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, count(DISTINCT sk) AS k FROM '{fixture:str_fact}' WHERE sk NOT IN (SELECT skey FROM '{fixture:str_dim}' WHERE sgrp > 1)"
+   }
+  },
+  {
+   "id": "join:strkey:not-in-null-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:str_fact}' WHERE sk NOT IN (SELECT dkey FROM '{fixture:str_dup}')"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:str_fact}' WHERE sk NOT IN (SELECT dkey FROM '{fixture:str_dup}')"
+   }
+  },
+  {
+   "id": "join:strkey:not-in-no-null-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:str_fact}' WHERE sk NOT IN (SELECT dkey FROM '{fixture:str_dup}' WHERE dkey IS NOT NULL)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:str_fact}' WHERE sk NOT IN (SELECT dkey FROM '{fixture:str_dup}' WHERE dkey IS NOT NULL)"
+   }
+  },
+  {
+   "id": "join:strkey:plain-fk",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sgrp, count(*) AS n FROM '{fixture:str_fact_plain}' f JOIN '{fixture:str_dim}' d ON f.psk = d.skey GROUP BY sgrp ORDER BY sgrp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT sgrp, count(*) AS n FROM '{fixture:str_fact_plain}' f JOIN '{fixture:str_dim}' d ON f.psk = d.skey GROUP BY sgrp ORDER BY sgrp"
+   }
+  },
+  {
+   "id": "join:strkey:plain-build",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT pgrp2, pname, count(*) AS n, sum(pval) AS v FROM '{fixture:str_fact}' f JOIN '{fixture:str_dim_plain}' d ON f.sk = d.pkey GROUP BY pgrp2, pname ORDER BY pgrp2, pname LIMIT 20"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT pgrp2, pname, count(*) AS n, sum(pval) AS v FROM '{fixture:str_fact}' f JOIN '{fixture:str_dim_plain}' d ON f.sk = d.pkey GROUP BY pgrp2, pname ORDER BY pgrp2, pname LIMIT 20"
+   }
+  },
+  {
+   "id": "join:strkey:snowflake",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT mname, count(*) AS n, sum(samt) AS s FROM '{fixture:str_fact}' f, '{fixture:str_dim}' d, '{fixture:mode_dim}' m WHERE f.sk = d.skey AND d.smode = m.mk GROUP BY mname ORDER BY mname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT mname, count(*) AS n, sum(samt) AS s FROM '{fixture:str_fact}' f, '{fixture:str_dim}' d, '{fixture:mode_dim}' m WHERE f.sk = d.skey AND d.smode = m.mk GROUP BY mname ORDER BY mname"
+   }
+  },
+  {
+   "id": "join:strkey:snowflake-fk-is-a-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.w, mmode, mname, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:mid_dim}' x, '{fixture:mode_dim}' m WHERE f.fk = d.pk AND d.w = x.mpk AND x.mmode = m.mk GROUP BY d.w, mmode, mname ORDER BY s DESC, d.w LIMIT 7"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.w, mmode, mname, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:mid_dim}' x, '{fixture:mode_dim}' m WHERE f.fk = d.pk AND d.w = x.mpk AND x.mmode = m.mk GROUP BY d.w, mmode, mname ORDER BY s DESC, d.w LIMIT 7"
+   }
+  },
+  {
+   "id": "join:strkey:snowflake-fetched",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.w, mmode, mw, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:mid_dim}' x, '{fixture:mode_dim}' m WHERE f.fk = d.pk AND d.w = x.mpk AND x.mmode = m.mk GROUP BY d.w, mmode, mw ORDER BY dq DESC, d.w LIMIT 7"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_LATE_FETCH": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.w, mmode, mw, count(DISTINCT q) AS dq FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:mid_dim}' x, '{fixture:mode_dim}' m WHERE f.fk = d.pk AND d.w = x.mpk AND x.mmode = m.mk GROUP BY d.w, mmode, mw ORDER BY dq DESC, d.w LIMIT 7"
+   }
+  },
+  {
+   "id": "join:strkey:star",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.grp, mname, count(*) AS n, sum(amt) AS s FROM '{fixture:sfact}' f, '{fixture:dim}' d, '{fixture:mode_dim}' m WHERE f.fk = d.pk AND f.mode = m.mk GROUP BY d.grp, mname ORDER BY d.grp, mname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.grp, mname, count(*) AS n, sum(amt) AS s FROM '{fixture:sfact}' f, '{fixture:dim}' d, '{fixture:mode_dim}' m WHERE f.fk = d.pk AND f.mode = m.mk GROUP BY d.grp, mname ORDER BY d.grp, mname"
+   }
+  },
+  {
+   "id": "join:strkey:empty-build",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, count(e.ekind) AS m, sum(e.ew) AS w FROM '{fixture:str_fact}' f LEFT JOIN '{fixture:empty_dim}' e ON f.sk = e.ekind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, count(e.ekind) AS m, sum(e.ew) AS w FROM '{fixture:str_fact}' f LEFT JOIN '{fixture:empty_dim}' e ON f.sk = e.ekind"
+   }
+  },
+  {
+   "id": "join:strkey:empty-build-inner",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:str_fact}' f JOIN '{fixture:empty_dim}' e ON f.sk = e.ekind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:str_fact}' f JOIN '{fixture:empty_dim}' e ON f.sk = e.ekind"
+   }
+  },
+  {
+   "id": "join:strkey:blob",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT bg, count(*) AS n FROM '{fixture:blob_fact}' f JOIN '{fixture:blob_dim}' d ON f.bk = d.bkey GROUP BY bg ORDER BY bg"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT bg, count(*) AS n FROM '{fixture:blob_fact}' f JOIN '{fixture:blob_dim}' d ON f.bk = d.bkey GROUP BY bg ORDER BY bg"
+   }
+  },
+  {
+   "id": "join:strkey:explain",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT sgrp, count(*) AS n FROM '{fixture:str_fact}' f JOIN '{fixture:str_dim}' d ON f.sk = d.skey GROUP BY sgrp",
+    "--explain"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    }
+   ],
+   "oracle": {
+    "compare": "plan",
+    "holds": {
+     "join": {
+      "build": {
+       "key": "skey",
+       "structure": "strings",
+       "keys": 1072
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "join:strkey:refuse:string-with-integer",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:str_fact}' f JOIN '{fixture:dim}' d ON f.sk = d.pk"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "the join compares sk with a key of another SQL type"
+   }
+  },
+  {
+   "id": "join:strkey:refuse:string-with-blob",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:str_fact}' f JOIN '{fixture:blob_dim}' d ON f.sk = d.bkey"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "the join compares sk with a key of another SQL type"
+   }
+  },
+  {
+   "id": "join:strkey:refuse:duplicate-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:str_fact}' f JOIN '{fixture:str_dup}' d ON f.sk = d.dkey"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "join lookup keys are not unique after re-rooting"
    }
   }
  ]

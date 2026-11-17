@@ -104,7 +104,7 @@ pub const Explained = struct {
                 .fk = try a.dupe(u8, l.fk),
                 .input = try a.dupe(u8, j.build_name),
                 .key = try a.dupe(u8, j.key_name),
-                .structure = @tagName(j.keys),
+                .structure = if (j.strings != null) "strings" else @tagName(j.keys),
                 .keys = j.n,
                 .bytes = j.bytes,
                 .columns = columns,
@@ -296,7 +296,9 @@ pub const Prepared = struct {
             };
             if (!lane_ok) continue;
             const via = j.payloads[q].via;
-            const f: expr_ast.Fetch = if (via != null and isKey(keys, j.virtual_base + via.?.fk))
+            // A fetch reads a build row by its integer key: a string key's columns stay GROUP BY keys.
+            const by_via = via != null and via.?.inner.strings == null and isKey(keys, j.virtual_base + via.?.fk);
+            const f: expr_ast.Fetch = if (by_via)
                 fetchOf(j.virtual_base + via.?.fk, via.?.inner, via.?.p)
             else if (j.domain == .signed and isKey(keys, j.fk_leaf))
                 fetchOf(j.fk_leaf, j, q)
@@ -468,8 +470,9 @@ fn withLookup(arena: std.mem.Allocator, f: ?filter_ast.Filter, leaf: filter_ast.
 /// A group-join when the FK is a GROUP BY key and every other key is a build column (each group is one build slot)
 /// and every aggregate is one the slots fold; else null, and the query groups as any other.
 fn groupJoin(gpa: std.mem.Allocator, j: *lookup.Join, q: plans.Aggregate, meta: *const schema.FileMetaData) !?*lookup.GroupJoin {
-    // An ANTI join's rows have no slot, and a LEFT join's misses none: their groups are the probe's own.
-    if (j.kind == .anti or j.kind == .left) return null;
+    // An ANTI join's rows have no slot, and a LEFT join's misses none: their groups are the probe's own. A string
+    // key's slot gives back its number, not the FK's value.
+    if (j.kind == .anti or j.kind == .left or j.strings != null) return null;
     for (j.payloads) |p| if (p.deferred != null) return null;
     const keys = q.keys orelse return null;
     const outputs = q.outputs orelse return null;
@@ -865,6 +868,11 @@ fn deferredPayloads(a: std.mem.Allocator, query: ?*const syntax.Query, b: syntax
             if (k.expr == .column and std.ascii.eqlIgnoreCase(k.expr.column, name)) break true;
         } else false;
         if (!bare) continue;
+        // A snowflake's string FK is read by slot when its table chains (`lookup.chain`).
+        const chained = for (b.dims) |d| {
+            if (std.ascii.eqlIgnoreCase(d.fk, name)) break true;
+        } else false;
+        if (chained) continue;
         if (q.filter) |f| if (predicateReads(f, name)) continue;
         if (b.filter) |f| if (predicateReads(f, name)) continue;
         const read = for (q.calls) |c| {

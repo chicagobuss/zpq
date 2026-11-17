@@ -131,12 +131,17 @@ pub const Codes = union(enum) {
             .{ .u32 = try a.alloc(u32, n) };
     }
 
-    /// These codes, copied into `a` at the narrowest width a dictionary of `entries` allows.
-    fn narrowed(c: Codes, a: std.mem.Allocator, entries: usize) !Codes {
-        const n = switch (c) {
-            .identity => return c,
+    fn len(c: Codes) usize {
+        return switch (c) {
+            .identity => |n| n,
             inline else => |v| v.len,
         };
+    }
+
+    /// These codes, copied into `a` at the narrowest width a dictionary of `entries` allows.
+    fn narrowed(c: Codes, a: std.mem.Allocator, entries: usize) !Codes {
+        if (c == .identity) return c;
+        const n = c.len();
         const out: Codes = try .init(a, n, entries);
         for (0..n) |i| out.set(@intCast(i), c.get(@intCast(i)));
         return out;
@@ -200,10 +205,31 @@ const Hash = struct {
     }
 };
 
+/// A string key's distinct build values, numbered from 0 in (row group, row) order of first appearance. A string's
+/// number is its key in the integer structures above, so a string key probes, chains and fills as an integer one.
+const Strings = struct {
+    values: []const []const u8,
+    /// Open addressing by the bytes' hash: a number, or `EMPTY`.
+    table: []u32,
+
+    fn home(s: *const Strings, v: []const u8) usize {
+        return @intCast(std.hash.Wyhash.hash(0, v) & (s.table.len - 1));
+    }
+
+    fn number(s: *const Strings, v: []const u8) ?u32 {
+        var i = s.home(v);
+        while (s.table[i] != EMPTY) : (i = (i + 1) & (s.table.len - 1)) {
+            if (std.mem.eql(u8, s.values[s.table[i]], v)) return s.table[i];
+        }
+        return null;
+    }
+};
+
 /// The SQL domain a key's stored integers compare in. Two keys join only within one: the same integers mean the same
 /// value there, where a timestamp in another unit, an unsigned value over a signed one or a DECIMAL of another scale
 /// would match integers that are not equal values (or miss ones that are). A DECIMAL key is not in this release: the
-/// build reads a DECIMAL as its f64 view.
+/// build reads a DECIMAL as its f64 view. Strings compare by their bytes, as DuckDB's do, and bytes with no type
+/// (a BLOB) only with their like.
 pub const KeyDomain = union(enum) {
     /// Plain or signed integers, of any width (they widen to i64 exactly).
     signed,
@@ -212,10 +238,17 @@ pub const KeyDomain = union(enum) {
     date,
     timestamp: struct { unit: std.meta.Tag(schema.TimeUnit), utc: bool },
     time: struct { unit: std.meta.Tag(schema.TimeUnit), utc: bool },
+    string,
+    bytes,
 
-    /// Null for a key no lookup takes (not stored as INT32 or INT64, or a logical type with no integer equality).
+    /// Null for a key no lookup takes: not stored as INT32, INT64 or BYTE_ARRAY, or a logical type with no equality
+    /// of integers or bytes (an ENUM, JSON or DECIMAL in a BYTE_ARRAY).
     pub fn of(e: schema.SchemaElement) ?KeyDomain {
         const t = e.type orelse return null;
+        if (t == .BYTE_ARRAY) {
+            const lt = e.effectiveLogicalType() orelse return .bytes;
+            return if (lt == .STRING) .string else null;
+        }
         if (t != .INT32 and t != .INT64) return null;
         const lt = e.effectiveLogicalType() orelse return .signed;
         return switch (lt) {
@@ -230,6 +263,10 @@ pub const KeyDomain = union(enum) {
     pub fn eql(a: KeyDomain, b: KeyDomain) bool {
         return std.meta.eql(a, b);
     }
+
+    fn text(d: KeyDomain) bool {
+        return d == .string or d == .bytes;
+    }
 };
 
 pub const Join = struct {
@@ -241,6 +278,8 @@ pub const Join = struct {
     key_name: []const u8,
     n: usize,
     keys: union(enum) { dense: Dense, hash: Hash },
+    /// A string key's values: `keys` then holds their numbers (`Strings`).
+    strings: ?Strings = null,
     payloads: []const Payload,
     /// Bytes the build holds for the query (charged against `--max-memory`).
     bytes: usize,
@@ -264,6 +303,13 @@ pub const Join = struct {
         return switch (j.keys) {
             inline else => |*s| s.slot(k),
         };
+    }
+
+    /// The slot of a foreign key's value: an integer is its own key, a string its number among the build's.
+    fn slotOf(j: *const Join, v: anytype) ?u32 {
+        if (@TypeOf(v) != []const u8) return j.slot(v);
+        const strings = j.strings orelse return null;
+        return j.slot(strings.number(v) orelse return null);
     }
 
     /// The payload a probe leaf index stands for, or null for a real leaf.
@@ -352,7 +398,7 @@ fn slotsOf(j: *const Join, comptime T: type, c: filter_eval.ColumnT(T), sel: *co
     if (c.codes) |codes| {
         const by_code = try a.alloc(u32, c.dict.len);
         defer a.free(by_code);
-        for (c.dict, by_code) |k, *s| s.* = j.slot(@intCast(k)) orelse EMPTY;
+        for (c.dict, by_code) |k, *s| s.* = j.slotOf(k) orelse EMPTY;
         var it = sel.iterator();
         while (it.next()) |r| {
             const is_null = if (c.def_levels) |dl| dl[r] < c.max_def else false;
@@ -361,13 +407,17 @@ fn slotsOf(j: *const Join, comptime T: type, c: filter_eval.ColumnT(T), sel: *co
         return;
     }
     var it = sel.iterator();
-    while (it.next()) |r| out[r] = if (keyAt(T, c, r)) |k| j.slot(k) orelse EMPTY else EMPTY;
+    while (it.next()) |r| {
+        const is_null = if (c.def_levels) |dl| dl[r] < c.max_def else false;
+        out[r] = if (is_null) EMPTY else j.slotOf(c.values[r]) orelse EMPTY;
+    }
 }
 
 fn slotsOfColumn(j: *const Join, fk: filter_eval.Batch.Column, sel: *const selection.SelectionVector, out: []u32, a: std.mem.Allocator) filter_eval.Error!void {
     return switch (fk) {
         .i32 => |c| slotsOf(j, i32, c, sel, out, a),
         .i64 => |c| slotsOf(j, i64, c, sel, out, a),
+        .string => |c| slotsOf(j, []const u8, c, sel, out, a),
         else => error.BadColumn,
     };
 }
@@ -570,6 +620,8 @@ const Part = struct {
     keys: Keys = .{ .wide = &.{} },
     /// A row the build's filter kept had a NULL key: `NOT IN` is then UNKNOWN for every probe row.
     null_key: bool = false,
+    /// A string key's survivors as a local dictionary, until they are numbered into `keys` (`numberStrings`).
+    key_local: Local = Local.empty,
     local: []Local = &.{},
     lo: i64 = std.math.maxInt(i64),
     hi: i64 = std.math.minInt(i64),
@@ -577,10 +629,16 @@ const Part = struct {
     /// (`LateLocal`).
     kept: []u64 = &.{},
 
+    fn localOf(p: *Part, payload: ?usize) *Local {
+        return if (payload) |i| &p.local[i] else &p.key_local;
+    }
+
     /// The keys, the survivors' mask and the local codes, which the build allocates from its `gpa` rather than an
     /// arena.
     fn freeLarge(p: *Part, gpa: std.mem.Allocator) void {
         p.keys.free(gpa);
+        p.key_local.codes.free(gpa);
+        p.key_local = Local.empty;
         gpa.free(p.kept);
         for (p.local) |l| l.codes.free(gpa);
         p.keys = .{ .wide = &.{} };
@@ -661,10 +719,9 @@ const Ctx = struct {
         return c.arenas[rg_index * (c.spec.payload.len + 1) + slot].allocator();
     }
 
-    /// `l` (on a task's scratch) kept for the layout: its codes narrowed into `gpa`, its dictionary copied into the
-    /// payload's arena.
-    fn keepLocal(c: *const Ctx, rg_index: usize, pi: usize, l: Local) !Local {
-        const a = c.arena(rg_index, 1 + pi);
+    /// `l` (on a task's scratch) kept for the layout: its codes narrowed into `gpa`, its dictionary copied into `a`
+    /// (the payload's arena, or the row group's for a key).
+    fn keepLocal(c: *const Ctx, a: std.mem.Allocator, l: Local) !Local {
         const codes = try l.codes.narrowed(c.gpa, l.dict.len());
         errdefer codes.free(c.gpa);
         const dict: Dict = switch (l.dict) {
@@ -839,6 +896,8 @@ fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
         const k: ?i64 = switch (key_col) {
             .i32 => |kc| keyAt(i32, kc, r),
             .i64 => |kc| keyAt(i64, kc, r),
+            // A string's key is its number among the build's, known once every part is read (`numberStrings`).
+            .string => |kc| if (kc.def_levels != null and kc.def_levels.?[r] < kc.max_def) null else 0,
             else => return error.JoinKeyType,
         };
         // A NULL build key matches no probe row, NULL ones included.
@@ -854,9 +913,14 @@ fn buildPart(c: *Ctx, worker: usize, rg_index: usize) !void {
     }
     for (c.spec.payload, part.local, 0..) |p, *l, pi| if (c.filter_cols[p]) {
         const col = cols.items[lookup[p].?];
-        l.* = if (c.plain[pi]) try plainLocal(c.arena(rg_index, 1 + pi), col, keep.items) else try c.keepLocal(rg_index, pi, try localOf(c, sa, rg, p, keep.items, col));
+        const pa = c.arena(rg_index, 1 + pi);
+        l.* = if (c.plain[pi]) try plainLocal(pa, col, keep.items) else try c.keepLocal(pa, try localOf(c, sa, rg, p, keep.items, col));
     };
     if (c.late.len != 0 or c.spec.deferred.len != 0) part.kept = try c.gpa.dupe(u64, sel.mask);
+    if (key_col == .string) {
+        part.key_local = try c.keepLocal(c.arena(rg_index, 0), try localDict([]const u8, sa, key_col.string, keep.items));
+        return;
+    }
     part.keys = if (keys.items.len != 0 and @as(i128, hi) - lo <= std.math.maxInt(u32)) blk: {
         const out = try c.gpa.alloc(u32, keys.items.len);
         for (keys.items, out) |k, *o| o.* = @intCast(k - lo);
@@ -903,7 +967,8 @@ const LateLocal = struct {
             return;
         }
         if (!c.plain[pi]) {
-            part.local[pi] = try c.keepLocal(rg_index, pi, try localOf(c, sa, rg, c.spec.payload[pi], keep, null));
+            const local = try localOf(c, sa, rg, c.spec.payload[pi], keep, null);
+            part.local[pi] = try c.keepLocal(c.arena(rg_index, 1 + pi), local);
             return;
         }
         // Plain: the survivors' values as decoded (strings into the payload's arena, which outlives the layout), unhashed.
@@ -1028,7 +1093,8 @@ const Unify = struct {
     }
 };
 
-fn unify(comptime T: type, c: *Ctx, p: usize) !Unified {
+/// `p`'s local dictionaries as one, or with no `p` the string key's.
+fn unify(comptime T: type, c: *Ctx, p: ?usize) !Unified {
     const tag = switch (T) {
         i32 => "i32",
         i64 => "i64",
@@ -1039,7 +1105,7 @@ fn unify(comptime T: type, c: *Ctx, p: usize) !Unified {
     const gpa = c.gpa;
     var bytes: usize = 0;
     if (c.parts.len == 1) {
-        const local = @field(c.parts[0].local[p].dict, tag);
+        const local = @field(c.parts[0].localOf(p).dict, tag);
         if (T == []const u8) for (local) |v| {
             bytes += v.len;
         };
@@ -1058,9 +1124,9 @@ fn unify(comptime T: type, c: *Ctx, p: usize) !Unified {
     var dict: std.ArrayList(T) = .empty;
     errdefer dict.deinit(gpa);
     for (c.parts, 0..) |*part, rg_index| {
-        const l = &part.local[p];
+        const l = part.localOf(p);
         const local = @field(l.dict, tag);
-        l.global = try c.arena(rg_index, 1 + p).alloc(u32, local.len);
+        l.global = try c.arena(rg_index, if (p) |i| 1 + i else 0).alloc(u32, local.len);
         for (local, l.global) |v, *g| {
             const gop = try map.getOrPut(gpa, v);
             if (!gop.found_existing) {
@@ -1072,6 +1138,38 @@ fn unify(comptime T: type, c: *Ctx, p: usize) !Unified {
         }
     }
     return .{ .values = @unionInit(Dict, tag, try dict.toOwnedSlice(gpa)), .owned = true, .bytes = bytes };
+}
+
+/// A string key's values over every part, numbered into `a` (the build's), and each part's survivors as those
+/// numbers: its keys. A value twice among the survivors is then a key twice, which the key structure sees.
+fn numberStrings(a: std.mem.Allocator, c: *Ctx) !Strings {
+    const u = try unify([]const u8, c, null);
+    defer u.deinit(c.gpa);
+    const values = try a.alloc([]const u8, u.values.string.len);
+    const blob = try a.alloc(u8, u.bytes);
+    const s: Strings = .{ .values = values, .table = try a.alloc(u32, std.math.ceilPowerOfTwoAssert(usize, @max(16, values.len * 2))) };
+    @memset(s.table, EMPTY);
+    var at: usize = 0;
+    for (u.values.string, values, 0..) |v, *out, number| {
+        @memcpy(blob[at..][0..v.len], v);
+        out.* = blob[at..][0..v.len];
+        at += v.len;
+        var i = s.home(v);
+        while (s.table[i] != EMPTY) i = (i + 1) & (s.table.len - 1);
+        s.table[i] = @intCast(number);
+    }
+    for (c.parts) |*part| {
+        const keys = try c.gpa.alloc(u32, part.key_local.codes.len());
+        part.keys = .{ .narrow = keys };
+        if (keys.len == 0) continue;
+        part.lo = 0;
+        part.hi = 0;
+        for (keys, 0..) |*k, row| {
+            k.* = part.key_local.globalOf(row);
+            part.hi = @max(part.hi, k.*);
+        }
+    }
+    return s;
 }
 
 /// Each part's keys into the dense map's bits, flagging a key set twice. With `disjoint` (no two parts' key ranges
@@ -1139,6 +1237,10 @@ const FillCodes = struct {
         const cursor = try c.gpa.alloc(usize, c.plain.len);
         defer c.gpa.free(cursor);
         for (c.plain, cursor) |pl, *at| at.* = if (pl.on) pl.starts[i] else 0;
+        // A part with no NULL fills as it always did.
+        const any_null = for (part.local) |l| {
+            if (l.nulls.len != 0) break true;
+        } else false;
         var source_row: usize = 0;
         switch (part.keys) {
             inline else => |keys| for (keys, 0..) |raw, row| {
@@ -1149,12 +1251,12 @@ const FillCodes = struct {
                     c.locators[s] = .{ .rg = @intCast(i), .row = @intCast(source_row) };
                     source_row += 1;
                 }
+                // Slots of several parts share a word.
+                if (any_null) for (part.local, 0..) |l, pi| if (l.nulls.len != 0 and bitAt(l.nulls, row)) {
+                    const word = &c.j.payloads[pi].nulls.?[s >> 6];
+                    _ = @atomicRmw(u64, word, .Or, @as(u64, 1) << @intCast(s & 63), .monotonic);
+                };
                 for (c.codes, part.local, c.plain, cursor, 0..) |dst, l, pl, *at, pi| {
-                    // Slots of several parts share a word.
-                    if (l.nulls.len != 0 and bitAt(l.nulls, row)) {
-                        const word = &c.j.payloads[pi].nulls.?[s >> 6];
-                        _ = @atomicRmw(u64, word, .Or, @as(u64, 1) << @intCast(s & 63), .monotonic);
-                    }
                     if (pi < c.deferred.len and c.deferred[pi]) continue;
                     if (!pl.on) {
                         dst.set(s, l.globalOf(row));
@@ -1244,6 +1346,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
         }
     }.f);
     if (trace) t = lap("decode+local dictionaries", t);
+    const strings = if (domain.text()) try numberStrings(a, &ctx) else null;
     var n: usize = 0;
     var lo: i64 = std.math.maxInt(i64);
     var hi: i64 = std.math.minInt(i64);
@@ -1255,7 +1358,7 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
         null_key = null_key or p.null_key;
     }
     const j = try a.create(Join);
-    j.* = .{ .kind = spec.kind, .build_name = spec.build_name, .key_name = spec.key_name, .n = n, .keys = undefined, .payloads = &.{}, .bytes = 0, .domain = domain, .null_key = null_key };
+    j.* = .{ .kind = spec.kind, .build_name = spec.build_name, .key_name = spec.key_name, .n = n, .keys = undefined, .payloads = &.{}, .bytes = 0, .domain = domain, .null_key = null_key, .strings = strings };
     // Bytes per structure, from the survivors' own domain: a bit per possible key plus a rank per 64, against two
     // slots per key of an 8-byte key and a 4-byte slot.
     const span: u128 = if (n == 0) 0 else @as(u128, @intCast(@as(i128, hi) - lo)) + 1;
@@ -1399,8 +1502,8 @@ pub fn chain(a: std.mem.Allocator, j: *Join, fk: usize, inner: *const Join) !voi
     const by_code = try a.alloc(u32, f.dict.len());
     defer a.free(by_code);
     switch (f.dict) {
-        inline .i32, .i64 => |d| for (d, by_code) |k, *s| {
-            s.* = inner.slot(k) orelse EMPTY;
+        inline .i32, .i64, .string => |d| for (d, by_code) |k, *s| {
+            s.* = inner.slotOf(k) orelse EMPTY;
         },
         else => return error.JoinKeyType,
     }

@@ -341,7 +341,8 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             .{},
         ),
         error.JoinKeyType => diagnosticPrint(
-            "zpq query: the join's key {s} is not an integer, DATE, TIME or TIMESTAMP column stored as INT32 or INT64\n",
+            "zpq query: the join's key {s} is not an integer, DATE, TIME or TIMESTAMP column stored as INT32 or INT64,\n" ++
+                "  nor a string\n",
             .{diag.column.get()},
         ),
         error.JoinPayloadType => diagnosticPrint(

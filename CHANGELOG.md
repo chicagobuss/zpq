@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Joins carry dimension strings to the result cut, compare numeric dictionary codes across files, and probe dense keys in one pass.** Only the rows that survive LIMIT fetch their dimension strings, a numeric comparison reads each side's own dictionary, and a dense INNER or SEMI probe captures slots and narrows the selection together. An expression over two copies of a self-joined table's same-named column is refused by name.
+
 - **An unordered GROUP BY … LIMIT builds only the groups it returns.** Without ORDER BY or HAVING, a dense GROUP BY with LIMIT n [OFFSET m] keeps the first n+m groups in first-appearance order straight from its lanes instead of building them all.
 
 - **Compaction keeps merged row groups within the row and byte targets, and copies a group that can't merge as it stands.** Rewriting DuckDB's 122,880-row groups no longer pairs them into 245,760-row groups.

@@ -42,11 +42,15 @@ def lit(s):
 def params(seed):
     r = random.Random(seed)
     lo = r.choice([0, -50, 1, 2147483647 - 400, 1 << 40, -2147483648])
-    p = {'lo': lo, 'kt': 'INTEGER' if -2147483648 <= lo and lo + 400 <= 2147483647 and r.random() < 0.6 else 'BIGINT',
+    int32 = -2147483648 <= lo and lo + 400 <= 2147483647 and r.random() < 0.6  # drawn here so seeds keep their tables
+    p = {'lo': lo, 'kt': None,
          'n': r.randint(200, 9000), 'nd': r.randint(5, 400), 'rg': r.choice([63, 64, 65, 100, 777, 1000, 4096]),
          'drg': r.choice([17, 64, 128, 500]), 'pfk': r.choice([0, 0.05, 0.3, 0.9]), 'hole': r.choice([2, 3, 7, 1000]),
          'ppay': r.choice([0, 0.05, 0.3, 0.6, 0.9]), 'ppart': r.choice([0, 0.1, 0.4]),
          'strs': r.sample(STRS, r.randint(6, len(STRS)))}
+    # INTEGER only when every generated key fits: an FK spans lo - 3 .. lo + nd + 3, every other key lies inside that.
+    fits = -2147483648 <= lo - 3 and lo + p['nd'] + 3 <= 2147483647
+    p['kt'] = 'INTEGER' if int32 and fits else 'BIGINT'
     return p
 
 

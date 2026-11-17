@@ -1176,6 +1176,7 @@
   {
    "id": "ch17",
    "set": "analyst",
+   "decimal_avg_scale": {"avg_customer_spend": 2},
    "tags": [
     "cte",
     "using"

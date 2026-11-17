@@ -20,7 +20,8 @@ Without them the S3 pass is skipped, and local runs need the data already presen
 
 Exit status: 1 when any case is wrong or crashes (or, with --fail-unnamed, is refused without a name), else 0.
 """
-import argparse, fnmatch, glob, json, os, re, statistics, sys
+import argparse, csv, fnmatch, glob, io, json, os, re, statistics, sys
+from decimal import Decimal, ROUND_HALF_UP
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import common  # noqa: E402
@@ -57,7 +58,20 @@ def sql_for(case, where, args):
 
 
 def expected(case, args):
-    return case['answer_tlc_single'] if args.tlc_single and 'answer_tlc_single' in case else case['answer']
+    answer = case['answer_tlc_single'] if args.tlc_single and 'answer_tlc_single' in case else case['answer']
+    scales = case.get('decimal_avg_scale', {}) if args.engine == 'zpq' else {}
+    if not scales:
+        return answer
+    rows = list(csv.reader(io.StringIO(answer)))
+    for name, scale in scales.items():
+        col = rows[0].index(name)
+        quantum = Decimal(1).scaleb(-scale)
+        for row in rows[1:]:
+            if row[col] not in ('', 'NULL'):
+                row[col] = str(Decimal(row[col]).quantize(quantum, rounding=ROUND_HALF_UP))
+    out = io.StringIO(newline='')
+    csv.writer(out, lineterminator='\n').writerows(rows)
+    return out.getvalue()
 
 
 def keys_needed(cases, args):

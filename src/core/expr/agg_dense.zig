@@ -446,7 +446,7 @@ pub const Ordinals = struct {
     }
 
     pub fn pack(o: Ordinals, position: u64) !u32 {
-        const item = position >> 32;
+        const item: usize = @intCast(position >> 32);
         const row: u32 = @truncate(position);
         if (item >= o.starts.len - 1 or row >= o.starts[item + 1] - o.starts[item]) return error.BadColumn;
         return o.starts[item] + row;

@@ -148,7 +148,7 @@ pub fn Full(comptime Group: type) type {
         }
 
         pub fn at(s: *const Self, index: u64) *const Group {
-            return &s.pieces[index >> 32].groups[@as(u32, @truncate(index))];
+            return &s.pieces[@intCast(index >> 32)].groups[@as(u32, @truncate(index))];
         }
 
         /// The caller funds output storage and worker stacks, as for typed-column fill. Every group reference is

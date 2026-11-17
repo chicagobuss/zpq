@@ -333,6 +333,7 @@ pub const testing_fixed_growth = struct {
 pub fn remapWithoutCopy(a: std.mem.Allocator, old: anytype, new_len: usize) ?@TypeOf(old) {
     if (old.len == 0) return null;
     if (a.resize(old, new_len)) return old.ptr[0..new_len];
+    if (comptime builtin.cpu.arch.isWasm()) return null;
     const page = std.heap.page_allocator;
     if (a.vtable == page.vtable) return a.remap(old, new_len);
     // Zig's SMP allocator either retains a small block in its size class or remaps a large page allocation;

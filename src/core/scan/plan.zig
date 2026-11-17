@@ -35,7 +35,7 @@ pub fn planAggregate(in: PlanInputs) ScanPlan {
     const blocks = @max(1, @min(in.work.len, group_blocks_max));
     const tables: usize = if (in.keys == null) 0 else if (!use_blocks) in.workers else blocks;
     const sketch_fits = if (args.sketch_topk) |cfg|
-        (in.workers *| (@as(usize, 4) << cfg.cell_bits)) *| 8 <= args.max_memory
+        (in.workers *| (@as(usize, 4) << @intCast(cfg.cell_bits))) *| 8 <= args.max_memory
     else
         false;
     const keys_unique = args.sketch_topk != null and keysLookUnique(in.metas, in.work, keys);
@@ -521,7 +521,7 @@ pub fn rankingCall(
     if (!callsTotal(calls)) return null;
     // The admitted cells must be few beside all of them, or admitting is grouping nearly everything.
     const k = order.offset +| limit;
-    if (k == 0 or cfg.cell_bits < 4 or k *| cfg.admit_per_row > (@as(u64, 1) << cfg.cell_bits) / 16) return null;
+    if (k == 0 or cfg.cell_bits < 4 or k *| cfg.admit_per_row > (@as(u64, 1) << @intCast(cfg.cell_bits)) / 16) return null;
     for (args.inputs) |in| if (in.gate != null) return null;
     // Both passes decode every column the filter reads. Beyond the group keys, which both passes decode anyway, that
     // is paid twice, and a filter over a long column (`URL LIKE '%google%'`) costs more than the cut saves. Not so for

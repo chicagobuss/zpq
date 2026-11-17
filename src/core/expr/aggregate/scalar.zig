@@ -115,10 +115,10 @@ pub fn sumConstantF64(acc: f64, v: f64, n: u64) f64 {
     var total = acc;
     const block: [64]f64 = @splat(v);
     const b = fullBlockSum(&block);
-    for (0..n / 64) |_| total += b;
+    for (0..@as(usize, @intCast(n / 64))) |_| total += b;
     if (n % 64 != 0) {
         var t = v;
-        for (1..n % 64) |_| t += v;
+        for (1..@as(usize, @intCast(n % 64))) |_| t += v;
         total += t;
     }
     return total;

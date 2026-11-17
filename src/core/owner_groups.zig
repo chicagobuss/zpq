@@ -1036,7 +1036,7 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         const sh: u6 = @intCast(shift);
                         if ((varying >> sh) & (buckets - 1) == 0) continue;
                         @memset(counts[0..buckets], 0);
-                        for (src.*) |r| counts[(pairField(field, r) >> sh) & (buckets - 1)] += 1;
+                        for (src.*) |r| counts[@intCast((pairField(field, r) >> sh) & (buckets - 1))] += 1;
                         var at: usize = 0;
                         for (counts[0..buckets]) |*c| {
                             const n = c.*;
@@ -1045,8 +1045,8 @@ pub fn Owner(comptime kind: Kind, comptime codec: Codec) type {
                         }
                         for (src.*) |r| {
                             const digit = (pairField(field, r) >> sh) & (buckets - 1);
-                            dst.*[counts[digit]] = r;
-                            counts[digit] += 1;
+                            dst.*[counts[@intCast(digit)]] = r;
+                            counts[@intCast(digit)] += 1;
                         }
                         std.mem.swap([]Record, src, dst);
                     }

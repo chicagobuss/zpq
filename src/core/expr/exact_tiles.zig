@@ -84,10 +84,10 @@ const DictTable = struct {
 
 /// Tiles by how they folded, process-wide: what tests and diagnostics read to see which path ran.
 pub const counters = struct {
-    pub var proved: std.atomic.Value(u64) = .init(0);
-    pub var wide: std.atomic.Value(u64) = .init(0);
+    pub var proved: @import("../wasm_atomic.zig").Value(u64) = .init(0);
+    pub var wide: @import("../wasm_atomic.zig").Value(u64) = .init(0);
     /// Row groups left to the established path.
-    pub var abandoned: std.atomic.Value(u64) = .init(0);
+    pub var abandoned: @import("../wasm_atomic.zig").Value(u64) = .init(0);
 
     pub fn reset() void {
         proved.store(0, .monotonic);

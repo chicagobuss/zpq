@@ -647,7 +647,7 @@ test "hash identity bounds use four-byte rows and bounded frontiers and free all
 test "bounded first discovery keeps at most H exact keys and only lowers the shared ordinal" {
     const calls = [_]AggCall{.{ .func = .count, .arg = null, .where = null, .alias = "c", .result = .i64 }};
     for ([_]bool{ false, true }) |fixed| {
-        var threshold: std.atomic.Value(u64) = .init(std.math.maxInt(u64));
+        var threshold: @import("../../wasm_atomic.zig").Value(u64) = .init(std.math.maxInt(u64));
         var early = GroupTable.init(std.testing.allocator, 1 << 20);
         defer early.deinit();
         var late = GroupTable.init(std.testing.allocator, 1 << 20);

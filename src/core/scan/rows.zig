@@ -215,7 +215,7 @@ pub const RowSource = struct {
             .folded = false,
             .dense = d,
         };
-        const table = if (s.in_place.len > 0) &s.in_place[slot.idx >> 32] else s.single;
+        const table = if (s.in_place.len > 0) &s.in_place[@intCast(@as(u64, slot.idx) >> 32)] else s.single;
         const group = if (s.in_place.len > 0) @as(u32, @truncate(slot.idx)) else slot.idx;
         const compact = table != null and table.?.compact.stride != 0;
         const at = if (s.folded) slot.idx else slot.idx * s.calls.len;
@@ -249,7 +249,7 @@ pub const RowSource = struct {
         }
         const at = if (s.folded) slot.idx else slot.idx * s.calls.len;
         const table: ?*const expr_agg.GroupTable = if (s.in_place.len > 0)
-            &s.in_place[slot.idx >> 32]
+            &s.in_place[@intCast(@as(u64, slot.idx) >> 32)]
         else
             s.single;
         const group = if (s.in_place.len > 0) @as(u32, @truncate(slot.idx)) else slot.idx;

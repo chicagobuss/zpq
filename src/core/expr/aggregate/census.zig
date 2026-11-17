@@ -323,7 +323,7 @@ pub const FingerprintSet = struct {
 
     pub fn contains(self: *const FingerprintSet, fp: u64) bool {
         const b = fp & ((1 << filter_bits) - 1);
-        if ((self.filter[b / 64] >> @intCast(b % 64)) & 1 == 0) return false;
+        if ((self.filter[@intCast(b / 64)] >> @intCast(b % 64)) & 1 == 0) return false;
         return self.map.contains(fp);
     }
 };

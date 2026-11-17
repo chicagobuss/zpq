@@ -178,6 +178,7 @@ const ThreadCodecs = struct {
     /// This thread's set; null when it cannot be registered to be freed at thread exit (no pthread key or memory
     /// left), and the caller then uses a set of its own for the one call.
     fn current() ?*ThreadCodecs {
+        if (builtin.os.tag == .wasi) return null;
         if (!haveKey()) return null;
         if (builtin.os.tag == .windows) {
             if (FlsGetValue(key)) |p| return @ptrCast(@alignCast(p));

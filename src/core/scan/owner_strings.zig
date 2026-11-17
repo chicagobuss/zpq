@@ -144,7 +144,7 @@ pub fn inlineSharedStrings(
     if (explain_only) return .{
         .layout = .shared_string_table,
         .reservation = quote,
-        .partitions = @as(usize, 1) << partagg.partBits(args.max_memory),
+        .partitions = @as(usize, 1) << @intCast(partagg.partBits(args.max_memory)),
     };
     var own_ledger: core_memory.SharedBudget = .{ .limit = args.max_memory };
     const ledger = args.ledger orelse &own_ledger;

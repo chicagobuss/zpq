@@ -12,6 +12,7 @@ pub const core = struct {
     pub const consumer = @import("core/consumer.zig");
     pub const invariant = @import("core/invariant.zig");
     pub const scan = @import("core/scan.zig");
+    pub const result_program = @import("core/result_program.zig");
     pub const diag = @import("core/diag.zig");
     pub const spawn = @import("core/spawn.zig");
     pub const huge_pages = @import("core/huge_pages.zig");

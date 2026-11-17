@@ -62,9 +62,9 @@ pub const Config = struct {
 };
 
 /// Tests: the most bytes any pass held advised ahead of its claims, page-rounded.
-pub var test_peak_ahead: std.atomic.Value(u64) = .init(0);
+pub var test_peak_ahead: @import("../wasm_atomic.zig").Value(u64) = .init(0);
 /// Tests: the bytes passes advised or found resident already, page-rounded: what the read-ahead looked at.
-pub var test_seen: std.atomic.Value(u64) = .init(0);
+pub var test_seen: @import("../wasm_atomic.zig").Value(u64) = .init(0);
 
 /// How far ahead of the latest claim advice reaches, in items per worker.
 const ahead_per_worker = 2;
@@ -105,13 +105,13 @@ pub const ReadAhead = struct {
     released: usize = 0,
     /// Page-rounded bytes advised and not yet decoded, never past the cap: the cursor's for items not yet claimed, and
     /// a gated column's for a claimed item its worker is decoding (`adviseClaimed`), until that worker's next claim.
-    ahead: std.atomic.Value(u64) = .init(0),
+    ahead: @import("../wasm_atomic.zig").Value(u64) = .init(0),
     /// The row group advised last and the item that advised it, so the items a row group was split into advise it
     /// once (and an item the cap stopped before its first block is not taken for one of them on return).
     last: ?struct { file: usize, rg: usize, item: usize } = null,
     /// Page-rounded bytes this scan advised, and those it found resident already (profile counts).
-    advised: std.atomic.Value(u64) = .init(0),
-    resident: std.atomic.Value(u64) = .init(0),
+    advised: @import("../wasm_atomic.zig").Value(u64) = .init(0),
+    resident: @import("../wasm_atomic.zig").Value(u64) = .init(0),
 
     pub fn init(
         config: Config,

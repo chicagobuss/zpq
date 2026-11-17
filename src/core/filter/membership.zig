@@ -1761,7 +1761,7 @@ const Probing = struct {
         for (omitted.reqs, omitted.index) |r, i| {
             const sp = spans[i] orelse continue;
             if (sp.len() <= r.out.len) {
-                fetch[i] = .{ .bytes = r.out[0..sp.len()] };
+                fetch[i] = .{ .bytes = r.out[0..@as(usize, @intCast(sp.len()))] };
                 spans[i] = null;
             }
         }

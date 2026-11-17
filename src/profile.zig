@@ -280,6 +280,7 @@ pub const Thread = struct {
 
     /// Out of line so a span site stays a branch and a call: the sites are many and the Lambda ships them all.
     pub noinline fn record(self: *Thread, kind: Kind, start_ns: i64, end_ns: i64, a: Args) void {
+        if (comptime builtin.os.tag == .wasi) return;
         self.push(.{ .kind = kind, .start = start_ns, .dur = @max(0, end_ns - start_ns), .args = a });
     }
 

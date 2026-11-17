@@ -93,3 +93,6 @@ pub const PrintResult = print.PrintResult;
 pub const runPrint = print.runPrint;
 pub const runPrintTo = print.runPrintTo;
 pub const runPrintSink = print.runPrintSink;
+
+pub const answerTextKinds = text.answerTextKinds;
+pub const answerTypes = text.answerTypes;

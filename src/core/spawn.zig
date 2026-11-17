@@ -48,6 +48,7 @@ pub fn spawn(
     comptime function: anytype,
     args: anytype,
 ) std.Thread.SpawnError!std.Thread {
+    if (builtin.os.tag == .wasi and builtin.single_threaded) return error.SystemResources;
     if (builtin.is_test) {
         if (fail_after) |limit| {
             if (success_count.fetchAdd(1, .monotonic) >= limit) {
@@ -58,7 +59,9 @@ pub fn spawn(
             }
         }
     }
-    return std.Thread.spawn(config, function, args);
+    var actual = config;
+    if (builtin.os.tag == .wasi) actual.allocator = @import("wasm_stack.zig").allocator(config.stack_size);
+    return std.Thread.spawn(actual, function, args);
 }
 
 /// Run `func(&ctxs[i])` for every context on a thread of its own. The threads come from a process-wide pool that
@@ -71,6 +74,7 @@ pub fn spawn(
 /// nothing, when not one thread started; the caller then does the work itself. When it returns true every started
 /// context has finished. A stack larger than the pool's falls back to a tree of fresh threads with that stack.
 pub fn runTree(comptime Ctx: type, ctxs: []Ctx, config: std.Thread.SpawnConfig, comptime func: fn (*Ctx) void) bool {
+    if (builtin.os.tag == .wasi and builtin.single_threaded) return false;
     if (ctxs.len == 0) return true;
     if (builtin.single_threaded or config.stack_size > Pool.stack_size) {
         const Node = TreeNode(Ctx, func);
@@ -220,7 +224,10 @@ pub const Pool = struct {
             cancelSubtree(fresh, i);
             return false;
         }
-        const t = std.Thread.spawn(.{ .stack_size = stack_size }, boot, .{ fresh, i }) catch {
+        const t = std.Thread.spawn(.{
+            .stack_size = stack_size,
+            .allocator = if (builtin.os.tag == .wasi) @import("wasm_stack.zig").allocator(stack_size) else null,
+        }, boot, .{ fresh, i }) catch {
             cancelSubtree(fresh, i);
             return false;
         };
@@ -268,6 +275,7 @@ pub const Pool = struct {
     }
 
     fn currentPid() if (builtin.os.tag == .windows) u32 else std.posix.pid_t {
+        if (builtin.os.tag == .wasi) return 1;
         if (builtin.target.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
         return if (builtin.target.os.tag == .linux) std.os.linux.getpid() else std.c.getpid();
     }

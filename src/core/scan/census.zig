@@ -258,7 +258,7 @@ pub fn certifiedTopK(
         if (hot) return;
     }
     const k: usize = @intCast(order.offset +| order.limit.?);
-    const n_cells = @as(usize, 1) << cfg.cell_bits;
+    const n_cells = @as(usize, 1) << @intCast(cfg.cell_bits);
     const sketches = try arena.alloc(expr_agg.CountSketch, workers.len);
     var made: usize = 0;
     defer for (sketches[0..made]) |s| gpa.free(s.cells);
@@ -851,7 +851,7 @@ fn identitySet(
     for (classes) |class| {
         set.map.putAssumeCapacity(class.fp, {});
         const bit = class.fp & ((1 << expr_agg.FingerprintSet.filter_bits) - 1);
-        filter[bit / 64] |= @as(u64, 1) << @intCast(bit % 64);
+        filter[@intCast(bit / 64)] |= @as(u64, 1) << @intCast(bit % 64);
     }
     return set;
 }
@@ -956,7 +956,7 @@ fn identityBoundPlan(
     for (items[0..n_admit]) |r| {
         set.map.putAssumeCapacity(r.fp, {});
         const b = r.fp & ((1 << expr_agg.FingerprintSet.filter_bits) - 1);
-        filter[b / 64] |= @as(u64, 1) << @intCast(b % 64);
+        filter[@intCast(b / 64)] |= @as(u64, 1) << @intCast(b % 64);
     }
     set.filter = filter;
 
@@ -1027,7 +1027,7 @@ pub fn firstAppearanceCut(
 ) !void {
     const k: usize = @intCast(order.offset +| order.limit.?);
     const saved = try arena.dupe(Worker, workers);
-    var threshold: std.atomic.Value(u64) = .init(std.math.maxInt(u64));
+    var threshold: @import("../wasm_atomic.zig").Value(u64) = .init(std.math.maxInt(u64));
     for (tables) |*table| table.discovery = .{ .limit = k, .threshold = &threshold };
     defer for (tables) |*table| {
         table.discovery = null;
@@ -1078,7 +1078,7 @@ pub fn firstAppearanceCut(
     for (seen.values()[0..n]) |first| {
         const fp = identity.fingerprint(tables[first.table].routeHash(first.group));
         set.map.putAssumeCapacity(fp, {});
-        filter[(fp % (1 << expr_agg.FingerprintSet.filter_bits)) / 64] |=
+        filter[@intCast((fp % (1 << expr_agg.FingerprintSet.filter_bits)) / 64)] |=
             @as(u64, 1) << @intCast(fp % 64);
     }
     // The first scan only discovered keys. Replay every row once for complete counts/payloads; hash collisions

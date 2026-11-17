@@ -625,7 +625,7 @@ const Shared = struct {
     strict: bool = false,
     /// See `unionBound`; `held` counts the values every partition holds against it.
     stop: ?u64 = null,
-    held: std.atomic.Value(u64) = .init(0),
+    held: @import("wasm_atomic.zig").Value(u64) = .init(0),
 
     fn retaining(s: *const Shared) bool {
         return !s.dropped.load(.monotonic);

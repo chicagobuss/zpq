@@ -75,6 +75,11 @@ pub fn build(b: *std.Build) void {
         else
             b.path("src/lambda/layout.ld"),
     };
+    if (target.result.os.tag == .wasi) {
+        generateTestRoots(b);
+        addWasm(b, target, optimize);
+        return;
+    }
     generateTestRoots(b);
     const a = artifacts(b, cfg, optimize);
 
@@ -717,13 +722,13 @@ const CoreDeps = struct {
         liteparser_mod.addIncludePath(b.path("vendor/liteparser"));
 
         return .{
-            .boring_tls = b.dependency("boring_tls", .{
+            .boring_tls = if (target.result.os.tag == .wasi) b.createModule(.{ .root_source_file = b.addWriteFiles().add("no_tls.zig", ""), .target = target, .optimize = optimize }) else b.dependency("boring_tls", .{
                 .target = target,
                 .optimize = optimize,
                 .@"fetch-prebuilt" = fetch_prebuilt,
                 .@"source-build" = boringssl_from_source,
             }).module("boring_tls"),
-            .snappy = b.dependency("snappy", .{
+            .snappy = if (target.result.os.tag == .wasi) wasmSnappy(b, target, optimize) else b.dependency("snappy", .{
                 .target = target,
                 .optimize = optimize,
                 .pic = archivePic(shared),
@@ -1159,4 +1164,83 @@ fn validPrerelease(pre: []const u8) bool {
         for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
     }
     return true;
+}
+
+/// Browser reactor: a whole Parquet buffer and a JSON request, with no native I/O graph.
+fn addWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
+    const threaded = b.option(bool, "wasm-threads", "Build the shared-memory WASI browser reactor") orelse false;
+    if (threaded and !target.result.cpu.has(.wasm, .atomics))
+        @panic("-Dwasm-threads needs -Dcpu=baseline+atomics+bulk_memory");
+    var deps = CoreDeps.init(b, target, optimize, false, false);
+    deps.profile = false;
+    const core = addCoreModule(b, deps, target, optimize, .{ .sql = true });
+    core.zpq.single_threaded = !threaded;
+    const root = b.createModule(.{
+        .root_source_file = b.path("src/wasm.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = !threaded,
+        .link_libc = true,
+        .imports = &.{.{ .name = "zpq", .module = core.zpq }},
+    });
+    // Zig 0.17 cannot build its C heap in a threaded WASM compilation. Compile
+    // the engine to an object, then link it with a separately locked serial heap.
+    const exe = if (threaded) blk: {
+        const engine = b.addObject(.{ .name = "zpq-wasm-engine", .root_module = root });
+        const heap = b.addObject(.{ .name = "zpq-wasm-heap", .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm_heap.zig"),
+            .target = target,
+            .optimize = optimize,
+            .single_threaded = true,
+            .link_libc = true,
+        }) });
+        const link = b.createModule(.{ .target = target, .optimize = optimize, .single_threaded = true, .link_libc = true, .link_libcpp = true });
+        // Keep codec archives on the final link. build-obj with archives produces
+        // an archive rather than the standalone engine object required here.
+        link.link_objects.appendSlice(b.allocator, core.zpq.link_objects.items) catch @panic("OOM");
+        core.zpq.link_objects.clearRetainingCapacity();
+        link.link_objects.appendSlice(b.allocator, deps.snappy.link_objects.items) catch @panic("OOM");
+        deps.snappy.link_objects.clearRetainingCapacity();
+        link.addObject(engine);
+        link.addObject(heap);
+        link.addObject(b.addObject(.{ .name = "zpq-wasm-lock", .root_module = b.createModule(.{
+            .root_source_file = b.path("src/wasm_lock.zig"),
+            .target = target,
+            .optimize = optimize,
+            .single_threaded = false,
+        }) }));
+        break :blk b.addExecutable(.{ .name = "zpq-wasm", .root_module = link });
+    } else b.addExecutable(.{ .name = "zpq-wasm", .root_module = root });
+    exe.entry = .disabled;
+    exe.wasi_exec_model = .reactor;
+    exe.root_module.export_symbol_names = if (threaded)
+        &.{ "zpq_alloc", "zpq_free", "zpq_run", "zpq_response_ptr", "zpq_response_len", "zpq_pool_threads", "wasi_thread_start" }
+    else
+        &.{ "zpq_alloc", "zpq_free", "zpq_run", "zpq_response_ptr", "zpq_response_len" };
+    root.strip = true;
+    exe.root_module.strip = true;
+    exe.export_memory = true;
+    if (threaded) {
+        exe.import_memory = true;
+        exe.shared_memory = true;
+        exe.initial_memory = 32 << 20;
+        exe.max_memory = 1 << 30;
+    }
+    exe.stack_size = 8 << 20;
+    const step = b.step("zpq-wasm", "Build the WASI browser reactor");
+    step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+}
+
+fn wasmSnappy(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
+    const root = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true, .single_threaded = !target.result.cpu.has(.wasm, .atomics) });
+    root.addCMacro("_WASI_EMULATED_MMAN", "1");
+    root.linkSystemLibrary("wasi-emulated-mman", .{});
+    root.addIncludePath(b.path("vendor/snappy"));
+    root.addCSourceFiles(.{ .root = b.path("vendor/snappy"), .files = &.{ "snappy.cc", "snappy-c.cc", "snappy-sinksource.cc", "snappy-stubs-internal.cc" }, .flags = &.{ "-std=c++17", "-DHAVE_CONFIG_H", "-fno-exceptions", "-fno-rtti" } });
+    const lib = b.addLibrary(.{ .name = "snappy", .root_module = root });
+    const mod = b.createModule(.{ .root_source_file = b.path("vendor/snappy/root.zig"), .target = target, .optimize = optimize });
+    const tc = b.addTranslateC(.{ .root_source_file = b.path("vendor/snappy/snappy-c.h"), .target = target, .optimize = optimize });
+    mod.addImport("snappy_c", tc.createModule());
+    mod.linkLibrary(lib);
+    return mod;
 }

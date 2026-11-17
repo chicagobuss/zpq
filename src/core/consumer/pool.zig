@@ -10,11 +10,11 @@ const AllocatorOwner = struct { ctx: usize, vt: usize };
 fn allocatorOwner(alloc: std.mem.Allocator) AllocatorOwner {
     const vt = @intFromPtr(alloc.vtable);
     if (alloc.vtable == std.heap.page_allocator.vtable) return .{ .ctx = 0, .vt = vt };
-    if (alloc.vtable == std.heap.smp_allocator.vtable) return .{ .ctx = 0, .vt = vt };
+    if (comptime !builtin.single_threaded and !builtin.cpu.arch.isWasm()) if (alloc.vtable == std.heap.smp_allocator.vtable) return .{ .ctx = 0, .vt = vt };
     if (comptime builtin.link_libc) {
         if (alloc.vtable == std.heap.c_allocator.vtable) return .{ .ctx = 0, .vt = vt };
     }
-    if (comptime builtin.target.cpu.arch.isWasm()) {
+    if (comptime builtin.target.cpu.arch.isWasm() and builtin.single_threaded) {
         if (alloc.vtable == std.heap.wasm_allocator.vtable) return .{ .ctx = 0, .vt = vt };
     }
     return .{ .ctx = @intFromPtr(alloc.ptr), .vt = vt };

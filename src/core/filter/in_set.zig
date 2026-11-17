@@ -66,7 +66,7 @@ fn windowTable(comptime K: type, arena: std.mem.Allocator, keys: []const K, empt
     const limit = std.math.log2_int_ceil(usize, @max(keys.len * max_growth, 16));
     var bits: u6 = @intCast(start);
     outer: while (bits <= limit) : (bits += 1) {
-        const slots = try arena.alloc(K, (@as(usize, 1) << bits) + window);
+        const slots = try arena.alloc(K, (@as(usize, 1) << @intCast(bits)) + window);
         @memset(slots, empty);
         for (keys) |k| {
             const h = home(@as(u64, k), bits);
@@ -166,11 +166,11 @@ pub fn NumSet(comptime T: type) type {
                 const wide: i129 = @as(i129, distinct[distinct.len - 1]) - min + 1;
                 if (wide <= bitmap_max_bits) {
                     const span: u64 = @intCast(wide);
-                    const bits = try arena.alloc(u64, (span + 63) / 64);
+                    const bits = try arena.alloc(u64, @intCast((span + 63) / 64));
                     @memset(bits, 0);
                     for (distinct) |v| {
                         const off: u64 = @as(Bits, @bitCast(v -% min));
-                        bits[off / 64] |= @as(u64, 1) << @intCast(off % 64);
+                        bits[@intCast(off / 64)] |= @as(u64, 1) << @intCast(off % 64);
                     }
                     return .{ .how = .{ .bitmap = .{ .min = min, .max = distinct[distinct.len - 1], .bits = bits } } };
                 }
@@ -202,7 +202,7 @@ pub fn NumSet(comptime T: type) type {
                     // the other end of T. Out of range reads word 0, so the load needs no branch either.
                     const in_range = @intFromBool(v >= b.min) & @intFromBool(v <= b.max) == 1;
                     const off: u64 = if (in_range) @as(Bits, @bitCast(v -% b.min)) else 0;
-                    return in_range and (b.bits[off / 64] >> @intCast(off % 64)) & 1 == 1;
+                    return in_range and (b.bits[@intCast(off / 64)] >> @intCast(off % 64)) & 1 == 1;
                 },
                 .hash => |h| {
                     const key: Bits = @bitCast(if (is_int) v else v + 0.0);

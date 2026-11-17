@@ -66,7 +66,7 @@ pub const Record = extern struct {
 };
 pub const Group = struct { record: Record, count: u32 };
 comptime {
-    std.debug.assert(@sizeOf(Record) == 28);
+    std.debug.assert(@sizeOf(Record) == 20 + @sizeOf(usize));
 }
 fn worse(_: void, a: Group, b: Group) std.math.Order {
     const order = std.math.order(a.count, b.count);
@@ -322,7 +322,7 @@ pub const Local = struct {
                 const shift: u6 = @intCast(64 - common - bits);
                 bucket_n = @as(usize, 1) << @intCast(bits);
                 const mask: u64 = bucket_n - 1;
-                for (0..v.len()) |i| counts[(digitWord(v.at(i).*, phase) >> shift) & mask] += 1;
+                for (0..v.len()) |i| counts[@intCast((digitWord(v.at(i).*, phase) >> shift) & mask)] += 1;
                 var at: usize = 0;
                 for (counts[0..bucket_n], starts[0..bucket_n]) |n, *p| {
                     p.* = at;
@@ -332,7 +332,7 @@ pub const Local = struct {
                 if (V == Cache) {
                     for (0..v.len()) |i| {
                         const r = v.at(i).*;
-                        const b = (digitWord(r, phase) >> shift) & mask;
+                        const b: usize = @intCast((digitWord(r, phase) >> shift) & mask);
                         tmp[next[b]] = r;
                         next[b] += 1;
                     }
@@ -344,7 +344,7 @@ pub const Local = struct {
                         const end = starts[b] + counts[b];
                         while (next[b] < end) {
                             const r = v.at(next[b]);
-                            const d = (digitWord(r.*, phase) >> shift) & mask;
+                            const d: usize = @intCast((digitWord(r.*, phase) >> shift) & mask);
                             if (d == b) {
                                 next[b] += 1;
                                 continue;

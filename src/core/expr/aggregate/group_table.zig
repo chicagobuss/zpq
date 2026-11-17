@@ -95,7 +95,7 @@ pub const GroupTable = struct {
     /// Discovery retains only a worker's first H exact keys. The shared ordinal bounds discovery, never counts.
     discovery: ?Discovery = null,
 
-    pub const Discovery = struct { limit: usize, threshold: *std.atomic.Value(u64) };
+    pub const Discovery = struct { limit: usize, threshold: *@import("../../wasm_atomic.zig").Value(u64) };
 
     pub fn discoveryDone(self: *const GroupTable, pos: u64) bool {
         return if (self.discovery) |d| pos >= d.threshold.load(.monotonic) else false;

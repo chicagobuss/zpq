@@ -154,6 +154,7 @@ pub fn hashMergeGroupRefs(
 /// Whether a full merge may leave each group's state in the source table that first holds it (`mergeInPlace`): no
 /// cut, which keeps and reorders merged state, and no count(DISTINCT), whose sets a read-only copy cannot merge.
 pub fn mergesInPlace(calls: []const expr_agg.AggCall, cut: ?ResultCut) bool {
+    if (@sizeOf(usize) < 8) return false;
     if (cut != null) return false;
     for (calls) |call| if (call.func == .count_distinct) return false;
     return true;
@@ -163,6 +164,10 @@ pub fn mergesInPlace(calls: []const expr_agg.AggCall, cut: ?ResultCut) bool {
 /// it now is: a fresh count(DISTINCT) state takes a count as it is, so the merge's every value is the same.
 /// A merged-in-place slot's `idx`: its source table above its group.
 fn packRef(ref: MergeGroupRef) usize {
+    if (@sizeOf(usize) < 8) {
+        std.debug.assert(ref.table == 0);
+        return ref.group;
+    }
     return (@as(usize, ref.table) << 32) | ref.group;
 }
 
@@ -173,7 +178,7 @@ fn inPlaceAccs(
     scratch: *[16]expr_agg.Accumulator,
 ) []expr_agg.Accumulator {
     const g: usize = @as(u32, @truncate(idx));
-    return tables[idx >> 32].readGroup(g, n_calls, scratch);
+    return tables[@intCast(@as(u64, idx) >> 32)].readGroup(g, n_calls, scratch);
 }
 
 /// `hashMergeGroupRefs` with no copy of a group's state: a key's first ref keeps it, and each later ref of the key is
@@ -212,7 +217,7 @@ pub fn mergeInPlace(
             d.* = try foldedAcc(gpa, call, d.*);
             try mergeOwnedAccumulator(d, s, gpa);
         }
-        tables[slot.idx >> 32].writeGroup(@as(u32, @truncate(slot.idx)), dst);
+        tables[@intCast(@as(u64, slot.idx) >> 32)].writeGroup(@as(u32, @truncate(slot.idx)), dst);
     }
 }
 
@@ -611,14 +616,14 @@ pub fn mergeFoldedRefs(
                 switch (t.phase) {
                     .count => for (t.refs[lo..hi], t.hashes[lo..hi]) |ref, *h| {
                         h.* = std.hash.Wyhash.hash(0, t.tables[ref.table].keyAt(ref.group));
-                        mine[(h.* >> 32) & t.mask] += 1;
+                        mine[@intCast((h.* >> 32) & t.mask)] += 1;
                     },
                     // `mine` now holds where this chunk writes next in each partition.
                     .scatter => for (t.refs[lo..hi], t.hashes[lo..hi]) |ref, h| {
-                        const at = mine[(h >> 32) & t.mask];
+                        const at = mine[@intCast((h >> 32) & t.mask)];
                         t.ordered[at] = ref;
                         t.ordered_hash[at] = h;
-                        mine[(h >> 32) & t.mask] = at + 1;
+                        mine[@intCast((h >> 32) & t.mask)] = at + 1;
                     },
                 }
             }

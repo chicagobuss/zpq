@@ -183,7 +183,7 @@ pub const PartAgg = struct {
     ) !PartAgg {
         const gpa = core_memory.groupAllocator(input_gpa);
         const bits: u6 = if (shared) shared_part_bits else partBits(budget.limit);
-        const parts = try gpa.alloc(Part, @as(usize, 1) << bits);
+        const parts = try gpa.alloc(Part, @as(usize, 1) << @intCast(bits));
         errdefer gpa.free(parts);
         for (parts) |*p| {
             p.* = .{ .table = expr_agg.GroupTable.init(gpa, 0) };
@@ -245,7 +245,7 @@ pub const PartAgg = struct {
             @sizeOf(expr_agg.Accumulator) * self.calls.len;
         const run_bytes = rows *| ((key_bytes +| payload +| 12) *| 2);
         const bits = partBits(self.budget.limit);
-        const metadata = (@as(usize, 1) << bits) * @sizeOf(Part) + self.runs.len * @sizeOf(Runs);
+        const metadata = (@as(usize, 1) << @intCast(bits)) * @sizeOf(Part) + self.runs.len * @sizeOf(Runs);
         // The initial reservation takes at most half the ceiling; the ledger must grant it beside
         // the query's existing holders. Unused credit returns before the final partitions are folded.
         const total = run_bytes +| metadata;
@@ -271,7 +271,7 @@ pub const PartAgg = struct {
     pub fn admitPrivate(self: *PartAgg, rows: u64, key_bytes: u64) !bool {
         if (!self.private_reserved and !self.reservePrivate(rows, key_bytes)) return false;
         const bits = partBits(self.budget.limit);
-        const parts = try self.gpa.alloc(Part, @as(usize, 1) << bits);
+        const parts = try self.gpa.alloc(Part, @as(usize, 1) << @intCast(bits));
         for (self.parts) |*p| {
             std.debug.assert(p.table.groupCount() == 0);
             p.table.deinit();

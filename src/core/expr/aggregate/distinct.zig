@@ -972,7 +972,7 @@ pub const DistinctAcc = struct {
 
     pub fn heap(self: DistinctAcc) ?*DistinctSet {
         if ((self.raw[0] & 7) != heap_mark) return null;
-        return @ptrFromInt(self.raw[0] & ~@as(u64, 7));
+        return @ptrFromInt(@as(usize, @intCast(self.raw[0] & ~@as(u64, 7))));
     }
 
     /// Budget stashed while the values are inline; a spilled set keeps it on the set. Null when the pointer is a
@@ -982,12 +982,12 @@ pub const DistinctAcc = struct {
         if ((self.raw[0] & ceiling_flag) != 0) return null;
         const p = self.raw[0] & ~@as(u64, 7);
         if (p == 0) return null;
-        return @ptrFromInt(p);
+        return @ptrFromInt(@as(usize, @intCast(p)));
     }
 
     fn ceilingPtr(self: DistinctAcc) ?*Ceiling {
         if ((self.raw[0] & 7) == heap_mark or (self.raw[0] & ceiling_flag) == 0) return null;
-        return @ptrFromInt(self.raw[0] & ~@as(u64, 15));
+        return @ptrFromInt(@as(usize, @intCast(self.raw[0] & ~@as(u64, 15))));
     }
 
     /// A 16-aligned budget pointer has bit 3 clear, so this also drops a private-ceiling pointer.

@@ -40,7 +40,7 @@ pub const State = struct {
     credit: usize,
 
     pub fn setupBytes(workers: usize, limit: usize) usize {
-        const parts: usize = @as(usize, 1) << partagg.partBits(limit);
+        const parts: usize = @as(usize, 1) << @intCast(partagg.partBits(limit));
         return parts * @sizeOf(partagg.Part) + workers * (@sizeOf(Sink) + batchRows() * 16 +
             (parts * 2 + 1) * @sizeOf(u32));
     }
@@ -56,7 +56,7 @@ pub const State = struct {
         const credit = ledger.drawExact(setupBytes(workers, ledger.limit)) orelse return null;
         errdefer ledger.release(credit);
         const bits = partagg.partBits(ledger.limit);
-        const parts = try gpa.alloc(partagg.Part, @as(usize, 1) << bits);
+        const parts = try gpa.alloc(partagg.Part, @as(usize, 1) << @intCast(bits));
         errdefer gpa.free(parts);
         for (parts) |*p| {
             p.* = .{ .table = .init(gpa, 0) };

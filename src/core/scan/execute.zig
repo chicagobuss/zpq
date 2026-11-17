@@ -2927,7 +2927,7 @@ fn referenceDispatch(in: PlanInputs) AggregateDispatch {
     const blocks = @max(1, @min(in.work.len, group_blocks_max));
     const tables: usize = if (in.keys == null) 0 else if (!use_blocks) in.workers else blocks;
     const sketch_fits = if (args.sketch_topk) |cfg|
-        (in.workers *| (@as(usize, 4) << cfg.cell_bits)) *| 8 <= args.max_memory
+        (in.workers *| (@as(usize, 4) << @intCast(cfg.cell_bits))) *| 8 <= args.max_memory
     else
         false;
     const keys_unique = args.sketch_topk != null and keysLookUnique(in.metas, in.work, in.keys orelse &.{});

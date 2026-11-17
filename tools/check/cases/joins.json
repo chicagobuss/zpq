@@ -202,7 +202,9 @@
   {"name": "over_dim", "copy": "COPY (SELECT (CASE WHEN k % 2 = 0 THEN 1 ELSE -1 END) * 4611686018427387904 + k AS wa, (k * 1099511627776)::BIGINT AS ob, k AS og FROM range(0, 64) t(k)) TO '{path}' (FORMAT PARQUET)"},
   {"name": "day_dim", "copy": "COPY (SELECT k AS dk, DATE '2024-01-01' + (k * 3 % 500)::INTEGER AS d_date, (2000 + k % 3)::INTEGER AS d_year FROM range(0, 1000) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 256)"},
   {"name": "alias_probe", "copy": "COPY (SELECT i AS id, (i * 7 % 60)::BIGINT AS fk, (i % 7)::BIGINT AS dup, CASE WHEN i % 11 = 0 THEN NULL ELSE (i * 3 % 7)::BIGINT END AS q FROM range(1, 5000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 1000)"},
-  {"name": "alias_build", "copy": "COPY (SELECT k AS pk, (k % 4)::BIGINT AS grp, 'n' || k AS name FROM range(0, 50) t(k)) TO '{path}' (FORMAT PARQUET)"}
+  {"name": "alias_build", "copy": "COPY (SELECT k AS pk, (k % 4)::BIGINT AS grp, 'n' || k AS name FROM range(0, 50) t(k)) TO '{path}' (FORMAT PARQUET)"},
+  {"name": "range_dim", "copy": "COPY (SELECT k AS g, (CASE WHEN k % 2 = 0 THEN 1 ELSE -1 END) * 4611686018427387904 + k AS a, (k * 1099511627776)::BIGINT AS b, (k % 4 * 1099511627776)::BIGINT AS b4, 'n' || k AS name FROM range(0, 64) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 16)"},
+  {"name": "range_fact", "copy": "COPY (SELECT i AS id, (CASE WHEN (i % 80) % 2 = 0 THEN 1 ELSE -1 END) * 4611686018427387904 + (i % 80) AS a, ((i % 80) * 1099511627776 + (CASE WHEN i % 5 = 0 THEN 1 ELSE 0 END))::BIGINT AS b, ((i % 80) % 4 * 1099511627776)::BIGINT AS b4, (CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END)::BIGINT AS v FROM range(0, 20000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 3000)"}
  ],
  "cases": [
   {
@@ -12990,12 +12992,246 @@
    }
   },
   {
-   "id": "join:composite:refuse:range",
+   "id": "join:composite:range:wp2-case-answers",
    "fixture": "wide_fact",
    "cli": [
     "query",
     "--query",
     "SELECT count(*) AS n FROM '{fixture:wide_fact}' f JOIN '{fixture:over_dim}' d ON f.fa = d.wa AND f.wid = d.ob"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:wide_fact}' f JOIN '{fixture:over_dim}' d ON f.fa = d.wa AND f.wid = d.ob"
+   }
+  },
+  {
+   "id": "join:composite:range:first-key-and-a-condition",
+   "fixture": "range_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(f.v) AS s, sum(d.g) AS g FROM '{fixture:range_fact}' f JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(f.v) AS s, sum(d.g) AS g FROM '{fixture:range_fact}' f JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b"
+   }
+  },
+  {
+   "id": "join:composite:range:where-form-other-order",
+   "fixture": "range_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.name, count(*) AS n FROM '{fixture:range_fact}' f, '{fixture:range_dim}' d WHERE f.b = d.b AND f.a = d.a AND f.v > 2 GROUP BY d.name ORDER BY n DESC, d.name LIMIT 6"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.name, count(*) AS n FROM '{fixture:range_fact}' f, '{fixture:range_dim}' d WHERE f.b = d.b AND f.a = d.a AND f.v > 2 GROUP BY d.name ORDER BY n DESC, d.name LIMIT 6"
+   }
+  },
+  {
+   "id": "join:composite:range:group-by-the-key-columns",
+   "fixture": "range_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.a, d.b, count(*) AS n FROM '{fixture:range_fact}' f JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b GROUP BY d.a, d.b ORDER BY n DESC, d.a LIMIT 5"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.a, d.b, count(*) AS n FROM '{fixture:range_fact}' f JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b GROUP BY d.a, d.b ORDER BY n DESC, d.a LIMIT 5"
+   }
+  },
+  {
+   "id": "join:composite:range:rows",
+   "fixture": "range_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.id, d.name, d.g FROM '{fixture:range_fact}' f JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b WHERE f.id < 40 ORDER BY f.id"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.id, d.name, d.g FROM '{fixture:range_fact}' f JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b WHERE f.id < 40 ORDER BY f.id"
+   }
+  },
+  {
+   "id": "join:composite:range:beside-another-dimension",
+   "fixture": "range_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.g, x.kind, count(*) AS n FROM '{fixture:range_fact}' f JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b JOIN '{fixture:dim}' x ON f.v = x.pk GROUP BY d.g, x.kind ORDER BY n DESC, d.g, x.kind LIMIT 6"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.g, x.kind, count(*) AS n FROM '{fixture:range_fact}' f JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b JOIN '{fixture:dim}' x ON f.v = x.pk GROUP BY d.g, x.kind ORDER BY n DESC, d.g, x.kind LIMIT 6"
+   }
+  },
+  {
+   "id": "join:composite:range:as-a-second-dimension",
+   "fixture": "range_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT x.kind, count(*) AS n, sum(d.g) AS g FROM '{fixture:range_fact}' f JOIN '{fixture:dim}' x ON f.v = x.pk JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b GROUP BY x.kind ORDER BY x.kind"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT x.kind, count(*) AS n, sum(d.g) AS g FROM '{fixture:range_fact}' f JOIN '{fixture:dim}' x ON f.v = x.pk JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b GROUP BY x.kind ORDER BY x.kind"
+   }
+  },
+  {
+   "id": "join:composite:range:with-a-build-filter-and-residual",
+   "fixture": "range_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:range_fact}' f JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b WHERE d.g > 10 AND f.v < d.g"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:range_fact}' f JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b WHERE d.g > 10 AND f.v < d.g"
+   }
+  },
+  {
+   "id": "join:composite:range:refuse-first-key-repeats",
+   "fixture": "range_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:range_fact}' f JOIN '{fixture:range_dim}' d ON f.b4 = d.b4 AND f.a = d.a"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "span more values together than fit 63 bits"
+   }
+  },
+  {
+   "id": "join:composite:range:refuse-left",
+   "fixture": "range_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, count(d.g) AS m FROM '{fixture:range_fact}' f LEFT JOIN '{fixture:range_dim}' d ON f.a = d.a AND f.b = d.b"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "span more values together than fit 63 bits"
+   }
+  },
+  {
+   "id": "join:composite:range:refuse-exists",
+   "fixture": "range_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:range_fact}' f WHERE NOT EXISTS (SELECT 1 FROM '{fixture:range_dim}' d WHERE d.a = f.a AND d.b = f.b)"
    ],
    "axes": [
     {

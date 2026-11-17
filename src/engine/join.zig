@@ -124,6 +124,13 @@ pub const Leaf = struct {
     join: *lookup.Join,
     semis: []const Leaf = &.{},
     dims: []const Leaf = &.{},
+    /// The key equalities a build that joins by its first key alone could not pack into the key (`build`): each holds
+    /// as a condition after the lookup instead.
+    demoted: []Demoted = &.{},
+
+    /// The probe's `fk` equals the build column published as payload `payload`, under `name` once the probe's footer
+    /// is at hand (`Prepared.nameDemoted`).
+    pub const Demoted = struct { fk: []const u8, payload: usize, name: []const u8 = "" };
 };
 
 /// The builds' memory: an arena for their many small pieces, and an exact allocation of its own for each large array (a
@@ -236,8 +243,42 @@ pub const Prepared = struct {
 
     /// Each publishing build's columns as virtual leaves, the main build's first, in the same order in every footer.
     pub fn extend(self: *Prepared, arena: std.mem.Allocator, meta: *schema.FileMetaData) !void {
+        try self.nameDemoted(arena, meta);
         try lookup.extend(self.main.join, arena, meta);
         for (self.dims) |d| try lookup.extend(d.join, arena, meta);
+    }
+
+    /// A demoted key column is a build column the query never named, so it is published under a name of its own: the
+    /// column's, with underscores until no column of the probe and no other build column has it. Chosen once, against
+    /// the first footer; every probe file has the same columns.
+    fn nameDemoted(self: *Prepared, arena: std.mem.Allocator, meta: *const schema.FileMetaData) !void {
+        const all = try self.publishing(arena);
+        const leaves = try arena.alloc(Leaf, 1 + self.dims.len);
+        leaves[0] = self.main;
+        @memcpy(leaves[1..], self.dims);
+        for (leaves) |l| {
+            if (l.demoted.len == 0 or l.demoted[0].name.len != 0) continue;
+            const names = try arena.alloc([]const u8, l.join.payloads.len);
+            for (l.join.payloads, names) |p, *n| n.* = p.name;
+            for (l.demoted) |*d| {
+                var name: std.ArrayList(u8) = .empty;
+                try name.appendSlice(arena, names[d.payload]);
+                while (true) : (try name.append(arena, '_')) {
+                    if (metadata.resolveColumn(meta, name.items)) |_| continue else |err| if (err != error.UnknownColumn) continue;
+                    const taken = for (all) |j| {
+                        const theirs = for (j.payloads, 0..) |p, i| {
+                            if (j == l.join and i == d.payload) continue;
+                            if (std.ascii.eqlIgnoreCase(if (j == l.join) names[i] else p.name, name.items)) break true;
+                        } else false;
+                        if (theirs) break true;
+                    } else false;
+                    if (!taken) break;
+                }
+                d.name = name.items;
+                names[d.payload] = name.items;
+            }
+            l.join.publishAs(names);
+        }
     }
 
     /// The column a float key goes by in its refusal: the key itself, or the first FLOAT or DOUBLE column its
@@ -273,7 +314,10 @@ pub const Prepared = struct {
             return error.JoinRowsFloat;
         };
         // Conditions on build columns come out of the probe's filter: they narrow after the lookups (`Residual`).
-        const residual = try self.splitResidual(arena, &a.filter);
+        var residual = try self.splitResidual(arena, &a.filter);
+        // So does each key equality a build could not pack into its key (`Leaf.demoted`).
+        for (self.dims, 0..) |_, i| try demotedConditions(arena, meta, self.dims[i], &residual, diag);
+        try demotedConditions(arena, meta, self.main, &residual, diag);
         for (self.semis) |s| a.filter = try withLookup(arena, a.filter, try leafOf(arena, meta, s, diag));
         for (self.dims) |d| a.filter = try withLookup(arena, a.filter, try leafOf(arena, meta, d, diag));
         var main_leaf = try leafOf(arena, meta, self.main, diag);
@@ -469,6 +513,17 @@ pub const Prepared = struct {
     }
 };
 
+/// `l`'s demoted key equalities as conditions, `fk = <the build column>`, bound against the probe's footer with the
+/// build columns in it.
+fn demotedConditions(arena: std.mem.Allocator, meta: *const schema.FileMetaData, l: Leaf, out: *std.ArrayList(filter_ast.Filter), diag: ?*Diag) !void {
+    for (l.demoted) |d| {
+        const sides = try arena.alloc(syntax.Expr, 2);
+        sides[0] = .{ .column = d.fk };
+        sides[1] = .{ .column = d.name };
+        try out.append(arena, try filters.bindSyntax(arena, .{ .expr_compare = .{ .left = &sides[0], .op = .Eq, .right = &sides[1] } }, meta, diag));
+    }
+}
+
 fn leafOf(arena: std.mem.Allocator, meta: *const schema.FileMetaData, l: Leaf, diag: ?*Diag) !filter_ast.Filter {
     const j = l.join;
     const leaves = try arena.alloc(usize, 1 + l.fk_more.len);
@@ -618,6 +673,10 @@ const Edge = struct {
     key_more: []const []const u8 = &.{},
     /// An ANTI join that is a NOT EXISTS, not a NOT IN.
     not_exists: bool = false,
+    /// The build may join by its first key alone when its composite key cannot be packed, the other key equalities
+    /// then conditions after the lookup (`Leaf.demoted`): a top-level INNER build, whose columns the probe reads and
+    /// whose misses drop the row either way.
+    demotes: bool = false,
 
     fn of(x: anytype) Edge {
         return .{
@@ -679,7 +738,7 @@ fn build(t: *Task, edge: Edge, build_syntax: syntax.Build, kind: lookup.Kind, al
     };
     const store = if (aligned != null) &t.aligned_store else &t.store;
     const before = store.capacity();
-    const j = lookup.build(store.allocator(), p.charge.allocator(), file.bytes, meta, .{
+    const spec: lookup.Spec = .{
         .kind = kind,
         .build_name = b.path,
         .key_name = b.key,
@@ -690,10 +749,24 @@ fn build(t: *Task, edge: Edge, build_syntax: syntax.Build, kind: lookup.Kind, al
         .filter = filter,
         .threads = t.threads,
         .budget = p.ledger.available(),
-    }) catch |err| {
-        Diag.setInput(diag, b.path, null);
-        Diag.setColumn(diag, b.key);
-        return if (p.charge.refusal(err) == error.ExceededMemoryBudget) error.JoinBuildExceedsBudget else err;
+    };
+    var demoted: []Leaf.Demoted = &.{};
+    const j = lookup.build(store.allocator(), p.charge.allocator(), file.bytes, meta, spec) catch |packed_err| blk: {
+        // A composite key whose columns span more values together than a key holds: when the first column alone is
+        // a key of the build (unique), the join is that key's, and the other equalities are conditions on the rows
+        // it finds. That is the plan a second equality had before keys were composite, with the same answer. A first
+        // column that repeats is no key: the refusal stands.
+        const alone = if (packed_err == error.JoinKeyRange and edge.demotes and aligned == null) one: {
+            var single = spec;
+            single.key_more = &.{};
+            single.payload = try std.mem.concat(arena, usize, &.{ payload, key_more });
+            break :one lookup.build(store.allocator(), p.charge.allocator(), file.bytes, meta, single) catch |err|
+                if (err == error.DuplicateBuildKey) null else return buildRefusal(p, diag, b, err);
+        } else null;
+        const first = alone orelse return buildRefusal(p, diag, b, packed_err);
+        demoted = try arena.alloc(Leaf.Demoted, key_more.len);
+        for (demoted, edge.fk_more, payload.len..) |*d, name, at| d.* = .{ .fk = name, .payload = at };
+        break :blk first;
     };
     j.publishAs(b.columns_as);
     // The binder publishes each FK column a snowflake's table reads.
@@ -718,7 +791,14 @@ fn build(t: *Task, edge: Edge, build_syntax: syntax.Build, kind: lookup.Kind, al
     };
     j.bytes = store.capacity() - before;
     t.charged += j.bytes;
-    return .{ .fk = fk, .fk_more = edge.fk_more, .join = j, .semis = semis, .dims = dims };
+    return .{ .fk = fk, .fk_more = if (demoted.len == 0) edge.fk_more else &.{}, .join = j, .semis = semis, .dims = dims, .demoted = demoted };
+}
+
+/// A build's refusal, with what it was about: the ledger's when the build did not fit.
+fn buildRefusal(p: *Prepared, diag: *Diag, b: syntax.Build, err: anyerror) anyerror {
+    Diag.setInput(diag, b.path, null);
+    Diag.setColumn(diag, b.key);
+    return if (p.charge.refusal(err) == error.ExceededMemoryBudget) error.JoinBuildExceedsBudget else err;
 }
 
 /// Read every build of `args`' join; null for a query without one.
@@ -756,6 +836,7 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
     // A copy of an arena or a store that has allocated nothing is a fresh one.
     for (tasks) |*t| t.* = task;
     tasks[0].edge = .of(sj.*);
+    tasks[0].edge.demotes = sj.kind == .inner;
     tasks[0].build = sj.build;
     tasks[0].aligned = args.aligned_join;
     tasks[0].kind = switch (sj.kind) {
@@ -768,6 +849,7 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
     }
     for (sj.dims, tasks[1 + sj.semis.len ..]) |d, *t| {
         t.edge = .of(d);
+        t.edge.demotes = !d.left;
         t.build = d.build;
         t.kind = if (d.left) .left else .inner;
     }

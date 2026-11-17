@@ -2151,7 +2151,11 @@ fn prepareAggregateWithMetas(
                     .dec => .dec,
                 },
                 .dec = if (out.derived) |d| d.decSpec() else if (key_types[k_idx] == .dec) key_types[k_idx].dec else null,
-                .source = if (out.derived != null) null else if (keys[k_idx] == .col_ref)
+                // A fetched build column passes its own values through, as a bare key does: its DATE or TIMESTAMP
+                // is the answer's. The key that stands in for it until the fetch is another column.
+                .source = if (out.derived) |d|
+                    (if (d == .col_ref) leafSchemaElem(meta0, d.col_ref.col_idx) else null)
+                else if (keys[k_idx] == .col_ref)
                     leafSchemaElem(meta0, keys[k_idx].col_ref.col_idx)
                 else
                     owner_support.computedAnswer(keys[k_idx]),

@@ -69,6 +69,8 @@ pub const Join = struct {
     fk_more: []const []const u8 = &.{},
     key_more: []const []const u8 = &.{},
     build: Build,
+    /// An ANTI join a NOT EXISTS wrote (`Semi.not_exists`).
+    not_exists: bool = false,
     /// More SEMI joins of the probe itself: a third table the frontend reduced onto it.
     semis: []const Semi = &.{},
     /// A star's other dimensions: INNER, N:1, each publishing its own columns as the main build does.
@@ -105,7 +107,8 @@ pub const Build = struct {
 
 /// `unique`: an INNER edge the frontend reduced to a SEMI join because no column of its table is read. Its keys must
 /// be unique, as any INNER join's are: a duplicate would multiply rows the SEMI join keeps once. `anti`: the query's
-/// `NOT IN (SELECT ...)`, an ANTI join.
+/// `NOT IN (SELECT ...)`, an ANTI join. `not_exists`: an ANTI join a NOT EXISTS wrote, where a NULL on either side
+/// matches nothing: a NULL FK stays, and a NULL build key drops no row.
 pub const Semi = struct {
     fk: []const u8,
     fk_more: []const []const u8 = &.{},

@@ -1226,7 +1226,7 @@ pub fn parseSqlJoinPlanRoot(allocator: std.mem.Allocator, sql: []const u8, schem
     var pq = try parseFolded(true, allocator, peeled.rest, markers);
     const q = try allocator.create(syntax.Query);
     q.* = pq.syntax.?.*;
-    q.join = .{ .kind = first.kind, .fk = first.fk, .build = first.build, .semis = peeled.semis, .dims = first.dims };
+    q.join = .{ .kind = first.kind, .fk = first.fk, .build = first.build, .not_exists = first.not_exists, .semis = peeled.semis, .dims = first.dims };
     pq.syntax = q;
     return pq;
 }
@@ -1239,6 +1239,7 @@ const Resolved = struct {
     probe_sql: []const u8,
     /// Its INs are reductions' (`sql_join.Plan.reduced`): their builds' keys must be unique.
     reduced: bool,
+    not_exists: bool,
 };
 
 const Owners = struct {
@@ -1279,6 +1280,7 @@ fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u
         .dims = dims,
         .probe_sql = p.probe_sql,
         .reduced = unique,
+        .not_exists = p.not_exists,
     };
 }
 
@@ -1315,7 +1317,7 @@ fn peelSemis(a: std.mem.Allocator, sql: []const u8, schemas: Schemas, markers: l
         const inner = (try sql_join.tables(a, z)) orelse break;
         const r = try resolveJoin(a, z, inner, schemas, markers, unique, null);
         const anti = r.kind == .anti;
-        try semis.append(a, .{ .fk = r.fk, .build = r.build, .unique = unique and !anti, .anti = anti });
+        try semis.append(a, .{ .fk = r.fk, .build = r.build, .unique = unique and !anti, .anti = anti, .not_exists = r.not_exists });
         rest = r.probe_sql;
     }
     return .{ .semis = semis.items, .rest = rest };

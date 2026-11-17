@@ -333,6 +333,8 @@ pub const Join = struct {
     group: ?*GroupJoin = null,
     /// A build row the build's filter kept had a NULL key (`Part.null_key`): an ANTI join then keeps no row.
     null_key: bool = false,
+    /// An ANTI join a NOT EXISTS wrote: a NULL matches nothing, so a NULL FK stays and a NULL build key drops no row.
+    not_exists: bool = false,
 
     pub fn slot(j: *const Join, k: i64) ?u32 {
         return switch (j.keys) {
@@ -517,7 +519,8 @@ pub fn moreColumns(a: std.mem.Allocator, cols: []const Column, lookup: []const ?
 /// Keep the selected rows whose foreign key has a build match (INNER and SEMI alike: the build is N:1). With
 /// `capture` (one entry per row of `sel`), the selected rows' slots stay there for the columns published later.
 /// Keep the selected rows the join keeps (`Kind`): INNER and SEMI those whose FK has a build match; ANTI those whose
-/// FK is not NULL and has none, and no row when a build key was NULL (SQL's `NOT IN`); LEFT every row. With `capture`
+/// FK is not NULL and has none, and no row when a build key was NULL (SQL's `NOT IN`; a NOT EXISTS keeps every row
+/// without a match, `not_exists`); LEFT every row. With `capture`
 /// (one entry per row of `sel`), the selected rows' slots stay there for the columns published later.
 pub fn narrow(j: *const Join, fk: Column, more: []const Column, sel: *Selection, a: std.mem.Allocator, capture: ?[]u32) filter_eval.Error!void {
     if (j.ownKey() and j.keys == .dense and (j.kind == .inner or j.kind == .semi)) switch (fk) {
@@ -527,7 +530,7 @@ pub fn narrow(j: *const Join, fk: Column, more: []const Column, sel: *Selection,
         },
         else => {},
     };
-    if (j.kind == .anti) {
+    if (j.kind == .anti and !j.not_exists) {
         // `x NOT IN (...)` is UNKNOWN against a NULL in the list, and TRUE for every x, NULL too, against no row.
         if (j.null_key) @memset(sel.mask, 0);
         if (j.null_key or j.n == 0) return;
@@ -543,7 +546,7 @@ pub fn narrow(j: *const Join, fk: Column, more: []const Column, sel: *Selection,
             const r = wi * 64 + @ctz(bits);
             const drop = switch (j.kind) {
                 .inner, .semi => at[r] == EMPTY,
-                .anti => at[r] != EMPTY or if (info.def_levels) |dl| dl[r] < info.max_def else false,
+                .anti => at[r] != EMPTY or (!j.not_exists and if (info.def_levels) |dl| dl[r] < info.max_def else false),
                 .left => unreachable,
             };
             if (drop) w.* &= ~(@as(u64, 1) << @intCast(r & 63));

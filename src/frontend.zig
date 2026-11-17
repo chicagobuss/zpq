@@ -340,6 +340,12 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             "zpq query: an IN (SELECT ...) that reads the outer query (a correlated subquery) is not supported in this release\n",
             .{},
         ),
+        error.ExistsSubquery => diagnosticPrint(
+            "zpq query: [NOT] EXISTS takes (SELECT ... FROM one table WHERE its_column = outer_alias.column AND\n" ++
+                "  conditions on its own table): one key equality with the outer query, the outer column qualified, and no\n" ++
+                "  aggregate, GROUP BY, HAVING or LIMIT\n",
+            .{},
+        ),
         error.JoinKeyType => diagnosticPrint(
             "zpq query: the join's key {s} is not an integer, DATE, TIME or TIMESTAMP column stored as INT32 or INT64,\n" ++
                 "  nor a string\n",

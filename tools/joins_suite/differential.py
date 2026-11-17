@@ -243,14 +243,24 @@ def queries(seed, p, T, count, shapes):
             else:
                 sql = f'SELECT d.grp, f.dup, count(*) AS n FROM {frm}{wh()} GROUP BY d.grp, f.dup ORDER BY n, d.grp, f.dup LIMIT {L} OFFSET {O}'
         else:  # exists
-            form = r.choice(['exists', 'not-exists', 'not-in', 'in', 'exists-cond', 'not-exists-str'])
+            form = r.choice(['exists', 'not-exists', 'not-in', 'in', 'exists-cond', 'not-exists-str', 'both', 'bare', 'in-join'])
+            sql = f'SELECT count(*) AS n, sum(f.v) AS sv FROM {F} f'
             if form == 'exists': w.append(f'EXISTS (SELECT 1 FROM {D} d WHERE d.nk = f.fk2)')
+            elif form == 'both':   # two of them on one table, beside the NOT IN whose NULLs differ
+                w.append(f'EXISTS (SELECT 1 FROM {DU} u WHERE u.dpk = f.fk)')
+                w.append(f"NOT EXISTS (SELECT 1 FROM {D} d WHERE f.fk2 = d.nk AND d.grp <> {r.randint(0, 3)})")
+                if r.random() < 0.5: w.append(f'f.ek NOT IN (SELECT pk FROM {D} WHERE w > 3)')
+            elif form == 'bare':   # no alias on the subquery's table, SELECT *, the key either way round
+                w.append(f"{r.choice(['', 'NOT '])}EXISTS (SELECT * FROM {D} WHERE {r.choice(['nk = f.fk2', 'f.fk2 = nk'])} AND w < {r.randint(0, 30)})")
+            elif form == 'in-join':   # on the probe and on a build of a join
+                w.append(f"{r.choice(['', 'NOT '])}EXISTS (SELECT 1 FROM {DU} u WHERE u.dpk = {r.choice(['f.fk2', 'd.pk'])})")
+                sql = f'SELECT d.grp, count(*) AS n, sum(f.v) AS sv FROM {F} f JOIN {D} d ON f.fk = d.pk'
             elif form == 'not-exists': w.append(f'NOT EXISTS (SELECT 1 FROM {D} d WHERE d.nk = f.fk2)')
             elif form == 'not-in': w.append(f'f.fk2 NOT IN (SELECT nk FROM {D})')
             elif form == 'in': w.append(f'f.fk2 IN (SELECT nk FROM {D})')
             elif form == 'exists-cond': w.append(f"{r.choice(['', 'NOT '])}EXISTS (SELECT 1 FROM {D} d WHERE d.nk = f.fk2 AND d.grp = {r.randint(0, 3)})")
             else: w.append(f'NOT EXISTS (SELECT 1 FROM {DS} ds WHERE ds.spk = f.sk)')
-            sql = f'SELECT count(*) AS n, sum(f.v) AS sv FROM {F} f{wh()}'
+            sql += wh() + (' GROUP BY d.grp ORDER BY d.grp' if form == 'in-join' else '')
         out.append({'id': f's{seed}-{i}-{shape}', 'shape': shape, 'sql': sql,
                     'j': r.choice([1, 4, 16] if shape == 'globfk' else [1, 2, 8])})
     return out

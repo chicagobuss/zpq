@@ -630,6 +630,7 @@ fn build(t: *Task, edge: Edge, build_syntax: syntax.Build, kind: lookup.Kind, al
     const semis = try arena.alloc(Leaf, b.semis.len);
     for (b.semis, semis) |s, *inner| {
         inner.* = try build(t, .of(s), s.build, semiKind(s), null);
+        inner.join.not_exists = s.not_exists;
         filter = try withLookup(arena, filter, try leafOf(arena, meta, inner.*, diag));
     }
     // A snowflake's tables under this build: INNER lookups of its filter, whose columns it publishes (`lookup.chain`).
@@ -768,10 +769,14 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
         p.charged += t.aligned_store.capacity() + t.aligned_source_bytes;
     }
     p.main = tasks[0].leaf;
+    p.main.join.not_exists = sj.not_exists;
     p.main.join.main = true;
     p.main.join.publishes = true;
     const semis = try arena.alloc(Leaf, sj.semis.len);
-    for (semis, tasks[1..][0..sj.semis.len]) |*out, t| out.* = t.leaf;
+    for (semis, tasks[1..][0..sj.semis.len], sj.semis) |*out, t, s| {
+        out.* = t.leaf;
+        out.join.not_exists = s.not_exists;
+    }
     // A star's dimensions publish after the main build, each with its own slots.
     const dims = try arena.alloc(Leaf, sj.dims.len);
     for (dims, tasks[1 + sj.semis.len ..], 1..) |*out, t, slot| {

@@ -206,6 +206,8 @@ pub const Prepared = struct {
     /// The top-level builds, each with what it holds (`Task`): released together.
     tasks: []Task = &.{},
     order: expr_ast.ResultOrder,
+    /// Group-join partials are indexed within one file, so multiple probe files use the generic aggregate.
+    single_probe: bool,
     inner: plans.Source = undefined,
 
     /// The probe query's own binding, with the lookups ANDed into its filter. It binds against footers `extend`
@@ -237,7 +239,7 @@ pub const Prepared = struct {
         if (residual.items.len != 0) main_leaf.lookup.residual = try self.residualOf(arena, residual.items);
         a.filter = try withLookup(arena, a.filter, main_leaf);
         const j = self.main.join;
-        if (j.group == null and j.kind == .inner) {
+        if (self.single_probe and j.group == null and j.kind == .inner) {
             const admitted = groupJoin(self.charge.allocator(), j, a.*, meta) catch |err| {
                 Diag.setInput(diag, j.build_name, null);
                 Diag.setColumn(diag, j.key_name);
@@ -639,7 +641,7 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
     };
     const threads = if (args.parallelism == 0) std.Thread.getCpuCount() catch 1 else args.parallelism;
     const p = try arena.create(Prepared);
-    p.* = .{ .main = undefined, .semis = &.{}, .ledger = ledger, .gpa = gpa, .order = args.result_order };
+    p.* = .{ .main = undefined, .semis = &.{}, .ledger = ledger, .gpa = gpa, .order = args.result_order, .single_probe = args.inputs.len == 1 };
     p.charge = .{ .child = gpa, .budget = ledger };
     p.replica_limit = args.replicated_join_limit;
     p.replica_budget = .{ .limit = args.replicated_join_limit orelse ledger.limit, .parent = ledger };

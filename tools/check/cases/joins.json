@@ -1,5 +1,9 @@
 {
  "fixtures": [
+  {"name": "group_glob_a", "copy": "COPY (SELECT i % 10 AS fk, i AS v FROM range(0, 100) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 4096)"},
+  {"name": "group_glob_b", "copy": "COPY (SELECT i % 10 AS fk, i AS v FROM range(0, 9000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)"},
+  {"name": "group_glob", "glob": "group_glob_*.parquet"},
+  {"name": "group_dim", "copy": "COPY (SELECT i AS pk, i % 3 AS grp FROM range(0, 10) t(i)) TO '{path}' (FORMAT PARQUET)"},
   {"name": "reroot_both", "copy": "COPY (SELECT i % 100 AS k FROM range(0, 1000) t(i)) TO '{path}' (FORMAT PARQUET)"},
   {"name": "reroot_unique", "copy": "COPY (SELECT i AS k, i % 7 AS g FROM range(0, 1000) t(i)) TO '{path}' (FORMAT PARQUET)"},
   {"name": "reroot_repeated", "copy": "COPY (SELECT i % 100 AS fk, i AS v FROM range(0, 500) t(i)) TO '{path}' (FORMAT PARQUET)"},
@@ -130,6 +134,34 @@
   }
  ],
  "cases": [
+  {
+   "id": "join:glob-group:fk",
+   "fixture": "group_glob",
+   "cli": ["query", "--query", "SELECT f.fk, count(*) AS n FROM '{fixture:group_glob}' f JOIN '{fixture:group_dim}' d ON f.fk = d.pk GROUP BY f.fk ORDER BY f.fk LIMIT 2"],
+   "axes": [{"jobs": 1}, {"jobs": 4}, {"jobs": 16}],
+   "oracle": {"compare": "ordered", "sql": "SELECT f.fk, count(*) AS n FROM '{fixture:group_glob}' f JOIN '{fixture:group_dim}' d ON f.fk = d.pk GROUP BY f.fk ORDER BY f.fk LIMIT 2"}
+  },
+  {
+   "id": "join:glob-group:build-key",
+   "fixture": "group_glob",
+   "cli": ["query", "--query", "SELECT d.pk, count(*) AS n FROM '{fixture:group_glob}' f JOIN '{fixture:group_dim}' d ON f.fk = d.pk GROUP BY d.pk ORDER BY d.pk"],
+   "axes": [{"jobs": 1}, {"jobs": 4}, {"jobs": 16}],
+   "oracle": {"compare": "ordered", "sql": "SELECT d.pk, count(*) AS n FROM '{fixture:group_glob}' f JOIN '{fixture:group_dim}' d ON f.fk = d.pk GROUP BY d.pk ORDER BY d.pk"}
+  },
+  {
+   "id": "join:glob-group:fk-and-payload",
+   "fixture": "group_glob",
+   "cli": ["query", "--query", "SELECT f.fk, d.grp, count(*) AS n, sum(f.v) AS total FROM '{fixture:group_glob}' f JOIN '{fixture:group_dim}' d ON f.fk = d.pk GROUP BY f.fk, d.grp ORDER BY f.fk, d.grp"],
+   "axes": [{"jobs": 1}, {"jobs": 4}, {"jobs": 16}],
+   "oracle": {"compare": "ordered", "sql": "SELECT f.fk, d.grp, count(*) AS n, sum(f.v) AS total FROM '{fixture:group_glob}' f JOIN '{fixture:group_dim}' d ON f.fk = d.pk GROUP BY f.fk, d.grp ORDER BY f.fk, d.grp"}
+  },
+  {
+   "id": "join:glob-group:having-order-page",
+   "fixture": "group_glob",
+   "cli": ["query", "--query", "SELECT f.fk, d.grp, count(*) AS n, sum(f.v) AS total FROM '{fixture:group_glob}' f JOIN '{fixture:group_dim}' d ON f.fk = d.pk GROUP BY f.fk, d.grp HAVING count(*) > 5 ORDER BY total DESC, f.fk LIMIT 4 OFFSET 2"],
+   "axes": [{"jobs": 1}, {"jobs": 4}, {"jobs": 16}],
+   "oracle": {"compare": "ordered", "sql": "SELECT f.fk, d.grp, count(*) AS n, sum(f.v) AS total FROM '{fixture:group_glob}' f JOIN '{fixture:group_dim}' d ON f.fk = d.pk GROUP BY f.fk, d.grp HAVING count(*) > 5 ORDER BY total DESC, f.fk LIMIT 4 OFFSET 2"}
+  },
   {
    "id": "join:reroot:many-to-many",
    "fixture": "reroot_both",

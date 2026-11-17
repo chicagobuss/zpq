@@ -73,5 +73,6 @@ python3 tools/joins_suite/differential.py --zpq zig-out/bin/zpq --seeds 1-12 --q
 | self | a table joined to itself: parent lookups, LEFT misses, comparisons of same-named columns, two levels |
 | rows | row output with duplicate rows under ORDER BY, LIMIT and OFFSET, DISTINCT, LEFT, semi |
 | exists | [NOT] EXISTS with NULLs on both sides, beside the matching [NOT] IN |
+| globfk | multi-file probe grouped by its FK or the build key, including HAVING, ordering and pagination |
 
 Tables go under `--dir`, or `$ZPQ_TEST_PARQUET_DIR/joins-differential` when that isn't given. They are removed afterwards unless you pass `--keep`. The last line is the score, and above it is a table of classes by shape.

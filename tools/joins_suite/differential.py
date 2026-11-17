@@ -14,6 +14,7 @@ Shapes (pick with --shapes; default all):
   self         a table joined to itself: parent lookups, LEFT misses, same-named columns compared
   rows         row output with duplicate rows under ORDER BY, LIMIT and OFFSET, and DISTINCT
   exists       [NOT] EXISTS with NULLs on both sides, beside the matching [NOT] IN
+  globfk       multi-file probe grouped by the FK, with varied row groups and result ordering
 
 Usage:
   python3 tools/joins_suite/differential.py --zpq zig-out/bin/zpq [--duckdb PATH] [--seeds 1-12] [--queries 40]
@@ -31,7 +32,7 @@ import common  # noqa: E402
 STRS = ['', 'a', 'A', 'ab', 'abc', 'abd', 'a ', ' a', 'key', 'key0', 'key00', 'key000', 'key1', 'kéy', 'kéy0',
         'ключ', 'ключи', '日本', '日本語', 'ß', 'ss', 'é', 'é', 'emoji😀', 'emoji😀😀']  # é and é: NFC vs NFD
 SHAPES = ['inner', 'star', 'snow', 'left', 'semi', 'semidup', 'anti', 'derived', 'nullpay', 'strkey', 'composite',
-          'self', 'rows', 'exists']
+          'self', 'rows', 'exists', 'globfk']
 
 
 def lit(s):
@@ -73,11 +74,14 @@ COPY (SELECT i AS id,
   {nul(ppart, "DATE '2024-01-01' + (random() * 3)::INTEGER")} AS c3,
   {nul(0.1, f'({lo} + (random() * {nd})::BIGINT)')}::{kt} AS ek
  FROM range(0, {n}) t(i)) TO '{T}/f.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE {rg});
+COPY (SELECT * FROM read_parquet('{T}/f.parquet') WHERE id < {n // 4}) TO '{T}/glob_a.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 8192);
+COPY (SELECT * FROM read_parquet('{T}/f.parquet') WHERE id >= {n // 4}) TO '{T}/glob_b.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 2048);
 COPY (SELECT ({lo} + k)::{kt} AS pk, 'p' || k || repeat('ß', (k % 5)::INTEGER) AS name, (k % 4)::BIGINT AS grp,
   (k % 30)::INTEGER AS w, {nul(ppay, f'({lo} + ((k * 7) % {nd}))')}::{kt} AS nk,
   {nul(ppay, '(k % 13)::INTEGER')} AS pn, {nul(ppay, "'s' || (k % 6)")} AS ps,
   {nul(ppay, '((k % 50) * 1.25 - 20)::DECIMAL(9,2)')} AS pdec
  FROM range(0, {nd}) t(k) WHERE k % {hole} <> 1) TO '{T}/d.parquet' {pq};
+COPY (SELECT * FROM read_parquet('{T}/d.parquet') LIMIT 10) TO '{T}/gdim.parquet' {pq};
 COPY (SELECT ({lo} + (k % {max(nd // 2, 1)}))::{kt} AS dpk, (k % 3)::BIGINT AS dg FROM range(0, {nd * 2}) t(k)) TO '{T}/dup.parquet' {pq};
 COPY (SELECT ({lo} + k)::{kt} AS pk3, 'z' || (k * 31 % 997) AS nm3, (k % 5)::BIGINT AS g3, {nul(ppay, '(k % 9)::INTEGER')} AS pn3
  FROM range(0, {nd}) t(k) WHERE k % 5 <> 2) TO '{T}/s.parquet' {pq};
@@ -103,7 +107,14 @@ def queries(seed, p, T, count, shapes):
         shape = r.choice(shapes)
         w = [c for c in [r.choice(pf)] if c]
         wh = lambda: (' WHERE ' + ' AND '.join(w)) if w else ''
-        if shape in ('inner', 'star', 'snow', 'left', 'semi', 'semidup', 'anti'):
+        if shape == 'globfk':
+            keys = r.choice(['f.fk', 'd.pk', 'f.fk, d.grp'])
+            order = ', '.join(k + ' NULLS FIRST' for k in keys.split(', '))
+            having = r.choice(['', ' HAVING count(*) > 1'])
+            sql = (f"SELECT {keys}, count(*) AS n, sum(f.v) AS sv FROM '{T}/glob_*.parquet' f "
+                   f"JOIN '{T}/gdim.parquet' d ON f.fk = d.pk{wh()} GROUP BY {keys}{having} "
+                   f"ORDER BY n DESC, {order} LIMIT {lim()} OFFSET {r.randint(0, 3)}")
+        elif shape in ('inner', 'star', 'snow', 'left', 'semi', 'semidup', 'anti'):
             if shape == 'inner': frm = f'{F} f, {D} d'; w.append('f.fk = d.pk')
             elif shape == 'star': frm = f'{F} f, {D} d, {S} s'; w += ['f.fk = d.pk', 'f.fk2 = s.pk3']
             elif shape == 'snow': frm = f'{F} f, {D} d, {S} s'; w += ['f.fk = d.pk', 'd.nk = s.pk3']
@@ -236,7 +247,8 @@ def queries(seed, p, T, count, shapes):
             elif form == 'exists-cond': w.append(f"{r.choice(['', 'NOT '])}EXISTS (SELECT 1 FROM {D} d WHERE d.nk = f.fk2 AND d.grp = {r.randint(0, 3)})")
             else: w.append(f'NOT EXISTS (SELECT 1 FROM {DS} ds WHERE ds.spk = f.sk)')
             sql = f'SELECT count(*) AS n, sum(f.v) AS sv FROM {F} f{wh()}'
-        out.append({'id': f's{seed}-{i}-{shape}', 'shape': shape, 'sql': sql, 'j': r.choice([1, 2, 8])})
+        out.append({'id': f's{seed}-{i}-{shape}', 'shape': shape, 'sql': sql,
+                    'j': r.choice([1, 4, 16] if shape == 'globfk' else [1, 2, 8])})
     return out
 
 

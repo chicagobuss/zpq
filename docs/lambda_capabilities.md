@@ -170,6 +170,22 @@ Max Memory Used: 78 MB  Init Duration: 4.13 ms
 nothing to load. The full `zpq-lambda` binary, at about 10 MB zipped, measured 18–35 ms (median per scenario) on
 2026-10-05; see [Cold starts are the design point](#cold-starts-are-the-design-point).
 
+### What a cold start pays for, and the code layout it asks for
+
+Measured 2026-11-15/17 in us-west-2 at 3008 MB (Tracker `zpq-060/lambda/COLDSTART-REPORT.md`). A function's code is a
+read-only squashfs on a virtio disk, and the first touch of each 128 KiB block of the binary reads and decompresses that
+block, one at a time: ~0.85 ms on arm64, ~1.15 ms on x86_64, the same for 4 KiB as for 128 KiB, with no gain from
+parallel reads or prefetching. The CPU work of a cold start is a few milliseconds; the rest of Init and of the first
+invocation's extra Duration is one read per block touched. File size does not matter, only how many blocks the code
+that runs is spread over.
+
+So `zpq-lambda` is linked with each function in its own section and `src/lambda/layout.ld` puts the code a cold start
+runs first, in the order it first runs: start-up to the first `/next`, then a cold and a warm TPC-H Q1 over a local
+file, then over S3. That code is ~0.4 MB (local) and ~0.7 MB (S3) of a 9–12 MB .text, and laid out this way a cold
+start touches about a third of the blocks it did. `tools/lambda/layout.sh` regenerates the list (qemu-user runs both
+architectures' bootstraps against a stand-in for the runtime API); names the list no longer matches only cost locality,
+so regenerate it when start-up or the first request's code moves.
+
 ## Implications for zpq v2 architecture
 
 These findings should drive the current architecture, not be appended to it:

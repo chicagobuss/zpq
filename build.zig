@@ -70,6 +70,10 @@ pub fn build(b: *std.Build) void {
         .test_filters = test_filters,
         .duckdb = b.option([]const u8, "duckdb", "DuckDB 2.0 CLI (the oracle)") orelse
             b.fmt("{s}/.cache/zpq-duckdb2/bin-2.0.0/duckdb", .{b.graph.environ_map.get("HOME") orelse ""}),
+        .lambda_layout = if (b.option([]const u8, "lambda-layout", "Linker script ordering zpq-lambda's code (default src/lambda/layout.ld)")) |p|
+            .{ .cwd_relative = p }
+        else
+            b.path("src/lambda/layout.ld"),
     };
     generateTestRoots(b);
     const a = artifacts(b, cfg, optimize);
@@ -186,6 +190,7 @@ const Config = struct {
     revision: []const u8,
     test_filters: []const []const u8,
     duckdb: []const u8,
+    lambda_layout: std.Build.LazyPath,
 };
 
 const UnitTest = struct { exe: *std.Build.Step.Compile, bin: []const u8, stage: []const u8 };
@@ -234,6 +239,12 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
     const lambda_zpq = addBinaryModules(b, deps, target, optimize, .lambda, cfg.sql, cfg.strip);
     const lambda = b.addExecutable(.{ .name = "zpq-lambda", .root_module = lambda_zpq.root });
     addCpuStart(b, lambda, target);
+    // On Lambda the first touch of each 128 KiB of the binary is a read (docs/lambda_capabilities.md): the code a cold
+    // start runs goes first, in the order it runs (src/lambda/layout.ld, made by tools/lambda/layout.sh).
+    if (target.result.os.tag == .linux) {
+        lambda.link_function_sections = true;
+        lambda.setLinkerScript(cfg.lambda_layout);
+    }
 
     // libzpq: the JSON handler behind a C ABI (include/zpq.h).
     var libzpq_deps = CoreDeps.init(b, target, optimize, cfg.fetch_prebuilt, true);

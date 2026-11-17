@@ -229,7 +229,10 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             "zpq query: a join is a tree of N:1 tables, each joined by one key to the largest or to a table joined to it (comma, INNER or LEFT JOIN ... ON), or [NOT] IN (SELECT ...)\n",
             .{},
         ),
-        error.JoinKeyNotFound => diagnosticPrint("zpq query: a join needs one key equality between its tables\n", .{}),
+        error.JoinKeyNotFound => diagnosticPrint(
+            "zpq query: a join needs a column-to-column key equality; expression join keys are not supported\n",
+            .{},
+        ),
         error.JoinResidualNotSupported => diagnosticPrint(
             "zpq query: a join condition reads both tables beyond its one key equality\n",
             .{},

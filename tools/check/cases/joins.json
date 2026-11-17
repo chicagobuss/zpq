@@ -193,7 +193,13 @@
   {"name": "column_order", "path": "ci/fixtures/parquet/column_order.parquet"},
   {"name": "p0_fact", "copy": "COPY (SELECT * FROM (VALUES (1,10,1.5),(2,20,2.5),(3,10,3.5),(4,30,4.5)) t(id,cid,amt)) TO '{path}' (FORMAT PARQUET)"},
   {"name": "p0_dim", "copy": "COPY (SELECT * FROM (VALUES (10,'a@x'),(20,'b@x'),(30,'c@x')) t(cid,email)) TO '{path}' (FORMAT PARQUET)"},
-  {"name": "p0_emp", "copy": "COPY (SELECT * FROM (VALUES (1,'Ann',NULL),(2,'Bob',1),(3,'Cy',2)) t(eid,name,boss)) TO '{path}' (FORMAT PARQUET)"}
+  {"name": "p0_emp", "copy": "COPY (SELECT * FROM (VALUES (1,'Ann',NULL),(2,'Bob',1),(3,'Cy',2)) t(eid,name,boss)) TO '{path}' (FORMAT PARQUET)"},
+  {"name": "comp_fact", "copy": "COPY (SELECT i AS cid, (CASE WHEN i % 37 = 0 THEN NULL ELSE 1990 + i % 43 END)::INTEGER AS cy, (CASE WHEN i % 41 = 0 THEN NULL ELSE 't' || (i % 23) END) AS ct, (CASE WHEN i % 5 = 0 THEN NULL WHEN i % 2 = 0 THEN 'AL' ELSE 'NL' END) AS cl, DATE '2024-01-01' + (i % 9)::INTEGER AS cdt, (i * 0.5)::DOUBLE AS camt, (i % 7)::BIGINT AS cq FROM range(1, 30000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 4096)"},
+  {"name": "comp_dim", "copy": "COPY (SELECT (1990 + y)::INTEGER AS dy, 't' || t AS dt, (CASE WHEN t % 2 = 0 THEN 'AL' ELSE 'NL' END) AS dl, DATE '2024-01-01' + (t % 7)::INTEGER AS ddt, 'team' || (y * 20 + t) % 57 AS dname, (CASE WHEN (y + t) % 6 = 0 THEN NULL ELSE y * 20 + t END)::INTEGER AS dval, 'm' || (t % 5) AS dmode FROM range(0, 40) a(y), range(0, 20) b(t) WHERE (y * 20 + t) % 11 <> 3 UNION ALL SELECT NULL, 't3', 'AL', DATE '2024-01-02', 'nullyear', 1, 'm0' UNION ALL SELECT 1995, NULL, 'NL', DATE '2024-01-03', 'nullteam', 2, 'm1') TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 128)"},
+  {"name": "comp_mid", "copy": "COPY (SELECT k AS cmpk, (1990 + k % 43)::INTEGER AS cmy, 't' || (k % 23) AS cmt, (k % 4)::BIGINT AS cmg FROM range(1, 801) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 256)"},
+  {"name": "wide_fact", "copy": "COPY (SELECT i AS wid, (i % 6000) * 1000003 AS fa, ((i % 6000) * 31 % 7919)::INTEGER AS fb, (i % 3)::BIGINT AS wq FROM range(0, 40000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 8192)"},
+  {"name": "wide_dim", "copy": "COPY (SELECT k * 1000003 AS wa, (k * 31 % 7919)::INTEGER AS wb, (k % 9)::BIGINT AS wg FROM range(0, 5000) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 1024)"},
+  {"name": "over_dim", "copy": "COPY (SELECT (CASE WHEN k % 2 = 0 THEN 1 ELSE -1 END) * 4611686018427387904 + k AS wa, (k * 1099511627776)::BIGINT AS ob, k AS og FROM range(0, 64) t(k)) TO '{path}' (FORMAT PARQUET)"}
  ],
  "cases": [
   {
@@ -6383,12 +6389,12 @@
    }
   },
   {
-   "id": "join:refuse:left-on-residual",
+   "id": "join:composite:left-two-equalities",
    "fixture": "fact",
    "cli": [
     "query",
     "--query",
-    "SELECT count(*) AS n FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk AND f.q = d.grp"
+    "SELECT count(*) AS n, count(d.pk) AS m, sum(d.w) AS w FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk AND f.q = d.grp"
    ],
    "axes": [
     {
@@ -6396,11 +6402,14 @@
     },
     {
      "jobs": 4
+    },
+    {
+     "jobs": 16
     }
    ],
-   "refuse": {
-    "error": "exit 1",
-    "diag": "a LEFT JOIN's ON is one key equality"
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, count(d.pk) AS m, sum(d.w) AS w FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk AND f.q = d.grp"
    }
   },
   {
@@ -12004,6 +12013,807 @@
    "oracle": {
     "compare": "written_sql",
     "sql": "SELECT d.ndate, d.ntime, count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:temp_dim}' d ON f.fk = d.tpk GROUP BY d.ndate, d.ntime ORDER BY d.ndate NULLS FIRST, d.ntime NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:composite:two-columns",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT dname, count(*) AS n, sum(camt) AS s, sum(dval) AS v FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt GROUP BY dname ORDER BY dname LIMIT 20"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT dname, count(*) AS n, sum(camt) AS s, sum(dval) AS v FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt GROUP BY dname ORDER BY dname LIMIT 20"
+   }
+  },
+  {
+   "id": "join:composite:where-form",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.dl, count(*) AS n FROM '{fixture:comp_fact}' f, '{fixture:comp_dim}' d WHERE f.ct = d.dt AND f.cq > 1 AND f.cy = d.dy GROUP BY d.dl ORDER BY d.dl"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.dl, count(*) AS n FROM '{fixture:comp_fact}' f, '{fixture:comp_dim}' d WHERE f.ct = d.dt AND f.cq > 1 AND f.cy = d.dy GROUP BY d.dl ORDER BY d.dl"
+   }
+  },
+  {
+   "id": "join:composite:left",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, count(d.dname) AS m, count(d.dval) AS nn, sum(d.dval) AS v FROM '{fixture:comp_fact}' f LEFT JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, count(d.dname) AS m, count(d.dval) AS nn, sum(d.dval) AS v FROM '{fixture:comp_fact}' f LEFT JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt"
+   }
+  },
+  {
+   "id": "join:composite:left-group",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.dmode, count(*) AS n FROM '{fixture:comp_fact}' f LEFT JOIN '{fixture:comp_dim}' d ON f.ct = d.dt AND f.cy = d.dy AND d.dval > 300 GROUP BY d.dmode ORDER BY d.dmode NULLS FIRST"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.dmode, count(*) AS n FROM '{fixture:comp_fact}' f LEFT JOIN '{fixture:comp_dim}' d ON f.ct = d.dt AND f.cy = d.dy AND d.dval > 300 GROUP BY d.dmode ORDER BY d.dmode NULLS FIRST"
+   }
+  },
+  {
+   "id": "join:composite:three-columns",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT dname, count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt AND f.cl = d.dl WHERE f.cy = 2016 GROUP BY dname ORDER BY n DESC, dname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT dname, count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt AND f.cl = d.dl WHERE f.cy = 2016 GROUP BY dname ORDER BY n DESC, dname"
+   }
+  },
+  {
+   "id": "join:composite:date-column",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(camt) AS s FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cdt = d.ddt AND f.ct = d.dt AND f.cy = d.dy"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(camt) AS s FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cdt = d.ddt AND f.ct = d.dt AND f.cy = d.dy"
+   }
+  },
+  {
+   "id": "join:composite:build-filter-and-residual",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(camt) AS s FROM '{fixture:comp_fact}' f, '{fixture:comp_dim}' d WHERE f.cy = d.dy AND f.ct = d.dt AND d.dval > 100 AND f.camt > d.dval"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(camt) AS s FROM '{fixture:comp_fact}' f, '{fixture:comp_dim}' d WHERE f.cy = d.dy AND f.ct = d.dt AND d.dval > 100 AND f.camt > d.dval"
+   }
+  },
+  {
+   "id": "join:composite:group-by-key-columns",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT d.dy, d.dt, dname, count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt GROUP BY d.dy, d.dt, dname ORDER BY n DESC, d.dy, d.dt LIMIT 12"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_GROUP_KEY_FD": "0"
+     }
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_JOIN_LATE_PAYLOAD": "0"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT d.dy, d.dt, dname, count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt GROUP BY d.dy, d.dt, dname ORDER BY n DESC, d.dy, d.dt LIMIT 12"
+   }
+  },
+  {
+   "id": "join:composite:distinct",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT DISTINCT dname FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt WHERE f.camt > 9000 AND d.dy > 2000 ORDER BY dname LIMIT 15"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT DISTINCT dname FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt WHERE f.camt > 9000 AND d.dy > 2000 ORDER BY dname LIMIT 15"
+   }
+  },
+  {
+   "id": "join:composite:snowflake-under",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT mname, count(*) AS n, sum(camt) AS s FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt JOIN '{fixture:mode_dim}' m ON d.dmode = m.mk GROUP BY mname ORDER BY mname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT mname, count(*) AS n, sum(camt) AS s FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt JOIN '{fixture:mode_dim}' m ON d.dmode = m.mk GROUP BY mname ORDER BY mname"
+   }
+  },
+  {
+   "id": "join:composite:snowflake-composite-fk",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT dname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:comp_mid}' x, '{fixture:comp_dim}' d WHERE f.fk = x.cmpk AND x.cmy = d.dy AND x.cmt = d.dt GROUP BY dname ORDER BY dname LIMIT 12"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT dname, count(*) AS n, sum(amt) AS s FROM '{fixture:fact}' f, '{fixture:comp_mid}' x, '{fixture:comp_dim}' d WHERE f.fk = x.cmpk AND x.cmy = d.dy AND x.cmt = d.dt GROUP BY dname ORDER BY dname LIMIT 12"
+   }
+  },
+  {
+   "id": "join:composite:star",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT x.grp, d.dl, count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt JOIN '{fixture:dim}' x ON f.cid = x.pk GROUP BY x.grp, d.dl ORDER BY x.grp, d.dl"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT x.grp, d.dl, count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt JOIN '{fixture:dim}' x ON f.cid = x.pk GROUP BY x.grp, d.dl ORDER BY x.grp, d.dl"
+   }
+  },
+  {
+   "id": "join:composite:hash-structure",
+   "fixture": "wide_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT wg, count(*) AS n FROM '{fixture:wide_fact}' f JOIN '{fixture:wide_dim}' d ON f.fa = d.wa AND f.fb = d.wb GROUP BY wg ORDER BY wg"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    },
+    {
+     "jobs": 4,
+     "force": {
+      "ZPQ_DECODE_BATCH_ROWS": "97"
+     }
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT wg, count(*) AS n FROM '{fixture:wide_fact}' f JOIN '{fixture:wide_dim}' d ON f.fa = d.wa AND f.fb = d.wb GROUP BY wg ORDER BY wg"
+   }
+  },
+  {
+   "id": "join:composite:explain",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt",
+    "--explain"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    }
+   ],
+   "oracle": {
+    "compare": "plan",
+    "holds": {
+     "join": {
+      "build": {
+       "key": "dy",
+       "structure": "composite",
+       "keys": 727
+      }
+     }
+    }
+   }
+  },
+  {
+   "id": "join:composite:refuse:many-to-many",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.cl = d.dl"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "many-to-many joins are not supported"
+   }
+  },
+  {
+   "id": "join:composite:refuse:column-types",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.cq = d.dt"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "many-to-many joins are not supported"
+   }
+  },
+  {
+   "id": "join:composite:refuse:range",
+   "fixture": "wide_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:wide_fact}' f JOIN '{fixture:over_dim}' d ON f.fa = d.wa AND f.wid = d.ob"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "span more values together than fit 63 bits"
+   }
+  },
+  {
+   "id": "join:composite:exists",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(camt) AS s FROM '{fixture:comp_fact}' f WHERE EXISTS (SELECT 1 FROM '{fixture:comp_dim}' d WHERE d.dy = f.cy AND d.dt = f.ct)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(camt) AS s FROM '{fixture:comp_fact}' f WHERE EXISTS (SELECT 1 FROM '{fixture:comp_dim}' d WHERE d.dy = f.cy AND d.dt = f.ct)"
+   }
+  },
+  {
+   "id": "join:composite:exists-with-conditions",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.cq, count(*) AS n FROM '{fixture:comp_fact}' f WHERE f.camt > 100 AND EXISTS (SELECT * FROM '{fixture:comp_dim}' d WHERE f.ct = d.dt AND d.dval > 300 AND d.dy = f.cy) GROUP BY f.cq ORDER BY f.cq"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.cq, count(*) AS n FROM '{fixture:comp_fact}' f WHERE f.camt > 100 AND EXISTS (SELECT * FROM '{fixture:comp_dim}' d WHERE f.ct = d.dt AND d.dval > 300 AND d.dy = f.cy) GROUP BY f.cq ORDER BY f.cq"
+   }
+  },
+  {
+   "id": "join:composite:not-exists-null-parts",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, count(cy) AS y, count(ct) AS t FROM '{fixture:comp_fact}' f WHERE NOT EXISTS (SELECT 1 FROM '{fixture:comp_dim}' d WHERE d.dy = f.cy AND d.dt = f.ct)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, count(cy) AS y, count(ct) AS t FROM '{fixture:comp_fact}' f WHERE NOT EXISTS (SELECT 1 FROM '{fixture:comp_dim}' d WHERE d.dy = f.cy AND d.dt = f.ct)"
+   }
+  },
+  {
+   "id": "join:composite:not-exists-three-columns",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, count(cl) AS l FROM '{fixture:comp_fact}' f WHERE NOT EXISTS (SELECT 1 FROM '{fixture:comp_dim}' d WHERE d.dy = f.cy AND d.dt = f.ct AND d.dl = f.cl AND d.dmode <> 'm0')"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, count(cl) AS l FROM '{fixture:comp_fact}' f WHERE NOT EXISTS (SELECT 1 FROM '{fixture:comp_dim}' d WHERE d.dy = f.cy AND d.dt = f.ct AND d.dl = f.cl AND d.dmode <> 'm0')"
+   }
+  },
+  {
+   "id": "join:composite:exists-and-not-exists",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:comp_fact}' f WHERE EXISTS (SELECT 1 FROM '{fixture:comp_dim}' d WHERE d.dy = f.cy AND d.dt = f.ct) AND NOT EXISTS (SELECT 1 FROM '{fixture:comp_dim}' e WHERE e.dy = f.cy AND e.dt = f.ct AND e.dl = f.cl) AND f.cid IN (SELECT pk FROM '{fixture:dim}' WHERE grp > 0)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:comp_fact}' f WHERE EXISTS (SELECT 1 FROM '{fixture:comp_dim}' d WHERE d.dy = f.cy AND d.dt = f.ct) AND NOT EXISTS (SELECT 1 FROM '{fixture:comp_dim}' e WHERE e.dy = f.cy AND e.dt = f.ct AND e.dl = f.cl) AND f.cid IN (SELECT pk FROM '{fixture:dim}' WHERE grp > 0)"
+   }
+  },
+  {
+   "id": "join:composite:exists-in-a-join",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT x.grp, count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:dim}' x ON f.cid = x.pk WHERE EXISTS (SELECT 1 FROM '{fixture:comp_dim}' d WHERE d.dy = f.cy AND d.dt = f.ct) AND NOT EXISTS (SELECT 1 FROM '{fixture:comp_dim}' e WHERE e.dy = f.cy AND e.dt = f.ct AND e.dval < 200) GROUP BY x.grp ORDER BY x.grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT x.grp, count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:dim}' x ON f.cid = x.pk WHERE EXISTS (SELECT 1 FROM '{fixture:comp_dim}' d WHERE d.dy = f.cy AND d.dt = f.ct) AND NOT EXISTS (SELECT 1 FROM '{fixture:comp_dim}' e WHERE e.dy = f.cy AND e.dt = f.ct AND e.dval < 200) GROUP BY x.grp ORDER BY x.grp"
+   }
+  },
+  {
+   "id": "join:composite:exists-on-a-build",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt WHERE EXISTS (SELECT 1 FROM '{fixture:comp_dim}' e WHERE e.dy = d.dy AND e.dl = d.dl AND e.dval > 700)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt WHERE EXISTS (SELECT 1 FROM '{fixture:comp_dim}' e WHERE e.dy = d.dy AND e.dl = d.dl AND e.dval > 700)"
+   }
+  },
+  {
+   "id": "join:composite:rows",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.cid, d.dname, d.dval FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt WHERE f.cid < 200 ORDER BY f.cid"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.cid, d.dname, d.dval FROM '{fixture:comp_fact}' f JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt WHERE f.cid < 200 ORDER BY f.cid"
+   }
+  },
+  {
+   "id": "join:composite:rows-left-duplicates",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.cq, d.dmode FROM '{fixture:comp_fact}' f LEFT JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt ORDER BY d.dmode NULLS FIRST, f.cq LIMIT 30 OFFSET 2500"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.cq, d.dmode FROM '{fixture:comp_fact}' f LEFT JOIN '{fixture:comp_dim}' d ON f.cy = d.dy AND f.ct = d.dt ORDER BY d.dmode NULLS FIRST, f.cq LIMIT 30 OFFSET 2500"
+   }
+  },
+  {
+   "id": "join:composite:refuse:exists-keys-of-two-tables",
+   "fixture": "comp_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:comp_fact}' f JOIN '{fixture:dim}' x ON f.cid = x.pk WHERE EXISTS (SELECT 1 FROM '{fixture:comp_dim}' d WHERE d.dy = f.cy AND d.dval = x.w)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "[NOT] EXISTS takes"
+   }
+  },
+  {
+   "id": "join:composite:decimal-equality-stays-a-condition",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(f.id) AS s FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk AND f.dec = x.ddec"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(f.id) AS s FROM '{fixture:fact}' f, '{fixture:dim_dec}' x WHERE f.fk = x.pk AND f.dec = x.ddec"
+   }
+  },
+  {
+   "id": "join:composite:double-equality-stays-a-condition",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.amt = d.w"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE f.amt = d.w"
+   }
+  },
+  {
+   "id": "join:composite:integer-widths-share-a-key",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(d.w) AS w FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk AND f.q = d.grp"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(d.w) AS w FROM '{fixture:fact}' f JOIN '{fixture:dim}' d ON f.fk = d.pk AND f.q = d.grp"
    }
   }
  ]

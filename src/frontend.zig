@@ -342,8 +342,8 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
         ),
         error.ExistsSubquery => diagnosticPrint(
             "zpq query: [NOT] EXISTS takes (SELECT ... FROM one table WHERE its_column = outer_alias.column AND\n" ++
-                "  conditions on its own table): one key equality with the outer query, the outer column qualified, and no\n" ++
-                "  aggregate, GROUP BY, HAVING or LIMIT\n",
+                "  conditions on its own table): key equalities with one table of the outer query, each outer column\n" ++
+                "  qualified, and no aggregate, GROUP BY, HAVING or LIMIT\n",
             .{},
         ),
         error.JoinRowsFloat => diagnosticPrint(

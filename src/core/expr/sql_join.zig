@@ -34,9 +34,11 @@ pub const Plan = struct {
     kind: Kind,
     probe_path: []const u8,
     build_path: []const u8,
-    /// The probe's foreign key and the build's key column.
+    /// The probe's foreign key and the build's key column, and a composite key's further columns of each, paired.
     fk: []const u8,
     build_key: []const u8,
+    fk_more: []const []const u8 = &.{},
+    build_key_more: []const []const u8 = &.{},
     /// The query with the join removed: a single-table SELECT over `probe_path`.
     probe_sql: []const u8,
     /// The build side's own conjuncts, as one SQL expression, or null.
@@ -47,11 +49,11 @@ pub const Plan = struct {
     /// must be unique, as any INNER join's are, though no column of its table is read. A query that reduced holds no IN
     /// of its own (its table count would not match).
     reduced: bool = false,
-    /// The join itself is a NOT EXISTS (`NotExists`), not a NOT IN.
+    /// The join itself is a NOT EXISTS (`Exists`), not a NOT IN.
     not_exists: bool = false,
     /// The query's (other) NOT EXISTS conditions on the probe, and on the main build.
-    semis: []const NotExists = &.{},
-    build_semis: []const NotExists = &.{},
+    semis: []const Exists = &.{},
+    build_semis: []const Exists = &.{},
     /// The star's other dimensions: each joined to the probe by one key equality and publishing its own columns.
     dims: []const Dim = &.{},
     /// A snowflake's tables joined to the main build by an FK of its own (`Dim.dims`).
@@ -63,6 +65,9 @@ pub const Dim = struct {
     path: []const u8,
     fk: []const u8,
     key: []const u8,
+    /// A composite key's further columns: the parent's and this table's, paired.
+    fk_more: []const []const u8 = &.{},
+    key_more: []const []const u8 = &.{},
     where: ?[]const u8,
     columns: []const []const u8,
     /// A LEFT JOIN's: every probe row stays, a miss reading the dimension's columns as NULL.
@@ -71,18 +76,24 @@ pub const Dim = struct {
     /// publishing its columns through this one's build.
     dims: []const Dim = &.{},
     /// The query's NOT EXISTS conditions on this table.
-    semis: []const NotExists = &.{},
+    semis: []const Exists = &.{},
 };
 
-/// A NOT EXISTS of the WHERE: an ANTI join of the table whose column `fk` is, where a NULL on either side matches
-/// nothing. It leaves the WHERE and travels here, beside the query, never inside its SQL: written as SQL it would be
-/// a NOT IN, whose answer is UNKNOWN against a NULL, and nothing a query can spell may stand for the difference.
-pub const NotExists = struct {
+/// An EXISTS of the WHERE that no IN can say: a NOT EXISTS (an ANTI join of the table whose column `fk` is, where a
+/// NULL on either side matches nothing), or one that reads the outer query by more than one key. It leaves the WHERE
+/// and travels here, beside the query, never inside its SQL: written as SQL a NOT EXISTS would be a NOT IN, whose
+/// answer is UNKNOWN against a NULL, and nothing a query can spell may stand for the difference.
+pub const Exists = struct {
     path: []const u8,
     fk: []const u8,
     key: []const u8,
+    /// A composite key's further columns: the outer table's and the subquery's, paired.
+    fk_more: []const []const u8 = &.{},
+    key_more: []const []const u8 = &.{},
     /// The subquery's conditions on its own table, as one SQL expression, or null.
     where: ?[]const u8,
+    /// NOT EXISTS; else EXISTS, a SEMI join.
+    anti: bool = true,
 };
 
 /// What the caller knows of the tables (from their footers): whether a column name is theirs, and their rows.
@@ -92,6 +103,9 @@ pub const Tables = struct {
     rows: []const u64,
     ctx: *const anyopaque,
     root: ?usize = null,
+    /// Whether two columns can be parts of one composite key: both of a type a key takes, and the same one. Null
+    /// takes every pair.
+    same_key: ?*const fn (ctx: *const anyopaque, table: usize, name: []const u8, other: usize, other_name: []const u8) bool = null,
     /// The FROM is as the query wrote it, so a table without an alias goes by its file's name. False for the binder's
     /// own text (a probe query, a build's filter), whose FROM has lost the alias the query gave it.
     user_from: bool = true,
@@ -250,30 +264,45 @@ fn semiConjunct(where: ?*c.LpNode) ?Conj {
     return null;
 }
 
-/// A NOT EXISTS `lowerExists` took out of the WHERE, as the parse holds it (`NotExists` once planned).
+/// A NOT EXISTS `lowerExists` took out of the WHERE, as the parse holds it (`Exists` once planned).
 const Lowered = struct {
     path: []const u8,
-    fk: *c.LpNode,
-    key: *c.LpNode,
+    /// The key equalities, the outer query's column and the subquery's: at least one.
+    fks: []const *c.LpNode,
+    keys: []const *c.LpNode,
     own: []const *c.LpNode,
+    anti: bool,
 
-    fn planned(x: Lowered, a: std.mem.Allocator, p: Parsed) Error!NotExists {
+    fn planned(x: Lowered, a: std.mem.Allocator, p: Parsed) Error!Exists {
         return .{
             .path = try a.dupe(u8, x.path),
-            .fk = try a.dupe(u8, span(x.fk.u.column_ref.column)),
-            .key = try a.dupe(u8, span(x.key.u.column_ref.column)),
+            .fk = try columnOf(a, x.fks[0]),
+            .key = try columnOf(a, x.keys[0]),
+            .fk_more = try columnsOf(a, x.fks[1..]),
+            .key_more = try columnsOf(a, x.keys[1..]),
             .where = try whereSql(a, p, x.own),
+            .anti = x.anti,
         };
     }
 };
 
-/// Each top-level `[NOT] EXISTS (SELECT ... FROM b WHERE b.k = a.fk AND ...)` of the WHERE, lowered. EXISTS becomes
-/// the `a.fk IN (SELECT b.k FROM b WHERE ...)` the SEMI path takes: the same rows. NOT EXISTS is no NOT IN (a NULL
-/// matches nothing, where NOT IN's answer is UNKNOWN), so it leaves the WHERE and is returned, for the plan to carry.
-/// Inside the subquery a name qualified by anything but its own table's name is the outer query's, and every other
-/// name its own table's (the innermost scope; one it lacks then refuses when its filter binds). The outer query is
-/// read by the one key equality alone, and the subquery is one table's rows, nothing that makes a row of none
-/// (an aggregate) or drops one (LIMIT).
+fn columnOf(a: std.mem.Allocator, ref: *c.LpNode) ![]const u8 {
+    return a.dupe(u8, span(ref.u.column_ref.column));
+}
+
+fn columnsOf(a: std.mem.Allocator, refs: []const *c.LpNode) ![]const []const u8 {
+    const out = try a.alloc([]const u8, refs.len);
+    for (refs, out) |ref, *name| name.* = try columnOf(a, ref);
+    return out;
+}
+
+/// Each top-level `[NOT] EXISTS (SELECT ... FROM b WHERE b.k = a.fk AND ...)` of the WHERE, lowered. An EXISTS by one
+/// key becomes the `a.fk IN (SELECT b.k FROM b WHERE ...)` the SEMI path takes: the same rows. A NOT EXISTS is no NOT
+/// IN (a NULL matches nothing, where NOT IN's answer is UNKNOWN), and no IN joins by two keys, so those leave the
+/// WHERE and are returned, for the plan to carry. Inside the subquery a name qualified by anything but its own table's
+/// name is the outer query's, and every other name its own table's (the innermost scope; one it lacks then refuses
+/// when its filter binds). The outer query is read by key equalities alone, each of two columns, and the subquery is
+/// one table's rows, nothing that makes a row of none (an aggregate) or drops one (LIMIT).
 fn lowerExists(a: std.mem.Allocator, root: *c.LpNode) Error![]const Lowered {
     var conjuncts: std.ArrayList(*c.LpNode) = .empty;
     try flatten(root.u.select.where, &conjuncts, a);
@@ -304,8 +333,8 @@ fn lowerExists(a: std.mem.Allocator, root: *c.LpNode) Error![]const Lowered {
         var terms: std.ArrayList(*c.LpNode) = .empty;
         try flatten(sub.where, &terms, a);
         var own: std.ArrayList(*c.LpNode) = .empty;
-        var key: ?*c.LpNode = null;
-        var fk: ?*c.LpNode = null;
+        var keys: std.ArrayList(*c.LpNode) = .empty;
+        var fks: std.ArrayList(*c.LpNode) = .empty;
         for (terms.items) |term| {
             const outer = for (try columnRefs(term, a)) |ref| {
                 if (outerRef(ref, table)) break true;
@@ -314,29 +343,30 @@ fn lowerExists(a: std.mem.Allocator, root: *c.LpNode) Error![]const Lowered {
                 try own.append(a, term);
                 continue;
             }
-            if (key != null or term.kind != c.LP_EXPR_BINARY_OP or term.u.binary.op != c.LP_OP_EQ) return error.ExistsSubquery;
+            if (term.kind != c.LP_EXPR_BINARY_OP or term.u.binary.op != c.LP_OP_EQ) return error.ExistsSubquery;
             const l: *c.LpNode = term.u.binary.left orelse return error.ExistsSubquery;
             const r: *c.LpNode = term.u.binary.right orelse return error.ExistsSubquery;
             if (l.kind != c.LP_EXPR_COLUMN_REF or r.kind != c.LP_EXPR_COLUMN_REF) return error.ExistsSubquery;
             const l_outer = outerRef(l, table);
             if (l_outer == outerRef(r, table)) return error.ExistsSubquery;
-            fk = if (l_outer) l else r;
-            key = if (l_outer) r else l;
+            try fks.append(a, if (l_outer) l else r);
+            try keys.append(a, if (l_outer) r else l);
         }
-        if (key == null) return error.ExistsSubquery;
-        if (not) {
-            try out.append(a, .{ .path = table.path, .fk = fk.?, .key = key.?, .own = own.items });
+        if (keys.items.len == 0) return error.ExistsSubquery;
+        // An IN says one key and no NULL rule of NOT EXISTS's: the rest the plan carries.
+        if (not or keys.items.len > 1) {
+            try out.append(a, .{ .path = table.path, .fks = fks.items, .keys = keys.items, .own = own.items, .anti = not });
             continue;
         }
         const rc = try create(a, c.LP_RESULT_COLUMN);
-        rc.u.result_column.expr = key;
+        rc.u.result_column.expr = keys.items[0];
         const items = try a.alloc([*c]c.LpNode, 1);
         items[0] = rc;
         sub.result_columns = .{ .items = items.ptr, .count = 1, .capacity = 1 };
         sub.where = try andOf(a, own.items);
         n.* = std.mem.zeroes(c.LpNode);
         n.kind = c.LP_EXPR_IN;
-        n.u.in.expr = fk;
+        n.u.in.expr = fks.items[0];
         n.u.in.select = sub_node;
         try kept.append(a, n);
     }
@@ -428,6 +458,12 @@ const Sides = struct {
         return side;
     }
 
+    /// Whether `l = x` (positions in `tables`) can be one more part of a key (`Tables.same_key`).
+    fn keyable(s: Sides, l: usize, l_ref: *c.LpNode, x: usize, x_ref: *c.LpNode) bool {
+        const same = s.t.same_key orelse return true;
+        return same(s.t.ctx, s.tables[l], span(l_ref.u.column_ref.column), s.tables[x], span(x_ref.u.column_ref.column));
+    }
+
     /// The tables `n` reads, as a bit set over positions in `tables`.
     fn reads(s: Sides, n: *c.LpNode, a: std.mem.Allocator) Error!u64 {
         var set: u64 = 0;
@@ -466,8 +502,8 @@ fn reduce(a: std.mem.Allocator, sel: anytype, tables_in: []*c.LpNode, conjuncts:
     for (try columnRefs(root, a)) |ref| if (try s.at(ref)) |i| {
         outside |= @as(u64, 1) << @intCast(i);
     };
-    // A NOT EXISTS reads its table too: the plan carries it on that table's build, which an IN's text could not.
-    for (lowered) |x| if (try s.at(x.fk)) |i| {
+    // An EXISTS the plan carries reads its table too, on that table's build, which an IN's text could not.
+    for (lowered) |x| if (try s.at(x.fks[0])) |i| {
         outside |= @as(u64, 1) << @intCast(i);
     };
     for (s.tables, 0..) |ti, l| {
@@ -718,7 +754,7 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
     if (null_set != 0) {
         const all: Sides = .{ .t = t, .tables = live.items, .aliases = aliases };
         for (conjuncts.items) |node| if ((try all.reads(node, a)) & null_set != 0) return error.LeftJoinWhere;
-        for (lowered) |x| if (try all.at(x.fk)) |i| {
+        for (lowered) |x| if (try all.at(x.fks[0])) |i| {
             if (null_set & (@as(u64, 1) << @intCast(i)) != 0) return error.LeftJoinWhere;
         };
     }
@@ -776,6 +812,26 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         }
         level = next;
     }
+    // Every further key equality between a table and its parent is part of that edge's key: a composite key. One of
+    // columns no key takes together (a DOUBLE, two types) stays what it was, a condition across the two tables.
+    const fks_more = try a.alloc(std.ArrayList([]const u8), n);
+    const keys_more = try a.alloc(std.ArrayList([]const u8), n);
+    @memset(fks_more, .empty);
+    @memset(keys_more, .empty);
+    for (conjuncts.items, used) |node, *u| {
+        if (u.*) continue;
+        const eq = try keyEquality(sides, node) orelse continue;
+        const dn = if (eq.l != probe and keys[eq.l] != null and parent[eq.l] == eq.x)
+            eq.l
+        else if (eq.x != probe and keys[eq.x] != null and parent[eq.x] == eq.l)
+            eq.x
+        else
+            continue;
+        if (!sides.keyable(eq.l, eq.l_ref, eq.x, eq.x_ref)) continue;
+        try fks_more[dn].append(a, try columnOf(a, if (dn == eq.l) eq.x_ref else eq.l_ref));
+        try keys_more[dn].append(a, try columnOf(a, if (dn == eq.l) eq.l_ref else eq.x_ref));
+        u.* = true;
+    }
     // A condition across tables (a cycle of the tree, or a build column against the probe's) stays the probe's: it
     // narrows after the lookups, over the columns they publish (`filter_ast.Residual`).
     var residuals: std.ArrayList(*c.LpNode) = .empty;
@@ -789,7 +845,7 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         const side = try sides.only(node, a) orelse probe;
         try wheres[side].append(a, node);
     }
-    // Each LEFT JOIN's ON: its one key equality with the probe, and conditions on its own table (its build's filter).
+    // Each LEFT JOIN's ON: its key equalities with the probe, and conditions on its own table (its build's filter).
     const left = try a.alloc(bool, n);
     @memset(left, false);
     for (nulls.items) |ns| {
@@ -803,6 +859,11 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
                     const key_ref = if (eq.l == probe) eq.x_ref else eq.l_ref;
                     fks[d] = try a.dupe(u8, span(fk_ref.*.u.column_ref.column));
                     keys[d] = try a.dupe(u8, span(key_ref.*.u.column_ref.column));
+                    continue;
+                }
+                if (sides.keyable(eq.l, eq.l_ref, eq.x, eq.x_ref)) {
+                    try fks_more[d].append(a, try columnOf(a, if (eq.l == probe) eq.l_ref else eq.x_ref));
+                    try keys_more[d].append(a, try columnOf(a, if (eq.l == probe) eq.x_ref else eq.l_ref));
                     continue;
                 }
             };
@@ -832,8 +893,10 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         ref.*.u.column_ref.table = null;
         var d = side orelse continue;
         var name = span(ref.*.u.column_ref.column);
-        while (d != probe and !left[d] and std.mem.eql(u8, name, keys[d].?)) {
-            name = fks[d].?;
+        while (d != probe and !left[d]) {
+            name = if (std.mem.eql(u8, name, keys[d].?)) fks[d].? else for (keys_more[d].items, fks_more[d].items) |k, f| {
+                if (std.mem.eql(u8, name, k)) break f;
+            } else break;
             d = parent[d];
         }
         if (name.ptr != span(ref.*.u.column_ref.column).ptr) ref.*.u.column_ref.column = (try a.dupeSentinel(u8, name, 0)).ptr;
@@ -845,7 +908,10 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
             rc.*.u.result_column.alias = (try a.dupeSentinel(u8, name, 0)).ptr;
     };
     // A snowflake's table reads its FK off its parent's build: the parent publishes it.
-    for (0..n) |d| if (d != probe and parent[d] != probe) try addName(a, &columns[parent[d]], fks[d].?);
+    for (0..n) |d| if (d != probe and parent[d] != probe) {
+        try addName(a, &columns[parent[d]], fks[d].?);
+        for (fks_more[d].items) |f| try addName(a, &columns[parent[d]], f);
+    };
     // A build column reaches the probe under its own name: one name two tables publish (a self join's `a.w < b.w`)
     // would be one ambiguous column there.
     for (0..n) |d| for (d + 1..n) |e| for (columns[d].items) |x| for (columns[e].items) |y| {
@@ -868,14 +934,16 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
             main = d;
         };
     };
-    // Each NOT EXISTS, on the table its FK is a column of: the probe's own beside its lookups, a build's inside it.
-    const semis = try a.alloc(std.ArrayList(NotExists), n);
+    // Each carried EXISTS, on the one table its FKs are columns of: the probe's own beside its lookups, a build's
+    // inside it.
+    const semis = try a.alloc(std.ArrayList(Exists), n);
     @memset(semis, .empty);
     for (lowered) |x| {
-        const d = try sides.at(x.fk) orelse return error.UnsupportedJoin;
+        const d = try sides.at(x.fks[0]) orelse return error.UnsupportedJoin;
+        for (x.fks[1..]) |ref| if ((try sides.at(ref)) != d) return error.ExistsSubquery;
         try semis[d].append(a, try x.planned(a, p));
     }
-    const tree: Tree = .{ .t = t, .p = p, .live = live.items, .probe = probe, .parent = parent, .fks = fks, .keys = keys, .wheres = wheres, .columns = columns, .left = left, .semis = semis };
+    const tree: Tree = .{ .t = t, .p = p, .live = live.items, .probe = probe, .parent = parent, .fks = fks, .keys = keys, .fks_more = fks_more, .keys_more = keys_more, .wheres = wheres, .columns = columns, .left = left, .semis = semis };
     var dims: std.ArrayList(Dim) = .empty;
     for (0..n) |d| if (d != probe and d != main and parent[d] == probe) try dims.append(a, try tree.dim(a, d));
     return .{
@@ -884,6 +952,8 @@ pub fn plan(a: std.mem.Allocator, sql: [:0]const u8, t: Tables) Error!Plan {
         .build_path = t.paths[live.items[main]],
         .fk = fks[main].?,
         .build_key = keys[main].?,
+        .fk_more = fks_more[main].items,
+        .build_key_more = keys_more[main].items,
         .probe_sql = try toSql(a, p, p.root),
         .build_where = try whereSql(a, p, wheres[main].items),
         .build_columns = columns[main].items,
@@ -909,16 +979,20 @@ const Tree = struct {
     parent: []const usize,
     fks: []const ?[]const u8,
     keys: []const ?[]const u8,
+    fks_more: []const std.ArrayList([]const u8),
+    keys_more: []const std.ArrayList([]const u8),
     wheres: []const std.ArrayList(*c.LpNode),
     columns: []const std.ArrayList([]const u8),
     left: []const bool,
-    semis: []const std.ArrayList(NotExists),
+    semis: []const std.ArrayList(Exists),
 
     fn dim(tr: Tree, a: std.mem.Allocator, d: usize) Error!Dim {
         return .{
             .path = tr.t.paths[tr.live[d]],
             .fk = tr.fks[d].?,
             .key = tr.keys[d].?,
+            .fk_more = tr.fks_more[d].items,
+            .key_more = tr.keys_more[d].items,
             .where = try whereSql(a, tr.p, tr.wheres[d].items),
             .columns = tr.columns[d].items,
             .left = tr.left[d],
@@ -963,17 +1037,21 @@ fn planSemi(a: std.mem.Allocator, p: Parsed, sel: anytype, from: *c.LpNode, t: T
     // What qualifies the outer table's columns. The binder's own text has no alias left on its FROM, and a qualifier
     // there is a stale one inside a subquery: it names another scope's table, whatever this file is called.
     const outer_name: ?[]const u8 = if (t.user_from) t0.name() else t0.alias;
-    for (lowered) |x| if (!qualifies(outer_name, x.fk)) return error.UnsupportedJoin;
+    for (lowered) |x| for (x.fks) |ref| if (!qualifies(outer_name, ref)) return error.UnsupportedJoin;
     var conjuncts: std.ArrayList(*c.LpNode) = .empty;
     try flatten(sel.where, &conjuncts, a);
     var probe_conj: std.ArrayList(*c.LpNode) = .empty;
     var build_conj: std.ArrayList(*c.LpNode) = .empty;
     var fk: []const u8 = "";
     var build_key: []const u8 = "";
+    var fk_more: []const []const u8 = &.{};
+    var build_key_more: []const []const u8 = &.{};
     var rest = lowered;
     if (semi == null) {
-        fk = try a.dupe(u8, span(lowered[0].fk.u.column_ref.column));
-        build_key = try a.dupe(u8, span(lowered[0].key.u.column_ref.column));
+        fk = try columnOf(a, lowered[0].fks[0]);
+        build_key = try columnOf(a, lowered[0].keys[0]);
+        fk_more = try columnsOf(a, lowered[0].fks[1..]);
+        build_key_more = try columnsOf(a, lowered[0].keys[1..]);
         try build_conj.appendSlice(a, lowered[0].own);
         rest = lowered[1..];
     }
@@ -1019,10 +1097,10 @@ fn planSemi(a: std.mem.Allocator, p: Parsed, sel: anytype, from: *c.LpNode, t: T
         if (!qualifies(outer_name, ref)) return error.UnsupportedJoin;
         ref.*.u.column_ref.table = null;
     }
-    const semis = try a.alloc(NotExists, rest.len);
+    const semis = try a.alloc(Exists, rest.len);
     for (rest, semis) |x, *out| out.* = try x.planned(a, p);
     return .{
-        .kind = if (semi) |in| (if (in.anti) .anti else .semi) else .anti,
+        .kind = if (semi) |in| (if (in.anti) .anti else .semi) else if (lowered[0].anti) .anti else .semi,
         .probe_path = t.paths[0],
         .build_path = t.paths[1],
         .fk = fk,
@@ -1030,7 +1108,9 @@ fn planSemi(a: std.mem.Allocator, p: Parsed, sel: anytype, from: *c.LpNode, t: T
         .probe_sql = try toSql(a, p, p.root),
         .build_where = try whereSql(a, p, build_conj.items),
         .build_columns = &.{},
-        .not_exists = semi == null,
+        .fk_more = fk_more,
+        .build_key_more = build_key_more,
+        .not_exists = semi == null and lowered[0].anti,
         .semis = semis,
     };
 }
@@ -1159,4 +1239,48 @@ test "EXISTS lowers to the IN a SEMI join takes; NOT EXISTS leaves the SQL and r
     try std.testing.expectError(error.ExistsSubquery, plan(a, q ++ "(SELECT 1 FROM 'd.parquet' d WHERE d.pk = f.fk AND d.w > f.amt)", t));
     try std.testing.expectError(error.ExistsSubquery, plan(a, q ++ "(SELECT count(*) FROM 'd.parquet' d WHERE d.pk = f.fk)", t));
     try std.testing.expectError(error.ExistsSubquery, plan(a, q ++ "(SELECT 1 FROM 'd.parquet' d WHERE d.pk = f.fk LIMIT 1)", t));
+}
+
+test "every key equality of an edge is its key, in a join's ON, its WHERE and an EXISTS" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const Cols = struct {
+        const of = [_][]const []const u8{ &.{ "cy", "ct", "cl", "amt" }, &.{ "dy", "dt", "dl", "name" } };
+        fn has(_: *const anyopaque, table: usize, name: []const u8) bool {
+            for (of[table]) |col| if (std.mem.eql(u8, col, name)) return true;
+            return false;
+        }
+    };
+    const t2: Tables = .{ .paths = &.{ "f.parquet", "d.parquet" }, .has = Cols.has, .rows = &.{ 1000, 100 }, .ctx = undefined };
+    // ON and WHERE alike; a key column of the build reads as its FK, whichever part of the key it is.
+    const p = try plan(a, "SELECT d.dt, d.name, count(*) AS n FROM 'f.parquet' f JOIN 'd.parquet' d ON f.cy = d.dy AND d.dt = f.ct WHERE f.cl = d.dl AND d.name <> 'x' GROUP BY d.dt, d.name", t2);
+    try std.testing.expectEqualStrings("cy", p.fk);
+    try std.testing.expectEqualStrings("dy", p.build_key);
+    try std.testing.expectEqual(@as(usize, 2), p.fk_more.len);
+    for (p.fk_more, p.build_key_more, [_][]const u8{ "ct", "cl" }, [_][]const u8{ "dt", "dl" }) |fk, key, want_fk, want_key| {
+        try std.testing.expectEqualStrings(want_fk, fk);
+        try std.testing.expectEqualStrings(want_key, key);
+    }
+    try std.testing.expectEqualStrings("name != 'x'", p.build_where.?);
+    try std.testing.expect(std.mem.startsWith(u8, p.probe_sql, "SELECT ct AS dt, name, count(*) AS n FROM "));
+    try std.testing.expect(std.mem.endsWith(u8, p.probe_sql, " GROUP BY ct, name"));
+    // A LEFT JOIN's ON.
+    const left = try plan(a, "SELECT count(d.name) AS n FROM 'f.parquet' f LEFT JOIN 'd.parquet' d ON f.cy = d.dy AND f.ct = d.dt", t2);
+    try std.testing.expectEqual(Kind.left, left.kind);
+    try std.testing.expectEqualStrings("ct", left.fk_more[0]);
+    // An EXISTS by two keys is no IN: the plan carries it, a SEMI join; a NOT EXISTS an ANTI one.
+    const ex = try plan(a, "SELECT count(*) AS n FROM 'f.parquet' f WHERE EXISTS (SELECT 1 FROM 'd.parquet' d WHERE d.dy = f.cy AND f.ct = d.dt AND d.name > 'm') AND NOT EXISTS (SELECT 1 FROM 'd.parquet' e WHERE e.dy = f.cy AND e.dl = f.cl)", t2);
+    try std.testing.expectEqual(Kind.semi, ex.kind);
+    try std.testing.expect(!ex.not_exists);
+    try std.testing.expectEqualStrings("cy", ex.fk);
+    try std.testing.expectEqualStrings("ct", ex.fk_more[0]);
+    try std.testing.expectEqualStrings("dt", ex.build_key_more[0]);
+    try std.testing.expectEqualStrings("name > 'm'", ex.build_where.?);
+    try std.testing.expectEqual(@as(usize, 1), ex.semis.len);
+    try std.testing.expect(ex.semis[0].anti);
+    try std.testing.expectEqualStrings("cl", ex.semis[0].fk_more[0]);
+    try std.testing.expectEqualStrings("dl", ex.semis[0].key_more[0]);
+    // In a join the keys of one EXISTS are one table's.
+    try std.testing.expectError(error.ExistsSubquery, plan(a, "SELECT count(*) AS n FROM 'f.parquet' f JOIN 'd.parquet' d ON f.cy = d.dy WHERE EXISTS (SELECT 1 FROM 'g.parquet' g WHERE g.gk = f.cy AND g.gname = d.name)", t2));
 }

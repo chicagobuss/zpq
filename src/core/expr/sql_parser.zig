@@ -10,6 +10,7 @@ const sql_setops = @import("sql_setops.zig");
 const sql_names = @import("sql_names.zig");
 const schema = @import("../schema.zig");
 const metadata = @import("../parquet/metadata.zig");
+const KeyDomain = @import("../join/lookup.zig").KeyDomain;
 
 // CLI machine diagnostics use the same parser messages without mixing prose into JSON stderr.
 pub threadlocal var diagnostic_fn: ?*const fn ([]const u8) void = null;
@@ -1278,7 +1279,7 @@ pub fn parseSqlJoinPlanRoot(allocator: std.mem.Allocator, sql: []const u8, schem
     const q = try allocator.create(syntax.Query);
     q.* = pq.syntax.?.*;
     const semis = try std.mem.concat(allocator, syntax.Semi, &.{ first.semis, peeled.semis });
-    q.join = .{ .kind = first.kind, .fk = first.fk, .build = first.build, .not_exists = first.not_exists, .semis = semis, .dims = first.dims };
+    q.join = .{ .kind = first.kind, .fk = first.fk, .fk_more = first.fk_more, .build = first.build, .not_exists = first.not_exists, .semis = semis, .dims = first.dims };
     pq.syntax = q;
     return pq;
 }
@@ -1286,6 +1287,7 @@ pub fn parseSqlJoinPlanRoot(allocator: std.mem.Allocator, sql: []const u8, schem
 const Resolved = struct {
     kind: syntax.JoinKind,
     fk: []const u8,
+    fk_more: []const []const u8,
     build: syntax.Build,
     dims: []const syntax.Dim,
     probe_sql: []const u8,
@@ -1302,6 +1304,19 @@ const Owners = struct {
         const self: *const Owners = @ptrCast(@alignCast(raw));
         _ = metadata.resolveColumn(self.metas[table], name) catch return false;
         return true;
+    }
+
+    /// `sql_join.Tables.same_key`: the lookup's own rule for what a key column is (`KeyDomain`).
+    fn sameKey(raw: *const anyopaque, table: usize, name: []const u8, other: usize, other_name: []const u8) bool {
+        const self: *const Owners = @ptrCast(@alignCast(raw));
+        const a = self.domain(table, name) orelse return false;
+        const b = self.domain(other, other_name) orelse return false;
+        return a.eql(b);
+    }
+
+    fn domain(self: *const Owners, table: usize, name: []const u8) ?KeyDomain {
+        const leaf = metadata.resolveColumn(self.metas[table], name) catch return null;
+        return KeyDomain.of(metadata.leafSchemaElement(self.metas[table], leaf) orelse return null);
     }
 };
 
@@ -1323,7 +1338,7 @@ fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u
         };
         if (root == null) return error.UnsupportedJoin;
     }
-    const p = try sql_join.plan(a, sql, .{ .paths = paths, .has = Owners.has, .rows = rows, .ctx = &owners, .root = root, .user_from = user_from });
+    const p = try sql_join.plan(a, sql, .{ .paths = paths, .has = Owners.has, .same_key = Owners.sameKey, .rows = rows, .ctx = &owners, .root = root, .user_from = user_from });
     const unique = unique_ins or p.reduced;
     const dims = try resolveDims(a, p.dims, schemas, markers, unique);
     return .{
@@ -1331,12 +1346,13 @@ fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u
             inline else => |k| @field(syntax.JoinKind, @tagName(k)),
         },
         .fk = p.fk,
-        .build = try resolveBuild(a, p.build_path, p.build_key, p.build_columns, p.build_where, p.build_dims, p.build_semis, schemas, markers, unique),
+        .fk_more = p.fk_more,
+        .build = try resolveBuild(a, p.build_path, p.build_key, p.build_key_more, p.build_columns, p.build_where, p.build_dims, p.build_semis, schemas, markers, unique),
         .dims = dims,
         .probe_sql = p.probe_sql,
         .reduced = unique,
         .not_exists = p.not_exists,
-        .semis = try resolveNotExists(a, p.semis, schemas, markers),
+        .semis = try resolveExists(a, p.semis, schemas, markers),
     };
 }
 
@@ -1344,7 +1360,8 @@ fn resolveDims(a: std.mem.Allocator, plan_dims: []const sql_join.Dim, schemas: S
     const dims = try a.alloc(syntax.Dim, plan_dims.len);
     for (plan_dims, dims) |d, *out| out.* = .{
         .fk = d.fk,
-        .build = try resolveBuild(a, d.path, d.key, d.columns, d.where, d.dims, d.semis, schemas, markers, unique),
+        .fk_more = d.fk_more,
+        .build = try resolveBuild(a, d.path, d.key, d.key_more, d.columns, d.where, d.dims, d.semis, schemas, markers, unique),
         .left = d.left,
     };
     return dims;
@@ -1352,10 +1369,10 @@ fn resolveDims(a: std.mem.Allocator, plan_dims: []const sql_join.Dim, schemas: S
 
 /// One build: its own conjuncts, the SEMI joins the binder reduced onto it (tables of a chain) after its NOT EXISTS
 /// joins, and a snowflake's tables under it.
-fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, columns: []const []const u8, where: ?[]const u8, plan_dims: []const sql_join.Dim, not_exists: []const sql_join.NotExists, schemas: Schemas, markers: literals.Markers, unique: bool) anyerror!syntax.Build {
+fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, key_more: []const []const u8, columns: []const []const u8, where: ?[]const u8, plan_dims: []const sql_join.Dim, not_exists: []const sql_join.Exists, schemas: Schemas, markers: literals.Markers, unique: bool) anyerror!syntax.Build {
     if (std.mem.indexOfScalar(u8, path, '*') != null) return error.JoinMultiFileBuild;
-    var build: syntax.Build = .{ .path = path, .key = key, .columns = columns, .dims = try resolveDims(a, plan_dims, schemas, markers, unique) };
-    build.semis = try resolveNotExists(a, not_exists, schemas, markers);
+    var build: syntax.Build = .{ .path = path, .key = key, .key_more = key_more, .columns = columns, .dims = try resolveDims(a, plan_dims, schemas, markers, unique) };
+    build.semis = try resolveExists(a, not_exists, schemas, markers);
     const w = where orelse return build;
     const text = try std.fmt.allocPrint(a, "SELECT count(*) FROM '{s}' WHERE {s}", .{ path, w });
     const peeled = try peelSemis(a, text, schemas, markers, unique);
@@ -1364,15 +1381,16 @@ fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, columns
     return build;
 }
 
-/// The plan's NOT EXISTS joins of one table: ANTI joins whose NULLs match nothing. Their conditions are the query's
-/// own, so an IN among them is no reduction's.
-fn resolveNotExists(a: std.mem.Allocator, plan_semis: []const sql_join.NotExists, schemas: Schemas, markers: literals.Markers) anyerror![]const syntax.Semi {
+/// The EXISTS joins of one table that the plan carries: a NOT EXISTS is an ANTI join whose NULLs match nothing, an
+/// EXISTS by a composite key a SEMI join. Their conditions are the query's own, so an IN among them is no reduction's.
+fn resolveExists(a: std.mem.Allocator, plan_semis: []const sql_join.Exists, schemas: Schemas, markers: literals.Markers) anyerror![]const syntax.Semi {
     const semis = try a.alloc(syntax.Semi, plan_semis.len);
     for (plan_semis, semis) |x, *out| out.* = .{
         .fk = x.fk,
-        .build = try resolveBuild(a, x.path, x.key, &.{}, x.where, &.{}, &.{}, schemas, markers, false),
-        .anti = true,
-        .not_exists = true,
+        .fk_more = x.fk_more,
+        .build = try resolveBuild(a, x.path, x.key, x.key_more, &.{}, x.where, &.{}, &.{}, schemas, markers, false),
+        .anti = x.anti,
+        .not_exists = x.anti,
     };
     return semis;
 }
@@ -1387,7 +1405,7 @@ fn peelSemis(a: std.mem.Allocator, sql: []const u8, schemas: Schemas, markers: l
         const inner = (try sql_join.tables(a, z)) orelse break;
         const r = try resolveJoin(a, z, inner, schemas, markers, unique, null, false);
         const anti = r.kind == .anti;
-        try semis.append(a, .{ .fk = r.fk, .build = r.build, .unique = unique and !anti, .anti = anti, .not_exists = r.not_exists });
+        try semis.append(a, .{ .fk = r.fk, .fk_more = r.fk_more, .build = r.build, .unique = unique and !anti, .anti = anti, .not_exists = r.not_exists });
         try semis.appendSlice(a, r.semis);
         rest = r.probe_sql;
     }

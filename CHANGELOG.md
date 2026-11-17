@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Joins read NULLs in a dimension's columns, and join on string keys.** A build-side column holding NULLs answers as DuckDB does, and a join on a VARCHAR key matches by bytes. A fetched DATE or TIMESTAMP key keeps its type in CSV and Parquet output.
+
 - **Joins run over S3.** Tables on S3, or a mix of local and S3 tables, join as local ones do, with the same answers. A build side larger than the query's memory budget is refused by name.
 
 - **Joins accept more of the queries people write.** A glob or several files can be a join's probe table, EXTRACT works inside a join, USING joins two tables on one column, and a build side that isn't unique on its key no longer refuses when the other side is. Every join refusal now names the feature it lacks.

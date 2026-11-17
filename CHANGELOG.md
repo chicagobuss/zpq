@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Compaction keeps merged row groups within the row and byte targets, and copies a group that can't merge as it stands.** Rewriting DuckDB's 122,880-row groups no longer pairs them into 245,760-row groups.
+
 - **Re-encoding writes of wide rows are faster again.** A write with more columns than encode workers used to encode only a quarter of the workers' row groups at a time, so most turns sat idle behind each group's slowest column. It now encodes one row group per worker, within the same memory share. Output bytes don't change. On a 16-thread placement, bench100 W4 (14 columns, filter, zstd) went from 218 to 173 ms, and an SF10 lineitem re-encode from 6.2 to 4.5 s (zstd).
 
 - **S3 Express: a failed refresh thread no longer fails requests.** If the background session refresh can't start a thread, zpq keeps serving the still-valid cached session instead of failing the request.

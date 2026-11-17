@@ -700,7 +700,7 @@ fn runParsedOnce(
     var aggregate = options.aggregate;
     const explain = options.explain;
     // `COLUMNS(...)` select items are written out once per column they name, which the footer says.
-    var column_schemas: engine.join.LocalSchemas = .{ .arena = arena };
+    var column_schemas: engine.join.LocalSchemas = .{ .arena = arena, .ctx = .{ .gpa = gpa, .io = io, .env = env } };
     defer column_schemas.deinit();
     // CTEs and subqueries in FROM run first, as queries of their own into scratch files the query then reads.
     if (comptime build_options.enable_sql) if (options.query) |q| {
@@ -752,6 +752,7 @@ fn runParsedOnce(
     const row_group = options.row_group;
     var group_by = options.group_by;
     var plan_source: ?engine.types.bound_plan.Source = null;
+    var remote_join = false;
     var select_cols = options.select_cols;
     var result_order = options.result_order;
     const column_order = options.column_order;
@@ -888,12 +889,13 @@ fn runParsedOnce(
                 return runUpdate(io, gpa, arena, up, output, fsync, summary, max_memory orelse zpq.core.system.discoverAvailableMemory(env));
             }
             // A two-table join binds its column names against both footers; the engine reads the build.
-            var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena } };
+            var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena, .ctx = .{ .gpa = gpa, .io = io, .env = env } } };
             defer schemas.deinit();
             const sql = zpq.core.expr.sql_parser;
             const pq = (try sql.parseSqlJoinPlanRoot(arena, q_str, .{ .ctx = &schemas, .footer = zpq.frontend.JoinSchemas.footer }, root)) orelse
                 try sql.parseSqlPlan(arena, q_str);
             parsed_join = pq.syntax.?.join;
+            remote_join = schemas.local.remote_seen;
             plan_source = engine.syntax_plan.source(pq.syntax.?);
             filter = pq.filter_str;
             select = pq.select_str;
@@ -1002,6 +1004,7 @@ fn runParsedOnce(
         const explain_args: engine.QueryArgs = .{
             .inputs = inputs,
             .plan_source = plan_source,
+            .replicated_join_limit = if (remote_join) engine_max_mem else null,
             .output = if (fmt == .parquet) engine_output orelse "-" else null,
             .typed_answer = fmt == .parquet,
             .text_output = if (fmt != .parquet) .{ .format = fmt } else null,
@@ -1043,6 +1046,7 @@ fn runParsedOnce(
     const query_args: engine.QueryArgs = .{
         .inputs = inputs,
         .plan_source = plan_source,
+        .replicated_join_limit = if (remote_join) engine_max_mem else null,
         .output = if (fmt == .parquet) engine_output orelse "-" else null,
         .output_fd = if (fmt == .parquet) (if (to_stdout) (if (@import("builtin").os.tag == .windows) std.Io.File.stdout().handle else 1) else publication.fd) else null,
         .output_restartable = fmt == .parquet and !to_stdout and publication.fd != null,

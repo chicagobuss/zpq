@@ -24,17 +24,25 @@ const fanout_plan = @import("fanout_plan.zig");
 /// the caller unmaps them (`deinit`) once it has the plan.
 pub const LocalSchemas = struct {
     arena: std.mem.Allocator,
+    ctx: ?types.Context = null,
+    remote_seen: bool = false,
     seen: std.StringHashMapUnmanaged(*schema.FileMetaData) = .empty,
     maps: std.ArrayList(local_fs.Mapped) = .empty,
 
     pub fn footer(raw: *const anyopaque, path: []const u8) anyerror!*const schema.FileMetaData {
         const self: *LocalSchemas = @ptrCast(@alignCast(@constCast(raw)));
         if (self.seen.get(path)) |m| return m;
-        try self.maps.ensureUnusedCapacity(self.arena, 1);
-        const opened = try open(self.arena, path);
-        self.maps.appendAssumeCapacity(opened.map.?);
         const m = try self.arena.create(schema.FileMetaData);
-        m.* = opened.meta;
+        if (std.mem.startsWith(u8, path, "s3://")) {
+            self.remote_seen = true;
+            const ctx = self.ctx orelse return error.JoinNotLocal;
+            m.* = try input.fetchS3Schema(ctx, path, self.arena);
+        } else {
+            try self.maps.ensureUnusedCapacity(self.arena, 1);
+            const opened = try open(self.arena, path);
+            self.maps.appendAssumeCapacity(opened.map.?);
+            m.* = opened.meta;
+        }
         try self.seen.put(self.arena, path, m);
         return m;
     }
@@ -48,9 +56,8 @@ pub const LocalSchemas = struct {
 
 const Opened = struct { map: ?local_fs.Mapped, bytes: []const u8, meta: schema.FileMetaData };
 
-/// Builds read local files in this release: a build on S3 refuses, naming it. The caller owns the mapping.
+/// The caller owns the local mapping.
 fn open(arena: std.mem.Allocator, path: []const u8) !Opened {
-    if (std.mem.startsWith(u8, path, "s3://")) return error.JoinNotLocal;
     const m = try local_fs.mapFile(path);
     errdefer m.unmap();
     return .{ .map = m, .bytes = m.bytes, .meta = try metadata.open(arena, m.bytes) };
@@ -563,7 +570,7 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: 
     const p = t.p;
     const diag = &t.diag;
     try t.maps.ensureUnusedCapacity(arena, 1);
-    const file = (if (p.replica_limit != null) openRemote(t, b, aligned) else open(arena, b.path)) catch |err| {
+    const file = (if (std.mem.startsWith(u8, b.path, "s3://")) openRemote(t, b, aligned) else open(arena, b.path)) catch |err| {
         Diag.setInput(diag, b.path, err);
         return err;
     };
@@ -600,7 +607,7 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: 
         .key_name = b.key,
         .key = key,
         .payload = payload,
-        .deferred = try deferredPayloads(arena, t.query, b, fk, meta, payload),
+        .deferred = if (file.map == null) &.{} else try deferredPayloads(arena, t.query, b, fk, meta, payload),
         .filter = filter,
         .threads = t.threads,
         .budget = p.ledger.available(),
@@ -630,15 +637,11 @@ fn build(t: *Task, fk: []const u8, b: syntax.Build, kind: lookup.Kind, aligned: 
     return .{ .fk = fk, .join = j, .semis = semis, .dims = dims };
 }
 
-/// Read every build of `args`' join; null for a query without one. The probe's inputs must be local files too.
+/// Read every build of `args`' join; null for a query without one.
 pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryArgs, ledger: *core_memory.SharedBudget) !?*Prepared {
     const gpa = ctx.gpa;
     const source = args.plan_source orelse return null;
     const sj = source.join orelse return null;
-    for (args.inputs) |path| if (args.replicated_join_limit == null and std.mem.startsWith(u8, path, "s3://")) {
-        Diag.setInput(args.diag, path, null);
-        return error.JoinNotLocal;
-    };
     const threads = if (args.parallelism == 0) std.Thread.getCpuCount() catch 1 else args.parallelism;
     const p = try arena.create(Prepared);
     p.* = .{ .main = undefined, .semis = &.{}, .ledger = ledger, .gpa = gpa, .order = args.result_order, .single_probe = args.inputs.len == 1 };

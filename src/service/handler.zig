@@ -672,7 +672,7 @@ fn executeSqlOnce(
     root: ?[]const u8,
     retry: *?[]const u8,
 ) ![]u8 {
-    var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena } };
+    var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena, .ctx = .{ .gpa = allocator, .io = io, .env = env } } };
     defer schemas.deinit();
     const parser = zpq.core.expr.sql_parser;
     const pq = (try parser.parseSqlJoinPlanRoot(arena, sql, .{ .ctx = &schemas, .footer = zpq.frontend.JoinSchemas.footer }, root)) orelse

@@ -243,9 +243,23 @@ def queries(seed, p, T, count, shapes):
             else:
                 sql = f'SELECT d.grp, f.dup, count(*) AS n FROM {frm}{wh()} GROUP BY d.grp, f.dup ORDER BY n, d.grp, f.dup LIMIT {L} OFFSET {O}'
         else:  # exists
-            form = r.choice(['exists', 'not-exists', 'not-in', 'in', 'exists-cond', 'not-exists-str', 'both', 'bare', 'in-join'])
+            form = r.choice(['exists', 'not-exists', 'not-in', 'in', 'exists-cond', 'not-exists-str', 'both', 'bare', 'in-join',
+                             'named', 'implicit'])
             sql = f'SELECT count(*) AS n, sum(f.v) AS sv FROM {F} f'
-            if form == 'exists': w.append(f'EXISTS (SELECT 1 FROM {D} d WHERE d.nk = f.fk2)')
+            if form == 'named':   # no name a query can spell changes its meaning: the frontend's own, as aliases
+                al = lambda: r.choice(['__zpq_not_exists', '__zpq_using_left', '__zpq_using_right', '__zpq_group_all', '__zpq_order_0'])
+                x, y = al(), al()
+                sub = r.choice([f'f.fk2 NOT IN (SELECT nk AS {al()} FROM {D} {y})', f'f.fk2 IN (SELECT nk AS {al()} FROM {D} {y})',
+                                f'NOT EXISTS (SELECT nk AS {al()} FROM {D} {y} WHERE {y}.nk = f.fk2)'])
+                w = [c.replace('f.', x + '.') for c in w + [sub]]
+                sql = f'SELECT count(*) AS n, sum({x}.v) AS sv FROM {F} {x}'
+            elif form == 'implicit':   # a file without an alias goes by its own name, outside and inside the subquery
+                w.append(r.choice([f'f.fk2 IN (SELECT d.nk FROM {D} WHERE d.grp < 3)', f'f.fk2 NOT IN (SELECT nk FROM {D})',
+                                   f'F.fk2 NOT IN (SELECT d.nk FROM {D} WHERE d.nk IS NOT NULL)',
+                                   f'EXISTS (SELECT 1 FROM {D} WHERE d.nk = f.fk2)', f'NOT EXISTS (SELECT 1 FROM {D} WHERE d.nk = f.fk2)']))
+                sql = f'SELECT count(*) AS n, sum(f.v) AS sv FROM {F}'
+            if form in ('named', 'implicit'): pass
+            elif form == 'exists': w.append(f'EXISTS (SELECT 1 FROM {D} d WHERE d.nk = f.fk2)')
             elif form == 'both':   # two of them on one table, beside the NOT IN whose NULLs differ
                 w.append(f'EXISTS (SELECT 1 FROM {DU} u WHERE u.dpk = f.fk)')
                 w.append(f"NOT EXISTS (SELECT 1 FROM {D} d WHERE f.fk2 = d.nk AND d.grp <> {r.randint(0, 3)})")

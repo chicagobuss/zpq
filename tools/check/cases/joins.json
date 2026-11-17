@@ -187,7 +187,10 @@
   {
    "name": "temp_snow",
    "copy": "COPY (SELECT g AS spk, (CASE WHEN g = 2 THEN NULL ELSE DATE '2020-02-27' + g::INTEGER END) AS sdate, TIMESTAMP '2020-02-28 23:59:59' + INTERVAL (g) SECOND AS sts FROM range(0, 6) t(g)) TO '{path}' (FORMAT PARQUET)"
-  }
+  },
+  {"name": "alias_fact", "copy": "COPY (SELECT * FROM (VALUES (NULL::BIGINT), (1), (2), (3)) t(fk)) TO '{path}' (FORMAT PARQUET)"},
+  {"name": "alias_dim", "copy": "COPY (SELECT * FROM (VALUES (1::BIGINT), (NULL)) t(pk)) TO '{path}' (FORMAT PARQUET)"},
+  {"name": "column_order", "path": "ci/fixtures/parquet/column_order.parquet"}
  ],
  "cases": [
   {
@@ -4415,16 +4418,16 @@
     "compare": "plan",
     "holds": {
      "join": {
-      "kind": "anti",
-      "fk": "fk",
+      "kind": "semi",
+      "fk": "q",
       "build": {
        "key": "pk"
       },
       "semis": {
        "$list": [
         {
-         "kind": "semi",
-         "fk": "q"
+         "kind": "anti",
+         "fk": "fk"
         }
        ]
       }
@@ -4598,6 +4601,478 @@
    "refuse": {
     "error": "exit 1",
     "diag": "a join is a tree of N:1 tables"
+   }
+  },
+  {
+   "id": "join:names:not-in-key-alias",
+   "fixture": "alias_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:alias_fact}' f WHERE f.fk NOT IN (SELECT pk AS __zpq_not_exists FROM '{fixture:alias_dim}')"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:alias_fact}' f WHERE f.fk NOT IN (SELECT pk AS __zpq_not_exists FROM '{fixture:alias_dim}')"
+   }
+  },
+  {
+   "id": "join:names:in-key-alias",
+   "fixture": "alias_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:alias_fact}' f WHERE f.fk IN (SELECT pk AS __zpq_not_exists FROM '{fixture:alias_dim}')"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:alias_fact}' f WHERE f.fk IN (SELECT pk AS __zpq_not_exists FROM '{fixture:alias_dim}')"
+   }
+  },
+  {
+   "id": "join:names:not-in-every-alias",
+   "fixture": "alias_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS __zpq_not_exists FROM '{fixture:alias_fact}' __zpq_using_left WHERE __zpq_using_left.fk NOT IN (SELECT pk AS __zpq_group_all FROM '{fixture:alias_dim}' __zpq_using_right)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS __zpq_not_exists FROM '{fixture:alias_fact}' __zpq_using_left WHERE __zpq_using_left.fk NOT IN (SELECT pk AS __zpq_group_all FROM '{fixture:alias_dim}' __zpq_using_right)"
+   }
+  },
+  {
+   "id": "join:names:not-exists-every-alias",
+   "fixture": "alias_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS __zpq_not_exists FROM '{fixture:alias_fact}' __zpq_not_exists WHERE NOT EXISTS (SELECT pk AS __zpq_not_exists FROM '{fixture:alias_dim}' __zpq_using_right WHERE __zpq_using_right.pk = __zpq_not_exists.fk)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS __zpq_not_exists FROM '{fixture:alias_fact}' __zpq_not_exists WHERE NOT EXISTS (SELECT pk AS __zpq_not_exists FROM '{fixture:alias_dim}' __zpq_using_right WHERE __zpq_using_right.pk = __zpq_not_exists.fk)"
+   }
+  },
+  {
+   "id": "join:names:using-left-alias",
+   "fixture": "using_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT label, count(*) AS n FROM '{fixture:using_fact}' __zpq_using_right JOIN '{fixture:using_dim}' USING (k) GROUP BY label ORDER BY label"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT label, count(*) AS n FROM '{fixture:using_fact}' __zpq_using_right JOIN '{fixture:using_dim}' USING (k) GROUP BY label ORDER BY label"
+   }
+  },
+  {
+   "id": "join:names:using-right-alias",
+   "fixture": "using_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT label, count(*) AS n FROM '{fixture:using_fact}' JOIN '{fixture:using_dim}' __zpq_using_left USING (k) GROUP BY label ORDER BY label"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT label, count(*) AS n FROM '{fixture:using_fact}' JOIN '{fixture:using_dim}' __zpq_using_left USING (k) GROUP BY label ORDER BY label"
+   }
+  },
+  {
+   "id": "join:names:using-same-file-twice",
+   "fixture": "using_dim",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:using_dim}' JOIN '{fixture:using_dim}' USING (k)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:using_dim}' JOIN '{fixture:using_dim}' USING (k)"
+   }
+  },
+  {
+   "id": "join:names:order-and-group-aliases",
+   "fixture": "using_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT label AS __zpq_order_0, count(*) AS __zpq_group_all FROM '{fixture:using_fact}' f JOIN '{fixture:using_dim}' d ON f.k = d.k GROUP BY label ORDER BY sum(v) DESC, label"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT label AS __zpq_order_0, count(*) AS __zpq_group_all FROM '{fixture:using_fact}' f JOIN '{fixture:using_dim}' d ON f.k = d.k GROUP BY label ORDER BY sum(v) DESC, label"
+   }
+  },
+  {
+   "id": "join:names:implicit-in",
+   "fixture": "column_order",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:column_order}' WHERE column_order.i IN (SELECT pk FROM '{fixture:alias_dim}')"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:column_order}' WHERE column_order.i IN (SELECT pk FROM '{fixture:alias_dim}')"
+   }
+  },
+  {
+   "id": "join:names:implicit-not-in",
+   "fixture": "column_order",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:column_order}' WHERE column_order.i NOT IN (SELECT pk FROM '{fixture:alias_dim}')"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:column_order}' WHERE column_order.i NOT IN (SELECT pk FROM '{fixture:alias_dim}')"
+   }
+  },
+  {
+   "id": "join:names:implicit-not-in-no-null",
+   "fixture": "column_order",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, min(s) AS lo FROM '{fixture:column_order}' WHERE COLUMN_ORDER.i NOT IN (SELECT pk FROM '{fixture:alias_dim}' WHERE pk IS NOT NULL)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, min(s) AS lo FROM '{fixture:column_order}' WHERE COLUMN_ORDER.i NOT IN (SELECT pk FROM '{fixture:alias_dim}' WHERE pk IS NOT NULL)"
+   }
+  },
+  {
+   "id": "join:names:implicit-exists",
+   "fixture": "column_order",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:column_order}' WHERE EXISTS (SELECT 1 FROM '{fixture:alias_fact}' f WHERE f.fk = column_order.i) AND NOT EXISTS (SELECT 1 FROM '{fixture:alias_dim}' b WHERE b.pk = column_order.i)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:column_order}' WHERE EXISTS (SELECT 1 FROM '{fixture:alias_fact}' f WHERE f.fk = column_order.i) AND NOT EXISTS (SELECT 1 FROM '{fixture:alias_dim}' b WHERE b.pk = column_order.i)"
+   }
+  },
+  {
+   "id": "join:names:implicit-subquery-table",
+   "fixture": "alias_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:alias_fact}' f WHERE f.fk IN (SELECT column_order.i FROM '{fixture:column_order}' WHERE column_order.i < 100 AND column_order.s <> 'a')"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:alias_fact}' f WHERE f.fk IN (SELECT column_order.i FROM '{fixture:column_order}' WHERE column_order.i < 100 AND column_order.s <> 'a')"
+   }
+  },
+  {
+   "id": "join:names:implicit-in-a-join",
+   "fixture": "alias_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT column_order.s, count(*) AS n FROM '{fixture:alias_fact}' f JOIN '{fixture:column_order}' ON f.fk = column_order.i WHERE column_order.i > 1 GROUP BY column_order.s ORDER BY column_order.s"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT column_order.s, count(*) AS n FROM '{fixture:alias_fact}' f JOIN '{fixture:column_order}' ON f.fk = column_order.i WHERE column_order.i > 1 GROUP BY column_order.s ORDER BY column_order.s"
+   }
+  },
+  {
+   "id": "join:names:refuse-implicit-beside-alias",
+   "fixture": "alias_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:column_order}' g WHERE column_order.i IN (SELECT pk FROM '{fixture:alias_dim}')"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a join is a tree of N:1 tables",
+    "binder_sql": "SELECT count(*) AS n FROM '{fixture:column_order}' g WHERE column_order.i IN (SELECT pk FROM '{fixture:alias_dim}')"
+   }
+  },
+  {
+   "id": "join:names:refuse-nested-outer-reference",
+   "fixture": "alias_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:alias_fact}' column_order WHERE column_order.fk IN (SELECT d.i FROM '{fixture:column_order}' d WHERE EXISTS (SELECT 1 FROM '{fixture:alias_dim}' x WHERE x.pk = column_order.fk))"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a join is a tree of N:1 tables"
+   }
+  },
+  {
+   "id": "join:exists:two-not-exists-and-not-in",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, count(fk) AS c FROM '{fixture:fact}' f WHERE NOT EXISTS (SELECT 1 FROM '{fixture:dim_nullkey}' z WHERE z.pk = f.fk) AND NOT EXISTS (SELECT 1 FROM '{fixture:dim}' d WHERE d.pk = f.fk AND d.grp = 2) AND f.q NOT IN (SELECT pk FROM '{fixture:dim_nullkey}' WHERE w <> 20)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, count(fk) AS c FROM '{fixture:fact}' f WHERE NOT EXISTS (SELECT 1 FROM '{fixture:dim_nullkey}' z WHERE z.pk = f.fk) AND NOT EXISTS (SELECT 1 FROM '{fixture:dim}' d WHERE d.pk = f.fk AND d.grp = 2) AND f.q NOT IN (SELECT pk FROM '{fixture:dim_nullkey}' WHERE w <> 20)"
+   }
+  },
+  {
+   "id": "join:exists:not-exists-on-a-filter-only-table",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND g.gname <> 'g0' AND NOT EXISTS (SELECT 1 FROM '{fixture:dim_nullkey}' z WHERE z.pk = g.gk)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND g.gname <> 'g0' AND NOT EXISTS (SELECT 1 FROM '{fixture:dim_nullkey}' z WHERE z.pk = g.gk)"
+   }
+  },
+  {
+   "id": "join:exists:not-exists-on-a-snowflake-table",
+   "fixture": "fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT g.gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND NOT EXISTS (SELECT 1 FROM '{fixture:dim_nullkey}' z WHERE z.pk = g.gk) AND NOT EXISTS (SELECT 1 FROM '{fixture:dim_nullkey}' y WHERE y.pk = d.pk) GROUP BY g.gname ORDER BY g.gname"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    },
+    {
+     "jobs": 16
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT g.gname, count(*) AS n FROM '{fixture:fact}' f, '{fixture:dim}' d, '{fixture:snow_grp}' g WHERE f.fk = d.pk AND d.grp = g.gk AND NOT EXISTS (SELECT 1 FROM '{fixture:dim_nullkey}' z WHERE z.pk = g.gk) AND NOT EXISTS (SELECT 1 FROM '{fixture:dim_nullkey}' y WHERE y.pk = d.pk) GROUP BY g.gname ORDER BY g.gname"
+   }
+  },
+  {
+   "id": "join:exists:refuse-not-exists-on-a-left-table",
+   "fixture": "alias_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:fact}' f LEFT JOIN '{fixture:dim}' d ON f.fk = d.pk WHERE NOT EXISTS (SELECT 1 FROM '{fixture:dim_nullkey}' z WHERE z.pk = d.grp)"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "a condition outside a LEFT JOIN's ON reads its table"
    }
   },
   {

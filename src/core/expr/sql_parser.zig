@@ -1220,13 +1220,14 @@ pub fn parseSqlJoinPlanRoot(allocator: std.mem.Allocator, sql: []const u8, schem
     const extracted = try extractAsDatePart(allocator, positioned);
     const z = try substringKeywords(allocator, extracted);
     const paths = (try sql_join.tables(allocator, z)) orelse return null;
-    const first = try resolveJoin(allocator, z, paths, schemas, markers, false, root_path);
-    // A probe query that still holds `IN (SELECT ...)` semi-joins the probe itself.
+    const first = try resolveJoin(allocator, z, paths, schemas, markers, false, root_path, true);
+    // A probe query that still holds `IN (SELECT ...)` semi-joins the probe itself, beside its NOT EXISTS joins.
     const peeled = try peelSemis(allocator, first.probe_sql, schemas, markers, first.reduced);
     var pq = try parseFolded(true, allocator, peeled.rest, markers);
     const q = try allocator.create(syntax.Query);
     q.* = pq.syntax.?.*;
-    q.join = .{ .kind = first.kind, .fk = first.fk, .build = first.build, .not_exists = first.not_exists, .semis = peeled.semis, .dims = first.dims };
+    const semis = try std.mem.concat(allocator, syntax.Semi, &.{ first.semis, peeled.semis });
+    q.join = .{ .kind = first.kind, .fk = first.fk, .build = first.build, .not_exists = first.not_exists, .semis = semis, .dims = first.dims };
     pq.syntax = q;
     return pq;
 }
@@ -1240,6 +1241,8 @@ const Resolved = struct {
     /// Its INs are reductions' (`sql_join.Plan.reduced`): their builds' keys must be unique.
     reduced: bool,
     not_exists: bool,
+    /// The probe's NOT EXISTS joins (`sql_join.Plan.semis`).
+    semis: []const syntax.Semi,
 };
 
 const Owners = struct {
@@ -1251,8 +1254,9 @@ const Owners = struct {
     }
 };
 
-/// `unique_ins`: the query this one came out of reduced, so every IN in it is a reduction's too.
-fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u8, schemas: Schemas, markers: literals.Markers, unique_ins: bool, root_path: ?[]const u8) anyerror!Resolved {
+/// `unique_ins`: the query this one came out of reduced, so every IN in it is a reduction's too. `user_from`: `sql` is
+/// the query as written, not a piece the binder unparsed (`sql_join.Tables.user_from`).
+fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u8, schemas: Schemas, markers: literals.Markers, unique_ins: bool, root_path: ?[]const u8, user_from: bool) anyerror!Resolved {
     const metas = try a.alloc(*const schema.FileMetaData, paths.len);
     const rows = try a.alloc(u64, paths.len);
     for (paths, metas, rows) |path, *m, *r| {
@@ -1268,7 +1272,7 @@ fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u
         };
         if (root == null) return error.UnsupportedJoin;
     }
-    const p = try sql_join.plan(a, sql, .{ .paths = paths, .has = Owners.has, .rows = rows, .ctx = &owners, .root = root });
+    const p = try sql_join.plan(a, sql, .{ .paths = paths, .has = Owners.has, .rows = rows, .ctx = &owners, .root = root, .user_from = user_from });
     const unique = unique_ins or p.reduced;
     const dims = try resolveDims(a, p.dims, schemas, markers, unique);
     return .{
@@ -1276,11 +1280,12 @@ fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u
             inline else => |k| @field(syntax.JoinKind, @tagName(k)),
         },
         .fk = p.fk,
-        .build = try resolveBuild(a, p.build_path, p.build_key, p.build_columns, p.build_where, p.build_dims, schemas, markers, unique),
+        .build = try resolveBuild(a, p.build_path, p.build_key, p.build_columns, p.build_where, p.build_dims, p.build_semis, schemas, markers, unique),
         .dims = dims,
         .probe_sql = p.probe_sql,
         .reduced = unique,
         .not_exists = p.not_exists,
+        .semis = try resolveNotExists(a, p.semis, schemas, markers),
     };
 }
 
@@ -1288,23 +1293,37 @@ fn resolveDims(a: std.mem.Allocator, plan_dims: []const sql_join.Dim, schemas: S
     const dims = try a.alloc(syntax.Dim, plan_dims.len);
     for (plan_dims, dims) |d, *out| out.* = .{
         .fk = d.fk,
-        .build = try resolveBuild(a, d.path, d.key, d.columns, d.where, d.dims, schemas, markers, unique),
+        .build = try resolveBuild(a, d.path, d.key, d.columns, d.where, d.dims, d.semis, schemas, markers, unique),
         .left = d.left,
     };
     return dims;
 }
 
-/// One build: its own conjuncts, the SEMI joins the binder reduced onto it (tables of a chain), and a snowflake's
-/// tables under it.
-fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, columns: []const []const u8, where: ?[]const u8, plan_dims: []const sql_join.Dim, schemas: Schemas, markers: literals.Markers, unique: bool) anyerror!syntax.Build {
+/// One build: its own conjuncts, the SEMI joins the binder reduced onto it (tables of a chain) after its NOT EXISTS
+/// joins, and a snowflake's tables under it.
+fn resolveBuild(a: std.mem.Allocator, path: []const u8, key: []const u8, columns: []const []const u8, where: ?[]const u8, plan_dims: []const sql_join.Dim, not_exists: []const sql_join.NotExists, schemas: Schemas, markers: literals.Markers, unique: bool) anyerror!syntax.Build {
     if (std.mem.indexOfScalar(u8, path, '*') != null) return error.JoinMultiFileBuild;
     var build: syntax.Build = .{ .path = path, .key = key, .columns = columns, .dims = try resolveDims(a, plan_dims, schemas, markers, unique) };
+    build.semis = try resolveNotExists(a, not_exists, schemas, markers);
     const w = where orelse return build;
     const text = try std.fmt.allocPrint(a, "SELECT count(*) FROM '{s}' WHERE {s}", .{ path, w });
     const peeled = try peelSemis(a, text, schemas, markers, unique);
-    build.semis = peeled.semis;
+    build.semis = try std.mem.concat(a, syntax.Semi, &.{ build.semis, peeled.semis });
     build.filter = (try parseFolded(true, a, peeled.rest, markers)).syntax.?.filter;
     return build;
+}
+
+/// The plan's NOT EXISTS joins of one table: ANTI joins whose NULLs match nothing. Their conditions are the query's
+/// own, so an IN among them is no reduction's.
+fn resolveNotExists(a: std.mem.Allocator, plan_semis: []const sql_join.NotExists, schemas: Schemas, markers: literals.Markers) anyerror![]const syntax.Semi {
+    const semis = try a.alloc(syntax.Semi, plan_semis.len);
+    for (plan_semis, semis) |x, *out| out.* = .{
+        .fk = x.fk,
+        .build = try resolveBuild(a, x.path, x.key, &.{}, x.where, &.{}, &.{}, schemas, markers, false),
+        .anti = true,
+        .not_exists = true,
+    };
+    return semis;
 }
 
 /// Every `IN (SELECT ...)` and `NOT IN (SELECT ...)` of `sql`, as SEMI and ANTI joins of its table, and the query left
@@ -1315,9 +1334,10 @@ fn peelSemis(a: std.mem.Allocator, sql: []const u8, schemas: Schemas, markers: l
     while (true) {
         const z = try a.dupeSentinel(u8, rest, 0);
         const inner = (try sql_join.tables(a, z)) orelse break;
-        const r = try resolveJoin(a, z, inner, schemas, markers, unique, null);
+        const r = try resolveJoin(a, z, inner, schemas, markers, unique, null, false);
         const anti = r.kind == .anti;
         try semis.append(a, .{ .fk = r.fk, .build = r.build, .unique = unique and !anti, .anti = anti, .not_exists = r.not_exists });
+        try semis.appendSlice(a, r.semis);
         rest = r.probe_sql;
     }
     return .{ .semis = semis.items, .rest = rest };

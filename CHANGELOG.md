@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Joins run over S3.** Tables on S3, or a mix of local and S3 tables, join as local ones do, with the same answers. A build side larger than the query's memory budget is refused by name.
+
 - **Joins accept more of the queries people write.** A glob or several files can be a join's probe table, EXTRACT works inside a join, USING joins two tables on one column, and a build side that isn't unique on its key no longer refuses when the other side is. Every join refusal now names the feature it lacks.
 
 - **Joins carry DECIMAL dimension columns.** A DECIMAL column from a join's dimension side keeps its scale through filters, GROUP BY, aggregates and comparisons.

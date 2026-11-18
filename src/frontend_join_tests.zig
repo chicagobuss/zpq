@@ -379,3 +379,56 @@ test "glob: an S3 pattern names the files the same pattern names locally, and no
         try std.testing.expectError(error.BadArgs, frontend.expandGlob(a, std.testing.io, try std.fmt.allocPrint(a, "{s}{s}", .{ local_base, pattern }), env, &diag));
     }
 }
+
+test "glob: keys the listing escapes come back as they were written, and read" {
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "POSIX environment fixture");
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(std.testing.allocator);
+    defer fake.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
+    defer tmp.cleanup();
+
+    // `&`, `<`, `>`, `"`, `'`, an entity written out in the name, UTF-8, a directory with `&` in its name, and a tab
+    // (S3 lists it as `&#9;`; a control byte in a key is refused when it is read, so that one is only listed). Each is
+    // a real object, so a wrong key is a 404 on the footer read.
+    const keys = [_][]const u8{
+        "amp/p&1.parquet",        "amp/p<2>.parquet", "amp/p\"3'.parquet", "amp/p&amp;4.parquet", "amp/t\t1.parquet",
+        "amp/p\xc3\xa9.parquet",  "amp/q1.parquet",   "a&b/p1.parquet",    "a&b/p2.parquet",      "amp/sub&/p1.parquet",
+    };
+    var rows: i64 = 0;
+    for (keys) |key| {
+        rows = (try serve(&fake, a, key, "group_order.parquet")).rows;
+        const slash = std.mem.lastIndexOfScalar(u8, key, '/').?;
+        try tmp.dir.createDirPath(std.testing.io, key[0..slash]);
+        const fd = try @import("local_fs.zig").createFile(try std.fmt.allocPrint(a, "{s}/{s}", .{ tmp.path, key }));
+        @import("local_fs.zig").close(fd);
+    }
+    const env = try fakeEnv(a, &fake);
+    var diag: Diag = .{};
+    const local_base = try std.fmt.allocPrint(a, "{s}/", .{tmp.path});
+    const patterns = [_]struct { pattern: []const u8, count: usize }{
+        .{ .pattern = "amp/p*.parquet", .count = 5 },
+        .{ .pattern = "amp/t*", .count = 1 },
+        .{ .pattern = "amp/*", .count = 7 },
+        .{ .pattern = "amp/q*", .count = 1 },
+        .{ .pattern = "a&b/p*.parquet", .count = 2 },
+    };
+    for (patterns) |c| {
+        const remote = try frontend.expandGlob(a, std.testing.io, try std.fmt.allocPrint(a, "s3://bkt/{s}", .{c.pattern}), env, &diag);
+        const local = try frontend.expandGlob(a, std.testing.io, try std.fmt.allocPrint(a, "{s}{s}", .{ local_base, c.pattern }), env, &diag);
+        const remote_names = try below(a, "s3://bkt/", remote);
+        const local_names = try below(a, local_base, local);
+        try std.testing.expectEqual(c.count, remote_names.len);
+        try std.testing.expectEqual(local_names.len, remote_names.len);
+        for (local_names, remote_names) |l, r| try std.testing.expectEqualStrings(l, r);
+    }
+    // The binder reads every one of them: the footers' rows add up, with no 404.
+    var schemas = schemasFor(a, env, &diag);
+    defer schemas.deinit();
+    frontend.JoinSchemas.prefetch(&schemas, &.{"s3://bkt/amp/p*.parquet"});
+    const meta = try frontend.JoinSchemas.footer(&schemas, "s3://bkt/amp/p*.parquet");
+    try std.testing.expectEqual(5 * rows, meta.num_rows);
+}

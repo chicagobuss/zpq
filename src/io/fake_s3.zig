@@ -416,7 +416,7 @@ pub const FakeS3 = struct {
             const prefix = try percentDecode(a, param(query, "prefix") orelse "");
             for (self.objects.items) |o| {
                 if (!std.mem.startsWith(u8, o.key, prefix)) continue;
-                try out.print(a, "<Contents><Key>{s}</Key><Size>{d}</Size></Contents>", .{ o.key, o.len });
+                try out.print(a, "<Contents><Key>{s}</Key><Size>{d}</Size></Contents>", .{ try xmlEscape(a, o.key), o.len });
             }
             try out.appendSlice(a, "</ListBucketResult>");
             resp_body = out.items;
@@ -502,7 +502,7 @@ pub const FakeS3 = struct {
                 const md = yd.calculateMonthDay();
                 const ds = t.getDaySeconds();
                 try out.print(a, "<Upload><Key>{s}</Key><UploadId>{s}</UploadId><Initiated>{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.000Z</Initiated></Upload>", .{
-                    u.key, u.id, yd.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+                    try xmlEscape(a, u.key), u.id, yd.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
                 });
             }
             try out.appendSlice(a, "</ListMultipartUploadsResult>");
@@ -736,6 +736,22 @@ fn param(query: []const u8, name: []const u8) ?[]const u8 {
         if (std.mem.eql(u8, kv[0..eq], name)) return if (eq < kv.len) kv[eq + 1 ..] else "";
     }
     return null;
+}
+
+/// A key as S3 writes it into a listing: `&` `<` `>` `"` `'` as entities, and a control character (which XML 1.0 cannot
+/// hold) as a numeric reference.
+fn xmlEscape(a: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (s) |c| switch (c) {
+        '&' => try out.appendSlice(a, "&amp;"),
+        '<' => try out.appendSlice(a, "&lt;"),
+        '>' => try out.appendSlice(a, "&gt;"),
+        '"' => try out.appendSlice(a, "&quot;"),
+        '\'' => try out.appendSlice(a, "&apos;"),
+        0...31 => try out.print(a, "&#{d};", .{c}),
+        else => try out.append(a, c),
+    };
+    return out.items;
 }
 
 fn percentDecode(a: std.mem.Allocator, s: []const u8) ![]const u8 {

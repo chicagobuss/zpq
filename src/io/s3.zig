@@ -1757,12 +1757,47 @@ fn urlEncodeForQuery(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     return out.items;
 }
 
+/// `s` with XML character references replaced by what they name, once: the five predefined entities and `&#N;` /
+/// `&#xH;` (S3 writes `&amp;` `&lt;` `&gt;` `&quot;` `&apos;` in keys, and a character XML 1.0 cannot hold as a
+/// number). Anything else that starts with `&` stays as written, and `&amp;amp;` becomes `&amp;`, not `&`. Returns
+/// `s` itself when it has no `&`.
+pub fn xmlUnescape(arena: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]const u8 {
+    if (std.mem.indexOfScalar(u8, s, '&') == null) return s;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '&') if (std.mem.indexOfScalarPos(u8, s[0..@min(s.len, i + 12)], i, ';')) |semi| {
+            if (xmlReference(s[i + 1 .. semi])) |cp| {
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
+                try out.appendSlice(arena, buf[0..n]);
+                i = semi + 1;
+                continue;
+            }
+        };
+        try out.append(arena, s[i]);
+        i += 1;
+    }
+    return out.items;
+}
+
+/// The character `name` (between `&` and `;`) stands for, if it is one of the five entities or a numeric reference
+/// to a Unicode scalar value.
+fn xmlReference(name: []const u8) ?u21 {
+    const named = [_]struct { []const u8, u21 }{ .{ "amp", '&' }, .{ "lt", '<' }, .{ "gt", '>' }, .{ "quot", '"' }, .{ "apos", '\'' } };
+    for (named) |e| if (std.mem.eql(u8, name, e[0])) return e[1];
+    if (name.len < 2 or name[0] != '#') return null;
+    const hex = name[1] == 'x';
+    const digits = name[if (hex) 2 else 1..];
+    if (digits.len == 0) return null;
+    const cp = std.fmt.parseInt(u21, digits, if (hex) 16 else 10) catch return null;
+    return if (std.unicode.utf8ValidCodepoint(cp)) cp else null;
+}
+
 /// Tiny XML scraper for the ListObjectsV2 response. Pulls every
 /// `<Key>` + `<Size>` from `<Contents>` blocks plus the optional
-/// `<NextContinuationToken>`. Doesn't do a real XML parse — the
-/// response shape is fixed and AWS/R2 don't put surprising entities
-/// in keys we care about. If a real parser becomes necessary it
-/// goes here.
+/// `<NextContinuationToken>`. Doesn't do a real XML parse: the
+/// response shape is fixed. The text it keeps is unescaped (`xmlUnescape`).
 fn parseListV2Body(arena: std.mem.Allocator, body: []const u8) Error!ListPage {
     var entries: std.ArrayList(ListEntry) = .empty;
     var pos: usize = 0;
@@ -1775,7 +1810,7 @@ fn parseListV2Body(arena: std.mem.Allocator, body: []const u8) Error!ListPage {
         const size_s = extractTag(body[start..block_end], "<Size>", "</Size>") orelse "0";
         const size = std.fmt.parseInt(u64, size_s, 10) catch 0;
         try entries.append(arena, .{
-            .key = try arena.dupe(u8, key),
+            .key = try arena.dupe(u8, try xmlUnescape(arena, key)),
             .size = size,
         });
         pos = block_end + "</Contents>".len;
@@ -1783,7 +1818,7 @@ fn parseListV2Body(arena: std.mem.Allocator, body: []const u8) Error!ListPage {
 
     var next_token: ?[]const u8 = null;
     if (extractTag(body, "<NextContinuationToken>", "</NextContinuationToken>")) |tok| {
-        next_token = try arena.dupe(u8, tok);
+        next_token = try arena.dupe(u8, try xmlUnescape(arena, tok));
     }
     return .{ .entries = entries.items, .next_token = next_token };
 }
@@ -2953,4 +2988,42 @@ test "inFlight: S3_IN_FLIGHT on Lambda, the pool's size elsewhere, ZPQ_S3_IN_FLI
     try testing.expectEqual(S3_IN_FLIGHT_MAX, inFlight(testEnviron(&.{"ZPQ_S3_IN_FLIGHT=1000"})));
     try testing.expectEqual(S3_IN_FLIGHT_MAX, inFlight(testEnviron(&.{"ZPQ_S3_IN_FLIGHT=0"})));
     try testing.expectEqual(S3_IN_FLIGHT, inFlight(null));
+}
+
+test "xmlUnescape: the five entities and numeric references are decoded once, anything else stays" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const cases = [_][2][]const u8{
+        .{ "plain/key.parquet", "plain/key.parquet" },
+        .{ "a&amp;b&lt;c&gt;d&quot;e&apos;f", "a&b<c>d\"e'f" },
+        .{ "&amp;amp;", "&amp;" },
+        .{ "tab&#9;nl&#10;", "tab\tnl\n" },
+        .{ "&#233;&#xE9;&#xe9;&#x1F600;", "\xc3\xa9\xc3\xa9\xc3\xa9\xf0\x9f\x98\x80" },
+        // Not references: kept as written.
+        .{ "&amp", "&amp" },
+        .{ "&bogus;", "&bogus;" },
+        .{ "&#;", "&#;" },
+        .{ "&#xZZ;", "&#xZZ;" },
+        .{ "&#1114112;", "&#1114112;" },
+        .{ "&#xD800;", "&#xD800;" },
+        .{ "a & b; c", "a & b; c" },
+    };
+    for (cases) |case| try testing.expectEqualStrings(case[1], try xmlUnescape(a, case[0]));
+}
+
+test "a ListObjectsV2 page's keys and continuation token are unescaped" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const page = try parseListV2Body(a,
+        "<ListBucketResult><IsTruncated>true</IsTruncated>" ++
+            "<Contents><Key>d/a&amp;b.parquet</Key><Size>7</Size></Contents>" ++
+            "<Contents><Key>d/&lt;x&gt;&#9;.parquet</Key><Size>8</Size></Contents>" ++
+            "<NextContinuationToken>t&amp;k</NextContinuationToken></ListBucketResult>");
+    try testing.expectEqual(@as(usize, 2), page.entries.len);
+    try testing.expectEqualStrings("d/a&b.parquet", page.entries[0].key);
+    try testing.expectEqualStrings("d/<x>\t.parquet", page.entries[1].key);
+    try testing.expectEqual(@as(u64, 8), page.entries[1].size);
+    try testing.expectEqualStrings("t&k", page.next_token.?);
 }

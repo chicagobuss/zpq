@@ -782,7 +782,7 @@ fn parseListedUploads(arena: std.mem.Allocator, xml: []const u8) ![]const Listed
         const key = xmlText(block, "Key") orelse continue;
         const id = xmlText(block, "UploadId") orelse continue;
         const initiated = xmlText(block, "Initiated") orelse continue;
-        try out.append(arena, .{ .key = try xmlUnescape(arena, key), .upload_id = try xmlUnescape(arena, id), .initiated = initiated });
+        try out.append(arena, .{ .key = try s3.xmlUnescape(arena, key), .upload_id = try s3.xmlUnescape(arena, id), .initiated = initiated });
     }
     return out.items;
 }
@@ -792,23 +792,6 @@ fn xmlText(block: []const u8, comptime tag: []const u8) ?[]const u8 {
     const start = (std.mem.indexOf(u8, block, open) orelse return null) + open.len;
     const end = std.mem.indexOfPos(u8, block, start, "</" ++ tag ++ ">") orelse return null;
     return block[start..end];
-}
-
-fn xmlUnescape(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
-    if (std.mem.indexOfScalar(u8, s, '&') == null) return s;
-    const entities = [_]struct { []const u8, u8 }{ .{ "&amp;", '&' }, .{ "&lt;", '<' }, .{ "&gt;", '>' }, .{ "&quot;", '"' }, .{ "&apos;", '\'' } };
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    outer: while (i < s.len) {
-        if (s[i] == '&') for (entities) |e| if (std.mem.startsWith(u8, s[i..], e[0])) {
-            try out.append(arena, e[1]);
-            i += e[0].len;
-            continue :outer;
-        };
-        try out.append(arena, s[i]);
-        i += 1;
-    }
-    return out.items;
 }
 
 /// The ETag S3 gives an object completed from `parts`: the MD5 of the parts' binary MD5s, then `-` and the part count.

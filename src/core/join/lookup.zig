@@ -496,8 +496,20 @@ fn slotsOfComposite(j: *const Join, fk: Column, more: []const Column, sel: *cons
         },
         else => return error.BadColumn,
     };
+    // A hash's slots lie far apart in memory: each window of rows has its home slots requested before any is read.
     var it = sel.iterator();
-    while (it.next()) |r| out[r] = if (keys[r] == none) EMPTY else j.slot(@intCast(keys[r])) orelse EMPTY;
+    var window: [32]usize = undefined;
+    while (true) {
+        var n: usize = 0;
+        while (n < window.len) : (n += 1) window[n] = it.next() orelse break;
+        if (n == 0) break;
+        if (j.keys == .hash) for (window[0..n]) |r| if (keys[r] != none) {
+            const home = j.keys.hash.home(@intCast(keys[r]));
+            @prefetch(&j.keys.hash.slots[home], .{});
+            @prefetch(&j.keys.hash.keys[home], .{});
+        };
+        for (window[0..n]) |r| out[r] = if (keys[r] == none) EMPTY else j.slot(@intCast(keys[r])) orelse EMPTY;
+    }
 }
 
 fn slotsOfColumn(j: *const Join, fk: Column, more: []const Column, sel: *const Selection, out: []u32, a: std.mem.Allocator) filter_eval.Error!void {
@@ -2599,4 +2611,74 @@ test "holdsPlain keeps its other conditions: a dictionary page, a filter's strin
     try std.testing.expect(holdsPlain(&(try synthFooter(a, big, .INT64, false)), 0, true));
     try std.testing.expect(!holdsPlain(&(try synthFooter(a, big, .FIXED_LEN_BYTE_ARRAY, false)), 0, false));
     try std.testing.expect(!holdsPlain(&(try synthFooter(a, big, .BOOLEAN, false)), 0, false));
+}
+
+test "a composite key probes the same slots through a hash as through a dense map, over windows of rows" {
+    const a = std.testing.allocator;
+    // Build keys (x, y) packing to x + 100 * y, for x in [0, 100) and y in [0, 50), where (3x + 5y) % 7 == 0.
+    var packed_keys: std.ArrayList(i64) = .empty;
+    defer packed_keys.deinit(a);
+    for (0..50) |y| for (0..100) |x| if ((3 * x + 5 * y) % 7 == 0) try packed_keys.append(a, @intCast(x + 100 * y));
+    const cols = [_]KeyColumn{
+        .{ .domain = .signed, .lo = 0, .span = 100 },
+        .{ .domain = .signed, .lo = 0, .span = 50, .weight = 100 },
+    };
+    // Slots are the keys' places in ascending order, in both structures.
+    const cap = std.math.ceilPowerOfTwoAssert(usize, packed_keys.items.len * 2);
+    const hash: Hash = .{ .keys = try a.alloc(i64, cap), .slots = try a.alloc(u32, cap) };
+    defer a.free(hash.keys);
+    defer a.free(hash.slots);
+    @memset(hash.slots, EMPTY);
+    for (packed_keys.items, 0..) |k, slot| {
+        var i = hash.home(k);
+        while (hash.slots[i] != EMPTY) i = (i + 1) & (cap - 1);
+        hash.keys[i] = k;
+        hash.slots[i] = @intCast(slot);
+    }
+    const words = 5000 / 64 + 1;
+    var bits: [words]u64 = @splat(0);
+    var rank: [words]u32 = undefined;
+    for (packed_keys.items) |k| bits[@intCast(k >> 6)] |= @as(u64, 1) << @intCast(k & 63);
+    var seen: u32 = 0;
+    for (bits, &rank) |w, *rk| {
+        rk.* = seen;
+        seen += @popCount(w);
+    }
+    // 203 rows, not a multiple of the 32-row window: values past either range, NULLs and misses among the hits.
+    const rows = 203;
+    var xs: [rows]i64 = undefined;
+    var ys: [rows]i64 = undefined;
+    var defs: [rows]u32 = undefined;
+    var wanted: [rows]u32 = undefined;
+    for (0..rows) |r| {
+        xs[r] = @intCast((r * 13) % 110);
+        ys[r] = @intCast((r * 7) % 55);
+        defs[r] = @intFromBool(r % 17 != 0);
+        const hit = defs[r] == 1 and xs[r] < 100 and ys[r] < 50 and @mod(3 * xs[r] + 5 * ys[r], 7) == 0;
+        wanted[r] = if (hit) @intCast(std.mem.indexOfScalar(i64, packed_keys.items, xs[r] + 100 * ys[r]).?) else EMPTY;
+    }
+    const fk: Column = .{ .i64 = .{ .values = &xs, .def_levels = &defs, .max_def = 1 } };
+    const more: Column = .{ .i64 = .{ .values = &ys } };
+    for ([_]Kind{ .inner, .left }) |kind| {
+        const structures = [_]@FieldType(Join, "keys"){ .{ .hash = hash }, .{ .dense = .{ .lo = 0, .bits = &bits, .rank = &rank } } };
+        for (structures) |keys| {
+            const j: Join = .{ .kind = kind, .build_name = "dim", .key_name = "pk", .n = packed_keys.items.len, .keys = keys, .cols = &cols, .payloads = &.{}, .bytes = 0 };
+            // Every row, then every row but each third (a sparse selection feeds the windows from a gapped iterator).
+            for ([_]usize{ 1, 3 }) |gap| {
+                var sel = try selection.SelectionVector.init(a, rows);
+                defer sel.deinit();
+                if (gap == 3) for (0..rows) |r| if (r % 3 == 0) sel.set(r, false);
+                var at: [rows]u32 = @splat(12345);
+                try narrow(&j, fk, &.{more}, &sel, a, &at);
+                for (0..rows) |r| {
+                    if (gap == 3 and r % 3 == 0) {
+                        try std.testing.expectEqual(@as(u32, 12345), at[r]);
+                        continue;
+                    }
+                    try std.testing.expectEqual(wanted[r], at[r]);
+                    try std.testing.expectEqual(kind == .left or wanted[r] != EMPTY, sel.isActive(r));
+                }
+            }
+        }
+    }
 }

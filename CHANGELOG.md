@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **zpq builds for the browser again.** The wasm32-wasi build that runs the site's Playground now comes from mainline zpq, single-threaded or with a shared-memory thread pool. Native builds are unchanged.
+
 - **Joins return rows, join on several key columns, and keep same-named columns apart.** A join without an aggregate answers its rows as DuckDB does, duplicates included, with ORDER BY, LIMIT and OFFSET; FLOAT and DOUBLE row items are refused by name for now. A join on two or more key columns binds them together, and falls back to its first key when the packed key would not fit in 63 bits. Two tables' same-named columns stay apart by their qualifiers. An ORDER BY name that is both a select alias and a qualified column sorts by the column, as DuckDB does, in joins and on single tables.
 
 - **Lambda cold starts read less of the binary.** The Lambda build links the code a cold start runs first, in the order it runs, so a cold start touches about half as many blocks of the binary. Init falls by about 7 ms on arm64 and 16 ms on x86_64.

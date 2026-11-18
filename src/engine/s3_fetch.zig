@@ -474,7 +474,7 @@ pub const S3Membership = struct {
     /// calibration until a distant link has been measured; it only chooses blocks against whole filters.
     fn bloomCost(self: *const S3Membership, request_bytes: u64) membership.Cost {
         const rtt = self.rtt_ns orelse 0;
-        const bps: u64 = if (self.bytes_per_s) |b| @intFromFloat(b) else s3.S3_BYTES_PER_S;
+        const bps: u64 = if (self.bytes_per_s) |b| @intFromFloat(b) else s3.connectionBytesPerS(self.in_flight);
         return .{
             .request_bytes = request_bytes,
             .concurrency = READ_CONCURRENCY,

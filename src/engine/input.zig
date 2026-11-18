@@ -540,7 +540,7 @@ const RemoteInputs = struct {
                 try appendRgFetchRanges(self.arena, &ranges, rg, cols, plan.carriedFilters(rg, &sp.meta), sp.total_size);
             }
             rg_first[sp.meta.row_groups.items.len] = ranges.items.len;
-            const gap_cap = coalescer.s3CoalesceGap(sp.rtt_ns, s3.S3_BYTES_PER_S);
+            const gap_cap = coalescer.s3CoalesceGap(sp.rtt_ns, s3.connectionBytesPerS(s3.inFlight(self.ctx.env)));
             var selected: u64 = 0;
             var g: usize = 0;
             for (ranges.items, 0..) |r, ri| {
@@ -932,7 +932,7 @@ const RemoteFilePlan = struct {
                 .jobs = rg_jobs.items,
                 .copied = copies.items,
                 .bytes = rg_bytes,
-                .gap = coalescer.s3CoalesceGap(sp.rtt_ns, s3.S3_BYTES_PER_S),
+                .gap = coalescer.s3CoalesceGap(sp.rtt_ns, s3.connectionBytesPerS(s3.inFlight(self.builder.ctx.env))),
                 .seg = @alignCast(self.builder.s3_mapped.items[self.builder.s3_mapped.items.len - 1][seg_start..seg_end]),
             };
             wf.rgs[ri] = wrg;

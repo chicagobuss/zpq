@@ -97,8 +97,15 @@ fn parseFirstWave(text: ?[]const u8) usize {
 }
 /// A data GET longer than this is split.
 pub const S3_RANGE_SPLIT: u64 = 8 << 20;
-/// Assumed bytes per second of one connection, for a coalesce gap once latency has been measured.
-pub const S3_BYTES_PER_S: u64 = 80_000_000;
+/// Assumed bytes per second of the whole link to S3 (Lambda in-region, which `docs/lambda_capabilities.md` measures at
+/// about 90 MB/s sustained), until a connection's own rate has been measured.
+pub const S3_LINK_BYTES_PER_S: u64 = 80_000_000;
+
+/// What one of `in_flight` connections gets of `S3_LINK_BYTES_PER_S`. A coalesce gap is worth bridging only while one
+/// round trip at that rate moves more than the gap, not at the whole link's rate: 64 connections share the link.
+pub fn connectionBytesPerS(in_flight: usize) u64 {
+    return S3_LINK_BYTES_PER_S / @max(in_flight, 1);
+}
 /// Target sub-range size when splitting. Kept separate from multipart
 /// write part size; reads and writes have different round-trip and
 /// buffering tradeoffs.

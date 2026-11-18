@@ -53,11 +53,12 @@ pub const s3_gap_default: u64 = 1 << 20;
 /// Cap on `bandwidth × first-byte latency`.
 pub const s3_gap_max: u64 = 2 << 20;
 
-/// Gap for one S3 object. `rtt_ns == 0` has not been measured, so the default applies. A measured latency uses
-/// `min(s3_gap_max, bytes_per_s × rtt)`.
+/// Gap for one S3 object, where `bytes_per_s` is what ONE connection moves (`s3.connectionBytesPerS`, or the rate a
+/// connection measured). `rtt_ns == 0` has not been measured, so the default applies. A measured latency uses
+/// `min(s3_gap_max, bytes_per_s × rtt)`: bridging a longer gap costs more transfer time than the round trip it saves.
 pub fn s3CoalesceGap(rtt_ns: u64, bytes_per_s: u64) u64 {
     if (rtt_ns == 0 or bytes_per_s == 0) return s3_gap_default;
-    const gap = bytes_per_s * rtt_ns / std.time.ns_per_s;
+    const gap = bytes_per_s *| rtt_ns / std.time.ns_per_s;
     return @min(s3_gap_max, gap);
 }
 
@@ -381,6 +382,54 @@ test "s3 coalesce gap is 1 MiB until latency is measured, then bandwidth times t
     try std.testing.expectEqual(s3_gap_max, s3CoalesceGap(std.time.ns_per_s, 80_000_000));
     // A short measured latency stays small: 80 MB/s × 1 ms.
     try std.testing.expectEqual(@as(u64, 80_000), s3CoalesceGap(std.time.ns_per_ms, 80_000_000));
+}
+
+test "s3 coalesce gap is a round trip at one connection's share of the link" {
+    const s3 = @import("s3.zig");
+    const ms = std.time.ns_per_ms;
+    // Outside Lambda 64 connections share the 80 MB/s link: 1.25 MB/s each.
+    try std.testing.expectEqual(@as(u64, 1_250_000), s3.connectionBytesPerS(64));
+    // Lambda keeps 16 in flight: 5 MB/s each, and 8 on aarch64: 10 MB/s each.
+    try std.testing.expectEqual(@as(u64, 5_000_000), s3.connectionBytesPerS(16));
+    try std.testing.expectEqual(@as(u64, 10_000_000), s3.connectionBytesPerS(8));
+    // A cap of zero does not divide by zero.
+    try std.testing.expectEqual(s3.S3_LINK_BYTES_PER_S, s3.connectionBytesPerS(0));
+    // 70 ms over a distant link (64 in flight): 87,500 bytes, so the 0.5-1.2 MB gaps between a fact table's wanted
+    // columns are no longer bridged. At 12 ms: 15,000.
+    try std.testing.expectEqual(@as(u64, 87_500), s3CoalesceGap(70 * ms, s3.connectionBytesPerS(64)));
+    try std.testing.expectEqual(@as(u64, 15_000), s3CoalesceGap(12 * ms, s3.connectionBytesPerS(64)));
+    // Lambda in-region, 25 ms at 16 in flight: 125,000.
+    try std.testing.expectEqual(@as(u64, 125_000), s3CoalesceGap(25 * ms, s3.connectionBytesPerS(16)));
+    // A tiny measured latency is a tiny gap, not the default; an absurd one stops at 2 MiB.
+    try std.testing.expectEqual(@as(u64, 1_250), s3CoalesceGap(ms, s3.connectionBytesPerS(64)));
+    try std.testing.expectEqual(@as(u64, 0), s3CoalesceGap(1, s3.connectionBytesPerS(64)));
+    try std.testing.expectEqual(s3_gap_max, s3CoalesceGap(3600 * std.time.ns_per_s, s3.connectionBytesPerS(1)));
+    try std.testing.expectEqual(s3_gap_max, s3CoalesceGap(std.math.maxInt(u32), s3.connectionBytesPerS(1)));
+}
+
+test "s3 coalesce at the 64-connection gap keeps a wanted column's far neighbour out, and the 2x budget still caps" {
+    const allocator = std.testing.allocator;
+    const s3 = @import("s3.zig");
+    // Two row groups of two wanted chunks (540 KB and 272 KB) 1.2 MB apart, as in a fact table's item_sk and sales_price.
+    const cap = s3CoalesceGap(70 * std.time.ns_per_ms, s3.connectionBytesPerS(64));
+    var pieces: [4]Piece = undefined;
+    for (0..2) |g| {
+        const base: u64 = g * 6_000_000;
+        pieces[g * 2] = .{ .object = 0, .group = @intCast(g), .start = base, .end = base + 540_000, .gap_cap = cap };
+        pieces[g * 2 + 1] = .{ .object = 0, .group = @intCast(g), .start = base + 1_740_000, .end = base + 2_012_000, .gap_cap = cap };
+    }
+    const selected: u64 = 2 * (540_000 + 272_000);
+    const apart = try coalesceDispatch(allocator, &pieces, 1, selected * 2, null);
+    defer allocator.free(apart);
+    try std.testing.expectEqual(@as(usize, 4), apart.len);
+    try std.testing.expectEqual(selected, spanBytes(apart));
+    // The same chunks under the old whole-link gap (2 MiB cap) are bridged, and the 2x budget still stops the second.
+    var wide = pieces;
+    for (&wide) |*p| p.gap_cap = s3_gap_max;
+    const bridged = try coalesceDispatch(allocator, &wide, 1, selected * 2, null);
+    defer allocator.free(bridged);
+    try std.testing.expect(bridged.len < 4);
+    try std.testing.expect(spanBytes(bridged) <= selected * 2);
 }
 
 test "s3 coalesce leaves a wave that already fits, and will not read gaps past twice the selected bytes" {

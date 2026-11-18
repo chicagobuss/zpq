@@ -298,3 +298,84 @@ test "binder: a batch of footer reads holds the footers, not the 64 KiB tails th
     // In flight at most one probe per read slot, and a retained tail would add up to one more per file.
     try std.testing.expect(opened.footer_resident_peak < files * s3_fetch.FOOTER_PROBE_MIN);
 }
+
+/// `names` as paths below `base`, sorted.
+fn below(a: std.mem.Allocator, base: []const u8, names: []const []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, names.len);
+    for (names, out) |name, *o| {
+        try std.testing.expect(std.mem.startsWith(u8, name, base));
+        o.* = name[base.len..];
+    }
+    std.sort.pdq([]const u8, out, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return out;
+}
+
+test "glob: an S3 pattern names the files the same pattern names locally, and none from a subdirectory" {
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "POSIX environment fixture");
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(std.testing.allocator);
+    defer fake.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = @import("test_scratch.zig").tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The tree, as keys and as files. The keys after the first group have no local twin: a directory marker, a key
+    // that ends in `/`, and an empty path component.
+    const tree = [_][]const u8{
+        "top.parquet",       "dir/p1.parquet",          "dir/p2.parquet",     "dir/q1.parquet",
+        "dir/sub/p1.parquet", "dir/sub/deeper/p9.parquet", "dirx/p1.parquet",
+    };
+    const s3_only = [_][]const u8{ "dir/", "dir/p3.parquet/", "dir//p4.parquet", "dir/sub/" };
+    for (tree ++ s3_only) |key| try fake.serveBytes(key, "x");
+    try tmp.dir.createDirPath(std.testing.io, "dir/sub/deeper");
+    try tmp.dir.createDirPath(std.testing.io, "dirx");
+    for (tree) |name| {
+        const fd = try @import("local_fs.zig").createFile(try std.fmt.allocPrint(a, "{s}/{s}", .{ tmp.path, name }));
+        @import("local_fs.zig").close(fd);
+    }
+
+    const env = try fakeEnv(a, &fake);
+    const Capture = struct {
+        fn write(_: []const u8) void {}
+    };
+    const saved = frontend.diagnostic_fn;
+    frontend.diagnostic_fn = Capture.write;
+    defer frontend.diagnostic_fn = saved;
+    var diag: Diag = .{};
+    const cases = [_]struct { pattern: []const u8, want: []const []const u8 }{
+        .{ .pattern = "dir/p*.parquet", .want = &.{ "dir/p1.parquet", "dir/p2.parquet" } },
+        // A prefix that is also the start of another directory's name: `dirx/p1` is not under `dir/`.
+        .{ .pattern = "dir/p*", .want = &.{ "dir/p1.parquet", "dir/p2.parquet" } },
+        .{ .pattern = "dir/*.parquet", .want = &.{ "dir/p1.parquet", "dir/p2.parquet", "dir/q1.parquet" } },
+        .{ .pattern = "dir/*", .want = &.{ "dir/p1.parquet", "dir/p2.parquet", "dir/q1.parquet" } },
+        .{ .pattern = "dir/sub/p*.parquet", .want = &.{"dir/sub/p1.parquet"} },
+        .{ .pattern = "dirx/p*", .want = &.{"dirx/p1.parquet"} },
+        .{ .pattern = "*.parquet", .want = &.{"top.parquet"} },
+        // Only `*` is a wildcard, once. `?` is a plain character, so a pattern without `*` is one path, as it is
+        // locally; a second `*` is a plain character too, and matches no file here or there.
+        .{ .pattern = "dir/p?.parquet", .want = &.{"dir/p?.parquet"} },
+        .{ .pattern = "dir/p**.parquet", .want = &.{} },
+    };
+    const local_base = try std.fmt.allocPrint(a, "{s}/", .{tmp.path});
+    for (cases) |c| {
+        const remote = try frontend.expandGlob(a, std.testing.io, try std.fmt.allocPrint(a, "s3://bkt/{s}", .{c.pattern}), env, &diag);
+        const local = try frontend.expandGlob(a, std.testing.io, try std.fmt.allocPrint(a, "{s}{s}", .{ local_base, c.pattern }), env, &diag);
+        const remote_names = try below(a, "s3://bkt/", remote);
+        const local_names = try below(a, local_base, local);
+        try std.testing.expectEqual(c.want.len, remote_names.len);
+        for (c.want, remote_names) |w, got| try std.testing.expectEqualStrings(w, got);
+        try std.testing.expectEqual(local_names.len, remote_names.len);
+        for (local_names, remote_names) |l, r| try std.testing.expectEqualStrings(l, r);
+    }
+    // A wildcard in a directory is refused in both places.
+    for ([_][]const u8{ "d*/p*.parquet", "dir/*/p*.parquet" }) |pattern| {
+        try std.testing.expectError(error.BadArgs, frontend.expandGlob(a, std.testing.io, try std.fmt.allocPrint(a, "s3://bkt/{s}", .{pattern}), env, &diag));
+        try std.testing.expectError(error.BadArgs, frontend.expandGlob(a, std.testing.io, try std.fmt.allocPrint(a, "{s}{s}", .{ local_base, pattern }), env, &diag));
+    }
+}

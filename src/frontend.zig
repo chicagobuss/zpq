@@ -1036,18 +1036,14 @@ fn expandS3Glob(
     client.diag = diag;
 
     const entries = try s3.listAll(arena, &client, list_prefix);
-    if (entries.len == 0) {
-        diagnosticPrint("zpq query: s3 glob matched no objects under prefix {s}\n", .{list_prefix});
-    }
-
     var out: std.ArrayList([]const u8) = .empty;
     for (entries) |e| {
-        // ListObjectsV2 returns full keys (e.g. "demo/yellow/foo.parquet").
-        // Match basename against the glob.
-        const key_basename = if (std.mem.lastIndexOfScalar(u8, e.key, '/')) |s| e.key[s + 1 ..] else e.key;
-        if (!matchSimpleGlob(basename_glob, key_basename)) continue;
+        if (!s3GlobMatches(list_prefix, basename_glob, e.key)) continue;
         const full = try std.fmt.allocPrint(arena, "s3://{s}/{s}", .{ url.bucket, e.key });
         try out.append(arena, full);
+    }
+    if (out.items.len == 0) {
+        diagnosticPrint("zpq query: s3 glob matched no objects under prefix {s}\n", .{list_prefix});
     }
     std.sort.pdq([]const u8, out.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
@@ -1055,6 +1051,16 @@ fn expandS3Glob(
         }
     }.lt);
     return out.items;
+}
+
+/// Whether the listed `key` is one the local glob would name: a file directly in the directory `list_prefix` (no `/`
+/// in what follows it, so neither `*` nor a directory marker such as `dir/` or `dir//x` reaches into a subdirectory),
+/// whose name matches `basename_glob`. ListObjectsV2 lists everything under the prefix, subdirectories included.
+fn s3GlobMatches(list_prefix: []const u8, basename_glob: []const u8, key: []const u8) bool {
+    if (!std.mem.startsWith(u8, key, list_prefix)) return false;
+    const name = key[list_prefix.len..];
+    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '/') != null) return false;
+    return matchSimpleGlob(basename_glob, name);
 }
 
 /// Minimal `prefix*suffix` matcher — a single `*` wildcard,

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **S3 globs read keys with `&`, `<` or `>`.** zpq decodes the XML escapes in S3 listings, so such a key no longer fails the glob with a 404, and a listing of more than 1,000 keys pages on when its continuation token holds such a character.
+
 - **Joins over S3 start sooner.** zpq reads each remote footer with one request, fetches a join's footers together and lists each glob once, so a small S3 join makes about half as many requests before it starts. The joins suite runs 9% faster over S3.
 
 - **An S3 glob no longer reads files in subdirectories.** `*` stops at `/`, as it does for local files. Before, `s3://b/dir/p*.parquet` also read `dir/sub/p1.parquet` and counted its rows.

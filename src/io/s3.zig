@@ -101,10 +101,15 @@ pub const S3_RANGE_SPLIT: u64 = 8 << 20;
 /// about 90 MB/s sustained), until a connection's own rate has been measured.
 pub const S3_LINK_BYTES_PER_S: u64 = 80_000_000;
 
-/// What one of `in_flight` connections gets of `S3_LINK_BYTES_PER_S`. A coalesce gap is worth bridging only while one
-/// round trip at that rate moves more than the gap, not at the whole link's rate: 64 connections share the link.
-pub fn connectionBytesPerS(in_flight: usize) u64 {
-    return S3_LINK_BYTES_PER_S / @max(in_flight, 1);
+/// The rate a coalesce gap is priced at: bridging is worth it while one round trip at this rate moves more than the gap.
+/// Off Lambda, one of `inFlight(env)` connections gets its share of `S3_LINK_BYTES_PER_S` (64 of them share the link).
+/// On Lambda (or with no environment) it stays the whole 80 MB/s, as before: with 8 or 16 in flight, the narrower gap
+/// issued more requests (arm64 Q1L fan:8 went from 288 to 508 GETs, Duration +40% cold and +54% warm, bench 060-s3-gap),
+/// and each extra wave pays a full time-to-first-byte that the network RTT the gap is built on does not include.
+pub fn connectionBytesPerS(env: ?std.process.Environ) u64 {
+    const e = env orelse return S3_LINK_BYTES_PER_S;
+    if (winEnvValue(e, "AWS_LAMBDA_FUNCTION_NAME") != null) return S3_LINK_BYTES_PER_S;
+    return S3_LINK_BYTES_PER_S / inFlight(env);
 }
 /// Target sub-range size when splitting. Kept separate from multipart
 /// write part size; reads and writes have different round-trip and
@@ -2080,7 +2085,7 @@ test "a GET that never got an answer still names its bucket and key" {
     try testing.expectEqualStrings("GET s3://bkt/key: failed while connecting: ConnectTimeout", try std.fmt.bufPrint(&buf, "{f}", .{f}));
 }
 
-fn testEnviron(comptime entries: []const [*:0]const u8) std.process.Environ {
+pub fn testEnviron(comptime entries: []const [*:0]const u8) std.process.Environ {
     const slice = comptime blk: {
         var a: [entries.len:null]?[*:0]const u8 = undefined;
         for (entries, 0..) |e, i| a[i] = e;
@@ -2995,6 +3000,37 @@ test "inFlight: S3_IN_FLIGHT on Lambda, the pool's size elsewhere, ZPQ_S3_IN_FLI
     try testing.expectEqual(S3_IN_FLIGHT_MAX, inFlight(testEnviron(&.{"ZPQ_S3_IN_FLIGHT=1000"})));
     try testing.expectEqual(S3_IN_FLIGHT_MAX, inFlight(testEnviron(&.{"ZPQ_S3_IN_FLIGHT=0"})));
     try testing.expectEqual(S3_IN_FLIGHT, inFlight(null));
+}
+
+test "coalesce gap: base rule (RTT x 80 MB/s) on Lambda, RTT x link / inFlight elsewhere" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
+    const gap = @import("coalescer.zig").s3CoalesceGap;
+    const ms = std.time.ns_per_ms;
+    const lambda = testEnviron(&.{"AWS_LAMBDA_FUNCTION_NAME=f"});
+    // Lambda (and no environment): the base per-connection rate, whatever the arch's in-flight cap (16 x86_64, 8
+    // aarch64) or a ZPQ_S3_IN_FLIGHT override.
+    try testing.expectEqual(@as(u64, 80_000_000), connectionBytesPerS(lambda));
+    try testing.expectEqual(@as(u64, 80_000_000), connectionBytesPerS(testEnviron(&.{ "AWS_LAMBDA_FUNCTION_NAME=f", "ZPQ_S3_IN_FLIGHT=8" })));
+    try testing.expectEqual(@as(u64, 80_000_000), connectionBytesPerS(testEnviron(&.{ "AWS_LAMBDA_FUNCTION_NAME=f", "ZPQ_S3_IN_FLIGHT=16" })));
+    try testing.expectEqual(@as(u64, 80_000_000), connectionBytesPerS(null));
+    // The gap is then exactly the base formula, min(2 MiB, RTT x 80 MB/s), for each RTT.
+    for ([_]u64{ 1 * ms, 5 * ms, 12 * ms, 25 * ms, 26 * ms, 70 * ms, 3600 * std.time.ns_per_s }) |rtt| {
+        const base = @min(@import("coalescer.zig").s3_gap_max, @as(u64, 80_000_000) *| rtt / std.time.ns_per_s);
+        try testing.expectEqual(base, gap(rtt, connectionBytesPerS(lambda)));
+    }
+    try testing.expectEqual(@as(u64, 2_000_000), gap(25 * ms, connectionBytesPerS(lambda)));
+    // Off Lambda it is fd1dfd10's rule: 80 MB/s / 64 = 1.25 MB/s a connection.
+    const far = testEnviron(&.{"AWS_REGION=us-east-1"});
+    try testing.expectEqual(@as(u64, 1_250_000), connectionBytesPerS(far));
+    try testing.expectEqual(@as(u64, 87_500), gap(70 * ms, connectionBytesPerS(far)));
+    try testing.expectEqual(@as(u64, 15_000), gap(12 * ms, connectionBytesPerS(far)));
+    try testing.expectEqual(@as(u64, 1_250), gap(1 * ms, connectionBytesPerS(far)));
+    try testing.expectEqual(@as(u64, 0), gap(1, connectionBytesPerS(far)));
+    // ZPQ_S3_IN_FLIGHT changes the share off Lambda: 80 MB/s / 8 = 10 MB/s.
+    try testing.expectEqual(@as(u64, 10_000_000), connectionBytesPerS(testEnviron(&.{"ZPQ_S3_IN_FLIGHT=8"})));
+    // A huge RTT clamps to 2 MiB either way; RTT 0 is still the unmeasured 1 MiB default.
+    try testing.expectEqual(@import("coalescer.zig").s3_gap_max, gap(std.math.maxInt(u32), connectionBytesPerS(far)));
+    try testing.expectEqual(@import("coalescer.zig").s3_gap_default, gap(0, connectionBytesPerS(far)));
 }
 
 test "xmlUnescape: the five entities and numeric references are decoded once, anything else stays" {

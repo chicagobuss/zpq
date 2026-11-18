@@ -384,34 +384,13 @@ test "s3 coalesce gap is 1 MiB until latency is measured, then bandwidth times t
     try std.testing.expectEqual(@as(u64, 80_000), s3CoalesceGap(std.time.ns_per_ms, 80_000_000));
 }
 
-test "s3 coalesce gap is a round trip at one connection's share of the link" {
-    const s3 = @import("s3.zig");
-    const ms = std.time.ns_per_ms;
-    // Outside Lambda 64 connections share the 80 MB/s link: 1.25 MB/s each.
-    try std.testing.expectEqual(@as(u64, 1_250_000), s3.connectionBytesPerS(64));
-    // Lambda keeps 16 in flight: 5 MB/s each, and 8 on aarch64: 10 MB/s each.
-    try std.testing.expectEqual(@as(u64, 5_000_000), s3.connectionBytesPerS(16));
-    try std.testing.expectEqual(@as(u64, 10_000_000), s3.connectionBytesPerS(8));
-    // A cap of zero does not divide by zero.
-    try std.testing.expectEqual(s3.S3_LINK_BYTES_PER_S, s3.connectionBytesPerS(0));
-    // 70 ms over a distant link (64 in flight): 87,500 bytes, so the 0.5-1.2 MB gaps between a fact table's wanted
-    // columns are no longer bridged. At 12 ms: 15,000.
-    try std.testing.expectEqual(@as(u64, 87_500), s3CoalesceGap(70 * ms, s3.connectionBytesPerS(64)));
-    try std.testing.expectEqual(@as(u64, 15_000), s3CoalesceGap(12 * ms, s3.connectionBytesPerS(64)));
-    // Lambda in-region, 25 ms at 16 in flight: 125,000.
-    try std.testing.expectEqual(@as(u64, 125_000), s3CoalesceGap(25 * ms, s3.connectionBytesPerS(16)));
-    // A tiny measured latency is a tiny gap, not the default; an absurd one stops at 2 MiB.
-    try std.testing.expectEqual(@as(u64, 1_250), s3CoalesceGap(ms, s3.connectionBytesPerS(64)));
-    try std.testing.expectEqual(@as(u64, 0), s3CoalesceGap(1, s3.connectionBytesPerS(64)));
-    try std.testing.expectEqual(s3_gap_max, s3CoalesceGap(3600 * std.time.ns_per_s, s3.connectionBytesPerS(1)));
-    try std.testing.expectEqual(s3_gap_max, s3CoalesceGap(std.math.maxInt(u32), s3.connectionBytesPerS(1)));
-}
-
 test "s3 coalesce at the 64-connection gap keeps a wanted column's far neighbour out, and the 2x budget still caps" {
     const allocator = std.testing.allocator;
     const s3 = @import("s3.zig");
+    const test_skip = @import("../test_skip.zig");
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "POSIX environment fixture");
     // Two row groups of two wanted chunks (540 KB and 272 KB) 1.2 MB apart, as in a fact table's item_sk and sales_price.
-    const cap = s3CoalesceGap(70 * std.time.ns_per_ms, s3.connectionBytesPerS(64));
+    const cap = s3CoalesceGap(70 * std.time.ns_per_ms, s3.connectionBytesPerS(s3.testEnviron(&.{"AWS_REGION=us-east-1"})));
     var pieces: [4]Piece = undefined;
     for (0..2) |g| {
         const base: u64 = g * 6_000_000;

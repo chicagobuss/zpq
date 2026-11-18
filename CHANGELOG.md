@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Joins over S3 start sooner.** zpq reads each remote footer with one request, fetches a join's footers together and lists each glob once, so a small S3 join makes about half as many requests before it starts. The joins suite runs 9% faster over S3.
+
+- **An S3 glob no longer reads files in subdirectories.** `*` stops at `/`, as it does for local files. Before, `s3://b/dir/p*.parquet` also read `dir/sub/p1.parquet` and counted its rows.
+
 - **A join skips probe row groups its dimension's keys cannot match.** An inner or semi join on one integer or DATE key compares each probe row group's corroborated statistics with the range of keys the filtered dimension kept, and skips the groups wholly outside it. The TPC-DS inventory join reads 217 of 1,084 row groups instead of all of them, and over S3 sends 149 requests instead of 733. `--scan-all` turns it off.
 
 - **zpq builds for the browser again.** The wasm32-wasi build that runs the site's Playground now comes from mainline zpq, single-threaded or with a shared-memory thread pool. Native builds are unchanged.

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Joins over S3 read about a third fewer bytes.** Outside Lambda, zpq sizes the gap it bridges between column chunks from the link's bandwidth shared across its requests in flight, so large S3 joins read about what DuckDB reads, and the joins suite runs 17% faster over S3. Lambda keeps its previous gap.
+
 - **Joins spend less CPU per row.** A small dimension table keeps its columns dictionary-coded, composite-key probes prefetch their hash slots, and DECIMAL columns compare with each other in 128-bit integers. On TPC-DS SF10, ds19 runs in 62 ms instead of 162 and ds23 in 83 ms instead of 153.
 
 - **S3 globs read keys with `&`, `<` or `>`.** zpq decodes the XML escapes in S3 listings, so such a key no longer fails the glob with a 404, and a listing of more than 1,000 keys pages on when its continuation token holds such a character.

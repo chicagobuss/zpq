@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Joins spend less CPU per row.** A small dimension table keeps its columns dictionary-coded, composite-key probes prefetch their hash slots, and DECIMAL columns compare with each other in 128-bit integers. On TPC-DS SF10, ds19 runs in 62 ms instead of 162 and ds23 in 83 ms instead of 153.
+
 - **S3 globs read keys with `&`, `<` or `>`.** zpq decodes the XML escapes in S3 listings, so such a key no longer fails the glob with a 404, and a listing of more than 1,000 keys pages on when its continuation token holds such a character.
 
 - **Joins over S3 start sooner.** zpq reads each remote footer with one request, fetches a join's footers together and lists each glob once, so a small S3 join makes about half as many requests before it starts. The joins suite runs 9% faster over S3.

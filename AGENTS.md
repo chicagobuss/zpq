@@ -6,8 +6,8 @@ Instructions for coding agents working on zpq.
 
 - Grumpy elitism: skepticism over optimism, honesty over salesmanship. Critique our own work ruthlessly.
 - Taco bell programming: zpq is one small Unix tool that does one job well and pipes into the next. The job is
-  Parquet: query, filter, aggregate and rewrite it, locally or on S3, and emit NDJSON, CSV or Parquet. No joins
-  (yet), no dataframe API (yet).
+  Parquet: query, filter, join, aggregate and rewrite it, locally or on S3, and emit NDJSON, CSV or Parquet. No dataframe
+  API (yet).
 - Exact by default, fastest anyway. zpq does the least work a query needs for an exact answer (README.md), and trusting
   statistics is opt-in (docs/statistics-trust.md). A shortcut that is exact only if file metadata is right belongs
   behind `--trust-stats`, not a new flag. Be the fastest engine both by default and with `--trust-stats`. When a rival

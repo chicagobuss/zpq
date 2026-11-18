@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Joins return rows, join on several key columns, and keep same-named columns apart.** A join without an aggregate answers its rows as DuckDB does, duplicates included, with ORDER BY, LIMIT and OFFSET; FLOAT and DOUBLE row items are refused by name for now. A join on two or more key columns binds them together, and falls back to its first key when the packed key would not fit in 63 bits. Two tables' same-named columns stay apart by their qualifiers. An ORDER BY name that is both a select alias and a qualified column sorts by the column, as DuckDB does, in joins and on single tables.
+
 - **Lambda cold starts read less of the binary.** The Lambda build links the code a cold start runs first, in the order it runs, so a cold start touches about half as many blocks of the binary. Init falls by about 7 ms on arm64 and 16 ms on x86_64.
 
 - **EXISTS and NOT EXISTS subqueries run as joins.** A correlated EXISTS becomes a semi join and NOT EXISTS an anti join, with SQL's NULL rules: NOT EXISTS ignores NULL keys where NOT IN does not.
@@ -26,7 +28,7 @@
 
 - **Zig 0.17.1: the pins name it.** `build.zig.zon`'s minimum, `.zig-version`, the CI and release workflows, `just bootstrap` and the docs move from 0.17.0, and bootstrap now checks the tarball against ziglang.org's published sha256 before unpacking it. Still any 0.17.x release, not only 0.17.1.
 
-- **SQL: non-recursive `WITH` CTEs and subqueries in FROM (derived tables), with column lists, nesting and joins.** A `SELECT *` filter of one file is inlined into the query that reads it; anything else read runs once into a scratch Parquet file. `WITH RECURSIVE`, `LATERAL` and circular or duplicate CTEs are refused by name. Row-output queries over a join or an `IN (SELECT …)` are refused by name (`JoinRowsNotSupported`) until row output of joins lands.
+- **SQL: non-recursive `WITH` CTEs and subqueries in FROM (derived tables), with column lists, nesting and joins.** A `SELECT *` filter of one file is inlined into the query that reads it; anything else read runs once into a scratch Parquet file. `WITH RECURSIVE`, `LATERAL` and circular or duplicate CTEs are refused by name.
 - **S3 Express One Zone: directory buckets on zonal endpoints, CreateSession session credentials with one shared refresh, reads, writes and multipart with CRC32, and unsorted directory listings handled.**
 - **Tests honor ZPQ_TEST_PARQUET_DIR: every place zpq's tests write Parquet scratch goes under it.**
 - **Fan-out is native: `zpq fanout` and the Lambda coordinator mode plan, invoke and merge in Zig, replacing the Python coordinator.** Joins fan out too, by aligned key ranges from footer statistics or with a replicated small side. Invoke retries transient failures.

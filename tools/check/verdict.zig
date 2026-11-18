@@ -29,6 +29,8 @@ pub const Spec = struct {
     codec: ?[]const u8 = null,
     /// `summary`: membership filters (Bloom or dictionary) must have pruned a row group.
     pruned: bool = false,
+    /// `summary`: exactly this many row groups ruled out by statistics (`row_groups_pruned`).
+    rg_pruned: ?usize = null,
     /// `bloom`: which chunks carry a filter. "dictionary": exactly the chunks with a dictionary page, plus `names`;
     /// "names": exactly `names`. Null: at least `names`, and some filter.
     bloom_on: ?[]const u8 = null,
@@ -2072,6 +2074,10 @@ fn modeSummary(in: Inputs, spec: Spec) !Reason {
     if (out < 0 or out > try num(v.get("total_us").?)) return fail(in, "output_us outside total_us", .{});
     if (in.path.len == 0 and
         try num(v.get("bytes_out").?) != in.text.len) return fail(in, "bytes_out differs from stdout", .{});
+    if (spec.rg_pruned) |n| if (try num(v.get("row_groups_pruned").?) != n) return fail(in, "summary row_groups_pruned {d}, want {d}", .{
+        try num(v.get("row_groups_pruned").?),
+        n,
+    });
     if (spec.pruned) {
         const m = (v.get("membership") orelse return fail(in, "summary has no membership", .{})).object;
         if (try num(m.get("bloom_pruned").?) + try num(m.get("dict_pruned").?) == 0) return fail(

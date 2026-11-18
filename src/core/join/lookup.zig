@@ -314,6 +314,10 @@ pub const Join = struct {
     keys: union(enum) { dense: Dense, hash: Hash },
     /// The key's columns when it is not one integer column (`KeyColumn`): `keys` then holds what they pack to.
     cols: []const KeyColumn = &.{},
+    /// The surviving keys' least and greatest, for one integer column (`cols` empty); unbounded otherwise. A probe row
+    /// group whose FK range lies outside holds no match (`filter/prune.zig`).
+    lo: i64 = std.math.minInt(i64),
+    hi: i64 = std.math.maxInt(i64),
     payloads: []const Payload,
     /// Bytes the build holds for the query (charged against `--max-memory`).
     bytes: usize,
@@ -1532,6 +1536,10 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     }
     const j = try a.create(Join);
     j.* = .{ .kind = spec.kind, .build_name = spec.build_name, .key_name = spec.key_name, .n = n, .keys = undefined, .payloads = &.{}, .bytes = 0, .domain = domain, .null_key = null_key, .cols = key_cols };
+    if (key_cols.len == 0) {
+        j.lo = lo;
+        j.hi = hi;
+    }
     // Bytes per structure, from the survivors' own domain: a bit per possible key plus a rank per 64, against two
     // slots per key of an 8-byte key and a 4-byte slot.
     const span: u128 = if (n == 0) 0 else @as(u128, @intCast(@as(i128, hi) - lo)) + 1;

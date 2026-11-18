@@ -67,8 +67,7 @@ pub fn pruneRowGroup(
         // LIKE: prefix patterns are stat-prunable via min/max (a future
         // win); conservatively keep for now. Correctness is in eval.
         .like => .unknown,
-        // The build's verified key range could prune row groups; the prototype keeps them.
-        .lookup => .unknown,
+        .lookup => |l| pruneLookup(rg, l, file_meta),
         // Two columns' ranges could prove `a < b` for a whole row group; not yet.
         .expr => .unknown,
         .and_filter, .or_filter => |c| blk: {
@@ -81,6 +80,23 @@ pub fn pruneRowGroup(
             break :blk d;
         },
     };
+}
+
+/// An INNER or SEMI lookup keeps only rows whose FK is a build key, so a row group whose FK bounds lie outside the build's
+/// key range holds none. ANTI and LEFT keep rows without a match; a composite or text key has no range.
+fn pruneLookup(rg: *const schema.RowGroup, l: ast.Lookup, file_meta: ?*const schema.FileMetaData) Decision {
+    const j = l.join;
+    if (j.kind != .inner and j.kind != .semi) return .unknown;
+    if (j.cols.len != 0 or l.more.len != 0 or (j.domain != .signed and j.domain != .date)) return .unknown;
+    const cm = (if (l.col_idx < rg.columns.items.len) rg.columns.items[l.col_idx].meta_data else null) orelse return .unknown;
+    const b = statistics.chunkStats(rg, l.col_idx, file_meta, .corroborated).bounds orelse return .unknown;
+    const range: ?[2]i64 = switch (cm.type) {
+        .INT32 => if (encoded.readFixedLE(i32, b.min)) |lo| if (encoded.readFixedLE(i32, b.max)) |hi| .{ lo, hi } else null else null,
+        .INT64 => if (encoded.readFixedLE(i64, b.min)) |lo| if (encoded.readFixedLE(i64, b.max)) |hi| .{ lo, hi } else null else null,
+        else => null,
+    };
+    const r = range orelse return .unknown;
+    return if (r[1] < j.lo or r[0] > j.hi) .skip else .unknown;
 }
 
 /// A comparison leaf's decision from statistics alone.
@@ -1187,4 +1203,104 @@ test "passFraction places range comparisons between a row group's bounds and kno
     try std.testing.expectEqual(@as(f64, 1), passFraction(either, rg, &meta));
     const str: ast.Filter = .{ .string = .{ .col_idx = 0, .op = .Eq, .value = "x" } };
     try std.testing.expectEqual(@as(f64, 1), passFraction(str, rg, &meta));
+}
+
+test "a lookup prunes a row group whose FK bounds lie outside the build's key range, for INNER and SEMI only" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const Case = struct { lo: i64, hi: i64, skip: bool };
+    // The build holds keys 100..200.
+    const cases = [_]Case{
+        .{ .lo = 0, .hi = 99, .skip = true },
+        .{ .lo = 201, .hi = 900, .skip = true },
+        .{ .lo = 0, .hi = 100, .skip = false }, // touching either end keeps
+        .{ .lo = 200, .hi = 900, .skip = false },
+        .{ .lo = 150, .hi = 160, .skip = false },
+        .{ .lo = 0, .hi = 900, .skip = false },
+    };
+    inline for (.{ i32, i64 }) |T| for (cases) |c| {
+        var min_buf: [@sizeOf(T)]u8 = undefined;
+        var max_buf: [@sizeOf(T)]u8 = undefined;
+        std.mem.writeInt(T, &min_buf, @intCast(c.lo), .little);
+        std.mem.writeInt(T, &max_buf, @intCast(c.hi), .little);
+        var rg = try synthRowGroupWithStats(a, if (T == i32) .INT32 else .INT64, &min_buf, &max_buf);
+        for ([_]lookup_mod.Kind{ .inner, .semi, .anti, .left }) |kind| {
+            const j = testJoin(kind, .signed, &.{}, 100, 200);
+            const want: Decision = if (c.skip and (kind == .inner or kind == .semi)) .skip else .unknown;
+            try testing.expectEqual(want, pruneRowGroup(&rg, .{ .lookup = .{ .col_idx = 0, .join = &j } }, null));
+        }
+    };
+}
+
+test "a lookup does not prune a composite, text, unsigned or float key, or a chunk without checked bounds" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var min_buf: [8]u8 = undefined;
+    var max_buf: [8]u8 = undefined;
+    std.mem.writeInt(i64, &min_buf, 0, .little);
+    std.mem.writeInt(i64, &max_buf, 50, .little);
+    var rg = try synthRowGroupWithStats(a, .INT64, &min_buf, &max_buf);
+    const plain = testJoin(.inner, .signed, &.{}, 100, 200);
+    const probe: ast.Filter = .{ .lookup = .{ .col_idx = 0, .join = &plain } };
+    try testing.expectEqual(Decision.skip, pruneRowGroup(&rg, probe, null));
+
+    const col: lookup_mod.KeyColumn = .{ .domain = .signed };
+    const more = [_]usize{1};
+    const not_signed = [_]lookup_mod.KeyDomain{ .string, .bytes, .{ .unsigned = .INT64 }, .{ .timestamp = .{ .unit = .MICROS, .utc = true } } };
+    const others = [_]struct { j: lookup_mod.Join, more: []const usize }{
+        .{ .j = testJoin(.inner, .signed, &.{ col, col }, 100, 200), .more = &.{} },
+        .{ .j = testJoin(.inner, .signed, &.{}, 100, 200), .more = &more },
+        .{ .j = testJoin(.inner, not_signed[0], &.{}, 100, 200), .more = &.{} },
+        .{ .j = testJoin(.inner, not_signed[1], &.{}, 100, 200), .more = &.{} },
+        .{ .j = testJoin(.inner, not_signed[2], &.{}, 100, 200), .more = &.{} },
+        .{ .j = testJoin(.inner, not_signed[3], &.{}, 100, 200), .more = &.{} },
+    };
+    for (&others) |*o| try testing.expectEqual(
+        Decision.unknown,
+        pruneRowGroup(&rg, .{ .lookup = .{ .col_idx = 0, .more = o.more, .join = &o.j } }, null),
+    );
+
+    // A DOUBLE chunk is no integer key; a chunk with no statistics, or an absent column, proves nothing.
+    var double_rg = try synthRowGroupWithStats(a, .DOUBLE, &min_buf, &max_buf);
+    try testing.expectEqual(Decision.unknown, pruneRowGroup(&double_rg, probe, null));
+    rg.columns.items[0].meta_data.?.statistics = null;
+    try testing.expectEqual(Decision.unknown, pruneRowGroup(&rg, probe, null));
+    try testing.expectEqual(Decision.unknown, pruneRowGroup(&rg, .{ .lookup = .{ .col_idx = 5, .join = &plain } }, null));
+}
+
+test "a lookup over an empty build prunes every row group, and a build of unbounded range none" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var min_buf: [4]u8 = undefined;
+    var max_buf: [4]u8 = undefined;
+    std.mem.writeInt(i32, &min_buf, 5, .little);
+    std.mem.writeInt(i32, &max_buf, 9, .little);
+    var rg = try synthRowGroupWithStats(arena.allocator(), .INT32, &min_buf, &max_buf);
+    // `lookup.build` leaves lo > hi when no key survives the build's filter: no probe row matches.
+    const empty = testJoin(.inner, .date, &.{}, std.math.maxInt(i64), std.math.minInt(i64));
+    try testing.expectEqual(Decision.skip, pruneRowGroup(&rg, .{ .lookup = .{ .col_idx = 0, .join = &empty } }, null));
+    const unbounded = testJoin(.inner, .signed, &.{}, std.math.minInt(i64), std.math.maxInt(i64));
+    try testing.expectEqual(Decision.unknown, pruneRowGroup(&rg, .{ .lookup = .{ .col_idx = 0, .join = &unbounded } }, null));
+}
+
+const lookup_mod = @import("../join/lookup.zig");
+
+fn testJoin(kind: lookup_mod.Kind, domain: lookup_mod.KeyDomain, cols: []const lookup_mod.KeyColumn, lo: i64, hi: i64) lookup_mod.Join {
+    return .{
+        .kind = kind,
+        .domain = domain,
+        .build_name = "dim",
+        .key_name = "pk",
+        .n = 0,
+        .keys = .{ .dense = .{ .lo = 0, .bits = &.{}, .rank = &.{} } },
+        .cols = cols,
+        .lo = lo,
+        .hi = hi,
+        .payloads = &.{},
+        .bytes = 0,
+    };
 }

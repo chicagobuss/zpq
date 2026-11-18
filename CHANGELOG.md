@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A join skips probe row groups its dimension's keys cannot match.** An inner or semi join on one integer or DATE key compares each row group's statistics for the foreign key with the range of keys the filtered dimension kept, and skips a group wholly outside it, as DuckDB does. The inventory join in the TPC-DS suite reads 217 of 1084 row groups, locally 250 ms to 70 ms and over S3 733 requests to 149. The statistics are read through the checks filter pruning uses, and `--scan-all` turns it off.
+
 - **zpq builds for the browser again.** The wasm32-wasi build that runs the site's Playground now comes from mainline zpq, single-threaded or with a shared-memory thread pool. Native builds are unchanged.
 
 - **Joins return rows, join on several key columns, and keep same-named columns apart.** A join without an aggregate answers its rows as DuckDB does, duplicates included, with ORDER BY, LIMIT and OFFSET; FLOAT and DOUBLE row items are refused by name for now. A join on two or more key columns binds them together, and falls back to its first key when the packed key would not fit in 63 bits. Two tables' same-named columns stay apart by their qualifiers. An ORDER BY name that is both a select alias and a qualified column sorts by the column, as DuckDB does, in joins and on single tables.

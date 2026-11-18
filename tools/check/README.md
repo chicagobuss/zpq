@@ -73,7 +73,7 @@ it may stand beside `oracle`.
 Some modes judge a written file or an explanation instead: `written_as` (DuckDB reads it as `sql` reads the
 inputs; `types` adds PyArrow's), `readers_agree`, `footer` and `plan` (readback.py's view or the `--explain` JSON
 `holds` a declared subset: `{"$len": N}`, `{"$list": [...]}`, `{"$all": X}`), `page_index`, `bloom` (filters checked
-from the spec's hashing alone), `summary`, and `golden`/`golden_rows` (`--bless` rewrites goldens; review the diff).
+from the spec's hashing alone), `summary` (`rg_pruned`: exactly that many row groups ruled out by statistics), and `golden`/`golden_rows` (`--bless` rewrites goldens; review the diff).
 `stderr_has` and `max_scans` (plan events in a `--profile` trace) apply to any mode.
 
 Matrices expand parametric cases: every combination of one entry per dimension instantiates `case` (`${VAR}`

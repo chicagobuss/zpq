@@ -1460,6 +1460,30 @@ fn lap(what: []const u8, since: i64) i64 {
     return now;
 }
 
+/// A build of at most this many rows is always hashed into dictionaries. Hashing it costs at most a few thousand
+/// inserts, and its codes let the probe side group and compare once per code, where plain strings are hashed again
+/// for every surviving probe row (`agg_coded.codePlainKeys`). The bound is `agg_coded.max_int_range`'s.
+const small_build_rows = 4096;
+
+/// Whether payload `leaf` is held plain: a value per slot, unhashed. A column its writer kept PLAIN in every row group
+/// (no dictionary page) is one it judged not to dedupe, and hashing it would cost a probe per value and save nothing;
+/// but a build of at most `small_build_rows` rows is hashed whatever its writer did. Only INT32, INT64, DOUBLE and
+/// BYTE_ARRAY columns are held plain, and a filter's strings never are: they decode into the row group's scratch, and
+/// only a late payload's outlive it (`LateLocal`).
+fn holdsPlain(meta: *const schema.FileMetaData, leaf: usize, filter_col: bool) bool {
+    if (meta.num_rows <= small_build_rows) return false;
+    for (meta.row_groups.items) |*rg| {
+        const cm = rg.columns.items[leaf].meta_data orelse return false;
+        if (cm.dictionary_page_offset != null) return false;
+        switch (cm.type) {
+            .INT32, .INT64, .DOUBLE => {},
+            .BYTE_ARRAY => if (filter_col) return false,
+            else => return false,
+        }
+    }
+    return true;
+}
+
 /// The build lives in `a` (used from this thread only) as long as the query; `gpa` (thread-safe) backs each row
 /// group's survivors and decode scratch until the build is laid out. Both draw from the query's ledger as they
 /// allocate (`engine/join.zig`), so a build that does not fit refuses while it builds.
@@ -1498,21 +1522,10 @@ pub fn build(a: std.mem.Allocator, gpa: std.mem.Allocator, bytes: []const u8, me
     var late: std.ArrayList(usize) = .empty;
     defer late.deinit(gpa);
     if (leaves != 0) for (spec.payload, 0..) |leaf, pi| if (!filter_cols[leaf]) try late.append(gpa, pi);
-    // A column its writer kept PLAIN in every row group (no dictionary page) is one it judged not to dedupe: hashing it
-    // into a dictionary would cost a probe per value and save nothing, so it is held plain.
+    // Held plain, and so not hashed into a dictionary, where `holdsPlain` says.
     const plain = try gpa.alloc(bool, spec.payload.len);
     defer gpa.free(plain);
-    @memset(plain, false);
-    for (spec.payload, plain) |leaf, *pl| pl.* = parts.len != 0 and for (meta.row_groups.items) |*rg| {
-        const cm = rg.columns.items[leaf].meta_data orelse break false;
-        if (cm.dictionary_page_offset != null) break false;
-        switch (cm.type) {
-            .INT32, .INT64, .DOUBLE => {},
-            // A filter's strings decode into the row group's scratch; only a late payload's outlive it (`LateLocal`).
-            .BYTE_ARRAY => if (filter_cols[leaf]) break false,
-            else => break false,
-        }
-    } else true;
+    for (spec.payload, plain) |leaf, *pl| pl.* = parts.len != 0 and holdsPlain(meta, leaf, filter_cols[leaf]);
     var ctx: Ctx = .{ .arenas = arenas, .gpa = gpa, .workers = &workers, .bytes = bytes, .meta = meta, .spec = spec, .parts = parts, .filter_cols = filter_cols, .late = late.items, .plain = plain };
     const trace = std.c.getenv("ZPQ_JOIN_TRACE") != null;
     var t = @import("../../clock.zig").monoNs();
@@ -2539,4 +2552,51 @@ pub fn fetchBatch(ctx: *const anyopaque, p: usize, keys: []const ?i64, a: std.me
     var it = sel.iterator();
     while (it.next()) |i| out[i] = .{ .bytes = col.string.values[i] };
     return out;
+}
+
+/// A footer of one row group and one leaf of `parquet_type`, dictionary-encoded or not, over `rows` rows.
+fn synthFooter(a: std.mem.Allocator, rows: i64, parquet_type: schema.Type, dictionary: bool) !schema.FileMetaData {
+    var rg: schema.RowGroup = .{ .columns = .empty, .total_byte_size = 0, .num_rows = rows };
+    try rg.columns.append(a, .{ .file_path = null, .file_offset = 0, .meta_data = .{
+        .type = parquet_type,
+        .encodings = .empty,
+        .path_in_schema = .empty,
+        .codec = .UNCOMPRESSED,
+        .num_values = rows,
+        .total_uncompressed_size = 0,
+        .total_compressed_size = 0,
+        .data_page_offset = 0,
+        .index_page_offset = null,
+        .dictionary_page_offset = if (dictionary) 4 else null,
+    } });
+    var meta: schema.FileMetaData = .{ .version = 2, .schema = .empty, .num_rows = rows, .created_by = null, .row_groups = .empty };
+    try meta.row_groups.append(a, rg);
+    return meta;
+}
+
+test "holdsPlain: a build of at most 4096 rows is hashed into dictionaries; a bigger one holds a PLAIN column plain" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Rows 4095 and 4096 hash, 4097 holds plain: for strings and numbers alike.
+    for ([_]schema.Type{ .BYTE_ARRAY, .INT32, .INT64, .DOUBLE }) |t| {
+        const at_4095 = try synthFooter(a, 4095, t, false);
+        const at_4096 = try synthFooter(a, 4096, t, false);
+        const at_4097 = try synthFooter(a, 4097, t, false);
+        try std.testing.expect(!holdsPlain(&at_4095, 0, false));
+        try std.testing.expect(!holdsPlain(&at_4096, 0, false));
+        try std.testing.expect(holdsPlain(&at_4097, 0, false));
+    }
+}
+
+test "holdsPlain keeps its other conditions: a dictionary page, a filter's string, another physical type" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const big = 1 << 20;
+    try std.testing.expect(!holdsPlain(&(try synthFooter(a, big, .INT64, true)), 0, false));
+    try std.testing.expect(!holdsPlain(&(try synthFooter(a, big, .BYTE_ARRAY, false)), 0, true));
+    try std.testing.expect(holdsPlain(&(try synthFooter(a, big, .INT64, false)), 0, true));
+    try std.testing.expect(!holdsPlain(&(try synthFooter(a, big, .FIXED_LEN_BYTE_ARRAY, false)), 0, false));
+    try std.testing.expect(!holdsPlain(&(try synthFooter(a, big, .BOOLEAN, false)), 0, false));
 }

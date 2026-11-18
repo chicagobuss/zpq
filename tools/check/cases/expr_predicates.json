@@ -10,6 +10,14 @@
     "exprtypes",
     "exprdecs"
    ]
+  },
+  {
+   "name": "deccmp",
+   "copy": "COPY (SELECT i AS id, (i % 50)::BIGINT AS k, (CASE WHEN i % 11 = 0 THEN NULL ELSE ((i % 41) - 20) * 0.5 END)::DECIMAL(7, 2) AS a72, (CASE WHEN i % 13 = 0 THEN NULL ELSE ((i * 7919) % 20001 - 10000) / 100.0 END)::DECIMAL(7, 2) AS a72h, (CASE WHEN i % 7 = 0 THEN NULL ELSE ((i % 37) - 18) * 0.5 END)::DECIMAL(5, 2) AS b52, (CASE WHEN i % 9 = 0 THEN NULL ELSE ((i % 23) - 11) * 0.25 END)::DECIMAL(9, 4) AS c94, (CASE WHEN i % 5 = 0 THEN NULL ELSE (i % 15) - 7 END)::DECIMAL(9, 0) AS z90, (CASE WHEN i % 17 = 0 THEN NULL ELSE ((i % 29) - 14) * 0.5 END)::DECIMAL(18, 6) AS d186, (CASE WHEN i % 19 = 0 THEN NULL ELSE ((i % 31) - 15) * 0.5 END)::DECIMAL(18, 4) AS e184, (CASE WHEN i % 3 = 0 THEN NULL ELSE ((i % 31) - 15) * 0.5 END)::DECIMAL(38, 10) AS f3810, (CASE WHEN i % 4 = 0 THEN NULL ELSE ((i % 13) - 6) * 0.5 END)::DECIMAL(38, 19) AS g3819, (CASE WHEN i % 6 = 0 THEN NULL ELSE ((i % 17) - 8) * 0.5 END)::DECIMAL(38, 18) AS h3818 FROM range(0, 3000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 512)"
+  },
+  {
+   "name": "deccmp_dim",
+   "copy": "COPY (SELECT i::BIGINT AS k, (((i * 7) % 41) - 20) * 0.5::DECIMAL(5, 2) AS cur FROM range(0, 50) t(i)) TO '{path}' (FORMAT PARQUET)"
   }
  ],
  "cases": [
@@ -1556,6 +1564,804 @@
    "refuse": {
     "error": "exit 1",
     "diag": "a WHERE comparison of FLOAT arithmetic is not supported"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72-eq-b52",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 = b52"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 = b52"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72-ne-b52",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 <> b52"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 <> b52"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72-lt-b52",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 < b52"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 < b52"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72-le-b52",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 <= b52"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 <= b52"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72-gt-b52",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 > b52"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 > b52"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72-ge-b52",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 >= b52"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 >= b52"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72-eq-c94",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 = c94"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 = c94"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72-ne-c94",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 <> c94"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 <> c94"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72-lt-c94",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 < c94"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 < c94"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72-le-c94",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 <= c94"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 <= c94"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72-gt-c94",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 > c94"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 > c94"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72-ge-c94",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 >= c94"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72 >= c94"
+   }
+  },
+  {
+   "id": "expr:deccmp:z90-eq-d186",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE z90 = d186"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE z90 = d186"
+   }
+  },
+  {
+   "id": "expr:deccmp:z90-ne-d186",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE z90 <> d186"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE z90 <> d186"
+   }
+  },
+  {
+   "id": "expr:deccmp:z90-lt-d186",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE z90 < d186"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE z90 < d186"
+   }
+  },
+  {
+   "id": "expr:deccmp:z90-le-d186",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE z90 <= d186"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE z90 <= d186"
+   }
+  },
+  {
+   "id": "expr:deccmp:z90-gt-d186",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE z90 > d186"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE z90 > d186"
+   }
+  },
+  {
+   "id": "expr:deccmp:z90-ge-d186",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE z90 >= d186"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE z90 >= d186"
+   }
+  },
+  {
+   "id": "expr:deccmp:e184-eq-f3810",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE e184 = f3810"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE e184 = f3810"
+   }
+  },
+  {
+   "id": "expr:deccmp:e184-ne-f3810",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE e184 <> f3810"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE e184 <> f3810"
+   }
+  },
+  {
+   "id": "expr:deccmp:e184-lt-f3810",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE e184 < f3810"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE e184 < f3810"
+   }
+  },
+  {
+   "id": "expr:deccmp:e184-le-f3810",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE e184 <= f3810"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE e184 <= f3810"
+   }
+  },
+  {
+   "id": "expr:deccmp:e184-gt-f3810",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE e184 > f3810"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE e184 > f3810"
+   }
+  },
+  {
+   "id": "expr:deccmp:e184-ge-f3810",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE e184 >= f3810"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE e184 >= f3810"
+   }
+  },
+  {
+   "id": "expr:deccmp:g3819-eq-h3818",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE g3819 = h3818"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE g3819 = h3818"
+   }
+  },
+  {
+   "id": "expr:deccmp:g3819-ne-h3818",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE g3819 <> h3818"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE g3819 <> h3818"
+   }
+  },
+  {
+   "id": "expr:deccmp:g3819-lt-h3818",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE g3819 < h3818"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE g3819 < h3818"
+   }
+  },
+  {
+   "id": "expr:deccmp:g3819-le-h3818",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE g3819 <= h3818"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE g3819 <= h3818"
+   }
+  },
+  {
+   "id": "expr:deccmp:g3819-gt-h3818",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE g3819 > h3818"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE g3819 > h3818"
+   }
+  },
+  {
+   "id": "expr:deccmp:g3819-ge-h3818",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE g3819 >= h3818"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE g3819 >= h3818"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72h-eq-b52",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72h = b52"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72h = b52"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72h-ne-b52",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72h <> b52"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72h <> b52"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72h-lt-b52",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72h < b52"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72h < b52"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72h-le-b52",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72h <= b52"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72h <= b52"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72h-gt-b52",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72h > b52"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72h > b52"
+   }
+  },
+  {
+   "id": "expr:deccmp:a72h-ge-b52",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72h >= b52"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(id) AS s FROM '{fixture:deccmp}' WHERE a72h >= b52"
+   }
+  },
+  {
+   "id": "join:deccmp:gt",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:deccmp}' f JOIN '{fixture:deccmp_dim}' d ON f.k = d.k WHERE f.a72 > d.cur"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:deccmp}' f JOIN '{fixture:deccmp_dim}' d ON f.k = d.k WHERE f.a72 > d.cur"
+   }
+  },
+  {
+   "id": "join:deccmp:le",
+   "fixture": "deccmp",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:deccmp}' f JOIN '{fixture:deccmp_dim}' d ON f.k = d.k WHERE f.a72 <= d.cur"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n FROM '{fixture:deccmp}' f JOIN '{fixture:deccmp_dim}' d ON f.k = d.k WHERE f.a72 <= d.cur"
    }
   }
  ]

@@ -884,7 +884,12 @@ fn withRowExact(x: ast.ExprCompare, batch: *const Batch, column_lookup: []const 
 /// meet in DuckDB's common type: DOUBLE when either is DOUBLE, FLOAT when the floating sides are all FLOAT, else the
 /// common DECIMAL when either is DECIMAL, else an integer wide enough for UINT64 and BIGINT alike.
 fn evalExprCompare(x: ast.ExprCompare, batch: *const Batch, sel: *selection.SelectionVector, column_lookup: []const ?usize, arena: std.mem.Allocator) Error!void {
-    if (try compareColumns(x, batch, sel, column_lookup)) return;
+    if (try compareColumns(x, batch, sel, column_lookup, arena)) return;
+    return evalExprCompareRows(x, batch, sel, column_lookup, arena);
+}
+
+/// `evalExprCompare` for any two sides, a row at a time at DuckDB's common type: the answer every fast path must give.
+fn evalExprCompareRows(x: ast.ExprCompare, batch: *const Batch, sel: *selection.SelectionVector, column_lookup: []const ?usize, arena: std.mem.Allocator) Error!void {
     const exact = try withRowExact(x, batch, column_lookup, arena);
     const wanted = exact.restrictedTo(sel);
     const l = try expr_eval.evalGroupKeyExpr(arena, &wanted, column_lookup, x.left.*);
@@ -918,11 +923,13 @@ fn evalExprCompare(x: ast.ExprCompare, batch: *const Batch, sel: *selection.Sele
 }
 
 /// Two columns of one integer or float lane compared in place at the selected rows (`l_commitdate < l_receiptdate`):
-/// nothing is widened or copied. False when the sides are anything else, for the general path.
-fn compareColumns(x: ast.ExprCompare, batch: *const Batch, sel: *selection.SelectionVector, column_lookup: []const ?usize) Error!bool {
+/// nothing is widened or copied. Two DECIMAL columns are compared by `compareDecimals`. False when the sides are
+/// anything else, for the general path.
+fn compareColumns(x: ast.ExprCompare, batch: *const Batch, sel: *selection.SelectionVector, column_lookup: []const ?usize, arena: std.mem.Allocator) Error!bool {
     if (x.left.* != .col_ref or x.right.* != .col_ref) return false;
     const lc = x.left.col_ref;
     const rc = x.right.col_ref;
+    if (lc.expr_type == .dec and rc.expr_type == .dec) return compareDecimals(x, batch, sel, column_lookup, arena);
     if (lc.expr_type != rc.expr_type or (lc.expr_type != .i64 and lc.expr_type != .f64)) return false;
     // An unsigned column's lane holds raw bits a signed compare would misorder.
     if (lc.unsigned_32 or rc.unsigned_32 or lc.unsigned_64 or rc.unsigned_64) return false;
@@ -947,6 +954,73 @@ fn compareColumns(x: ast.ExprCompare, batch: *const Batch, sel: *selection.Selec
         },
         else => return false,
     }
+}
+
+/// A DECIMAL column's exact unscaled integers as `compareDecimals` reads them: row for row, or by code into a dictionary.
+const DecimalSide = struct {
+    codes: ?[]const u32,
+    /// The rows' integers, or the dictionary's when `codes` is set.
+    ints: Exact,
+    def_levels: ?[]const u32,
+    max_def: u32,
+
+    /// Null where the column holds no exact integers (the general path says why) or is nested.
+    fn of(col: Batch.Column) ?DecimalSide {
+        switch (col) {
+            inline .i32, .i64, .f64 => |c| {
+                if (c.max_rep > 0) return null;
+                const ints = (if (c.codes != null) c.dict_unscaled else c.unscaled) orelse return null;
+                return .{ .codes = c.codes, .ints = ints, .def_levels = c.def_levels, .max_def = c.max_def };
+            },
+            .i128 => |c| {
+                if (c.max_rep > 0) return null;
+                return .{ .codes = c.codes, .ints = .{ .i128 = if (c.codes != null) c.dict else c.values }, .def_levels = c.def_levels, .max_def = c.max_def };
+            },
+            else => return null,
+        }
+    }
+
+    inline fn at(s: DecimalSide, row: usize) i128 {
+        const i = if (s.codes) |codes| codes[row] else row;
+        return switch (s.ints) {
+            inline else => |v| v[i],
+        };
+    }
+};
+
+/// Two DECIMAL columns compared at the selected rows as the general path compares them: both sides at DuckDB's common
+/// DECIMAL type (the larger scale, room for the larger integer part), a NULL on either side dropping the row. The
+/// integers stay i128 and are never widened further. Where a side's rescaled value overflows i128 or reaches the
+/// common type's 10^precision (the general path's `ComparisonValueOutOfRange`), or the columns hold no exact
+/// integers, this returns false with `sel` untouched, and the general path answers, with its error where it has one.
+fn compareDecimals(x: ast.ExprCompare, batch: *const Batch, sel: *selection.SelectionVector, column_lookup: []const ?usize, arena: std.mem.Allocator) Error!bool {
+    const ls = x.left.decSpec() orelse return false;
+    const rs = x.right.decSpec() orelse return false;
+    const common = commonDec(ls, rs);
+    const l = DecimalSide.of(batch.cols[column_lookup[x.left.col_ref.col_idx] orelse return error.BadColumn]) orelse return false;
+    const r = DecimalSide.of(batch.cols[column_lookup[x.right.col_ref.col_idx] orelse return error.BadColumn]) orelse return false;
+    const bound: u128 = @intCast(expr_ast.pow10(common.precision));
+    const lf = expr_ast.pow10(common.scale - ls.scale);
+    const rf = expr_ast.pow10(common.scale - rs.scale);
+    // The answer goes to a copy, so a refusal halfway leaves `sel` as it was.
+    const out = try arena.dupe(u64, sel.mask);
+    for (sel.mask, out, 0..) |word, *o, wi| {
+        var bits = word;
+        while (bits != 0) : (bits &= bits - 1) {
+            const row = wi * 64 + @ctz(bits);
+            const drop = @as(u64, 1) << @intCast(row & 63);
+            if (rowIsNull(l.def_levels, l.max_def, row) or rowIsNull(r.def_levels, r.max_def, row)) {
+                o.* &= ~drop;
+                continue;
+            }
+            const a = std.math.mul(i128, l.at(row), lf) catch return false;
+            const b = std.math.mul(i128, r.at(row), rf) catch return false;
+            if (@abs(a) >= bound or @abs(b) >= bound) return false;
+            if (!ast.applyOp(i128, a, x.op, b)) o.* &= ~drop;
+        }
+    }
+    @memcpy(sel.mask, out);
+    return true;
 }
 
 /// The column a value leaf tests; null for AND/OR and IS [NOT] NULL (which reads levels only).
@@ -1858,7 +1932,7 @@ test "column comparisons use independent numeric dictionaries without widening" 
                 var sel = try selection.SelectionVector.init(a, lv.len);
                 defer sel.deinit();
                 sel.set(5, false);
-                try std.testing.expect(try compareColumns(.{ .op = op, .left = &l, .right = &r }, &batch, &sel, &.{ 0, 1 }));
+                try std.testing.expect(try compareColumns(.{ .op = op, .left = &l, .right = &r }, &batch, &sel, &.{ 0, 1 }, a));
                 for (lv, rv, 0..) |left, right, i| {
                     const expected = i != 5 and dl[i] == 1 and dr[i] == 1 and ast.applyOp(T, left, op, right);
                     try std.testing.expectEqual(expected, sel.isActive(i));
@@ -1866,4 +1940,129 @@ test "column comparisons use independent numeric dictionaries without widening" 
             }
         };
     }
+}
+
+/// Two DECIMAL columns of `rows` rows for `compareDecimals`'s differential test: values within each side's precision
+/// (some equal across the scales, some at the precision's edge), a few past it in rows the selection drops, NULLs, and
+/// the smallest lane that holds the precision, plain or coded.
+const DecimalFixture = struct {
+    ints: [2][]i128,
+    def: [2][]u32,
+    keep: []bool,
+    cols: [2]Batch.Column,
+
+    fn make(a: std.mem.Allocator, rng: std.Random, rows: usize, specs: [2]expr_ast.Dec, coded: bool) !DecimalFixture {
+        var f: DecimalFixture = undefined;
+        f.keep = try a.alloc(bool, rows);
+        for (f.keep) |*k| k.* = rng.uintLessThan(u8, 8) != 0;
+        for (0..2) |side| {
+            f.ints[side] = try a.alloc(i128, rows);
+            f.def[side] = try a.alloc(u32, rows);
+        }
+        const edge = [2]i128{ expr_ast.pow10(specs[0].precision) - 1, expr_ast.pow10(specs[1].precision) - 1 };
+        for (0..rows) |r| {
+            // A whole number both sides can hold, at each side's scale: a tie for `=`.
+            const room = @min(specs[0].precision - specs[0].scale, specs[1].precision - specs[1].scale);
+            const lim: i128 = if (room >= 1) 9 else 0;
+            const n = rng.intRangeAtMost(i128, -lim, lim);
+            for (0..2) |side| {
+                const own = specs[side];
+                f.ints[side][r] = switch (rng.uintLessThan(u8, 8)) {
+                    0, 1 => n * expr_ast.pow10(own.scale),
+                    2 => edge[side],
+                    3 => -edge[side],
+                    4 => 0,
+                    // Past the precision, in a row nothing reads.
+                    5 => if (f.keep[r]) rng.intRangeAtMost(i128, -edge[side], edge[side]) else edge[side] + 1 + rng.intRangeAtMost(i128, 0, 1000),
+                    else => rng.intRangeAtMost(i128, -edge[side], edge[side]),
+                };
+                f.def[side][r] = @intFromBool(rng.uintLessThan(u8, 10) != 0);
+            }
+        }
+        for (0..2) |side| {
+            const p = specs[side].precision;
+            const d = f.def[side];
+            f.cols[side] = if (p <= 9) blk: {
+                const v = try a.alloc(i32, rows);
+                for (v, f.ints[side]) |*o, i| o.* = @intCast(i);
+                break :blk if (coded) try codedColumn(i32, a, v, d, .i32) else .{ .i32 = .{ .values = v, .unscaled = .{ .i32 = v }, .def_levels = d, .max_def = 1, .has_nulls = true } };
+            } else if (p <= 18) blk: {
+                const v = try a.alloc(i64, rows);
+                for (v, f.ints[side]) |*o, i| o.* = @intCast(i);
+                break :blk if (coded) try codedColumn(i64, a, v, d, .i64) else .{ .i64 = .{ .values = v, .unscaled = .{ .i64 = v }, .def_levels = d, .max_def = 1, .has_nulls = true } };
+            } else .{ .i128 = .{ .values = f.ints[side], .def_levels = d, .max_def = 1, .has_nulls = true } };
+        }
+        return f;
+    }
+
+    /// `v` as a coded column: its distinct values in a dictionary, a code per row, and no values.
+    fn codedColumn(comptime T: type, a: std.mem.Allocator, v: []const T, def: []const u32, comptime tag: std.meta.Tag(Batch.Column)) !Batch.Column {
+        var dict: std.ArrayList(T) = .empty;
+        const codes = try a.alloc(u32, v.len);
+        for (v, codes) |x, *c| {
+            c.* = @intCast(std.mem.indexOfScalar(T, dict.items, x) orelse blk: {
+                try dict.append(a, x);
+                break :blk dict.items.len - 1;
+            });
+        }
+        const exact: Exact = if (T == i32) .{ .i32 = dict.items } else .{ .i64 = dict.items };
+        return @unionInit(Batch.Column, @tagName(tag), .{ .values = &.{}, .codes = codes, .dict = dict.items, .dict_unscaled = exact, .def_levels = def, .max_def = 1, .has_nulls = true });
+    }
+};
+
+test "compareDecimals answers as the general path does, or leaves the selection for it to refuse" {
+    var state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer state.deinit();
+    const a = state.allocator();
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const rng = prng.random();
+    const rows = 203;
+    // Equal and unequal scales, each lane (i32, i64, i128), precision up to 38, an all-fraction type, scale 0.
+    const pairs = [_][2]expr_ast.Dec{
+        .{ .{ .precision = 7, .scale = 2 }, .{ .precision = 5, .scale = 2 } },
+        .{ .{ .precision = 7, .scale = 2 }, .{ .precision = 9, .scale = 4 } },
+        .{ .{ .precision = 9, .scale = 0 }, .{ .precision = 18, .scale = 6 } },
+        .{ .{ .precision = 18, .scale = 4 }, .{ .precision = 18, .scale = 4 } },
+        .{ .{ .precision = 18, .scale = 18 }, .{ .precision = 9, .scale = 9 } },
+        .{ .{ .precision = 18, .scale = 4 }, .{ .precision = 38, .scale = 10 } },
+        .{ .{ .precision = 38, .scale = 0 }, .{ .precision = 38, .scale = 38 } },
+        .{ .{ .precision = 38, .scale = 19 }, .{ .precision = 38, .scale = 18 } },
+        .{ .{ .precision = 38, .scale = 37 }, .{ .precision = 12, .scale = 0 } },
+        .{ .{ .precision = 30, .scale = 30 }, .{ .precision = 5, .scale = 0 } },
+    };
+    var taken: usize = 0;
+    var refused: usize = 0;
+    for (pairs) |specs| for ([_]bool{ false, true }) |coded| for (0..4) |_| {
+        const f = try DecimalFixture.make(a, rng, rows, specs, coded);
+        const batch: Batch = .{ .cols = &f.cols, .num_rows = rows };
+        var l: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 0, .physical_type = if (specs[0].precision <= 9) .INT32 else if (specs[0].precision <= 18) .INT64 else .FIXED_LEN_BYTE_ARRAY, .expr_type = .dec, .dec = specs[0] } };
+        var r: expr_ast.Expr = .{ .col_ref = .{ .col_idx = 1, .physical_type = if (specs[1].precision <= 9) .INT32 else if (specs[1].precision <= 18) .INT64 else .FIXED_LEN_BYTE_ARRAY, .expr_type = .dec, .dec = specs[1] } };
+        for ([_]ast.Operator{ .Eq, .NotEq, .Lt, .LtEq, .Gt, .GtEq }) |op| {
+            const x: ast.ExprCompare = .{ .op = op, .left = &l, .right = &r };
+            var fast = try selection.SelectionVector.init(a, rows);
+            for (f.keep, 0..) |k, i| if (!k) fast.set(i, false);
+            var general = try selection.SelectionVector.init(a, rows);
+            @memcpy(general.mask, fast.mask);
+            const before = try a.dupe(u64, fast.mask);
+            const handled = try compareColumns(x, &batch, &fast, &.{ 0, 1 }, a);
+            if (general_blk: {
+                evalExprCompareRows(x, &batch, &general, &.{ 0, 1 }, a) catch |err| {
+                    // The general path refuses where the fast one steps aside, and the fast one left the selection as it was.
+                    try std.testing.expectEqual(error.ComparisonValueOutOfRange, err);
+                    try std.testing.expect(!handled);
+                    try std.testing.expectEqualSlices(u64, before, fast.mask);
+                    refused += 1;
+                    break :general_blk false;
+                };
+                break :general_blk true;
+            }) {
+                try std.testing.expect(handled);
+                try std.testing.expectEqualSlices(u64, general.mask, fast.mask);
+                taken += 1;
+            }
+        }
+    };
+    // Both outcomes were reached; most draws are answered by the fast path.
+    try std.testing.expect(taken > 100);
+    try std.testing.expect(refused > 0);
 }

@@ -1323,7 +1323,7 @@ pub fn parseSqlJoinPlanRoot(allocator: std.mem.Allocator, sql: []const u8, schem
     const q = try allocator.create(syntax.Query);
     q.* = pq.syntax.?.*;
     const semis = try std.mem.concat(allocator, syntax.Semi, &.{ first.semis, peeled.semis });
-    q.join = .{ .kind = first.kind, .fk = first.fk, .fk_more = first.fk_more, .build = first.build, .not_exists = first.not_exists, .semis = semis, .dims = first.dims };
+    q.join = .{ .kind = first.kind, .sql = z, .fk = first.fk, .fk_more = first.fk_more, .build = first.build, .not_exists = first.not_exists, .semis = semis, .dims = first.dims };
     pq.syntax = q;
     return pq;
 }

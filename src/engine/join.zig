@@ -230,6 +230,8 @@ pub const Prepared = struct {
     /// The top-level builds, each with what it holds (`Task`): released together.
     tasks: []Task = &.{},
     order: expr_ast.ResultOrder,
+    /// The query as written (`syntax.Join.sql`).
+    sql: []const u8 = "",
     /// Group-join partials are indexed within one file, so multiple probe files use the generic aggregate.
     single_probe: bool,
     inner: plans.Source = undefined,
@@ -249,8 +251,9 @@ pub const Prepared = struct {
     }
 
     /// A demoted key column is a build column the query never named, so it is published under a name of its own: the
-    /// column's, with underscores until no column of the probe and no other build column has it. Chosen once, against
-    /// the first footer; every probe file has the same columns.
+    /// column's, with underscores until no column of the probe and no other build column has it and the query spells
+    /// it nowhere, as a build column the binder renames (`sql_join.publishedName`). Chosen once, against the first
+    /// footer; every probe file has the same columns.
     fn nameDemoted(self: *Prepared, arena: std.mem.Allocator, meta: *const schema.FileMetaData) !void {
         const all = try self.publishing(arena);
         const leaves = try arena.alloc(Leaf, 1 + self.dims.len);
@@ -264,6 +267,7 @@ pub const Prepared = struct {
                 var name: std.ArrayList(u8) = .empty;
                 try name.appendSlice(arena, names[d.payload]);
                 while (true) : (try name.append(arena, '_')) {
+                    if (syntax.spells(self.sql, name.items)) continue;
                     if (metadata.resolveColumn(meta, name.items)) |_| continue else |err| if (err != error.UnknownColumn) continue;
                     const taken = for (all) |j| {
                         const theirs = for (j.payloads, 0..) |p, i| {
@@ -808,7 +812,7 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
     const sj = source.join orelse return null;
     const threads = if (args.parallelism == 0) std.Thread.getCpuCount() catch 1 else args.parallelism;
     const p = try arena.create(Prepared);
-    p.* = .{ .main = undefined, .semis = &.{}, .ledger = ledger, .gpa = gpa, .order = args.result_order, .single_probe = args.inputs.len == 1 };
+    p.* = .{ .main = undefined, .semis = &.{}, .ledger = ledger, .gpa = gpa, .order = args.result_order, .sql = sj.sql, .single_probe = args.inputs.len == 1 };
     p.charge = .{ .child = gpa, .budget = ledger };
     p.replica_limit = args.replicated_join_limit;
     p.replica_budget = .{ .limit = args.replicated_join_limit orelse ledger.limit, .parent = ledger };

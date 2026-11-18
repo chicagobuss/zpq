@@ -204,7 +204,10 @@
   {"name": "alias_probe", "copy": "COPY (SELECT i AS id, (i * 7 % 60)::BIGINT AS fk, (i % 7)::BIGINT AS dup, CASE WHEN i % 11 = 0 THEN NULL ELSE (i * 3 % 7)::BIGINT END AS q FROM range(1, 5000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 1000)"},
   {"name": "alias_build", "copy": "COPY (SELECT k AS pk, (k % 4)::BIGINT AS grp, 'n' || k AS name FROM range(0, 50) t(k)) TO '{path}' (FORMAT PARQUET)"},
   {"name": "range_dim", "copy": "COPY (SELECT k AS g, (CASE WHEN k % 2 = 0 THEN 1 ELSE -1 END) * 4611686018427387904 + k AS a, (k * 1099511627776)::BIGINT AS b, (k % 4 * 1099511627776)::BIGINT AS b4, 'n' || k AS name FROM range(0, 64) t(k)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 16)"},
-  {"name": "range_fact", "copy": "COPY (SELECT i AS id, (CASE WHEN (i % 80) % 2 = 0 THEN 1 ELSE -1 END) * 4611686018427387904 + (i % 80) AS a, ((i % 80) * 1099511627776 + (CASE WHEN i % 5 = 0 THEN 1 ELSE 0 END))::BIGINT AS b, ((i % 80) % 4 * 1099511627776)::BIGINT AS b4, (CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END)::BIGINT AS v FROM range(0, 20000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 3000)"}
+  {"name": "range_fact", "copy": "COPY (SELECT i AS id, (CASE WHEN (i % 80) % 2 = 0 THEN 1 ELSE -1 END) * 4611686018427387904 + (i % 80) AS a, ((i % 80) * 1099511627776 + (CASE WHEN i % 5 = 0 THEN 1 ELSE 0 END))::BIGINT AS b, ((i % 80) % 4 * 1099511627776)::BIGINT AS b4, (CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END)::BIGINT AS v FROM range(0, 20000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 3000)"},
+  {"name": "range_k_dim", "copy": "COPY (SELECT k AS g, (k * 1099511627776)::BIGINT AS k1, ((63 - k) * 34359738368)::BIGINT AS k2 FROM range(0, 64) t(k)) TO '{path}' (FORMAT PARQUET)"},
+  {"name": "range_k_fact", "copy": "COPY (SELECT i AS id, ((i % 80) * 1099511627776)::BIGINT AS k1, ((63 - i % 80) * 34359738368 + (CASE WHEN i % 5 = 0 THEN 1 ELSE 0 END))::BIGINT AS k2, (i % 7)::BIGINT AS v FROM range(0, 2000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 500)"},
+  {"name": "range_k_fact_named", "copy": "COPY (SELECT i AS id, ((i % 80) * 1099511627776)::BIGINT AS k1, ((63 - i % 80) * 34359738368 + (CASE WHEN i % 5 = 0 THEN 1 ELSE 0 END))::BIGINT AS k2, (i % 3)::BIGINT AS k2_ FROM range(0, 2000) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 500)"}
  ],
  "cases": [
   {
@@ -13244,6 +13247,224 @@
    "refuse": {
     "error": "exit 1",
     "diag": "span more values together than fit 63 bits"
+   }
+  },
+  {
+   "id": "join:composite:range:same-names-answer",
+   "fixture": "range_k_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(b.g) AS g, sum(b.k2) AS s, min(p.k2) AS m FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(b.g) AS g, sum(b.k2) AS s, min(p.k2) AS m FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2"
+   }
+  },
+  {
+   "id": "join:composite:range:made-up-name-refuses",
+   "fixture": "range_k_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 WHERE k2_ IS NOT NULL"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "unknown column",
+    "binder_sql": "SELECT count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 WHERE k2_ IS NOT NULL"
+   }
+  },
+  {
+   "id": "join:composite:range:made-up-name-quoted-refuses",
+   "fixture": "range_k_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 WHERE \"k2_\" IS NOT NULL"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "unknown column",
+    "binder_sql": "SELECT count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 WHERE \"k2_\" IS NOT NULL"
+   }
+  },
+  {
+   "id": "join:composite:range:made-up-name-upper-case-refuses",
+   "fixture": "range_k_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 WHERE K2_ IS NOT NULL"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "unknown column",
+    "binder_sql": "SELECT count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 WHERE K2_ IS NOT NULL"
+   }
+  },
+  {
+   "id": "join:composite:range:made-up-name-qualified-refuses",
+   "fixture": "range_k_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 WHERE p.k2_ IS NOT NULL"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "unknown column",
+    "binder_sql": "SELECT count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 WHERE p.k2_ IS NOT NULL"
+   }
+  },
+  {
+   "id": "join:composite:range:made-up-name-of-the-build-refuses",
+   "fixture": "range_k_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 WHERE b.k2_ IS NOT NULL"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "unknown column",
+    "binder_sql": "SELECT count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 WHERE b.k2_ IS NOT NULL"
+   }
+  },
+  {
+   "id": "join:composite:range:made-up-name-grouped-refuses",
+   "fixture": "range_k_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT k2_ AS x, count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 GROUP BY k2_ ORDER BY x LIMIT 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "unknown column",
+    "binder_sql": "SELECT k2_ AS x, count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 GROUP BY k2_ ORDER BY x LIMIT 3"
+   }
+  },
+  {
+   "id": "join:composite:range:made-up-name-in-rows-refuses",
+   "fixture": "range_k_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT p.id, k2_ AS x FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 ORDER BY p.id LIMIT 3"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "unknown column",
+    "binder_sql": "SELECT p.id, k2_ AS x FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 ORDER BY p.id LIMIT 3"
+   }
+  },
+  {
+   "id": "join:composite:range:made-up-name-longer-refuses",
+   "fixture": "range_k_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 WHERE k2__ IS NOT NULL"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 2",
+    "diag": "unknown column",
+    "binder_sql": "SELECT count(*) AS n FROM '{fixture:range_k_fact}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2 WHERE k2__ IS NOT NULL"
+   }
+  },
+  {
+   "id": "join:composite:range:probe-has-the-name",
+   "fixture": "range_k_fact_named",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT count(*) AS n, sum(k2_) AS s, sum(b.g) AS g FROM '{fixture:range_k_fact_named}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT count(*) AS n, sum(k2_) AS s, sum(b.g) AS g FROM '{fixture:range_k_fact_named}' p JOIN '{fixture:range_k_dim}' b ON p.k1 = b.k1 AND p.k2 = b.k2"
    }
   },
   {

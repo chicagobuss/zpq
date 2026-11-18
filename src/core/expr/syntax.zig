@@ -1,4 +1,5 @@
 //! Owned, schema-independent syntax shared by native frontends and versioned worker requests.
+const std = @import("std");
 const ast = @import("ast.zig");
 const filter = @import("../filter/ast.zig");
 const agg = @import("agg.zig");
@@ -64,6 +65,8 @@ pub const RowKey = struct { expr: Expr, display: []const u8, descending: bool, n
 /// the query to a worker.
 pub const Join = struct {
     kind: JoinKind,
+    /// The query as written. A name made up for a build column is one it does not spell (`spells`).
+    sql: []const u8 = "",
     /// The probe's foreign key.
     fk: []const u8,
     fk_more: []const []const u8 = &.{},
@@ -76,6 +79,13 @@ pub const Join = struct {
     /// A star's other dimensions: INNER, N:1, each publishing its own columns as the main build does.
     dims: []const Dim = &.{},
 };
+
+/// Whether a query's text spells `name` anywhere, in any case, be it inside a longer word. A build column that goes by
+/// a made-up name in the probe query (`Build.columns_as`, a key column the engine demotes) takes one the query does
+/// not spell, so nothing the query wrote can mean it: a name no table has still refuses.
+pub fn spells(sql: []const u8, name: []const u8) bool {
+    return std.ascii.findIgnoreCase(sql, name) != null;
+}
 
 /// One more dimension of a star: the probe's FK into it, and its build. `left`: a LEFT JOIN's, every probe row kept.
 pub const Dim = struct {

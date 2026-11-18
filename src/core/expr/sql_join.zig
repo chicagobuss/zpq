@@ -11,6 +11,7 @@
 //! than guess.
 const std = @import("std");
 const c = @import("liteparser_c");
+const spells = @import("syntax.zig").spells;
 
 pub const Kind = enum { inner, semi, anti, left };
 
@@ -1117,7 +1118,7 @@ fn publishedName(a: std.mem.Allocator, sql: []const u8, t: Tables, taken: []cons
     };
     if (std.ascii.isDigit(name.items[0])) try name.insert(a, 0, '_');
     while (true) : (try name.append(a, '_')) {
-        if (std.ascii.findIgnoreCase(sql, name.items) != null) continue;
+        if (spells(sql, name.items)) continue;
         const used = for (taken) |other| {
             if (std.ascii.eqlIgnoreCase(other, name.items)) break true;
         } else for (0..t.paths.len) |ti| {

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **A join skips probe row groups its dimension's keys cannot match.** An inner or semi join on one integer or DATE key compares each row group's statistics for the foreign key with the range of keys the filtered dimension kept, and skips a group wholly outside it, as DuckDB does. The inventory join in the TPC-DS suite reads 217 of 1084 row groups, locally 250 ms to 70 ms and over S3 733 requests to 149. The statistics are read through the checks filter pruning uses, and `--scan-all` turns it off.
+- **A join skips probe row groups its dimension's keys cannot match.** An inner or semi join on one integer or DATE key compares each probe row group's corroborated statistics with the range of keys the filtered dimension kept, and skips the groups wholly outside it. The TPC-DS inventory join reads 217 of 1,084 row groups instead of all of them, and over S3 sends 149 requests instead of 733. `--scan-all` turns it off.
 
 - **zpq builds for the browser again.** The wasm32-wasi build that runs the site's Playground now comes from mainline zpq, single-threaded or with a shared-memory thread pool. Native builds are unchanged.
 

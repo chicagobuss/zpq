@@ -240,6 +240,22 @@ pub const Prepared = struct {
         for (self.dims) |d| try lookup.extend(d.join, arena, meta);
     }
 
+    /// The column a float key goes by in its refusal: the key itself, or the first FLOAT or DOUBLE column its
+    /// expression reads, or with none (`id / 2.0`) the first column of any type.
+    fn floatColumn(arena: std.mem.Allocator, meta: *const schema.FileMetaData, key: expr_ast.Expr) !?usize {
+        if (key == .col_ref) return key.col_ref.col_idx;
+        const reads = try arena.alloc(bool, metadata.leafCount(meta));
+        @memset(reads, false);
+        key.collectColumns(reads);
+        var first: ?usize = null;
+        for (reads, 0..) |read, leaf| if (read) {
+            const element = metadata.leafSchemaElement(meta, leaf) orelse continue;
+            if (element.type == .FLOAT or element.type == .DOUBLE) return leaf;
+            if (first == null) first = leaf;
+        };
+        return first;
+    }
+
     fn bind(raw: *const anyopaque, arena: std.mem.Allocator, meta: *const schema.FileMetaData, diag: ?*Diag, options: plans.Options) anyerror!plans.Query {
         const self: *Prepared = @ptrCast(@alignCast(@constCast(raw)));
         var q = try self.inner.bind_fn(self.inner.context, arena, meta, diag, options);
@@ -251,7 +267,7 @@ pub const Prepared = struct {
         // A join's rows run as their groups (`ResultOrder.repeat`), and a group's FLOAT or DOUBLE key is no row's value:
         // -0.0 groups with 0.0, every NaN with every other, and a FLOAT is held as a DOUBLE.
         if (self.order.repeat != null) for (a.keys orelse &.{}) |k| if (k.typeOf() == .f64) {
-            if (k == .col_ref) if (try metadata.leafPathSegments(arena, meta, k.col_ref.col_idx)) |path| {
+            if (try floatColumn(arena, meta, k)) |leaf| if (try metadata.leafPathSegments(arena, meta, leaf)) |path| {
                 Diag.setColumn(diag, path[path.len - 1]);
             };
             return error.JoinRowsFloat;

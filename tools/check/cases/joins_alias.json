@@ -1,0 +1,758 @@
+{
+ "fixtures": [
+  {"name": "alias_sweep_fact", "copy": "COPY (SELECT i AS id, (i * 7 % 60)::BIGINT AS fk, (i % 7)::BIGINT AS dup, CASE WHEN i % 11 = 0 THEN NULL ELSE (i * 3 % 7)::BIGINT END AS q, (i * 37 % 101) / 8.0 AS dbl FROM range(1, 400) t(i)) TO '{path}' (FORMAT PARQUET, ROW_GROUP_SIZE 100)"},
+  {"name": "alias_sweep_dim", "copy": "COPY (SELECT k AS pk, (k * 5 % 13)::BIGINT AS grp, 'n' || k AS name FROM range(0, 50) t(k)) TO '{path}' (FORMAT PARQUET)"},
+  {"name": "alias_review_fact", "copy": "COPY (SELECT * FROM (VALUES (1::BIGINT, 1::BIGINT, 30::BIGINT, 0.2::DOUBLE), (2, 1, 10, 0.1), (3, 1, 20, 0.3)) t(id, fk, v, dbl)) TO '{path}' (FORMAT PARQUET)"},
+  {"name": "alias_review_dim", "copy": "COPY (SELECT 1::BIGINT AS pk) TO '{path}' (FORMAT PARQUET)"}
+ ],
+ "refuse": {
+  "join:alias:sweep:join:probe-column:plain:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-column:plain:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-column:plain:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-column:plain:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-column:quoted:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-column:quoted:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-column:quoted:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-column:quoted:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-column:quoted-upper:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-column:quoted-upper:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-column:quoted-upper:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-column:quoted-upper:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-fk:plain:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-fk:plain:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-fk:plain:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-fk:plain:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-fk:quoted:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-fk:quoted:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-fk:quoted:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-fk:quoted:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-fk:quoted-upper:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-fk:quoted-upper:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-fk:quoted-upper:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:probe-fk:quoted-upper:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:double-column:plain:qualified:all": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:plain:qualified:limit": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:plain:qualified:offset": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:plain:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:double-column:plain:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:double-column:plain:qualified-quoted:all": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:plain:qualified-quoted:limit": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:plain:qualified-quoted:offset": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:plain:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:double-column:plain:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:double-column:quoted:qualified:all": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:quoted:qualified:limit": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:quoted:qualified:offset": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:quoted:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:double-column:quoted:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:double-column:quoted:qualified-quoted:all": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:quoted:qualified-quoted:limit": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:quoted:qualified-quoted:offset": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:quoted:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:double-column:quoted:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:double-column:quoted-upper:qualified:all": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:quoted-upper:qualified:limit": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:quoted-upper:qualified:offset": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:quoted-upper:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:double-column:quoted-upper:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:double-column:quoted-upper:qualified-quoted:all": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:quoted-upper:qualified-quoted:limit": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:quoted-upper:qualified-quoted:offset": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:join:double-column:quoted-upper:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:double-column:quoted-upper:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-column:plain:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-column:plain:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-column:plain:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-column:plain:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-column:quoted:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-column:quoted:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-column:quoted:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-column:quoted:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-column:quoted-upper:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-column:quoted-upper:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-column:quoted-upper:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-column:quoted-upper:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-key:plain:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-key:plain:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-key:plain:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-key:plain:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-key:quoted:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-key:quoted:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-key:quoted:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-key:quoted:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-key:quoted-upper:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-key:quoted-upper:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-key:quoted-upper:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-key:quoted-upper:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-shown-as-probe:plain:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-shown-as-probe:plain:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-shown-as-probe:plain:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-shown-as-probe:plain:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-shown-as-probe:quoted:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-shown-as-probe:quoted:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-shown-as-probe:quoted:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-shown-as-probe:quoted:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-shown-as-probe:quoted-upper:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-shown-as-probe:quoted-upper:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-shown-as-probe:quoted-upper:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:join:build-shown-as-probe:quoted-upper:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-column:plain:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-column:plain:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-column:plain:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-column:plain:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-column:quoted:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-column:quoted:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-column:quoted:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-column:quoted:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-column:quoted-upper:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-column:quoted-upper:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-column:quoted-upper:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-column:quoted-upper:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-fk:plain:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-fk:plain:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-fk:plain:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-fk:plain:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-fk:quoted:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-fk:quoted:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-fk:quoted:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-fk:quoted:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-fk:quoted-upper:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-fk:quoted-upper:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-fk:quoted-upper:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:probe-fk:quoted-upper:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:double-column:plain:qualified:all": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:plain:qualified:limit": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:plain:qualified:offset": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:plain:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:double-column:plain:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:double-column:plain:qualified-quoted:all": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:plain:qualified-quoted:limit": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:plain:qualified-quoted:offset": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:plain:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:double-column:plain:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:double-column:quoted:qualified:all": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:quoted:qualified:limit": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:quoted:qualified:offset": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:quoted:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:double-column:quoted:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:double-column:quoted:qualified-quoted:all": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:quoted:qualified-quoted:limit": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:quoted:qualified-quoted:offset": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:quoted:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:double-column:quoted:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:double-column:quoted-upper:qualified:all": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:quoted-upper:qualified:limit": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:quoted-upper:qualified:offset": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:quoted-upper:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:double-column:quoted-upper:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:double-column:quoted-upper:qualified-quoted:all": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:quoted-upper:qualified-quoted:limit": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:quoted-upper:qualified-quoted:offset": {"error": "exit 1", "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"},
+  "join:alias:sweep:semi:double-column:quoted-upper:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:semi:double-column:quoted-upper:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-column:plain:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-column:plain:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-column:plain:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-column:plain:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-column:quoted:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-column:quoted:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-column:quoted:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-column:quoted:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-column:quoted-upper:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-column:quoted-upper:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-column:quoted-upper:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-column:quoted-upper:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-fk:plain:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-fk:plain:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-fk:plain:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-fk:plain:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-fk:quoted:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-fk:quoted:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-fk:quoted:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-fk:quoted:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-fk:quoted-upper:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-fk:quoted-upper:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-fk:quoted-upper:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:probe-fk:quoted-upper:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:double-column:plain:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:double-column:plain:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:double-column:plain:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:double-column:plain:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:double-column:quoted:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:double-column:quoted:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:double-column:quoted:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:double-column:quoted:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:double-column:quoted-upper:qualified:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:double-column:quoted-upper:qualified:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:double-column:quoted-upper:qualified-quoted:distinct": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"},
+  "join:alias:sweep:one-table:double-column:quoted-upper:qualified-quoted:distinct-offset": {"error": "exit 2", "diag": "must be in the GROUP BY list or aggregated"}
+ },
+ "matrices": [
+  {
+   "vars": {
+    "what": {
+     "probe-column": {
+      "EXPR": "f.q",
+      "NAME": "id",
+      "UPPER": "ID",
+      "T": "f"
+     },
+     "probe-fk": {
+      "EXPR": "f.q",
+      "NAME": "fk",
+      "UPPER": "FK",
+      "T": "f"
+     },
+     "double-column": {
+      "EXPR": "f.q",
+      "NAME": "dbl",
+      "UPPER": "DBL",
+      "T": "f"
+     },
+     "build-column": {
+      "EXPR": "f.q",
+      "NAME": "grp",
+      "UPPER": "GRP",
+      "T": "d"
+     },
+     "build-key": {
+      "EXPR": "f.q",
+      "NAME": "pk",
+      "UPPER": "PK",
+      "T": "d"
+     },
+     "build-shown-as-probe": {
+      "EXPR": "d.grp",
+      "NAME": "q",
+      "UPPER": "Q",
+      "T": "f"
+     }
+    },
+    "alias": {
+     "plain": {
+      "ALIAS": "${NAME}"
+     },
+     "quoted": {
+      "ALIAS": "\"${NAME}\""
+     },
+     "quoted-upper": {
+      "ALIAS": "\"${UPPER}\""
+     }
+    },
+    "by": {
+     "bare": {
+      "REF": "${NAME}"
+     },
+     "bare-quoted": {
+      "REF": "\"${NAME}\""
+     },
+     "bare-upper": {
+      "REF": "${UPPER}"
+     },
+     "qualified": {
+      "REF": "${T}.${NAME}"
+     },
+     "qualified-quoted": {
+      "REF": "\"${T}\".\"${NAME}\""
+     }
+    },
+    "tail": {
+     "all": {
+      "HEAD": "SELECT",
+      "K": "f.id",
+      "TAIL": ""
+     },
+     "limit": {
+      "HEAD": "SELECT",
+      "K": "f.id",
+      "TAIL": " LIMIT 5"
+     },
+     "offset": {
+      "HEAD": "SELECT",
+      "K": "f.id",
+      "TAIL": " LIMIT 3 OFFSET 2"
+     },
+     "distinct": {
+      "HEAD": "SELECT DISTINCT",
+      "K": "f.dup",
+      "TAIL": " LIMIT 5"
+     },
+     "distinct-offset": {
+      "HEAD": "SELECT DISTINCT",
+      "K": "f.dup",
+      "TAIL": " LIMIT 3 OFFSET 2"
+     },
+     "distinct-shows-the-column": {
+      "HEAD": "SELECT DISTINCT",
+      "K": "${T}.${NAME}",
+      "TAIL": ", ${NAME} NULLS LAST LIMIT 5"
+     }
+    }
+   },
+   "case": {
+    "id": "join:alias:sweep:join:${what}:${alias}:${by}:${tail}",
+    "fixture": "alias_sweep_fact",
+    "cli": [
+     "query",
+     "--query",
+     "${HEAD} ${EXPR} AS ${ALIAS}, ${K} AS k FROM '{fixture:alias_sweep_fact}' f JOIN '{fixture:alias_sweep_dim}' d ON f.fk = d.pk ORDER BY ${REF} DESC NULLS LAST, k${TAIL}"
+    ],
+    "axes": [
+     {
+      "jobs": 1
+     },
+     {
+      "jobs": 4
+     }
+    ],
+    "oracle": {
+     "compare": "ordered",
+     "sql": "${HEAD} ${EXPR} AS ${ALIAS}, ${K} AS k FROM '{fixture:alias_sweep_fact}' f JOIN '{fixture:alias_sweep_dim}' d ON f.fk = d.pk ORDER BY ${REF} DESC NULLS LAST, k${TAIL}"
+    }
+   }
+  },
+  {
+   "vars": {
+    "what": {
+     "probe-column": {
+      "EXPR": "f.q",
+      "NAME": "id",
+      "UPPER": "ID",
+      "T": "f"
+     },
+     "probe-fk": {
+      "EXPR": "f.q",
+      "NAME": "fk",
+      "UPPER": "FK",
+      "T": "f"
+     },
+     "double-column": {
+      "EXPR": "f.q",
+      "NAME": "dbl",
+      "UPPER": "DBL",
+      "T": "f"
+     }
+    },
+    "alias": {
+     "plain": {
+      "ALIAS": "${NAME}"
+     },
+     "quoted": {
+      "ALIAS": "\"${NAME}\""
+     },
+     "quoted-upper": {
+      "ALIAS": "\"${UPPER}\""
+     }
+    },
+    "by": {
+     "bare": {
+      "REF": "${NAME}"
+     },
+     "bare-quoted": {
+      "REF": "\"${NAME}\""
+     },
+     "bare-upper": {
+      "REF": "${UPPER}"
+     },
+     "qualified": {
+      "REF": "${T}.${NAME}"
+     },
+     "qualified-quoted": {
+      "REF": "\"${T}\".\"${NAME}\""
+     }
+    },
+    "tail": {
+     "all": {
+      "HEAD": "SELECT",
+      "K": "f.id",
+      "TAIL": ""
+     },
+     "limit": {
+      "HEAD": "SELECT",
+      "K": "f.id",
+      "TAIL": " LIMIT 5"
+     },
+     "offset": {
+      "HEAD": "SELECT",
+      "K": "f.id",
+      "TAIL": " LIMIT 3 OFFSET 2"
+     },
+     "distinct": {
+      "HEAD": "SELECT DISTINCT",
+      "K": "f.dup",
+      "TAIL": " LIMIT 5"
+     },
+     "distinct-offset": {
+      "HEAD": "SELECT DISTINCT",
+      "K": "f.dup",
+      "TAIL": " LIMIT 3 OFFSET 2"
+     },
+     "distinct-shows-the-column": {
+      "HEAD": "SELECT DISTINCT",
+      "K": "${T}.${NAME}",
+      "TAIL": ", ${NAME} NULLS LAST LIMIT 5"
+     }
+    }
+   },
+   "case": {
+    "id": "join:alias:sweep:semi:${what}:${alias}:${by}:${tail}",
+    "fixture": "alias_sweep_fact",
+    "cli": [
+     "query",
+     "--query",
+     "${HEAD} ${EXPR} AS ${ALIAS}, ${K} AS k FROM '{fixture:alias_sweep_fact}' f WHERE f.fk IN (SELECT pk FROM '{fixture:alias_sweep_dim}' WHERE grp < 9) ORDER BY ${REF} DESC NULLS LAST, k${TAIL}"
+    ],
+    "axes": [
+     {
+      "jobs": 1
+     },
+     {
+      "jobs": 4
+     }
+    ],
+    "oracle": {
+     "compare": "ordered",
+     "sql": "${HEAD} ${EXPR} AS ${ALIAS}, ${K} AS k FROM '{fixture:alias_sweep_fact}' f WHERE f.fk IN (SELECT pk FROM '{fixture:alias_sweep_dim}' WHERE grp < 9) ORDER BY ${REF} DESC NULLS LAST, k${TAIL}"
+    }
+   }
+  },
+  {
+   "vars": {
+    "what": {
+     "probe-column": {
+      "EXPR": "f.q",
+      "NAME": "id",
+      "UPPER": "ID",
+      "T": "f"
+     },
+     "probe-fk": {
+      "EXPR": "f.q",
+      "NAME": "fk",
+      "UPPER": "FK",
+      "T": "f"
+     },
+     "double-column": {
+      "EXPR": "f.q",
+      "NAME": "dbl",
+      "UPPER": "DBL",
+      "T": "f"
+     }
+    },
+    "alias": {
+     "plain": {
+      "ALIAS": "${NAME}"
+     },
+     "quoted": {
+      "ALIAS": "\"${NAME}\""
+     },
+     "quoted-upper": {
+      "ALIAS": "\"${UPPER}\""
+     }
+    },
+    "by": {
+     "bare": {
+      "REF": "${NAME}"
+     },
+     "bare-quoted": {
+      "REF": "\"${NAME}\""
+     },
+     "bare-upper": {
+      "REF": "${UPPER}"
+     },
+     "qualified": {
+      "REF": "${T}.${NAME}"
+     },
+     "qualified-quoted": {
+      "REF": "\"${T}\".\"${NAME}\""
+     }
+    },
+    "tail": {
+     "all": {
+      "HEAD": "SELECT",
+      "K": "f.id",
+      "TAIL": ""
+     },
+     "limit": {
+      "HEAD": "SELECT",
+      "K": "f.id",
+      "TAIL": " LIMIT 5"
+     },
+     "offset": {
+      "HEAD": "SELECT",
+      "K": "f.id",
+      "TAIL": " LIMIT 3 OFFSET 2"
+     },
+     "distinct": {
+      "HEAD": "SELECT DISTINCT",
+      "K": "f.dup",
+      "TAIL": " LIMIT 5"
+     },
+     "distinct-offset": {
+      "HEAD": "SELECT DISTINCT",
+      "K": "f.dup",
+      "TAIL": " LIMIT 3 OFFSET 2"
+     },
+     "distinct-shows-the-column": {
+      "HEAD": "SELECT DISTINCT",
+      "K": "${T}.${NAME}",
+      "TAIL": ", ${NAME} NULLS LAST LIMIT 5"
+     }
+    }
+   },
+   "case": {
+    "id": "join:alias:sweep:one-table:${what}:${alias}:${by}:${tail}",
+    "fixture": "alias_sweep_fact",
+    "cli": [
+     "query",
+     "--query",
+     "${HEAD} ${EXPR} AS ${ALIAS}, ${K} AS k FROM '{fixture:alias_sweep_fact}' f ORDER BY ${REF} DESC NULLS LAST, k${TAIL}"
+    ],
+    "axes": [
+     {
+      "jobs": 1
+     },
+     {
+      "jobs": 4
+     }
+    ],
+    "oracle": {
+     "compare": "ordered",
+     "sql": "${HEAD} ${EXPR} AS ${ALIAS}, ${K} AS k FROM '{fixture:alias_sweep_fact}' f ORDER BY ${REF} DESC NULLS LAST, k${TAIL}"
+    }
+   }
+  }
+ ],
+ "cases": [
+  {
+   "id": "join:alias:review:limit",
+   "fixture": "alias_review_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.v AS id FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY f.id LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.v AS id FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY f.id LIMIT 2"
+   }
+  },
+  {
+   "id": "join:alias:review:offset",
+   "fixture": "alias_review_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.v AS id FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY f.id LIMIT 1 OFFSET 1"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.v AS id FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY f.id LIMIT 1 OFFSET 1"
+   }
+  },
+  {
+   "id": "join:alias:review:limit-quoted",
+   "fixture": "alias_review_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.v AS \"id\" FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY \"f\".\"id\" LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.v AS \"id\" FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY \"f\".\"id\" LIMIT 2"
+   }
+  },
+  {
+   "id": "join:alias:review:bare-is-the-alias",
+   "fixture": "alias_review_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.v AS id FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY id LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.v AS id FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY id LIMIT 2"
+   }
+  },
+  {
+   "id": "join:alias:review:double-refuses",
+   "fixture": "alias_review_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.v AS dbl FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY f.dbl LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"
+   }
+  },
+  {
+   "id": "join:alias:review:double-quoted-refuses",
+   "fixture": "alias_review_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.v AS \"dbl\" FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY \"f\".\"dbl\" LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"
+   }
+  },
+  {
+   "id": "join:alias:review:double-offset-refuses",
+   "fixture": "alias_review_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.v AS dbl FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY f.dbl LIMIT 1 OFFSET 1"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"
+   }
+  },
+  {
+   "id": "join:alias:review:double-in-an-expression-refuses",
+   "fixture": "alias_review_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.v AS dbl FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY f.dbl + 0 LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"
+   }
+  },
+  {
+   "id": "join:alias:review:double-from-arithmetic-refuses",
+   "fixture": "alias_review_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.v AS dbl FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY f.id / 2.0 LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "do not show a FLOAT or DOUBLE column in this release (id)"
+   }
+  },
+  {
+   "id": "join:alias:review:double-in-a-semi-join-refuses",
+   "fixture": "alias_review_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.v AS dbl FROM '{fixture:alias_review_fact}' f WHERE f.fk IN (SELECT pk FROM '{fixture:alias_review_dim}') ORDER BY f.dbl LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "refuse": {
+    "error": "exit 1",
+    "diag": "do not show a FLOAT or DOUBLE column in this release (dbl)"
+   }
+  },
+  {
+   "id": "join:alias:review:double-bare-is-the-alias",
+   "fixture": "alias_review_fact",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT f.v AS dbl FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY dbl LIMIT 2"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 4
+    }
+   ],
+   "oracle": {
+    "compare": "ordered",
+    "sql": "SELECT f.v AS dbl FROM '{fixture:alias_review_fact}' f JOIN '{fixture:alias_review_dim}' d ON f.fk = d.pk ORDER BY dbl LIMIT 2"
+   }
+  }
+ ]
+}

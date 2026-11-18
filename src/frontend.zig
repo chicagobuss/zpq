@@ -25,6 +25,13 @@ pub fn retryJoinRoot(join: syntax.Join, failed: ?[]const u8) ?[]const u8 {
     return if (matches == 1) path else null;
 }
 
+/// What one bind leaves for the next bind of the same query (`runParsed` retries a join once): the S3 listings and the
+/// remote footers. Both live in the query's arena.
+pub const JoinMemo = struct {
+    listed: std.StringHashMapUnmanaged(anyerror![][]const u8) = .empty,
+    remote: std.StringHashMapUnmanaged(*zpq.core.schema.FileMetaData) = .empty,
+};
+
 /// Resolve a table pattern for join planning while keeping the footer mappings alive through binding.
 pub const JoinSchemas = struct {
     arena: std.mem.Allocator,
@@ -32,10 +39,39 @@ pub const JoinSchemas = struct {
     env: std.process.Environ,
     diag: ?*Diag,
     local: zpq.engine.join.LocalSchemas,
+    /// Each S3 pattern's listing, error included, so a glob is listed once per query and its diagnostic printed once.
+    listed: std.StringHashMapUnmanaged(anyerror![][]const u8) = .empty,
+
+    /// What `expandGlob` says of `pattern`; an S3 pattern is listed the first time only. The listing names objects and
+    /// nothing else (no ETag or size is kept), and the engine opens each one itself, so there is no check to carry.
+    pub fn listing(self: *JoinSchemas, pattern: []const u8) ![][]const u8 {
+        if (!std.mem.startsWith(u8, pattern, "s3://")) return expandGlob(self.arena, self.io, pattern, self.env, self.diag);
+        const hit = try self.listed.getOrPut(self.arena, pattern);
+        if (!hit.found_existing) hit.value_ptr.* = expandGlob(self.arena, self.io, pattern, self.env, self.diag);
+        return hit.value_ptr.*;
+    }
+
+    /// `Schemas.prefetch`: the footers of every S3 file the join's tables name, in one batch. A failure leaves them to
+    /// `footer`, which reads them one by one and reports the first bad object by name, as it always did.
+    pub fn prefetch(raw: *const anyopaque, paths: []const []const u8) void {
+        const self: *JoinSchemas = @ptrCast(@alignCast(@constCast(raw)));
+        var want: std.ArrayList([]const u8) = .empty;
+        var dedup: std.StringHashMapUnmanaged(void) = .empty;
+        for (paths) |path| {
+            if (!std.mem.startsWith(u8, path, "s3://")) continue;
+            const names = self.listing(path) catch return;
+            for (names) |name| {
+                if (self.local.remote.contains(name) or dedup.contains(name)) continue;
+                dedup.put(self.arena, name, {}) catch return;
+                want.append(self.arena, name) catch return;
+            }
+        }
+        if (want.items.len > 0) self.local.fetchMany(want.items) catch {};
+    }
 
     pub fn footer(raw: *const anyopaque, path: []const u8) anyerror!*const zpq.core.schema.FileMetaData {
         const self: *JoinSchemas = @ptrCast(@alignCast(@constCast(raw)));
-        const files = try expandGlob(self.arena, self.io, path, self.env, self.diag);
+        const files = try self.listing(path);
         if (files.len == 0) {
             noSqlMatches(path);
             return error.NoMatches;
@@ -55,6 +91,16 @@ pub const JoinSchemas = struct {
         combined.* = first.?.*;
         combined.num_rows = total;
         return combined;
+    }
+
+    pub fn restore(self: *JoinSchemas, memo: *const JoinMemo) void {
+        self.listed = memo.listed;
+        self.local.remote = memo.remote;
+    }
+
+    pub fn save(self: *const JoinSchemas, memo: *JoinMemo) void {
+        memo.listed = self.listed;
+        memo.remote = self.local.remote;
     }
 
     pub fn deinit(self: *JoinSchemas) void {

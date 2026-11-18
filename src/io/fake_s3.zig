@@ -413,7 +413,11 @@ pub const FakeS3 = struct {
         } else if (std.mem.eql(u8, method, "GET") and param(query, "list-type") != null) {
             var out: std.ArrayList(u8) = .empty;
             try out.appendSlice(a, "<ListBucketResult><IsTruncated>false</IsTruncated>");
-            for (self.objects.items) |o| try out.print(a, "<Contents><Key>{s}</Key><Size>{d}</Size></Contents>", .{ o.key, o.len });
+            const prefix = try percentDecode(a, param(query, "prefix") orelse "");
+            for (self.objects.items) |o| {
+                if (!std.mem.startsWith(u8, o.key, prefix)) continue;
+                try out.print(a, "<Contents><Key>{s}</Key><Size>{d}</Size></Contents>", .{ o.key, o.len });
+            }
             try out.appendSlice(a, "</ListBucketResult>");
             resp_body = out.items;
         } else if (std.mem.eql(u8, method, "POST") and param(query, "uploads") != null) {

@@ -660,12 +660,13 @@ fn runParsed(
     arena: std.mem.Allocator,
 ) !void {
     var retry: ?[]const u8 = null;
-    runParsedOnce(init, options, diag, arena, null, &retry) catch |err| {
+    var memo: zpq.frontend.JoinMemo = .{};
+    runParsedOnce(init, options, diag, arena, null, &retry, &memo) catch |err| {
         if (err != error.DuplicateBuildKey or retry == null) return err;
         const prior = diag.*;
         const root = retry.?;
         diag.* = .{};
-        return runParsedOnce(init, options, diag, arena, root, &retry) catch |second| {
+        return runParsedOnce(init, options, diag, arena, root, &retry, &memo) catch |second| {
             if (second == error.DuplicateBuildKey) return error.JoinNonUnique;
             if (second == error.UnsupportedJoin) {
                 diag.* = prior;
@@ -683,6 +684,7 @@ fn runParsedOnce(
     arena: std.mem.Allocator,
     root: ?[]const u8,
     retry: *?[]const u8,
+    memo: *zpq.frontend.JoinMemo,
 ) !void {
     var parsed_join: ?zpq.core.expr.syntax.Join = null;
     errdefer if (parsed_join) |j| {
@@ -889,9 +891,11 @@ fn runParsedOnce(
             }
             // A two-table join binds its column names against both footers; the engine reads the build.
             var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena, .ctx = .{ .gpa = gpa, .io = io, .env = env, .diag = diag } } };
+            schemas.restore(memo);
+            defer schemas.save(memo);
             defer schemas.deinit();
             const sql = zpq.core.expr.sql_parser;
-            const pq = (try sql.parseSqlJoinPlanRoot(arena, q_str, .{ .ctx = &schemas, .footer = zpq.frontend.JoinSchemas.footer }, root)) orelse
+            const pq = (try sql.parseSqlJoinPlanRoot(arena, q_str, .{ .ctx = &schemas, .footer = zpq.frontend.JoinSchemas.footer, .prefetch = zpq.frontend.JoinSchemas.prefetch }, root)) orelse
                 try sql.parseSqlPlan(arena, q_str);
             parsed_join = pq.syntax.?.join;
             remote_join = schemas.local.remote_seen;
@@ -910,7 +914,7 @@ fn runParsedOnce(
                 limit = @intCast(n);
             };
 
-            const matches = try expandGlob(arena, io, pq.table_name, env, diag);
+            const matches = try schemas.listing(pq.table_name);
             if (matches.len == 0) {
                 zpq.frontend.noSqlMatches(pq.table_name);
                 return error.NoMatches;

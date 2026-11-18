@@ -47,7 +47,7 @@ test "S3 fetch window caps only the Lambda default and preserves explicit overri
 /// checked when a fetched range covers offset 0, including a footer-prefix GET that starts there. A footer that does
 /// not fit is one more GET for the missing prefix, and never a third.
 pub const FOOTER_PROBE_DEFAULT: u64 = 1 << 20;
-const FOOTER_PROBE_MIN: u64 = 64 << 10;
+pub const FOOTER_PROBE_MIN: u64 = 64 << 10;
 const FOOTER_PROBE_MAX: u64 = 16 << 20;
 
 pub fn footerProbeBytes(env: std.process.Environ) u64 {
@@ -188,6 +188,10 @@ pub const FetchWindow = struct {
     always: bool = false,
     /// Explain fetches the trailer and exact footer only, and never starts a data fetcher.
     footer_only: bool = false,
+    /// With `footer_only`, the bytes of the object tail one suffix GET asks for. Eight is the trailer alone, and the
+    /// footer follows in a second GET (explain reads nothing more). A caller that wants the footer in one round trip
+    /// asks for `FOOTER_PROBE_MIN`: a footer that does not fit still costs one more GET, as it does for a data read.
+    footer_probe: u64 = 8,
 };
 
 /// Footer and metadata worker loops. One worker holds one permit. A worker sleeping in retry backoff still holds
@@ -378,6 +382,8 @@ pub const FetchSpec = struct {
     /// Index into the query's inputs, for profile spans.
     file_index: usize = 0,
     footer_only: bool = false,
+    /// The suffix a `footer_only` read asks for (`FetchWindow.footer_probe`).
+    footer_probe: u64 = 8,
     meta: schema.FileMetaData = undefined,
     file_buf: []u8 = &.{},
     compact_ranges: []CompactRange = &.{},
@@ -782,7 +788,7 @@ pub fn fetchMetaBatch(
     account: *ByteAccount,
 ) !void {
     const permits = @min(READ_CONCURRENCY, @max(specs.len, 1));
-    const probe = if (specs.len > 0 and specs[0].footer_only) 8 else footerProbeFor(ctx.env, account.limit, permits);
+    const probe = if (specs.len > 0 and specs[0].footer_only) specs[0].footer_probe else footerProbeFor(ctx.env, account.limit, permits);
     const TaskCtx = struct {
         ctx: Context,
         creds: s3.Credentials,
@@ -1001,8 +1007,9 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
     if (!std.mem.eql(u8, footer_region[footer_region.len - 4 ..], &PAR1)) return error.NotParquet;
 
     // The response buffer is already charged. Keep a second copy only when the budget still has room; otherwise
-    // later ranges are fetched on their own. Correctness does not depend on the copy.
-    if (t.account.tryAdd(tail.len)) {
+    // later ranges are fetched on their own. Correctness does not depend on the copy. A footer-only read fetches no
+    // ranges, so a batch of them holds only the footers.
+    if (!sp.footer_only and t.account.tryAdd(tail.len)) {
         sp.tail = t.ctx.gpa.dupe(u8, tail) catch |err| {
             t.account.sub(tail.len);
             return err;

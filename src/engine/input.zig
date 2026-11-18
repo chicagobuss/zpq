@@ -425,6 +425,7 @@ const RemoteInputs = struct {
             .url = u,
             .file_index = self.s3_indices.items[k],
             .footer_only = self.fetch_window.footer_only,
+            .footer_probe = self.fetch_window.footer_probe,
             .pin_generation = self.args.pin_input_generation or self.args.input_snapshots != null,
         };
         if (self.args.input_snapshots) |expected| for (self.s3_indices.items, specs) |idx, *sp| {

@@ -17,6 +17,7 @@ const plans = @import("bound_plan.zig");
 const types = @import("types.zig");
 const s3 = @import("../io/s3.zig");
 const input = @import("input.zig");
+const s3_fetch = @import("s3_fetch.zig");
 const fanout_plan = @import("fanout_plan.zig");
 
 /// Footers of the local files a join names, for the SQL frontend's binder (`sql_parser.parseSqlJoinPlan`). Each is
@@ -27,27 +28,46 @@ pub const LocalSchemas = struct {
     ctx: ?types.Context = null,
     remote_seen: bool = false,
     seen: std.StringHashMapUnmanaged(*schema.FileMetaData) = .empty,
+    /// The remote files' footers. They live in the arena, not in a mapping, so a caller that binds the same query again
+    /// (`runParsed`'s retry) hands this map to the next `LocalSchemas` and skips the round trips.
+    remote: std.StringHashMapUnmanaged(*schema.FileMetaData) = .empty,
     maps: std.ArrayList(local_fs.Mapped) = .empty,
 
     pub fn footer(raw: *const anyopaque, path: []const u8) anyerror!*const schema.FileMetaData {
         const self: *LocalSchemas = @ptrCast(@alignCast(@constCast(raw)));
-        if (self.seen.get(path)) |m| return m;
-        const m = try self.arena.create(schema.FileMetaData);
-        if (std.mem.startsWith(u8, path, "s3://")) {
-            self.remote_seen = true;
-            const ctx = self.ctx orelse return error.JoinNotLocal;
-            const args: types.QueryArgs = .{ .inputs = &.{path}, .diag = ctx.diag };
-            var opened = try input.openInputs(ctx, self.arena, args, .{ .limit = args.max_memory, .footer_only = true });
-            defer opened.deinit();
-            m.* = (try input.materializeMetas(self.arena, opened, ctx.diag, null))[0];
-        } else {
-            try self.maps.ensureUnusedCapacity(self.arena, 1);
-            const opened = try open(self.arena, path);
-            self.maps.appendAssumeCapacity(opened.map.?);
-            m.* = opened.meta;
+        const is_remote = std.mem.startsWith(u8, path, "s3://");
+        if (is_remote) self.remote_seen = true;
+        if ((if (is_remote) self.remote else self.seen).get(path)) |m| return m;
+        if (is_remote) {
+            if (self.ctx == null) return error.JoinNotLocal;
+            try self.fetchMany(&.{path});
+            return self.remote.get(path).?;
         }
+        const m = try self.arena.create(schema.FileMetaData);
+        try self.maps.ensureUnusedCapacity(self.arena, 1);
+        const opened = try open(self.arena, path);
+        self.maps.appendAssumeCapacity(opened.map.?);
+        m.* = opened.meta;
         try self.seen.put(self.arena, path, m);
         return m;
+    }
+
+    /// The footers of remote `files` (one bucket), fetched together: their reads go out in parallel over one pool,
+    /// under the S3 read concurrency, each one suffix GET. Only the footers are held, not the tails they came from.
+    pub fn fetchMany(self: *LocalSchemas, files: []const []const u8) !void {
+        const ctx = self.ctx orelse return;
+        const args: types.QueryArgs = .{ .inputs = files, .diag = ctx.diag };
+        const window: s3_fetch.FetchWindow = .{ .limit = args.max_memory, .footer_only = true, .footer_probe = s3_fetch.FOOTER_PROBE_MIN };
+        var opened = try input.openInputs(ctx, self.arena, args, window);
+        defer opened.deinit();
+        const metas = try input.materializeMetas(self.arena, opened, ctx.diag, null);
+        self.remote_seen = true;
+        try self.remote.ensureUnusedCapacity(self.arena, @intCast(files.len));
+        for (files, metas) |f, m| {
+            const p = try self.arena.create(schema.FileMetaData);
+            p.* = m;
+            self.remote.putAssumeCapacity(f, p);
+        }
     }
 
     pub fn deinit(self: *LocalSchemas) void {

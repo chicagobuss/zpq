@@ -907,6 +907,7 @@ fn runParsedOnce(
             }
             // A two-table join binds its column names against both footers; the engine reads the build.
             var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena, .pin_remote = true, .ctx = .{ .gpa = gpa, .io = io, .env = env, .diag = diag } } };
+            schemas.local.max_memory = max_memory;
             schemas.restore(memo);
             defer schemas.save(memo);
             defer schemas.deinit();

@@ -426,6 +426,7 @@ const RemoteInputs = struct {
             .url = u,
             .file_index = self.s3_indices.items[k],
             .footer_only = self.fetch_window.footer_only,
+            .retain_binder_tail = self.fetch_window.binder_tail_bytes != null,
             .footer_probe = self.fetch_window.footer_probe,
             .pin_generation = self.args.pin_input_generation or self.args.input_snapshots != null,
         };
@@ -441,22 +442,25 @@ const RemoteInputs = struct {
             for (snapshot.etag) |c| if (std.ascii.isControl(c) or c == '"') return error.JoinBuildNoSnapshot;
             sp.if_match = try std.fmt.allocPrint(self.arena, "\"{s}\"", .{snapshot.etag});
         };
+        // Retained suffixes and in-flight footer bodies share one budget, capped by the caller's max memory.
+        var account: ByteAccount = .{
+            .limit = @min(s3_window.windowFor(self.args.max_memory), @as(u64, self.args.max_memory)),
+        };
         if (self.args.remote_footers) |footers| {
             if (self.args.input_snapshots == null) for (specs) |*sp| {
                 if (sp.omitsIfMatch()) continue;
                 const entry = footers.get(self.paths[sp.file_index]) orelse continue;
                 if (!sp.reuseFooter(entry.snapshot, entry.rtt_ns)) continue;
+                if (!self.fetch_window.footer_only and account.tryAdd(entry.tail.len)) {
+                    sp.tail = entry.tail;
+                    sp.tail_start = sp.total_size - entry.tail.len;
+                }
                 sp.meta = entry.meta;
                 // Range planning rewrites chunks in place. The binder's copy is shared across builds and retries.
                 sp.meta.row_groups = try entry.meta.row_groups.clone(self.arena);
                 for (sp.meta.row_groups.items) |*rg| rg.columns = try rg.columns.clone(self.arena);
             };
         }
-        // Retained suffixes and in-flight footer bodies share one budget: the caller's max, and never the fetch
-        // window's 64 MiB floor when that floor is higher. A suffix that does not fit is dropped and those ranges
-        // are fetched later. The streaming window (including a test's ZPQ_S3_WINDOW_KIB) stays the admission limit;
-        // a suffix the budget can hold is still reused.
-        var account: ByteAccount = .{ .limit = @min(s3_window.windowFor(self.args.max_memory), @as(u64, self.args.max_memory)) };
         const batch_span = profile.Span.begin(self.prof);
         fetchMetaBatch(read_ctx, self.arena, creds, pool, specs, self.args.profiler, &account) catch |err| {
             for (specs) |*sp| {
@@ -737,6 +741,14 @@ const RemoteInputs = struct {
             if (self.args.row_groups) |ranges|
                 try restrictRowGroups(self.arena, &self.metas[idx], ranges[idx], self.args.diag, self.paths[idx]);
             self.meta_ready[idx] = true;
+            if (self.fetch_window.binder_tail_bytes) |used| {
+                // Leave room for the later fetch and scan, and bound the arena across all batches and retries.
+                const limit = @min(account.limit, self.args.max_memory / 4);
+                if (sp.if_match != null and !sp.omitsIfMatch() and sp.tail.len > 0 and sp.tail.len <= limit -| used.*) {
+                    self.inputs[idx].bytes = try self.arena.dupe(u8, sp.tail);
+                    used.* += sp.tail.len;
+                }
+            }
             releaseChargedTail(sp, self.ctx.gpa, account);
             self.ctx.gpa.free(sp.footer_region);
             sp.footer_region = &.{};
@@ -972,8 +984,7 @@ const RemoteFilePlan = struct {
             try self.win_order.append(self.builder.arena, wrg);
         }
         if (keep_tail) {
-            const owned: []u8 = @constCast(sp.tail);
-            self.builder.s3_buffers.append(self.builder.arena, owned) catch |err| {
+            if (!sp.reused_footer) self.builder.s3_buffers.append(self.builder.arena, @constCast(sp.tail)) catch |err| {
                 keep_tail = false;
                 return err;
             };

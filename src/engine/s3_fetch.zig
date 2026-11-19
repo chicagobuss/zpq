@@ -192,6 +192,8 @@ pub const FetchWindow = struct {
     /// footer follows in a second GET (explain reads nothing more). A caller that wants the footer in one round trip
     /// asks for `FOOTER_PROBE_MIN`: a footer that does not fit still costs one more GET, as it does for a data read.
     footer_probe: u64 = 8,
+    /// The binder's retained data so far, including any earlier attempts in this query.
+    binder_tail_bytes: ?*u64 = null,
 };
 
 /// Footer and metadata worker loops. One worker holds one permit. A worker sleeping in retry backoff still holds
@@ -382,6 +384,7 @@ pub const FetchSpec = struct {
     /// Index into the query's inputs, for profile spans.
     file_index: usize = 0,
     footer_only: bool = false,
+    retain_binder_tail: bool = false,
     /// The suffix a `footer_only` read asks for (`FetchWindow.footer_probe`).
     footer_probe: u64 = 8,
     meta: schema.FileMetaData = undefined,
@@ -409,9 +412,9 @@ pub const FetchSpec = struct {
     /// The S3 answer behind `err`, when the request reached the server; set on the fetching thread.
     failure: ?s3.S3Failure = null,
 
-    /// Free the fetched tail, unless it is `footer_region` itself (the warm meta-cache path), which is owned apart.
+    /// Free the tail unless it belongs to the binder or is the warm meta-cache copy of `footer_region`.
     pub fn releaseTail(self: *FetchSpec, gpa: std.mem.Allocator) void {
-        if (self.tail.len > 0 and self.tail.ptr != self.footer_region.ptr) gpa.free(self.tail);
+        if (self.tail.len > 0 and !self.reused_footer and self.tail.ptr != self.footer_region.ptr) gpa.free(self.tail);
         self.tail = &.{};
     }
 
@@ -717,7 +720,7 @@ pub fn releaseChargedTail(sp: *FetchSpec, gpa: std.mem.Allocator, account: *Byte
 /// Drop a retained suffix down to the span planned ranges still overlap. No overlap frees it: a count over many
 /// files keeps the footer, not a probe per file.
 pub fn trimRetainedSuffix(gpa: std.mem.Allocator, sp: *FetchSpec, plan: RangePlan, account: *ByteAccount) void {
-    if (sp.tail.len == 0 or sp.tail.ptr == sp.footer_region.ptr) return;
+    if (sp.tail.len == 0 or sp.reused_footer or sp.retain_binder_tail or sp.tail.ptr == sp.footer_region.ptr) return;
     const tail_lo = sp.tail_start;
     const tail_hi = tail_lo + sp.tail.len;
     var lo: u64 = tail_hi;
@@ -1048,9 +1051,9 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
     if (!std.mem.eql(u8, footer_region[footer_region.len - 4 ..], &PAR1)) return error.NotParquet;
 
     // The response buffer is already charged. Keep a second copy only when the budget still has room; otherwise
-    // later ranges are fetched on their own. Correctness does not depend on the copy. A footer-only read fetches no
-    // ranges, so a batch of them holds only the footers.
-    if (!sp.footer_only and t.account.tryAdd(tail.len)) {
+    // later ranges are fetched on their own. The binder also keeps suffixes that include data for the engine.
+    const retain_for_binder = sp.retain_binder_tail and footer_actual_start > sp.tail_start;
+    if ((!sp.footer_only or retain_for_binder) and t.account.tryAdd(tail.len)) {
         sp.tail = t.ctx.gpa.dupe(u8, tail) catch |err| {
             t.account.sub(tail.len);
             return err;

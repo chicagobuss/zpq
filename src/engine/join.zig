@@ -28,6 +28,8 @@ pub const LocalSchemas = struct {
     ctx: ?types.Context = null,
     remote_seen: bool = false,
     pin_remote: bool = false,
+    max_memory: ?usize = null,
+    tail_bytes: u64 = 0,
     seen: std.StringHashMapUnmanaged(*schema.FileMetaData) = .empty,
     /// The remote files' footers. They live in the arena, not in a mapping, so a caller that binds the same query again
     /// (`runParsed`'s retry) hands this map to the next `LocalSchemas` and skips the round trips.
@@ -56,7 +58,7 @@ pub const LocalSchemas = struct {
     }
 
     /// The footers of remote `files` (one bucket), fetched together: their reads go out in parallel over one pool,
-    /// under the S3 read concurrency, each one suffix GET. Only the footers are held, not the tails they came from.
+    /// under the S3 read concurrency. Joining callers also retain suffix data within the binder's budget.
     pub fn fetchMany(self: *LocalSchemas, files: []const []const u8) !void {
         const ctx = self.ctx orelse return;
         if (self.pin_remote) for (files) |path| {
@@ -68,17 +70,23 @@ pub const LocalSchemas = struct {
         const args: types.QueryArgs = .{
             .inputs = files,
             .diag = ctx.diag,
+            .max_memory = self.max_memory orelse (types.QueryArgs{ .inputs = &.{} }).max_memory,
             .pin_input_generation = self.pin_remote,
             .remote_read_policies = if (self.pin_remote) &self.read_policies else null,
         };
-        const window: s3_fetch.FetchWindow = .{ .limit = args.max_memory, .footer_only = true, .footer_probe = s3_fetch.FOOTER_PROBE_MIN };
+        const window: s3_fetch.FetchWindow = .{
+            .limit = args.max_memory,
+            .footer_only = true,
+            .footer_probe = s3_fetch.FOOTER_PROBE_MIN,
+            .binder_tail_bytes = if (self.pin_remote) &self.tail_bytes else null,
+        };
         var opened = try input.openInputs(ctx, self.arena, args, window);
         defer opened.deinit();
         self.remote_seen = true;
         try self.remote.ensureUnusedCapacity(self.arena, @intCast(files.len));
-        for (files, opened.metas, opened.snapshots) |f, m, snapshot| {
+        for (files, opened.metas, opened.snapshots, opened.inputs) |f, m, snapshot, in| {
             const entry = try self.arena.create(types.RemoteFooter);
-            entry.* = .{ .meta = m, .snapshot = snapshot.?, .rtt_ns = opened.footer_rtt_ns };
+            entry.* = .{ .meta = m, .snapshot = snapshot.?, .rtt_ns = opened.footer_rtt_ns, .tail = in.bytes };
             self.remote.putAssumeCapacity(f, entry);
         }
     }

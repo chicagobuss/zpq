@@ -101,6 +101,8 @@ pub const RemoteFooter = struct {
     meta: schema.FileMetaData,
     snapshot: SourceSnapshot,
     rtt_ns: u64,
+    /// A suffix from the same response that supplied the snapshot's ETag, owned by the binder arena.
+    tail: []const u8,
 };
 pub const AlignedJoin = struct {
     low: ?i64 = null,

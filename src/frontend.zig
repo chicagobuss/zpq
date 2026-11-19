@@ -30,6 +30,7 @@ pub fn retryJoinRoot(join: syntax.Join, failed: ?[]const u8) ?[]const u8 {
 pub const JoinMemo = struct {
     listed: std.StringHashMapUnmanaged(anyerror![][]const u8) = .empty,
     remote: @import("engine/types.zig").RemoteFooters = .empty,
+    tail_bytes: u64 = 0,
     read_policies: @import("engine/types.zig").RemoteReadPolicies = .empty,
 };
 
@@ -100,12 +101,14 @@ pub const JoinSchemas = struct {
     pub fn restore(self: *JoinSchemas, memo: *const JoinMemo) void {
         self.listed = memo.listed;
         self.local.remote = memo.remote;
+        self.local.tail_bytes = memo.tail_bytes;
         self.local.read_policies = memo.read_policies;
     }
 
     pub fn save(self: *const JoinSchemas, memo: *JoinMemo) void {
         memo.listed = self.listed;
         memo.remote = self.local.remote;
+        memo.tail_bytes = self.local.tail_bytes;
         memo.read_policies = self.local.read_policies;
     }
 

@@ -481,6 +481,46 @@ test "binder: execution reuses its footer and a replaced object needs a fresh fo
     var reopened = try input.openInputs(ctx, a, args, .{ .limit = 1 << 24 });
     defer reopened.deinit();
     try std.testing.expectEqual(replacement.rows, reopened.metas[0].num_rows);
+    // The binder received this smaller replacement whole, so neither planning nor data needs another GET.
+    try std.testing.expectEqual(before + 1, fake.gets);
+    try std.testing.expect(reopened.inputs[0].bytes.len > 0);
+}
+
+test "binder: a partial suffix serves selected chunks from its pinned generation" {
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "POSIX environment fixture");
+    const input = @import("engine/input.zig");
+    const types = @import("engine/types.zig");
+    const key = "t/tail.parquet";
+    const path = "s3://bkt/" ++ key;
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(std.testing.allocator);
+    defer fake.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diag = .{};
+    var schemas = schemasFor(a, try fakeEnv(a, &fake), &diag);
+    defer schemas.deinit();
+
+    const old = try serve(&fake, a, key, "group_order.parquet");
+    const end: u32 = @intCast(old.groups);
+    var args: types.QueryArgs = .{ .inputs = &.{path}, .row_groups = &.{.{ .start = end - 1, .end = end }} };
+    const ctx = schemas.local.ctx.?;
+    const window: s3_fetch.FetchWindow = .{ .limit = 1 << 24 };
+    var original = try input.openInputs(ctx, a, args, window);
+    defer original.deinit();
+    _ = try frontend.JoinSchemas.footer(&schemas, path);
+    const remote = schemas.local.remote.get(path).?;
+    try std.testing.expectEqual(s3_fetch.FOOTER_PROBE_MIN, remote.tail.len);
+    try std.testing.expect(remote.tail.len < remote.snapshot.size);
+    _ = try serve(&fake, a, key, "decimal_precision40.parquet");
+
+    const before = fake.gets;
+    args.remote_footers = &schemas.local.remote;
+    var opened = try input.openInputs(ctx, a, args, window);
+    defer opened.deinit();
+    try std.testing.expectEqual(before, fake.gets);
+    try std.testing.expectEqualSlices(u8, original.inputs[0].bytes, opened.inputs[0].bytes);
 }
 
 test "binder: If-Match requires the response ETag even if fake S3 ignores the precondition or omits the tag" {
@@ -510,11 +550,11 @@ test "binder: If-Match requires the response ETag even if fake S3 ignores the pr
         defer schemas.deinit();
 
         // Keep the old byte offsets in bounds in the larger replacement so the unchecked range GET succeeds.
-        const old = try serve(&fake, a, key, "decimal_precision40.parquet");
+        const old = try serve(&fake, a, key, "group_order.parquet");
         _ = try frontend.JoinSchemas.footer(&schemas, path);
         const ctx = schemas.local.ctx.?;
         const args: types.QueryArgs = .{ .inputs = &.{path}, .remote_footers = &schemas.local.remote };
-        if (mode == .ignores_match) _ = try serve(&fake, a, key, "group_order.parquet");
+        if (mode == .ignores_match) _ = try serve(&fake, a, key, "many_tiny.parquet");
 
         if (mode == .omits_all_tags) {
             // No ETag at bind time means the memo is ineligible, so the engine fetches its own footer.
@@ -572,16 +612,18 @@ test "binder: rejected If-Match reopens the object with the ordinary footer and 
         var schemas = schemasFor(a, try fakeEnv(a, &fake), &diag);
         defer schemas.deinit();
 
-        _ = try serve(&fake, a, key, "decimal_precision40.parquet");
+        _ = try serve(&fake, a, key, "group_order.parquet");
         _ = try frontend.JoinSchemas.footer(&schemas, path);
         const ctx = schemas.local.ctx.?;
         const window: s3_fetch.FetchWindow = .{ .limit = 1 << 24 };
+        const row_groups: []const ?types.RowGroupRange = &.{.{ .start = 0, .end = 1 }};
         const before = fake.gets;
-        var base = try input.openInputs(ctx, a, .{ .inputs = &.{path} }, window);
+        var base = try input.openInputs(ctx, a, .{ .inputs = &.{path}, .row_groups = row_groups }, window);
         defer base.deinit();
         const base_gets = fake.gets - before;
         const args: types.QueryArgs = .{
             .inputs = &.{path},
+            .row_groups = row_groups,
             .remote_footers = &schemas.local.remote,
             .remote_read_policies = &schemas.local.read_policies,
         };
@@ -644,7 +686,7 @@ test "binder: If-Match accepts a weakened response ETag and detects a real repla
     var diag: Diag = .{};
     var schemas = schemasFor(a, try fakeEnv(a, &fake), &diag);
     defer schemas.deinit();
-    const old = try serve(&fake, a, key, "decimal_precision40.parquet");
+    const old = try serve(&fake, a, key, "group_order.parquet");
     _ = try frontend.JoinSchemas.footer(&schemas, path);
     const ctx = schemas.local.ctx.?;
     const args: types.QueryArgs = .{
@@ -656,7 +698,7 @@ test "binder: If-Match accepts a weakened response ETag and detects a real repla
     defer opened.deinit();
     try std.testing.expect(opened.inputs[0].bytes.len > 0);
     try std.testing.expectEqual(old.rows, opened.metas[0].num_rows);
-    _ = try serve(&fake, a, key, "group_order.parquet");
+    _ = try serve(&fake, a, key, "many_tiny.parquet");
     try std.testing.expectError(error.AlignedJoinSnapshotChanged, input.openInputs(ctx, a, args, .{ .limit = 1 << 24 }));
     try std.testing.expectEqualStrings(path, diag.input orelse return error.TestUnexpectedResult);
 }

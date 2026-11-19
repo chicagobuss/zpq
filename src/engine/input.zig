@@ -802,14 +802,8 @@ const RemoteInputs = struct {
             };
             // Use the fastest sample from the binder batch so a slow first response does not widen the gaps.
             if (sp.rtt_ns != 0 and (footer_rtt_ns == 0 or sp.rtt_ns < footer_rtt_ns)) footer_rtt_ns = sp.rtt_ns;
+            // Parsed from an arena copy and restricted to its row groups already, so both responses can go.
             self.metas[idx] = sp.meta;
-            if (!sp.reused_footer) {
-                // Copy borrowed footer strings into the arena, then release both responses.
-                const copy = try self.arena.dupe(u8, sp.footer_region[0 .. sp.footer_region.len - 8]);
-                self.metas[idx] = try metadata.openFooter(self.arena, copy);
-            }
-            if (self.args.row_groups) |ranges|
-                try restrictRowGroups(self.arena, &self.metas[idx], ranges[idx], self.args.diag, self.paths[idx]);
             self.meta_ready[idx] = true;
             if (self.fetch_window.binder_tail_bytes) |used| {
                 // Leave room for the later fetch and scan, and bound the arena across all batches and retries.

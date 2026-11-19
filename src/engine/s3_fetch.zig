@@ -894,7 +894,10 @@ pub fn fetchMetaBatch(
         const footer_len = sp.footer_region.len - 8;
         const span = profile.Span.begin(prof);
         defer span.end(.footer_parse, profile.args(.{ sp.file_index, footer_len }));
-        sp.meta = try metadata.openFooter(arena, sp.footer_region[0..footer_len]);
+        // Parsed strings borrow their bytes. A footer-only read frees its response before the caller binds again on
+        // these footers (`metadataOnly`), so it parses an arena copy: what fetch planning binds stays valid.
+        const footer = sp.footer_region[0..footer_len];
+        sp.meta = try metadata.openFooter(arena, if (sp.footer_only) try arena.dupe(u8, footer) else footer);
     }
 }
 
@@ -951,7 +954,12 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
     // we proceed exactly as the cold path. The fresh entry is
     // installed at the end of the cold path.
     if (!sp.footer_only) if (t.ctx.meta_cache) |cache| {
-        if (cache.get(t.ctx.io, sp.url.bucket, sp.url.key)) |entry| {
+        if (try cache.get(t.ctx.io, sp.url.bucket, sp.url.key, t.ctx.gpa)) |entry| {
+            var kept_footer = false;
+            defer {
+                t.ctx.gpa.free(entry.etag);
+                if (!kept_footer) t.ctx.gpa.free(entry.footer_bytes);
+            }
             // Charged before it is asked for: the suffix is at most the probe.
             t.account.add(t.probe);
             defer t.account.sub(t.probe);
@@ -967,7 +975,8 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
                 sp.total_size = entry.total_size;
                 sp.footer_offset = entry.footer_offset;
                 sp.tail_start = entry.footer_offset;
-                sp.footer_region = try t.ctx.gpa.dupe(u8, entry.footer_bytes);
+                sp.footer_region = entry.footer_bytes;
+                kept_footer = true;
                 sp.tail = sp.footer_region;
                 cache.noteRevalidated(t.ctx.io);
                 return;

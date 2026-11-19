@@ -1299,3 +1299,34 @@ test "explainAggregate: S3 reads exactly the trailer and footer, never pages" {
     try std.testing.expectEqualStrings("aggregate", pass.get("kind").?.string);
     try std.testing.expectEqual(@as(usize, 2), pass.get("columns").?.array.items.len);
 }
+
+test "regression: a footer-only S3 open leaves the plan cache bound to footers that outlive it" {
+    if (comptime @import("../test_skip.zig").lacks(.posix)) return @import("../test_skip.zig").skipNeeding(.posix, "POSIX environment fixture");
+    // A fan-out prepare (`fanout_plan.prepare`) binds while planning the footer-only fetch, then again on the opened
+    // footers. The first binding once kept a schema whose names lived in a footer response freed before the second.
+    const gpa = std.testing.allocator;
+    const bytes = try metadata.readFileSlice("ci/fixtures/parquet/full_match.parquet", gpa);
+    defer gpa.free(bytes);
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(gpa);
+    defer fake.deinit();
+    try fake.serveBytes("t/f.parquet", bytes);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const endpoint = try std.fmt.allocPrintSentinel(a, "S3_ENDPOINT_URL=http://127.0.0.1:{d}", .{fake.port}, 0);
+    const lines = [_:null]?[*:0]const u8{ endpoint, "AWS_REGION=us-east-1", "AWS_ACCESS_KEY_ID=ak", "AWS_SECRET_ACCESS_KEY=sk" };
+    const ctx: Context = .{ .gpa = gpa, .env = .{ .block = .{ .slice = &lines } }, .io = std.testing.io };
+    const m = try @import("fanout_plan.zig").mergeable(a, "count(*) AS c, sum(x) AS sx", null, null);
+    var cache: engine_types.bound_plan.Cache = .{};
+    var args: QueryArgs = .{ .inputs = &.{"s3://bkt/t/f.parquet"}, .aggregate = "count(*) AS c, sum(x) AS sx" };
+    args.plan_source = @import("syntax_plan.zig").source(&m.query);
+    args = args.withPlanCache(&cache);
+    var opened = try openInputs(ctx, a, args, .{ .limit = args.max_memory, .footer_only = true });
+    defer opened.deinit();
+    const metas = try materializeMetas(a, opened, null, null);
+    _ = (try args.boundAggregate(a, &metas[0])).?;
+    // The planning binding is the one the opened footers use: same schema, nothing bound twice.
+    try std.testing.expectEqual(metas[0].schema.items.ptr, cache.schema_items.ptr);
+    try std.testing.expect(cache.extra == null);
+}

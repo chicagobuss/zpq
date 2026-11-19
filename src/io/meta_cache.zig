@@ -132,10 +132,22 @@ pub const MetaCache = struct {
         return out_buf[0..need];
     }
 
-    /// Look up an entry. Returns a pointer to the live entry or null.
-    /// Callers should NOT mutate the returned entry; on a hit, the
-    /// cache will update the LRU position via `touch`.
-    pub fn get(self: *MetaCache, io: Io, bucket: []const u8, key: []const u8) ?*const Entry {
+    /// What `get` copies out of an entry under the lock. Another reader of the same footer batch may `put` or
+    /// `invalidate` as soon as the lock is released, freeing the entry. The caller owns both slices.
+    pub const Hit = struct {
+        etag: []u8,
+        total_size: u64,
+        footer_offset: u64,
+        footer_bytes: []u8,
+
+        pub fn deinit(self: Hit, gpa: std.mem.Allocator) void {
+            gpa.free(self.etag);
+            gpa.free(self.footer_bytes);
+        }
+    };
+
+    /// Look up an entry and copy it into `gpa`, or null. On a hit, the entry moves to the MRU end.
+    pub fn get(self: *MetaCache, io: Io, bucket: []const u8, key: []const u8, gpa: std.mem.Allocator) error{OutOfMemory}!?Hit {
         var key_buf: [4096]u8 = undefined;
         const ck = cacheKey(&key_buf, bucket, key) orelse {
             self.mutex.lockUncancelable(io);
@@ -152,11 +164,19 @@ pub const MetaCache = struct {
             return null;
         };
 
+        const etag = try gpa.dupe(u8, entry_ptr.etag);
+        errdefer gpa.free(etag);
+        const hit: Hit = .{
+            .etag = etag,
+            .total_size = entry_ptr.total_size,
+            .footer_offset = entry_ptr.footer_offset,
+            .footer_bytes = try gpa.dupe(u8, entry_ptr.footer_bytes),
+        };
         // Touch — move to tail (MRU).
         self.entries.remove(&entry_ptr.lru_node);
         self.entries.append(&entry_ptr.lru_node);
         self.stats.hits += 1;
-        return entry_ptr;
+        return hit;
     }
 
     /// Record a successful 304 revalidation; only the statistics change.
@@ -388,6 +408,12 @@ pub const MetaCache = struct {
 
 const testing = std.testing;
 
+fn cached(cache: *MetaCache, io: Io, bucket: []const u8, key: []const u8) !bool {
+    const hit = try cache.get(io, bucket, key, testing.allocator) orelse return false;
+    hit.deinit(testing.allocator);
+    return true;
+}
+
 test "MetaCache miss/insert/hit cycle" {
     var cache: MetaCache = undefined;
     cache.init(testing.allocator, 4);
@@ -395,14 +421,15 @@ test "MetaCache miss/insert/hit cycle" {
 
     const io = Io.Threaded.global_single_threaded.io();
 
-    try testing.expect(cache.get(io, "b1", "k1") == null);
+    try testing.expect(!try cached(&cache, io, "b1", "k1"));
     try testing.expectEqual(@as(u64, 1), cache.snapshotStats().misses);
 
     const footer = "FOOTER_BYTES_FOR_TEST";
     try cache.put(io, "b1", "k1", "etag-v1", 1024, 1003, footer);
     try testing.expectEqual(@as(u64, 1), cache.snapshotStats().inserts);
 
-    const e = cache.get(io, "b1", "k1") orelse return error.TestUnexpectedNull;
+    const e = try cache.get(io, "b1", "k1", testing.allocator) orelse return error.TestUnexpectedNull;
+    defer e.deinit(testing.allocator);
     try testing.expectEqualStrings("etag-v1", e.etag);
     try testing.expectEqual(@as(u64, 1024), e.total_size);
     try testing.expectEqual(@as(u64, 1003), e.footer_offset);
@@ -421,9 +448,9 @@ test "MetaCache LRU eviction at capacity" {
     try cache.put(io, "b", "k2", "e2", 200, 190, "f2");
     try cache.put(io, "b", "k3", "e3", 300, 290, "f3"); // evicts k1
 
-    try testing.expect(cache.get(io, "b", "k1") == null); // evicted
-    try testing.expect(cache.get(io, "b", "k2") != null);
-    try testing.expect(cache.get(io, "b", "k3") != null);
+    try testing.expect(!try cached(&cache, io, "b", "k1")); // evicted
+    try testing.expect(try cached(&cache, io, "b", "k2"));
+    try testing.expect(try cached(&cache, io, "b", "k3"));
     try testing.expectEqual(@as(u64, 1), cache.snapshotStats().evictions);
 }
 
@@ -435,9 +462,9 @@ test "MetaCache invalidate drops entry" {
     const io = Io.Threaded.global_single_threaded.io();
 
     try cache.put(io, "b", "k", "e", 100, 90, "f");
-    try testing.expect(cache.get(io, "b", "k") != null);
+    try testing.expect(try cached(&cache, io, "b", "k"));
     cache.invalidate(io, "b", "k");
-    try testing.expect(cache.get(io, "b", "k") == null);
+    try testing.expect(!try cached(&cache, io, "b", "k"));
 }
 
 test "MetaCache blobs: kept per version, dropped with their entry, bounded by the budget" {
@@ -476,4 +503,19 @@ test "MetaCache blobs: kept per version, dropped with their entry, bounded by th
     // Replacing an entry frees its blobs.
     try cache.put(io, "b", "k2", "y", 100, 90, "f");
     try testing.expectEqual(@as(usize, 0), cache.blob_bytes);
+}
+
+test "regression: a hit outlives its entry's replacement and invalidation" {
+    // Footer readers of one batch share the cache: one's `put` or `invalidate` frees an entry another just got.
+    var cache: MetaCache = undefined;
+    cache.init(testing.allocator, 4);
+    defer cache.deinit();
+    const io = Io.Threaded.global_single_threaded.io();
+    try cache.put(io, "b", "k", "etag-v1", 100, 90, "footer-v1");
+    const e = try cache.get(io, "b", "k", testing.allocator) orelse return error.TestUnexpectedNull;
+    defer e.deinit(testing.allocator);
+    try cache.put(io, "b", "k", "etag-v2", 100, 90, "footer-v2");
+    cache.invalidate(io, "b", "k");
+    try testing.expectEqualStrings("etag-v1", e.etag);
+    try testing.expectEqualStrings("footer-v1", e.footer_bytes);
 }

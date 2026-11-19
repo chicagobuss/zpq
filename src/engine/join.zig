@@ -32,6 +32,7 @@ pub const LocalSchemas = struct {
     /// The remote files' footers. They live in the arena, not in a mapping, so a caller that binds the same query again
     /// (`runParsed`'s retry) hands this map to the next `LocalSchemas` and skips the round trips.
     remote: types.RemoteFooters = .empty,
+    read_policies: types.RemoteReadPolicies = .empty,
     maps: std.ArrayList(local_fs.Mapped) = .empty,
 
     pub fn footer(raw: *const anyopaque, path: []const u8) anyerror!*const schema.FileMetaData {
@@ -58,7 +59,18 @@ pub const LocalSchemas = struct {
     /// under the S3 read concurrency, each one suffix GET. Only the footers are held, not the tails they came from.
     pub fn fetchMany(self: *LocalSchemas, files: []const []const u8) !void {
         const ctx = self.ctx orelse return;
-        const args: types.QueryArgs = .{ .inputs = files, .diag = ctx.diag, .pin_input_generation = self.pin_remote };
+        if (self.pin_remote) for (files) |path| {
+            if (self.read_policies.contains(path)) continue;
+            const policy = try self.arena.create(s3.ReadPolicy);
+            policy.* = .{ .path = path };
+            try self.read_policies.put(self.arena, path, policy);
+        };
+        const args: types.QueryArgs = .{
+            .inputs = files,
+            .diag = ctx.diag,
+            .pin_input_generation = self.pin_remote,
+            .remote_read_policies = if (self.pin_remote) &self.read_policies else null,
+        };
         const window: s3_fetch.FetchWindow = .{ .limit = args.max_memory, .footer_only = true, .footer_probe = s3_fetch.FOOTER_PROBE_MIN };
         var opened = try input.openInputs(ctx, self.arena, args, window);
         defer opened.deinit();
@@ -662,6 +674,7 @@ const Task = struct {
     build: syntax.Build,
     query: ?*const syntax.Query = null,
     remote_footers: ?*const types.RemoteFooters = null,
+    remote_read_policies: ?*const types.RemoteReadPolicies = null,
     kind: lookup.Kind,
     arena: std.heap.ArenaAllocator,
     store: Store,
@@ -849,6 +862,7 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
         .ctx = ctx,
         .threads = threads,
         .remote_footers = args.remote_footers,
+        .remote_read_policies = args.remote_read_policies,
         .edge = undefined,
         .build = undefined,
         .query = if (!(args.typed_answer and args.output != null) and args.result_order.limit != null and
@@ -962,6 +976,7 @@ fn openRemote(t: *Task, b: syntax.Build, aligned: ?types.AlignedJoin) !Opened {
     if (!std.mem.startsWith(u8, b.path, "s3://")) return error.ReplicatedJoinNeedsS3;
     if (aligned) |selection| if (selection.build.of != null) return error.AlignedJoinBadRange;
     var ctx = t.ctx;
+    ctx.diag = &t.diag;
     ctx.pool_gpa = ctx.pool_gpa orelse ctx.gpa;
     ctx.gpa = if (aligned != null) t.p.charge.allocator() else t.p.replica_charge.allocator();
     var cache: plans.Cache = .{};
@@ -974,6 +989,7 @@ fn openRemote(t: *Task, b: syntax.Build, aligned: ?types.AlignedJoin) !Opened {
         .input_snapshots = if (aligned) |selection| &.{selection.build_snapshot} else null,
         .pin_input_generation = true,
         .remote_footers = t.remote_footers,
+        .remote_read_policies = t.remote_read_policies,
         .max_memory = if (aligned != null) t.p.ledger.available() else t.p.replica_budget.available(),
         .parallelism = t.threads,
         .diag = &t.diag,

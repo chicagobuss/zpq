@@ -660,7 +660,8 @@ fn runParsed(
     arena: std.mem.Allocator,
 ) !void {
     var memo: zpq.frontend.JoinMemo = .{};
-    for (0..2) |attempt| {
+    var rebound = false;
+    while (true) {
         var retry: ?[]const u8 = null;
         const err = retry_root: {
             const first = if (runParsedOnce(init, options, diag, arena, null, &retry, &memo)) |_| return else |err| err;
@@ -677,12 +678,19 @@ fn runParsed(
             };
             return;
         };
-        // A failed If-Match precedes the aggregate answer. Bind again against fresh footers before reading any data.
-        if (err != error.AlignedJoinSnapshotChanged or attempt != 0) return err;
-        memo.remote = .empty;
+        switch (err) {
+            // At least one object now bypasses its memoized footer. Keep the parsed binder schema until a fresh
+            // open shows that it changed. Each object can trigger this fallback only once.
+            error.S3IfMatchRejected => {},
+            error.AlignedJoinSnapshotChanged => {
+                if (rebound) return error.InputChanged;
+                rebound = true;
+                memo.remote = .empty;
+            },
+            else => return err,
+        }
         diag.* = .{};
     }
-    unreachable;
 }
 
 fn runParsedOnce(
@@ -1017,6 +1025,7 @@ fn runParsedOnce(
             .plan_source = plan_source,
             .replicated_join_limit = if (remote_join) engine_max_mem else null,
             .remote_footers = if (remote_join and parsed_join != null) &memo.remote else null,
+            .remote_read_policies = if (remote_join and parsed_join != null) &memo.read_policies else null,
             .output = if (fmt == .parquet) engine_output orelse "-" else null,
             .typed_answer = fmt == .parquet,
             .text_output = if (fmt != .parquet) .{ .format = fmt } else null,
@@ -1060,6 +1069,7 @@ fn runParsedOnce(
         .plan_source = plan_source,
         .replicated_join_limit = if (remote_join) engine_max_mem else null,
         .remote_footers = if (remote_join and parsed_join != null) &memo.remote else null,
+        .remote_read_policies = if (remote_join and parsed_join != null) &memo.read_policies else null,
         .output = if (fmt == .parquet) engine_output orelse "-" else null,
         .output_fd = if (fmt == .parquet) (if (to_stdout) (if (@import("builtin").os.tag == .windows) std.Io.File.stdout().handle else 1) else publication.fd) else null,
         .output_restartable = fmt == .parquet and !to_stdout and publication.fd != null,

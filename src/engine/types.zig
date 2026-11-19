@@ -96,6 +96,7 @@ pub const RowGroupRange = struct {
 pub const SourceSnapshot = struct { etag: []const u8, size: u64 };
 
 pub const RemoteFooters = std.StringHashMapUnmanaged(*const RemoteFooter);
+pub const RemoteReadPolicies = std.StringHashMapUnmanaged(*s3.ReadPolicy);
 pub const RemoteFooter = struct {
     meta: schema.FileMetaData,
     snapshot: SourceSnapshot,
@@ -229,6 +230,7 @@ pub const QueryArgs = struct {
     pin_input_generation: bool = false,
     /// The SQL join binder's raw footers, borrowed for this query.
     remote_footers: ?*const RemoteFooters = null,
+    remote_read_policies: ?*const RemoteReadPolicies = null,
     aligned_join: ?AlignedJoin = null,
 
     /// A join or an `IN (SELECT ...)` is bound only on the aggregate path (`engine/join.zig`); row output would run the

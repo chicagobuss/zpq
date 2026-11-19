@@ -872,9 +872,43 @@ pub const GetOpts = struct {
     /// data-page-bearing rounds when an object is unchanged.
     if_none_match: ?[]const u8 = null,
     if_match: ?[]const u8 = null,
+    detect_if_match_rejection: bool = false,
     /// Records the request as an `http_get` span when set.
     prof: ?*profile.Thread = null,
 };
+
+/// Only CLI joins supply this state. It lives through rebinds and is shared by an object's parallel GETs.
+pub const ReadPolicy = struct {
+    path: []const u8,
+    omit_if_match: std.atomic.Value(bool) = .init(false),
+};
+
+pub const ReadPin = struct {
+    etag: []const u8,
+    policy: ?*ReadPolicy = null,
+    reused_footer: bool = false,
+
+    pub fn header(self: ReadPin) !?[]const u8 {
+        if (self.policy) |p| if (p.omit_if_match.load(.acquire)) {
+            if (self.reused_footer) return error.S3IfMatchRejected;
+            return null;
+        };
+        return self.etag;
+    }
+
+    /// Report a rejected precondition once. A fresh footer can still pin unconditional range responses.
+    pub fn rejected(self: ReadPin, sent: ?[]const u8, status: u16) !bool {
+        const p = self.policy orelse return false;
+        if (sent == null or !ifMatchRejected(status)) return false;
+        p.omit_if_match.store(true, .release);
+        if (self.reused_footer) return error.S3IfMatchRejected;
+        return true;
+    }
+};
+
+fn ifMatchRejected(status: u16) bool {
+    return status == 400 or status == 405 or status == 501;
+}
 
 /// An ETag is opaque, including its multipart suffix. Only the enclosing quotes are optional.
 pub fn etagValue(tag: []const u8) []const u8 {
@@ -889,7 +923,9 @@ pub fn checkIfMatch(response: http.Response, if_match: ?[]const u8) error{Aligne
         412 => return error.AlignedJoinSnapshotChanged,
         200, 206, 304 => {
             const got = response.header("ETag") orelse return error.AlignedJoinSnapshotChanged;
-            if (!std.mem.eql(u8, etagValue(want), etagValue(got))) return error.AlignedJoinSnapshotChanged;
+            // Some intermediaries weaken the response tag without changing the object.
+            const got_tag = etagValue(if (std.mem.startsWith(u8, got, "W/")) got[2..] else got);
+            if (!std.mem.eql(u8, etagValue(want), got_tag)) return error.AlignedJoinSnapshotChanged;
         },
         else => {},
     }
@@ -904,6 +940,9 @@ test "If-Match verifies response ETags and preserves multipart suffixes" {
     try checkIfMatch(response, "\"abcdef-3\"");
     try std.testing.expectError(error.AlignedJoinSnapshotChanged, checkIfMatch(response, "\"abcdef-2\""));
     try std.testing.expectError(error.AlignedJoinSnapshotChanged, checkIfMatch(response, "\"abcdef\""));
+    response.headers = &.{.{ .name = "ETag", .value = "W/\"abcdef-3\"" }};
+    try checkIfMatch(response, "\"abcdef-3\"");
+    try std.testing.expectError(error.AlignedJoinSnapshotChanged, checkIfMatch(response, "\"abcdef-2\""));
     response.headers = &.{};
     try std.testing.expectError(error.AlignedJoinSnapshotChanged, checkIfMatch(response, "\"abcdef-3\""));
     try checkIfMatch(response, null);
@@ -941,6 +980,7 @@ pub fn getViaPoolWithOpts(
         .prof = opts.prof,
         .tag = tag,
         .bytes = bytes,
+        .detect_if_match_rejection = opts.detect_if_match_rejection,
     }, Get{ .io = io, .creds = creds, .host = host, .url = url, .opts = opts }, Get.send);
 }
 
@@ -957,6 +997,7 @@ pub const RequestOpts = struct {
     tag: [2]u64 = .{ 0, 0 },
     /// Bytes the request is expected to move, for the in-flight gauge; 0 when unknown.
     bytes: u64 = 0,
+    detect_if_match_rejection: bool = false,
 };
 
 /// One request's timing for its profile span: the final attempt's pool wait and connect, time to first byte, and
@@ -1050,7 +1091,8 @@ pub fn requestViaPool(
                     trace.ttfb_ns = first - t_send;
                     trace.body_ns = t_done - first;
                 }
-                if (!retry.retryableStatus(out.status)) return out;
+                if (!retry.retryableStatus(out.status) or (opts.detect_if_match_rejection and ifMatchRejected(out.status)))
+                    return out;
                 retry_status = out.status;
                 const code = out.header("x-amz-error-code") orelse extractTag(out.body, "<Code>", "</Code>") orelse "";
                 slow_down = std.mem.eql(u8, std.mem.trim(u8, code, " \t\r\n"), "SlowDown");
@@ -1155,7 +1197,7 @@ pub const FetchJob = struct {
     /// This request overlaps a filter column, so a dispatch sends it before the others.
     urgent: bool = false,
     /// A footer-derived selection must read only the generation the planner proved.
-    if_match: ?[]const u8 = null,
+    pin: ?ReadPin = null,
 };
 
 pub const Landed = struct {
@@ -1260,7 +1302,7 @@ pub fn fetchJobs(
                     .target = j.target[sub_off_start..sub_off_end],
                     .landed = j.landed,
                     .urgent = j.urgent,
-                    .if_match = j.if_match,
+                    .pin = j.pin,
                 });
             }
         } else {
@@ -1302,7 +1344,7 @@ pub fn fetchJobs(
             .port = hi.port,
             .use_tls = hi.use_tls,
             .range = j.range,
-            .if_match = j.if_match,
+            .pin = j.pin,
             .target = j.target,
             .ok = false,
             .profiler = profiler,
@@ -1330,6 +1372,7 @@ pub fn fetchJobs(
     var fetched: u64 = 0;
     var failed: ?anyerror = null;
     var failed_failure: ?S3Failure = null;
+    var changed_path: ?[]const u8 = null;
     for (ctxs) |ctx| {
         if (ctx.ok) {
             fetched += ctx.target.len;
@@ -1338,9 +1381,11 @@ pub fn fetchJobs(
         if (failed == null or (failed_failure == null and ctx.failure != null)) {
             failed = ctx.err orelse error.RangeFetchFailed;
             failed_failure = ctx.failure;
+            changed_path = if (ctx.pin) |pin| if (pin.policy) |policy| policy.path else null else null;
         }
     }
     if (failed) |err| {
+        if (err == error.AlignedJoinSnapshotChanged) if (changed_path) |path| diag_mod.Diag.setInput(diag, path, err);
         if (failed_failure) |f| diag_mod.setS3Failure(diag, f);
         return err;
     }
@@ -1386,6 +1431,7 @@ const FetchCtx = struct {
     port: u16,
     use_tls: bool,
     range: Range,
+    pin: ?ReadPin = null,
     if_match: ?[]const u8 = null,
     /// Pre-sized target buffer; `target.len == range.end - range.start`.
     target: []u8,
@@ -1414,7 +1460,7 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
         .use_tls = ctx.use_tls,
         .timeouts = ctx.creds.timeouts,
     };
-    const opts: RequestOpts = .{
+    var opts: RequestOpts = .{
         .idempotent = true,
         .method = .GET,
         .prof = profile.threadOf(ctx.profiler, .fetch),
@@ -1422,15 +1468,30 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
         .bytes = ctx.target.len,
     };
     const arena = arena_state.allocator();
-    const resp = requestViaPool(io, ctx.pool, arena, criteria, opts, ctx, doFetch) catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
-        else => {
+    const resp = while (true) {
+        if (ctx.pin) |pin| ctx.if_match = pin.header() catch |err| {
             ctx.err = err;
-            ctx.failure = transportFailure(.GetObject, ctx.bucket, ctx.key, err);
             return;
-        },
+        };
+        opts.detect_if_match_rejection = ctx.if_match != null and ctx.pin.?.policy != null;
+        const response = requestViaPool(io, ctx.pool, arena, criteria, opts, ctx, doFetch) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => {
+                ctx.err = err;
+                ctx.failure = transportFailure(.GetObject, ctx.bucket, ctx.key, err);
+                return;
+            },
+        };
+        if (ctx.pin) |pin| {
+            const retry_unconditional = pin.rejected(ctx.if_match, response.status) catch |err| {
+                ctx.err = err;
+                return;
+            };
+            if (retry_unconditional) continue;
+        }
+        break response;
     };
-    checkIfMatch(resp, ctx.if_match) catch |err| {
+    checkIfMatch(resp, if (ctx.pin) |pin| pin.etag else null) catch |err| {
         ctx.err = err;
         return;
     };

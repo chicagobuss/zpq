@@ -429,6 +429,12 @@ const RemoteInputs = struct {
             .footer_probe = self.fetch_window.footer_probe,
             .pin_generation = self.args.pin_input_generation or self.args.input_snapshots != null,
         };
+        if (self.args.input_snapshots == null) if (self.args.remote_read_policies) |policies| {
+            for (specs) |*sp| {
+                sp.read_policy = policies.get(self.paths[sp.file_index]);
+                if (sp.omitsIfMatch()) sp.pin_generation = true;
+            }
+        };
         if (self.args.input_snapshots) |expected| for (self.s3_indices.items, specs) |idx, *sp| {
             const snapshot = expected[idx] orelse return error.AlignedJoinSnapshotChanged;
             if (snapshot.etag.len == 0 or std.mem.startsWith(u8, snapshot.etag, "W/")) return error.JoinBuildNoSnapshot;
@@ -437,6 +443,7 @@ const RemoteInputs = struct {
         };
         if (self.args.remote_footers) |footers| {
             if (self.args.input_snapshots == null) for (specs) |*sp| {
+                if (sp.omitsIfMatch()) continue;
                 const entry = footers.get(self.paths[sp.file_index]) orelse continue;
                 if (!sp.reuseFooter(entry.snapshot, entry.rtt_ns)) continue;
                 sp.meta = entry.meta;
@@ -479,6 +486,14 @@ const RemoteInputs = struct {
             self.snapshots[idx] = snapshot;
             if (sp.pin_generation and sp.if_match == null and etag.len > 0 and !std.mem.startsWith(u8, etag, "W/"))
                 sp.if_match = try std.fmt.allocPrint(self.arena, "\"{s}\"", .{etag});
+            if (!sp.reused_footer and sp.omitsIfMatch()) if (self.args.remote_footers) |footers| {
+                if (footers.get(self.paths[idx])) |entry| {
+                    if (sp.if_match == null or !std.mem.eql(u8, entry.snapshot.etag, etag) or entry.snapshot.size != sp.total_size) {
+                        Diag.setInput(self.args.diag, self.paths[idx], error.AlignedJoinSnapshotChanged);
+                        return error.AlignedJoinSnapshotChanged;
+                    }
+                }
+            };
             if (self.args.input_snapshots) |expected| {
                 const want = expected[idx] orelse return error.AlignedJoinSnapshotChanged;
                 if (etag.len == 0 or std.mem.startsWith(u8, etag, "W/") or
@@ -917,7 +932,7 @@ const RemoteFilePlan = struct {
                     try appendSplitFetch(list, self.builder.arena, sp.url.bucket, sp.url.key, r.start, fetch_end, dst[0..@intCast(fetch_end - r.start)]);
                     for (list.items[before..]) |*j| {
                         job_bytes += j.target.len;
-                        j.if_match = sp.if_match;
+                        j.pin = sp.readPin();
                     }
                 }
 

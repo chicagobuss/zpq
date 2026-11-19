@@ -61,7 +61,8 @@ pub const FakeS3 = struct {
     gets_allowed: ?u32 = null,
     gets: u32 = 0,
     ignore_if_match: bool = false,
-    get_etag: enum { always, omit, omit_conditional } = .always,
+    reject_if_match: ?u16 = null,
+    get_etag: enum { always, omit, omit_conditional, weak_range } = .always,
     /// Object byte ranges served by GETs, for metadata-only and range-planning assertions.
     get_bytes: u64 = 0,
     lowest_get_offset: ?usize = null,
@@ -520,19 +521,25 @@ pub const FakeS3 = struct {
                 return self.reply(fd, lose, 403, "", "<Error><Code>AccessDenied</Code></Error>", null);
             };
             const if_match = header(head, "If-Match");
+            if (if_match != null) if (self.reject_if_match) |rejection_status| {
+                return self.reply(fd, lose, rejection_status, "", "", null);
+            };
             if (!self.ignore_if_match) if (if_match) |tag| {
                 const quoted = try std.fmt.allocPrint(a, "\"{s}\"", .{o.etag});
                 if (!std.mem.eql(u8, tag, quoted)) return self.reply(fd, lose, 412, "", "", null);
             };
-            const etag_header = if (self.get_etag == .always or (self.get_etag == .omit_conditional and if_match == null))
-                try std.fmt.allocPrint(a, "ETag: \"{s}\"\r\n", .{o.etag})
+            const range = header(head, "Range");
+            const weak = self.get_etag == .weak_range and if (range) |r| std.mem.startsWith(u8, r, "bytes=") and
+                !std.mem.startsWith(u8, r, "bytes=-") else false;
+            const etag_header = if (self.get_etag != .omit and !(self.get_etag == .omit_conditional and if_match != null))
+                try std.fmt.allocPrint(a, "ETag: {s}\"{s}\"\r\n", .{ if (weak) "W/" else "", o.etag })
             else
                 "";
             const no_key = "<Error><Code>NoSuchKey</Code></Error>";
             const data = o.data orelse return self.reply(fd, lose, 404, "", no_key, null);
             var lo: usize = 0;
             var hi: usize = data.len; // exclusive
-            if (header(head, "Range")) |r| if (std.mem.startsWith(u8, r, "bytes=")) {
+            if (range) |r| if (std.mem.startsWith(u8, r, "bytes=")) {
                 const spec = r["bytes=".len..];
                 const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return false;
                 if (dash == 0) {

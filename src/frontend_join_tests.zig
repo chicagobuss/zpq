@@ -553,3 +553,110 @@ test "binder: If-Match rejects a split footer with a missing ETag in the second 
     try std.testing.expectEqual(@as(u32, 2), fake.gets);
     try std.testing.expectEqual(@as(usize, 0), schemas.local.remote.count());
 }
+
+test "binder: rejected If-Match reopens the object with the ordinary footer and data path" {
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "POSIX environment fixture");
+    const input = @import("engine/input.zig");
+    const types = @import("engine/types.zig");
+    const key = "t/input.parquet";
+    const path = "s3://bkt/" ++ key;
+    for ([_]u16{ 400, 405, 501 }) |status| {
+        var fake: fake_s3.FakeS3 = undefined;
+        try fake.start(std.testing.allocator);
+        defer fake.deinit();
+        fake.reject_if_match = status;
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var diag: Diag = .{};
+        var schemas = schemasFor(a, try fakeEnv(a, &fake), &diag);
+        defer schemas.deinit();
+
+        _ = try serve(&fake, a, key, "decimal_precision40.parquet");
+        _ = try frontend.JoinSchemas.footer(&schemas, path);
+        const ctx = schemas.local.ctx.?;
+        const window: s3_fetch.FetchWindow = .{ .limit = 1 << 24 };
+        const before = fake.gets;
+        var base = try input.openInputs(ctx, a, .{ .inputs = &.{path} }, window);
+        defer base.deinit();
+        const base_gets = fake.gets - before;
+        const args: types.QueryArgs = .{
+            .inputs = &.{path},
+            .remote_footers = &schemas.local.remote,
+            .remote_read_policies = &schemas.local.read_policies,
+        };
+        const before_reject = fake.gets;
+        try std.testing.expectError(error.S3IfMatchRejected, input.openInputs(ctx, a, args, window));
+        var reopened = try input.openInputs(ctx, a, args, window);
+        defer reopened.deinit();
+        try std.testing.expectEqualSlices(u8, base.inputs[0].bytes, reopened.inputs[0].bytes);
+        try std.testing.expectEqual(base.metas[0].num_rows, reopened.metas[0].num_rows);
+        try std.testing.expectEqual(base_gets + 1, fake.gets - before_reject);
+    }
+}
+
+test "binder: rejected If-Match on a split footer retries once without the header" {
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "POSIX environment fixture");
+    const key = "t/wide.parquet";
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(std.testing.allocator);
+    defer fake.deinit();
+    fake.reject_if_match = 501;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diag = .{};
+    var schemas = schemasFor(a, try fakeEnv(a, &fake), &diag);
+    defer schemas.deinit();
+
+    const wide = try serve(&fake, a, key, "many_tiny.parquet");
+    const path = "s3://bkt/" ++ key;
+    const bound = try frontend.JoinSchemas.footer(&schemas, path);
+    try std.testing.expectEqual(wide.rows, bound.num_rows);
+    try std.testing.expectEqual(@as(u32, 3), fake.gets);
+    // Reopen through the normal path, even when the binder still has a footer in its memo.
+    const input = @import("engine/input.zig");
+    var reopened = try input.openInputs(schemas.local.ctx.?, a, .{
+        .inputs = &.{path},
+        .remote_footers = &schemas.local.remote,
+        .remote_read_policies = &schemas.local.read_policies,
+    }, .{ .limit = 1 << 24, .footer_only = true, .footer_probe = s3_fetch.FOOTER_PROBE_MIN });
+    defer reopened.deinit();
+    try std.testing.expectEqual(wide.rows, reopened.metas[0].num_rows);
+    try std.testing.expectEqual(@as(u32, 5), fake.gets);
+}
+
+test "binder: If-Match accepts a weakened response ETag and detects a real replacement" {
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "POSIX environment fixture");
+    const input = @import("engine/input.zig");
+    const types = @import("engine/types.zig");
+    const key = "t/weak.parquet";
+    const path = "s3://bkt/t/weak.parquet";
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(std.testing.allocator);
+    defer fake.deinit();
+    fake.ignore_if_match = true;
+    fake.get_etag = .weak_range;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diag = .{};
+    var schemas = schemasFor(a, try fakeEnv(a, &fake), &diag);
+    defer schemas.deinit();
+    const old = try serve(&fake, a, key, "decimal_precision40.parquet");
+    _ = try frontend.JoinSchemas.footer(&schemas, path);
+    const ctx = schemas.local.ctx.?;
+    const args: types.QueryArgs = .{
+        .inputs = &.{path},
+        .remote_footers = &schemas.local.remote,
+        .remote_read_policies = &schemas.local.read_policies,
+    };
+    var opened = try input.openInputs(ctx, a, args, .{ .limit = 1 << 24 });
+    defer opened.deinit();
+    try std.testing.expect(opened.inputs[0].bytes.len > 0);
+    try std.testing.expectEqual(old.rows, opened.metas[0].num_rows);
+    _ = try serve(&fake, a, key, "group_order.parquet");
+    try std.testing.expectError(error.AlignedJoinSnapshotChanged, input.openInputs(ctx, a, args, .{ .limit = 1 << 24 }));
+    try std.testing.expectEqualStrings(path, diag.input orelse return error.TestUnexpectedResult);
+}

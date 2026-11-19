@@ -398,6 +398,7 @@ pub const FetchSpec = struct {
     etag_buf: [96]u8 = undefined,
     etag_len: usize = 0,
     if_match: ?[]const u8 = null,
+    read_policy: ?*s3.ReadPolicy = null,
     pin_generation: bool = false,
     reused_footer: bool = false,
     /// Time to the first byte of a successful footer request: a cold suffix, a stale 200/206, or a 304. Zero until
@@ -416,6 +417,14 @@ pub const FetchSpec = struct {
 
     fn etag(self: *const FetchSpec) []const u8 {
         return self.etag_buf[0..self.etag_len];
+    }
+
+    pub fn omitsIfMatch(self: *const FetchSpec) bool {
+        return if (self.read_policy) |p| p.omit_if_match.load(.acquire) else false;
+    }
+
+    pub fn readPin(self: *const FetchSpec) ?s3.ReadPin {
+        return if (self.if_match) |tag| .{ .etag = tag, .policy = self.read_policy, .reused_footer = self.reused_footer } else null;
     }
 
     pub fn reuseFooter(self: *FetchSpec, snapshot: @import("types.zig").SourceSnapshot, rtt_ns: u64) bool {
@@ -579,7 +588,7 @@ pub const S3Membership = struct {
             if (s.start < fetch_end) try jobs.append(arena, .{
                 .bucket = sp.url.bucket,
                 .key = sp.url.key,
-                .if_match = if (sp.reused_footer) sp.if_match else null,
+                .pin = if (sp.reused_footer or sp.omitsIfMatch()) sp.readPin() else null,
                 .range = .{ .start = s.start, .end = fetch_end },
                 .target = buf[0..@intCast(fetch_end - s.start)],
             });
@@ -635,7 +644,7 @@ pub const S3Membership = struct {
             if (s.start < fetch_end) try jobs.append(arena, .{
                 .bucket = sp.url.bucket,
                 .key = sp.url.key,
-                .if_match = if (sp.reused_footer) sp.if_match else null,
+                .pin = if (sp.reused_footer or sp.omitsIfMatch()) sp.readPin() else null,
                 .range = .{ .start = s.start, .end = fetch_end },
                 .target = dest[0..@intCast(fetch_end - s.start)],
             });
@@ -855,6 +864,9 @@ pub fn fetchMetaBatch(
         try group.await(ctx.io);
     }
     for (specs) |sp| if (sp.err) |err| {
+        if (err == error.AlignedJoinSnapshotChanged) if (sp.read_policy) |p| {
+            diag_mod.Diag.setInput(ctx.diag, p.path, err);
+        };
         if (sp.failure) |f| diag_mod.setS3Failure(ctx.diag, f);
         return err;
     };
@@ -878,16 +890,25 @@ fn getMetaObject(
     creds: s3.Credentials,
     opts: s3.GetOpts,
 ) !http.Response {
-    var conditional = opts;
-    conditional.if_match = sp.if_match;
-    if (conditional.if_match == null and sp.pin_generation and sp.etag_len > 0 and !std.mem.startsWith(u8, sp.etag(), "W/"))
-        conditional.if_match = try std.fmt.allocPrint(scratch, "\"{s}\"", .{sp.etag()});
-    const response = s3.getViaPoolWithOpts(io, pool, scratch, creds, sp.url, conditional) catch |err| {
-        sp.failure = s3.transportFailure(.GetObject, sp.url.bucket, sp.url.key, err);
-        return err;
-    };
-    try s3.checkIfMatch(response, conditional.if_match);
-    return response;
+    var pin = sp.readPin();
+    if (pin == null and sp.pin_generation and sp.etag_len > 0 and !std.mem.startsWith(u8, sp.etag(), "W/")) {
+        pin = .{
+            .etag = try std.fmt.allocPrint(scratch, "\"{s}\"", .{sp.etag()}),
+            .policy = sp.read_policy,
+        };
+    }
+    var request = opts;
+    while (true) {
+        request.if_match = if (pin) |p| try p.header() else null;
+        request.detect_if_match_rejection = request.if_match != null and sp.read_policy != null;
+        const response = s3.getViaPoolWithOpts(io, pool, scratch, creds, sp.url, request) catch |err| {
+            sp.failure = s3.transportFailure(.GetObject, sp.url.bucket, sp.url.key, err);
+            return err;
+        };
+        if (pin) |p| if (try p.rejected(request.if_match, response.status)) continue;
+        try s3.checkIfMatch(response, if (pin) |p| p.etag else null);
+        return response;
+    }
 }
 
 /// Fail a GET on `resp`: the one parser maps S3's answer to a named error, and the fetch keeps the details for the

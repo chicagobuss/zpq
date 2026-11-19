@@ -30,6 +30,7 @@ pub fn retryJoinRoot(join: syntax.Join, failed: ?[]const u8) ?[]const u8 {
 pub const JoinMemo = struct {
     listed: std.StringHashMapUnmanaged(anyerror![][]const u8) = .empty,
     remote: @import("engine/types.zig").RemoteFooters = .empty,
+    read_policies: @import("engine/types.zig").RemoteReadPolicies = .empty,
 };
 
 /// Resolve a table pattern for join planning while keeping the footer mappings alive through binding.
@@ -99,11 +100,13 @@ pub const JoinSchemas = struct {
     pub fn restore(self: *JoinSchemas, memo: *const JoinMemo) void {
         self.listed = memo.listed;
         self.local.remote = memo.remote;
+        self.local.read_policies = memo.read_policies;
     }
 
     pub fn save(self: *const JoinSchemas, memo: *JoinMemo) void {
         memo.listed = self.listed;
         memo.remote = self.local.remote;
+        memo.read_policies = self.local.read_policies;
     }
 
     pub fn deinit(self: *JoinSchemas) void {
@@ -670,7 +673,10 @@ fn querySetupError(err: anyerror, diag: *const Diag) bool {
                 "  type (corrupt file)\n",
             .{},
         ),
-        error.InputChanged => diagnosticPrint(
+        error.InputChanged => if (diag.input) |path| diagnosticPrint(
+            "zpq query: input '{s}' changed or its generation could not be verified while reading it\n",
+            .{path},
+        ) else diagnosticPrint(
             "zpq query: an input file was truncated or rewritten while the query read it\n",
             .{},
         ),

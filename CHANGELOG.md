@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Fan-out and footer-only S3 queries no longer crash on large footers.** A footer-only S3 open kept its plan bound to a footer it had already freed. A Lambda fan-out over files with large footers could crash its workers, and `--explain` or `LIMIT 0` over S3 could crash or print freed memory. The footer cache also hands out copies now, so a concurrent update can't free an entry still in use.
+
 - **Scans count and group faster, and footers parse in place.** Histogram columns fold their entries once and count codes in cache-sized lanes, a lone GROUP BY key is filtered once per dictionary entry, and a footer parses in place into one block. On granite, ClickBench q7 runs 39% faster hot and 28% cold, q2 25% and 17%, and q29 23% and 14%.
 
 - **Every S3 read checks the object's version.** A Parquet object replaced while zpq reads it now fails with a named error (`InputChanged`) instead of returning a mix of old and new data. This covers every query shape, including fan-out and Lambda, where workers must agree on each object's ETag before their results are merged. A store or proxy that drops the ETag from range responses now fails the query instead of risking a mixed answer.

@@ -511,7 +511,7 @@ SECTIONS {
     *(".text.core.consumer.scan.exactTileTarget" ".text..Lcore.consumer.scan.exactTileTarget")
     *(".text.core.expr.exact_tiles.admits" ".text..Lcore.expr.exact_tiles.admits")
     *(".text.core.expr.exact_tiles.treeAdmits" ".text..Lcore.expr.exact_tiles.treeAdmits")
-    *(".text.core.consumer.scan.scanRGForAggImpl" ".text..Lcore.consumer.scan.scanRGForAggImpl")
+    *(".text.core.consumer.scan.scanRGForAggSpecialized" ".text..Lcore.consumer.scan.scanRGForAggSpecialized")
     *(".text.core.row_group_arena.RowGroupArena.nextRowGroup" ".text..Lcore.row_group_arena.RowGroupArena.nextRowGroup")
     *(".text.core.consumer.budget.decodeEstimate" ".text..Lcore.consumer.budget.decodeEstimate")
     *(".text.core.consumer.plan.streamByteArray" ".text..Lcore.consumer.plan.streamByteArray")

@@ -27,22 +27,24 @@ pub const LocalSchemas = struct {
     arena: std.mem.Allocator,
     ctx: ?types.Context = null,
     remote_seen: bool = false,
+    pin_remote: bool = false,
     seen: std.StringHashMapUnmanaged(*schema.FileMetaData) = .empty,
     /// The remote files' footers. They live in the arena, not in a mapping, so a caller that binds the same query again
     /// (`runParsed`'s retry) hands this map to the next `LocalSchemas` and skips the round trips.
-    remote: std.StringHashMapUnmanaged(*schema.FileMetaData) = .empty,
+    remote: types.RemoteFooters = .empty,
     maps: std.ArrayList(local_fs.Mapped) = .empty,
 
     pub fn footer(raw: *const anyopaque, path: []const u8) anyerror!*const schema.FileMetaData {
         const self: *LocalSchemas = @ptrCast(@alignCast(@constCast(raw)));
         const is_remote = std.mem.startsWith(u8, path, "s3://");
         if (is_remote) self.remote_seen = true;
-        if ((if (is_remote) self.remote else self.seen).get(path)) |m| return m;
         if (is_remote) {
+            if (self.remote.get(path)) |entry| return &entry.meta;
             if (self.ctx == null) return error.JoinNotLocal;
             try self.fetchMany(&.{path});
-            return self.remote.get(path).?;
+            return &self.remote.get(path).?.meta;
         }
+        if (self.seen.get(path)) |m| return m;
         const m = try self.arena.create(schema.FileMetaData);
         try self.maps.ensureUnusedCapacity(self.arena, 1);
         const opened = try open(self.arena, path);
@@ -56,17 +58,16 @@ pub const LocalSchemas = struct {
     /// under the S3 read concurrency, each one suffix GET. Only the footers are held, not the tails they came from.
     pub fn fetchMany(self: *LocalSchemas, files: []const []const u8) !void {
         const ctx = self.ctx orelse return;
-        const args: types.QueryArgs = .{ .inputs = files, .diag = ctx.diag };
+        const args: types.QueryArgs = .{ .inputs = files, .diag = ctx.diag, .pin_input_generation = self.pin_remote };
         const window: s3_fetch.FetchWindow = .{ .limit = args.max_memory, .footer_only = true, .footer_probe = s3_fetch.FOOTER_PROBE_MIN };
         var opened = try input.openInputs(ctx, self.arena, args, window);
         defer opened.deinit();
-        const metas = try input.materializeMetas(self.arena, opened, ctx.diag, null);
         self.remote_seen = true;
         try self.remote.ensureUnusedCapacity(self.arena, @intCast(files.len));
-        for (files, metas) |f, m| {
-            const p = try self.arena.create(schema.FileMetaData);
-            p.* = m;
-            self.remote.putAssumeCapacity(f, p);
+        for (files, opened.metas, opened.snapshots, opened.footer_rtts) |f, m, snapshot, rtt_ns| {
+            const entry = try self.arena.create(types.RemoteFooter);
+            entry.* = .{ .meta = m, .snapshot = snapshot.?, .rtt_ns = rtt_ns };
+            self.remote.putAssumeCapacity(f, entry);
         }
     }
 
@@ -660,6 +661,7 @@ const Task = struct {
     edge: Edge,
     build: syntax.Build,
     query: ?*const syntax.Query = null,
+    remote_footers: ?*const types.RemoteFooters = null,
     kind: lookup.Kind,
     arena: std.heap.ArenaAllocator,
     store: Store,
@@ -846,6 +848,7 @@ pub fn prepare(ctx: types.Context, arena: std.mem.Allocator, args: types.QueryAr
         .p = p,
         .ctx = ctx,
         .threads = threads,
+        .remote_footers = args.remote_footers,
         .edge = undefined,
         .build = undefined,
         .query = if (!(args.typed_answer and args.output != null) and args.result_order.limit != null and
@@ -970,6 +973,7 @@ fn openRemote(t: *Task, b: syntax.Build, aligned: ?types.AlignedJoin) !Opened {
         .row_groups = if (aligned) |selection| &.{selection.build} else null,
         .input_snapshots = if (aligned) |selection| &.{selection.build_snapshot} else null,
         .pin_input_generation = true,
+        .remote_footers = t.remote_footers,
         .max_memory = if (aligned != null) t.p.ledger.available() else t.p.replica_budget.available(),
         .parallelism = t.threads,
         .diag = &t.diag,

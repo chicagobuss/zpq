@@ -331,6 +331,8 @@ fn executeAggregateOver(
     // A process about to exit leaves the builds to it, as the scan leaves its tables (`leave_regions`): unmapping a
     // large dimension's arrays is serial time the exit would only repeat. Builds that check for leaks free them.
     defer if (joined) |j| if (!ctx.exit_after or std.debug.runtime_safety) j.release();
+    errdefer if (ctx.exit_after and !std.debug.runtime_safety and args.remote_footers != null)
+        if (joined) |j| j.release();
     if (joined) |j| {
         args.plan_source = j.source(args_in.plan_source.?);
         args.join = j;

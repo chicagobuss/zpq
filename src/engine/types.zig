@@ -94,6 +94,13 @@ pub const RowGroupRange = struct {
 
 /// Immutable S3 generation used by a footer-derived physical selection (ETag without quotes).
 pub const SourceSnapshot = struct { etag: []const u8, size: u64 };
+
+pub const RemoteFooters = std.StringHashMapUnmanaged(*const RemoteFooter);
+pub const RemoteFooter = struct {
+    meta: schema.FileMetaData,
+    snapshot: SourceSnapshot,
+    rtt_ns: u64,
+};
 pub const AlignedJoin = struct {
     low: ?i64 = null,
     high: ?i64 = null,
@@ -220,6 +227,8 @@ pub const QueryArgs = struct {
     row_groups: ?[]const ?RowGroupRange = null,
     input_snapshots: ?[]const ?SourceSnapshot = null,
     pin_input_generation: bool = false,
+    /// The SQL join binder's raw footers, borrowed for this query.
+    remote_footers: ?*const RemoteFooters = null,
     aligned_join: ?AlignedJoin = null,
 
     /// A join or an `IN (SELECT ...)` is bound only on the aggregate path (`engine/join.zig`); row output would run the

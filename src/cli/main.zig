@@ -659,22 +659,30 @@ fn runParsed(
     diag: *Diag,
     arena: std.mem.Allocator,
 ) !void {
-    var retry: ?[]const u8 = null;
     var memo: zpq.frontend.JoinMemo = .{};
-    runParsedOnce(init, options, diag, arena, null, &retry, &memo) catch |err| {
-        if (err != error.DuplicateBuildKey or retry == null) return err;
-        const prior = diag.*;
-        const root = retry.?;
-        diag.* = .{};
-        return runParsedOnce(init, options, diag, arena, root, &retry, &memo) catch |second| {
-            if (second == error.DuplicateBuildKey) return error.JoinNonUnique;
-            if (second == error.UnsupportedJoin) {
-                diag.* = prior;
-                return err;
-            }
-            return second;
+    for (0..2) |attempt| {
+        var retry: ?[]const u8 = null;
+        const err = retry_root: {
+            const first = if (runParsedOnce(init, options, diag, arena, null, &retry, &memo)) |_| return else |err| err;
+            if (first != error.DuplicateBuildKey or retry == null) break :retry_root first;
+            const prior = diag.*;
+            diag.* = .{};
+            runParsedOnce(init, options, diag, arena, retry.?, &retry, &memo) catch |second| {
+                if (second == error.DuplicateBuildKey) return error.JoinNonUnique;
+                if (second == error.UnsupportedJoin) {
+                    diag.* = prior;
+                    return first;
+                }
+                break :retry_root second;
+            };
+            return;
         };
-    };
+        // A failed If-Match precedes the aggregate answer. Bind again against fresh footers before reading any data.
+        if (err != error.AlignedJoinSnapshotChanged or memo.remote.count() == 0 or attempt != 0) return err;
+        memo.remote = .empty;
+        diag.* = .{};
+    }
+    unreachable;
 }
 
 fn runParsedOnce(
@@ -890,7 +898,7 @@ fn runParsedOnce(
                 return runUpdate(io, gpa, arena, up, output, fsync, summary, max_memory orelse zpq.core.system.discoverAvailableMemory(env));
             }
             // A two-table join binds its column names against both footers; the engine reads the build.
-            var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena, .ctx = .{ .gpa = gpa, .io = io, .env = env, .diag = diag } } };
+            var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena, .pin_remote = true, .ctx = .{ .gpa = gpa, .io = io, .env = env, .diag = diag } } };
             schemas.restore(memo);
             defer schemas.save(memo);
             defer schemas.deinit();
@@ -1008,6 +1016,7 @@ fn runParsedOnce(
             .inputs = inputs,
             .plan_source = plan_source,
             .replicated_join_limit = if (remote_join) engine_max_mem else null,
+            .remote_footers = if (remote_join and parsed_join != null) &memo.remote else null,
             .output = if (fmt == .parquet) engine_output orelse "-" else null,
             .typed_answer = fmt == .parquet,
             .text_output = if (fmt != .parquet) .{ .format = fmt } else null,
@@ -1050,6 +1059,7 @@ fn runParsedOnce(
         .inputs = inputs,
         .plan_source = plan_source,
         .replicated_join_limit = if (remote_join) engine_max_mem else null,
+        .remote_footers = if (remote_join and parsed_join != null) &memo.remote else null,
         .output = if (fmt == .parquet) engine_output orelse "-" else null,
         .output_fd = if (fmt == .parquet) (if (to_stdout) (if (@import("builtin").os.tag == .windows) std.Io.File.stdout().handle else 1) else publication.fd) else null,
         .output_restartable = fmt == .parquet and !to_stdout and publication.fd != null,

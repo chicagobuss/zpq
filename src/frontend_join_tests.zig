@@ -27,7 +27,7 @@ fn schemasFor(a: std.mem.Allocator, env: std.process.Environ, diag: *Diag) front
         .io = std.testing.io,
         .env = env,
         .diag = diag,
-        .local = .{ .arena = a, .ctx = .{ .gpa = std.testing.allocator, .io = std.testing.io, .env = env, .diag = diag } },
+        .local = .{ .arena = a, .pin_remote = true, .ctx = .{ .gpa = std.testing.allocator, .io = std.testing.io, .env = env, .diag = diag } },
     };
 }
 
@@ -431,4 +431,54 @@ test "glob: keys the listing escapes come back as they were written, and read" {
     frontend.JoinSchemas.prefetch(&schemas, &.{"s3://bkt/amp/p*.parquet"});
     const meta = try frontend.JoinSchemas.footer(&schemas, "s3://bkt/amp/p*.parquet");
     try std.testing.expectEqual(5 * rows, meta.num_rows);
+}
+
+test "binder: execution reuses its footer and a replaced object needs a fresh footer" {
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "POSIX environment fixture");
+    const input = @import("engine/input.zig");
+    const path = "s3://bkt/t/input.parquet";
+    const key = "t/input.parquet";
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(std.testing.allocator);
+    defer fake.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var diag: Diag = .{};
+    var schemas = schemasFor(a, try fakeEnv(a, &fake), &diag);
+    defer schemas.deinit();
+
+    const old = try serve(&fake, a, key, "group_order.parquet");
+    const raw = try frontend.JoinSchemas.footer(&schemas, path);
+    const offset = raw.row_groups.items[0].columns.items[0].meta_data.?.data_page_offset;
+    const ctx = schemas.local.ctx.?;
+    const args: @import("engine/types.zig").QueryArgs = .{
+        .inputs = &.{path},
+        .remote_footers = &schemas.local.remote,
+    };
+
+    // Explain/metadata-only opens need no requests at all after binding.
+    var only = try input.openInputs(ctx, a, args, .{ .limit = 1 << 24, .footer_only = true });
+    defer only.deinit();
+    try std.testing.expectEqual(@as(u32, 1), fake.gets);
+    try std.testing.expectEqual(old.rows, only.metas[0].num_rows);
+
+    var opened = try input.openInputs(ctx, a, args, .{ .limit = 1 << 24 });
+    defer opened.deinit();
+    try std.testing.expect(opened.inputs[0].bytes.len > 0);
+    try std.testing.expectEqual(offset, raw.row_groups.items[0].columns.items[0].meta_data.?.data_page_offset);
+
+    const replacement = try serve(&fake, a, key, "decimal_precision40.parquet");
+    try std.testing.expect(old.rows != replacement.rows);
+    try std.testing.expectError(error.AlignedJoinSnapshotChanged, input.openInputs(ctx, a, args, .{ .limit = 1 << 24 }));
+
+    // The CLI's retry clears the memo and binds again before opening the new generation.
+    schemas.local.remote = .empty;
+    const before = fake.gets;
+    const fresh = try frontend.JoinSchemas.footer(&schemas, path);
+    try std.testing.expectEqual(before + 1, fake.gets);
+    try std.testing.expectEqual(replacement.rows, fresh.num_rows);
+    var reopened = try input.openInputs(ctx, a, args, .{ .limit = 1 << 24 });
+    defer reopened.deinit();
+    try std.testing.expectEqual(replacement.rows, reopened.metas[0].num_rows);
 }

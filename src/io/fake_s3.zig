@@ -517,6 +517,10 @@ pub const FakeS3 = struct {
             if (self.gets_allowed) |n| if (self.gets > n) {
                 return self.reply(fd, lose, 403, "", "<Error><Code>AccessDenied</Code></Error>", null);
             };
+            if (header(head, "If-Match")) |tag| {
+                const quoted = try std.fmt.allocPrint(a, "\"{s}\"", .{o.etag});
+                if (!std.mem.eql(u8, tag, quoted)) return self.reply(fd, lose, 412, "", "", null);
+            }
             const no_key = "<Error><Code>NoSuchKey</Code></Error>";
             const data = o.data orelse return self.reply(fd, lose, 404, "", no_key, null);
             var lo: usize = 0;

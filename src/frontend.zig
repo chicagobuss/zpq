@@ -29,7 +29,7 @@ pub fn retryJoinRoot(join: syntax.Join, failed: ?[]const u8) ?[]const u8 {
 /// remote footers. Both live in the query's arena.
 pub const JoinMemo = struct {
     listed: std.StringHashMapUnmanaged(anyerror![][]const u8) = .empty,
-    remote: std.StringHashMapUnmanaged(*zpq.core.schema.FileMetaData) = .empty,
+    remote: @import("engine/types.zig").RemoteFooters = .empty,
 };
 
 /// Resolve a table pattern for join planning while keeping the footer mappings alive through binding.

@@ -88,6 +88,7 @@ pub const OpenedInputs = struct {
     inputs: []const scan.Input,
     metas: []schema.FileMetaData,
     snapshots: []const ?types.SourceSnapshot = &.{},
+    footer_rtts: []const u64 = &.{},
     meta_ready: []bool,
     /// `QueryArgs.row_groups`, applied to each footer as it is parsed (`restrictRowGroups`).
     row_groups: ?[]const ?types.RowGroupRange = null,
@@ -434,6 +435,16 @@ const RemoteInputs = struct {
             for (snapshot.etag) |c| if (std.ascii.isControl(c) or c == '"') return error.JoinBuildNoSnapshot;
             sp.if_match = try std.fmt.allocPrint(self.arena, "\"{s}\"", .{snapshot.etag});
         };
+        if (self.args.remote_footers) |footers| {
+            if (self.args.input_snapshots == null) for (specs) |*sp| {
+                const entry = footers.get(self.paths[sp.file_index]) orelse continue;
+                if (!sp.reuseFooter(entry.snapshot, entry.rtt_ns)) continue;
+                sp.meta = entry.meta;
+                // Range planning rewrites chunks in place. The binder's copy is shared across builds and retries.
+                sp.meta.row_groups = try entry.meta.row_groups.clone(self.arena);
+                for (sp.meta.row_groups.items) |*rg| rg.columns = try rg.columns.clone(self.arena);
+            };
+        }
         // Retained suffixes and in-flight footer bodies share one budget: the caller's max, and never the fetch
         // window's 64 MiB floor when that floor is higher. A suffix that does not fit is dropped and those ranges
         // are fetched later. The streaming window (including a test's ZPQ_S3_WINDOW_KIB) stays the admission limit;
@@ -691,6 +702,8 @@ const RemoteInputs = struct {
         windowed: bool,
         account: *ByteAccount,
     ) !OpenedInputs {
+        const footer_rtts = try self.arena.alloc(u64, self.paths.len);
+        @memset(footer_rtts, 0);
         for (specs, 0..) |*sp, k| {
             const idx = self.s3_indices.items[k];
             self.inputs[idx] = .{
@@ -699,9 +712,13 @@ const RemoteInputs = struct {
                 .logical_size = sp.total_size,
                 .gate = if (windowed) metadataGate() else null,
             };
-            // Copy borrowed footer strings into the arena, then release both responses.
-            const copy = try self.arena.dupe(u8, sp.footer_region[0 .. sp.footer_region.len - 8]);
-            self.metas[idx] = try metadata.openFooter(self.arena, copy);
+            footer_rtts[idx] = sp.rtt_ns;
+            self.metas[idx] = sp.meta;
+            if (!sp.reused_footer) {
+                // Copy borrowed footer strings into the arena, then release both responses.
+                const copy = try self.arena.dupe(u8, sp.footer_region[0 .. sp.footer_region.len - 8]);
+                self.metas[idx] = try metadata.openFooter(self.arena, copy);
+            }
             if (self.args.row_groups) |ranges|
                 try restrictRowGroups(self.arena, &self.metas[idx], ranges[idx], self.args.diag, self.paths[idx]);
             self.meta_ready[idx] = true;
@@ -714,6 +731,7 @@ const RemoteInputs = struct {
             .inputs = self.inputs,
             .metas = self.metas,
             .snapshots = self.snapshots,
+            .footer_rtts = footer_rtts,
             .meta_ready = self.meta_ready,
             .has_preparsed_meta = true,
             .mmaps = self.mmaps,

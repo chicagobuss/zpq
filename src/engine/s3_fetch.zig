@@ -399,6 +399,7 @@ pub const FetchSpec = struct {
     etag_len: usize = 0,
     if_match: ?[]const u8 = null,
     pin_generation: bool = false,
+    reused_footer: bool = false,
     /// Time to the first byte of a successful footer request: a cold suffix, a stale 200/206, or a 304. Zero until
     /// one has. That is the latency the coalesce gap uses. A 304 used to record the whole exchange; the body after
     /// the first byte is not latency.
@@ -415,6 +416,19 @@ pub const FetchSpec = struct {
 
     fn etag(self: *const FetchSpec) []const u8 {
         return self.etag_buf[0..self.etag_len];
+    }
+
+    pub fn reuseFooter(self: *FetchSpec, snapshot: @import("types.zig").SourceSnapshot, rtt_ns: u64) bool {
+        const tag = snapshot.etag;
+        if (tag.len == 0 or tag.len > self.etag_buf.len or std.mem.startsWith(u8, tag, "W/")) return false;
+        for (tag) |c| if (std.ascii.isControl(c) or c == '"') return false;
+        self.noteEtag(tag);
+        self.pin_generation = true;
+        self.reused_footer = true;
+        self.total_size = snapshot.size;
+        self.tail_start = snapshot.size;
+        self.rtt_ns = rtt_ns;
+        return true;
     }
 
     fn noteEtag(self: *FetchSpec, raw: ?[]const u8) void {
@@ -566,6 +580,7 @@ pub const S3Membership = struct {
             if (s.start < fetch_end) try jobs.append(arena, .{
                 .bucket = sp.url.bucket,
                 .key = sp.url.key,
+                .if_match = if (sp.reused_footer) sp.if_match else null,
                 .range = .{ .start = s.start, .end = fetch_end },
                 .target = buf[0..@intCast(fetch_end - s.start)],
             });
@@ -621,6 +636,7 @@ pub const S3Membership = struct {
             if (s.start < fetch_end) try jobs.append(arena, .{
                 .bucket = sp.url.bucket,
                 .key = sp.url.key,
+                .if_match = if (sp.reused_footer) sp.if_match else null,
                 .range = .{ .start = s.start, .end = fetch_end },
                 .target = dest[0..@intCast(fetch_end - s.start)],
             });
@@ -804,6 +820,7 @@ pub fn fetchMetaBatch(
     };
     const Task = struct {
         fn run(t: *TaskCtx) std.Io.Cancelable!void {
+            if (t.sp.reused_footer) return;
             var scratch_state = std.heap.ArenaAllocator.init(t.ctx.gpa);
             defer scratch_state.deinit();
             t.prof = profile.threadOf(t.profiler, .fetch);
@@ -844,6 +861,7 @@ pub fn fetchMetaBatch(
     };
     const prof = profile.threadOf(profiler, .main);
     for (specs) |*sp| {
+        if (sp.reused_footer) continue;
         if (sp.footer_region.len < 8) return error.BadResponse;
         const footer_len = sp.footer_region.len - 8;
         const span = profile.Span.begin(prof);

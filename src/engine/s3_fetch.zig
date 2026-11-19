@@ -928,7 +928,7 @@ fn getMetaObject(
             sp.failure = s3.transportFailure(.GetObject, sp.url.bucket, sp.url.key, err);
             return err;
         };
-        if (pin) |p| if (try p.rejected(request.if_match, response.status)) continue;
+        if (pin) |p| if (try p.rejected(request.if_match, response)) continue;
         if (pin) |p| try p.verify(response);
         return response;
     }

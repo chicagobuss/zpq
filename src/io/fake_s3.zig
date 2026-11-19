@@ -84,6 +84,8 @@ pub const FakeS3 = struct {
     fail_status: u16 = 503,
     fail_code: []const u8 = "SlowDown",
     fail_body: ?[]const u8 = null,
+    /// Raw response head for framing tests, followed by fail_body. Leave the socket open.
+    fail_response_head: ?[]const u8 = null,
     fails_left: u32 = 1,
     /// When set, a CompleteMultipartUpload answers 200 at once and then a space every `complete_keepalive_every_ms`
     /// for this long before its result, as S3 does while it assembles a large object.
@@ -266,6 +268,8 @@ pub const FakeS3 = struct {
             // ACK, about 40 ms a request, which a test fetching row group by row group pays hundreds of times.
             const one: c_int = 1;
             _ = posix.system.setsockopt(fd, posix.IPPROTO.TCP, posix.TCP.NODELAY, @ptrCast(&one), @sizeOf(c_int));
+            if (@hasDecl(posix.SO, "NOSIGPIPE"))
+                _ = posix.system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, @ptrCast(&one), @sizeOf(c_int));
             self.conn_fds[self.conns] = fd;
             self.conn_threads[self.conns] = std.Thread.spawn(.{}, serveConn, .{ self, fd }) catch null;
             self.conns += 1;
@@ -354,6 +358,11 @@ pub const FakeS3 = struct {
             self.failed += 1;
             self.fails_left -|= 1;
             if (self.fails_left == 0) self.fail = null;
+            if (self.fail_response_head) |response_head| {
+                try writeAll(fd, response_head);
+                try writeAll(fd, self.fail_body.?);
+                return true;
+            }
             var err_buf: [256]u8 = undefined;
             const err_body = self.fail_body orelse try std.fmt.bufPrint(&err_buf, "<Error><Code>{s}</Code></Error>", .{self.fail_code});
             return self.reply(fd, false, self.fail_status, "", err_body, null);
@@ -719,7 +728,8 @@ fn readMore(allocator: std.mem.Allocator, fd: posix.fd_t, buf: *std.ArrayList(u8
 fn writeAll(fd: posix.fd_t, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const r = posix.system.write(fd, bytes[off..].ptr, bytes.len - off);
+        const flags = if (@hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0;
+        const r = posix.system.sendto(fd, bytes[off..].ptr, bytes.len - off, flags, null, 0);
         if (posix.errno(r) != .SUCCESS or r == 0) return error.WriteFailed;
         off += @intCast(r);
     }

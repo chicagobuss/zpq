@@ -740,7 +740,7 @@ pub const Client = struct {
         if (self.conn == null) {
             self.conn = try connect(self.client_arena, self.creds, self.addrs, self.host);
         }
-        return try buildAndSend(
+        const response = try buildAndSend(
             req_arena,
             &self.conn.?,
             creds,
@@ -749,6 +749,8 @@ pub const Client = struct {
             key,
             .{ .method = method, .range = range },
         );
+        if (response.body_failure != null) self.deinit();
+        return response;
     }
 
     /// One ListObjectsV2 page. Reuses the cached TLS connection.
@@ -905,9 +907,9 @@ pub const ReadPin = struct {
     }
 
     /// Report a rejected precondition once. A fresh footer can still pin unconditional range responses.
-    pub fn rejected(self: ReadPin, sent: ?[]const u8, status: u16) !bool {
+    pub fn rejected(self: ReadPin, sent: ?[]const u8, response: http.Response) !bool {
         const p = self.policy orelse return false;
-        if (sent == null or !ifMatchRejected(status)) return false;
+        if (sent == null or !response.retry_after_body or !ifMatchRejected(response.status)) return false;
         p.omit_if_match.store(true, .release);
         if (self.reused_footer) return error.S3IfMatchRejected;
         return true;
@@ -1095,7 +1097,7 @@ pub fn requestViaPool(
             const t_send = clock.monoNs();
             trace.reused = handle.reused;
             if (send(context, arena, handle.conn)) |resp| {
-                p.release(io, handle);
+                if (resp.body_failure != null) p.discard(io, handle) else p.release(io, handle);
                 var out = resp;
                 if (out.first_byte_ns != 0) {
                     const d = out.first_byte_ns - t_send;
@@ -1116,7 +1118,8 @@ pub fn requestViaPool(
                     trace.ttfb_ns = first - t_send;
                     trace.body_ns = t_done - first;
                 }
-                if (!retry.retryableStatus(out.status) or (opts.detect_if_match_rejection and ifMatchRejected(out.status)))
+                if (!out.retry_after_body or !retry.retryableStatus(out.status) or
+                    (opts.detect_if_match_rejection and ifMatchRejected(out.status)))
                     return out;
                 retry_status = out.status;
                 const code = out.header("x-amz-error-code") orelse extractTag(out.body, "<Code>", "</Code>") orelse "";
@@ -1509,7 +1512,7 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
             },
         };
         if (ctx.pin) |pin| {
-            const retry_unconditional = pin.rejected(ctx.if_match, response.status) catch |err| {
+            const retry_unconditional = pin.rejected(ctx.if_match, response) catch |err| {
                 ctx.err = err;
                 return;
             };
@@ -1686,7 +1689,8 @@ pub fn refusal(op: diag_mod.S3Failure.Op, bucket: []const u8, key: []const u8, r
         .bucket = .of(bucket),
         .key = .of(key),
     };
-    const code_raw = if (extractTag(resp.body, "<Code>", "</Code>")) |code| std.mem.trim(u8, code, " \t\r\n") else "";
+    const code_raw = std.mem.trim(u8, extractTag(resp.body, "<Code>", "</Code>") orelse
+        (if (resp.body_failure != null) resp.header("x-amz-error-code") else null) orelse "", " \t\r\n");
     const message_raw = if (extractTag(resp.body, "<Message>", "</Message>")) |message| std.mem.trim(u8, message, " \t\r\n") else "";
     if (resp.header("x-amz-bucket-region")) |region| failure.region.set(std.mem.trim(u8, region, " \t\r\n"));
 
@@ -1733,6 +1737,13 @@ pub fn refusal(op: diag_mod.S3Failure.Op, bucket: []const u8, key: []const u8, r
 
     redactInto(&failure.code, code_raw, creds, resp.request_secrets);
     redactInto(&failure.message, message_raw, creds, resp.request_secrets);
+    if (resp.body_failure) |body_err| {
+        if (failure.code.len == 0) failure.code.set(@errorName(err));
+        failure.message.set(if (body_err == error.BodyTooLarge)
+            "error response body exceeded the size limit"
+        else
+            "error response body was incomplete");
+    }
     if (failure.message.len == 0 and err == error.NoSuchKey) failure.message.set("the object does not exist");
     return .{ .failure = failure, .err = err };
 }
@@ -1807,6 +1818,7 @@ fn buildAndSend(
         .host = host,
         .path = path,
         .headers = req_headers.items,
+        .keep_error_status = opts.range != null,
     }), creds);
 }
 
@@ -2769,6 +2781,7 @@ test "fake S3 reports oversized ranged GET errors with their object, code and me
     for ([_]struct { status: u16, code: []const u8, err: anyerror }{
         .{ .status = 403, .code = "AccessDenied", .err = error.AccessDenied },
         .{ .status = 404, .code = "NoSuchKey", .err = error.NoSuchKey },
+        .{ .status = 503, .code = "SlowDown", .err = error.SlowDown },
         .{ .status = 206, .code = "", .err = error.BodyTooLarge },
     }) |case| {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2822,6 +2835,93 @@ test "fake S3 reports oversized ranged GET errors with their object, code and me
             try testing.expectEqualStrings(message, failure.message.get());
         }
         try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &target);
+        try testing.expectEqual(@as(u32, 2), fake.requests_seen.load(.monotonic));
+    }
+}
+
+test "fake S3 caps unterminated ranged GET errors and discards without retry" {
+    const memory = @import("../core/memory.zig");
+    // A finite prefix suffices to cross the wire cap. FakeS3 leaves the response open after it.
+    const prefix = try testing.allocator.alloc(u8, (2 << 20) + 4096);
+    defer testing.allocator.free(prefix);
+    @memset(prefix, ' ');
+    for ([_]struct { head: []const u8, chunk: []const u8 = "", failure: http.Error }{
+        .{ .head = "", .failure = error.BodyTooLarge },
+        .{ .head = "Transfer-Encoding: chunked\r\n", .chunk = "400000\r\n", .failure = error.BodyTooLarge },
+        .{ .head = "Content-Length: 4096\r\n", .failure = error.ReadTimeout },
+    }) |framing| {
+        for ([_]struct { status: u16, err: Error }{
+            .{ .status = 403, .err = error.AccessDenied },
+            .{ .status = 503, .err = error.S3ServerError },
+        }) |case| {
+            var head: [128]u8 = undefined;
+            const response_head = try std.fmt.bufPrint(&head, "HTTP/1.1 {d} Error\r\n{s}\r\n{s}", .{
+                case.status, framing.head, framing.chunk,
+            });
+            var fake: fake_s3.FakeS3 = undefined;
+            try fake.start(testing.allocator);
+            defer fake.deinit();
+            fake.fail = "GET /bkt/obj";
+            fake.fails_left = std.math.maxInt(u32);
+            fake.fail_response_head = response_head;
+            fake.fail_body = if (framing.failure == error.BodyTooLarge) prefix else prefix[0..16];
+
+            var endpoint: [64]u8 = undefined;
+            const creds: Credentials = .{
+                .access_key = "fake-access",
+                .secret_key = "fake-secret",
+                .region = "us-east-1",
+                .endpoint = try std.fmt.bufPrint(&endpoint, "http://127.0.0.1:{d}", .{fake.port}),
+                .timeouts = .{ .first_byte_ms = 2000, .idle_ms = 1000 },
+            };
+            var pool: Pool(4) = undefined;
+            try pool.init(testing.allocator);
+            defer pool.deinit();
+            var budget: memory.SharedBudget = .{ .limit = 8 << 20 };
+            var charge: memory.Charged = .{ .child = testing.allocator, .budget = &budget };
+            const gpa = charge.allocator();
+            const url: Url = .{ .bucket = "bkt", .key = "obj" };
+            const message = if (framing.failure == error.BodyTooLarge)
+                "error response body exceeded the size limit"
+            else
+                "error response body was incomplete";
+            {
+                var arena = std.heap.ArenaAllocator.init(gpa);
+                defer arena.deinit();
+                const response = try getViaPool(testing.io, &pool, arena.allocator(), creds, url, Range.span(0, 3));
+                try testing.expectEqual(framing.failure, response.body_failure.?);
+                try testing.expectEqual(@as(usize, 0), response.body.len);
+                const r = refusal(.GetObject, url.bucket, url.key, response, creds);
+                try testing.expectEqual(case.err, r.err);
+                try testing.expectEqualStrings(message, r.failure.message.get());
+            }
+
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            var target: [4]u8 = @splat(0);
+            const job: FetchJob = .{
+                .bucket = url.bucket,
+                .key = url.key,
+                .range = .{ .start = 0, .end = 4 },
+                .target = &target,
+            };
+            var diag: diag_mod.Diag = .{};
+            try testing.expectError(case.err, fetchJobs(testing.io, &pool, gpa, arena.allocator(), creds, &.{job}, 1, null, null, &diag));
+            try testing.expect(diag.detail == .s3_request);
+            const failure = diag.detail.s3_request;
+            try testing.expectEqual(case.status, failure.status);
+            try testing.expectEqualStrings(url.bucket, failure.bucket.get());
+            try testing.expectEqualStrings(url.key, failure.key.get());
+            try testing.expectEqualStrings(@errorName(case.err), failure.code.get());
+            try testing.expectEqualStrings(message, failure.message.get());
+            try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &target);
+            if (framing.failure == error.BodyTooLarge) try testing.expect(budget.peak.load(.monotonic) >= 2 << 20);
+            try testing.expect(!charge.refused.load(.monotonic));
+            const stats = pool.snapshotStats();
+            try testing.expectEqual(@as(u64, 2), stats.discards);
+            try testing.expectEqual(@as(u64, 0), stats.backoff_retries);
+            try testing.expectEqual(@as(u32, 2), fake.requests_seen.load(.monotonic));
+        }
     }
 }
 

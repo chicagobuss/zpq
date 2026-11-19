@@ -62,6 +62,8 @@ pub const Request = struct {
     total_ms: ?u32 = null,
     /// Stop before reading the body when this response header is present; the caller must discard the connection.
     reject_response_header: ?[]const u8 = null,
+    /// Retain the status when an error document is cut short. The caller must discard the connection.
+    keep_error_status: bool = false,
 };
 
 pub const Response = struct {
@@ -73,6 +75,10 @@ pub const Response = struct {
     status: u16,
     headers: []const Header,
     body: []const u8,
+    /// The error document could not be read in full. The connection must not be reused.
+    body_failure: ?Error = null,
+    /// Retry only when the error body fit the original range budget.
+    retry_after_body: bool = true,
     /// Borrowed from the request arena; used only to redact an error response.
     request_secrets: ?RequestSecrets = null,
     /// `clock.monoNs` when the first response byte arrived (0 when not read off a connection): splits a request's
@@ -102,7 +108,9 @@ pub fn sendRequest(
     defer conn.disarmDeadline();
     try sendRequestBytes(arena, conn, req);
 
-    return try drainResponse(arena, conn, req.method == .HEAD, bodyCap(req), req.reject_response_header);
+    return try drainBuffered(arena, conn, req.method == .HEAD, bodyCap(req), req.reject_response_header, .{
+        .keep_error_status = req.keep_error_status,
+    });
 }
 
 /// The bytes `req` and its answer move, for the attempt's deadline (`tls.Connection.armDeadline`): its body and the
@@ -115,6 +123,8 @@ fn expectedBytes(req: Request) usize {
 /// The most a response body may carry when its request names no byte range: control-plane answers (an upload's XML, a
 /// page of a listing), never object data, which is fetched by range.
 const max_unranged_body: usize = 64 << 20;
+/// Error XML is small even when the success response is large.
+const max_error_body: usize = 1 << 20;
 /// What a ranged response may carry beyond its range. A compliant server sends none, and a short object less.
 const range_slack: usize = 64 << 10;
 
@@ -226,6 +236,7 @@ const BufferedResponse = struct {
     stream: std.ArrayList(u8) = .empty,
     first_byte_ns: i64 = 0,
     received: usize = 0,
+    keep_error_status: bool = false,
 };
 
 /// Takes ownership of any bytes already read while deciding whether to stream directly into a target.
@@ -247,6 +258,8 @@ fn drainBuffered(
     var first_byte_ns = buffered.first_byte_ns;
     var received = buffered.received;
     var max_body = success_cap;
+    var error_status = false;
+    var body_failure: ?Error = null;
 
     while (true) {
         if (headers_end == null) {
@@ -255,34 +268,31 @@ fn drainBuffered(
                 headers_end = i;
                 const code = try parseStatus(stream.items[0..i]);
                 status = code;
-                // Error documents are control-plane responses regardless of the size of the requested range.
-                if (code < 200 or code >= 300) max_body = max_unranged_body;
+                error_status = code < 200 or code >= 300;
+                if (error_status) max_body = max_error_body;
                 if (reject_header) |name| {
                     for (try parseHeaders(arena, stream.items[0..i])) |h| {
                         if (std.ascii.eqlIgnoreCase(h.name, name)) return error.RejectedResponseHeader;
                     }
                 }
-                content_length = parseContentLength(stream.items[0..i]);
-                // Before any sum uses it: a length near 2^64 would wrap `headers_end + 4 + length`.
-                if (!head_only) if (content_length) |clen| if (clen > max_body) return error.BodyTooLarge;
-                // A declared body arrives into one buffer of its size, not one doubled as it grows.
-                if (!head_only) if (content_length) |clen| try stream.ensureTotalCapacityPrecise(arena, i + 4 + clen);
-                chunked = parseTransferEncodingChunked(stream.items[0..i]);
-                // RFC 7230 §3.3.3 rule 1: 1xx, 204, and 304 responses
-                // MUST NOT include a message body — regardless of any
-                // Content-Length the server may have sent (some
-                // implementations send it; some don't). Without this
-                // check the no-CL/no-chunked path falls through to
-                // "read until conn closes," which on a keep-alive
-                // connection hangs until the TCP idle timeout fires.
-                if (status) |s| if (head_only or statusIsBodyless(s)) {
+                // HEAD, 1xx, 204 and 304 have no body. A Content-Length there cannot exhaust a body budget.
+                if (head_only or statusIsBodyless(code)) {
                     return .{
-                        .status = s,
+                        .status = code,
                         .headers = try parseHeaders(arena, stream.items[0..i]),
                         .body = &.{},
                         .first_byte_ns = first_byte_ns,
                     };
-                };
+                }
+                content_length = parseContentLength(stream.items[0..i]);
+                // Before any sum uses it: a length near 2^64 would wrap `headers_end + 4 + length`.
+                if ((content_length orelse 0) > max_body) {
+                    body_failure = error.BodyTooLarge;
+                    break;
+                }
+                // A declared body arrives into one buffer of its size, not one doubled as it grows.
+                if (content_length) |clen| try stream.ensureTotalCapacityPrecise(arena, i + 4 + clen);
+                chunked = parseTransferEncodingChunked(stream.items[0..i]);
             }
         }
         if (headers_end) |he| {
@@ -293,11 +303,25 @@ fn drainBuffered(
             }
             // No Content-Length, no chunked: read until conn closes. Chunked framing adds a few bytes per chunk;
             // whatever the framing, a body may not grow past its cap twice over.
-            if (stream.items.len - (he + 4) > max_body +| max_body) return error.BodyTooLarge;
+            if (stream.items.len - (he + 4) > max_body +| max_body) {
+                body_failure = error.BodyTooLarge;
+                break;
+            }
         } else if (stream.items.len > MAX_HEADERS_BYTES + 4) return error.HeadersTooLarge;
 
         var tmp: [16 * 1024]u8 = undefined;
-        const n = try recvResponseBytes(conn, &tmp, received);
+        const read_len = if (error_status and content_length == null)
+            @min(tmp.len, 2 * max_error_body + 1 - (stream.items.len - (headers_end.? + 4)))
+        else
+            tmp.len;
+        const n = recvResponseBytes(conn, tmp[0..read_len], received) catch |err| switch (err) {
+            error.ReadTimeout, error.RequestTimeout, error.RecvFailed, error.BodyTruncated => {
+                if (!error_status or !buffered.keep_error_status) return err;
+                body_failure = err;
+                break;
+            },
+            else => return err,
+        };
         if (n == 0) break;
         received += n;
         if (first_byte_ns == 0) first_byte_ns = clock.monoNs();
@@ -305,26 +329,45 @@ fn drainBuffered(
     }
 
     const he = headers_end orelse return error.BodyTruncated;
-    if (chunked and !chunkedBodyComplete(stream.items, he + 4)) return error.BodyTruncated;
     const final_status = status orelse try parseStatus(stream.items[0..he]);
-    const headers = try parseHeaders(arena, stream.items[0..he]);
-
     const body_start = he + 4;
-    const raw_body_end = if (content_length) |clen|
-        @min(body_start + clen, stream.items.len)
-    else
-        stream.items.len;
-
-    if (content_length) |clen| {
-        if (raw_body_end < body_start + clen) return error.BodyTruncated;
+    if (body_failure == null) {
+        if (content_length) |clen| {
+            if (stream.items.len - body_start < clen) body_failure = error.BodyTruncated;
+        }
+        if (chunked and !chunkedBodyComplete(stream.items, body_start)) body_failure = error.BodyTruncated;
     }
-
-    const raw_body = stream.items[body_start..raw_body_end];
-    // The body is the buffer it arrived in, not a copy beside it: `arena` owns the response, and frees it whole.
-    const body = if (chunked) try decodeChunked(arena, raw_body) else raw_body;
-    if (body.len > max_body) return error.BodyTooLarge;
-
-    return .{ .status = final_status, .headers = headers, .body = body, .first_byte_ns = first_byte_ns };
+    if (body_failure) |err| if (!error_status or !buffered.keep_error_status) return err;
+    const headers = try parseHeaders(arena, stream.items[0..he]);
+    const wire_body_len = content_length orelse stream.items.len - body_start;
+    var body: []const u8 = &.{};
+    if (body_failure == null) {
+        const body_end = if (content_length) |clen| body_start + clen else stream.items.len;
+        const raw_body = stream.items[body_start..body_end];
+        body = if (chunked) decodeChunked(arena, raw_body) catch |err| blk: {
+            if (err != error.BodyTruncated or !error_status or !buffered.keep_error_status) return err;
+            body_failure = err;
+            break :blk &.{};
+        } else raw_body;
+        if (body.len > max_body) {
+            if (chunked) arena.free(body);
+            if (!error_status or !buffered.keep_error_status) return error.BodyTooLarge;
+            body_failure = error.BodyTooLarge;
+            body = &.{};
+        }
+    }
+    if (body_failure != null) {
+        stream.deinit(arena);
+    }
+    return .{
+        .status = final_status,
+        .headers = headers,
+        .body = body,
+        .body_failure = body_failure,
+        .retry_after_body = body_failure == null and !(error_status and buffered.keep_error_status and
+            wire_body_len > success_cap),
+        .first_byte_ns = first_byte_ns,
+    };
 }
 
 /// Where the final response's head ends in `stream` (the index of its blank line), once it has arrived. Interim 1xx
@@ -383,9 +426,14 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
     const he = headers_end.?;
     const status = try parseStatus(stream.items[0..he]);
     if (status < 200 or status >= 300) {
-        const buffered: BufferedResponse = .{ .stream = stream, .first_byte_ns = first_byte_ns, .received = received };
+        const buffered: BufferedResponse = .{
+            .stream = stream,
+            .first_byte_ns = first_byte_ns,
+            .received = received,
+            .keep_error_status = true,
+        };
         stream = .empty;
-        return drainBuffered(arena, conn, false, max_unranged_body, reject_header, buffered);
+        return drainBuffered(arena, conn, false, target.len, reject_header, buffered);
     }
     const headers = try parseHeaders(arena, stream.items[0..he]);
     if (reject_header) |name| for (headers) |h| {
@@ -717,6 +765,8 @@ test "a response whose framing claims more than its cap, or near 2^64, is refuse
     try testing.expectError(error.HeadersTooLarge, drainSent(endless, 100));
     // Within the cap, unchanged.
     try drainSent("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", 3);
+    // A 304 may describe a large object without carrying any body.
+    try drainSent("HTTP/1.1 304 Not Modified\r\nContent-Length: 2097152\r\n\r\n", 100);
 }
 
 test "a request's body cap is its range plus slack, else the control-plane cap" {

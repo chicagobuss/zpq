@@ -2764,6 +2764,67 @@ test "a response that keeps arriving is not cut off by the idle timeout, however
     try testing.expectEqual(@as(u64, 0), stats.backoff_retries);
 }
 
+test "fake S3 reports oversized ranged GET errors with their object, code and message" {
+    const padding: [96 * 1024]u8 = @splat(' ');
+    for ([_]struct { status: u16, code: []const u8, err: anyerror }{
+        .{ .status = 403, .code = "AccessDenied", .err = error.AccessDenied },
+        .{ .status = 404, .code = "NoSuchKey", .err = error.NoSuchKey },
+        .{ .status = 206, .code = "", .err = error.BodyTooLarge },
+    }) |case| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const message = "The requested object could not be read";
+        const body = try std.fmt.allocPrint(arena, "<Error>{s}<Code>{s}</Code><Message>{s}</Message></Error>", .{
+            &padding, case.code, message,
+        });
+        var fake: fake_s3.FakeS3 = undefined;
+        try fake.start(testing.allocator);
+        defer fake.deinit();
+        fake.fail = "GET /bkt/dir/obj";
+        fake.fails_left = 2;
+        fake.fail_status = case.status;
+        fake.fail_body = body;
+
+        var endpoint: [64]u8 = undefined;
+        const creds: Credentials = .{
+            .access_key = "fake-access",
+            .secret_key = "fake-secret",
+            .region = "us-east-1",
+            .endpoint = try std.fmt.bufPrint(&endpoint, "http://127.0.0.1:{d}", .{fake.port}),
+            .timeouts = test_timeouts,
+        };
+        var pool: Pool(4) = undefined;
+        try pool.init(testing.allocator);
+        defer pool.deinit();
+        const url: Url = .{ .bucket = "bkt", .key = "dir/obj" };
+        const buffered = getViaPool(testing.io, &pool, arena, creds, url, Range.span(0, 3));
+        if (case.status == 206) {
+            try testing.expectError(case.err, buffered);
+        } else {
+            const r = refusal(.GetObject, url.bucket, url.key, try buffered, creds);
+            try testing.expectEqual(case.err, r.err);
+            try testing.expectEqualStrings(case.code, r.failure.code.get());
+            try testing.expectEqualStrings(message, r.failure.message.get());
+        }
+
+        var target: [4]u8 = @splat(0);
+        const job: FetchJob = .{ .bucket = url.bucket, .key = url.key, .range = .{ .start = 0, .end = 4 }, .target = &target };
+        var diag: diag_mod.Diag = .{};
+        try testing.expectError(case.err, fetchJobs(testing.io, &pool, testing.allocator, arena, creds, &.{job}, 1, null, null, &diag));
+        try testing.expect(diag.detail == .s3_request);
+        const failure = diag.detail.s3_request;
+        try testing.expectEqualStrings(url.bucket, failure.bucket.get());
+        try testing.expectEqualStrings(url.key, failure.key.get());
+        if (case.status != 206) {
+            try testing.expectEqual(case.status, failure.status);
+            try testing.expectEqualStrings(case.code, failure.code.get());
+            try testing.expectEqualStrings(message, failure.message.get());
+        }
+        try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &target);
+    }
+}
+
 test "a later named refusal is not hidden by an earlier short body" {
     var fake: fake_s3.FakeS3 = undefined;
     try fake.start(testing.allocator);

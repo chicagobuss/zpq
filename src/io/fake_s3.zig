@@ -83,6 +83,7 @@ pub const FakeS3 = struct {
     fail: ?[]const u8 = null,
     fail_status: u16 = 503,
     fail_code: []const u8 = "SlowDown",
+    fail_body: ?[]const u8 = null,
     fails_left: u32 = 1,
     /// When set, a CompleteMultipartUpload answers 200 at once and then a space every `complete_keepalive_every_ms`
     /// for this long before its result, as S3 does while it assembles a large object.
@@ -354,7 +355,7 @@ pub const FakeS3 = struct {
             self.fails_left -|= 1;
             if (self.fails_left == 0) self.fail = null;
             var err_buf: [256]u8 = undefined;
-            const err_body = try std.fmt.bufPrint(&err_buf, "<Error><Code>{s}</Code></Error>", .{self.fail_code});
+            const err_body = self.fail_body orelse try std.fmt.bufPrint(&err_buf, "<Error><Code>{s}</Code></Error>", .{self.fail_code});
             return self.reply(fd, false, self.fail_status, "", err_body, null);
         };
         const stalls_here = self.stall_at != .request_body and self.stall != null and

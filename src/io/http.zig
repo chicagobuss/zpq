@@ -139,7 +139,8 @@ fn bodyCap(req: Request) usize {
 
 /// Send a request and stream the response body directly into `target`.
 /// Used by ranged S3 GETs where the expected body size is known from
-/// parquet metadata. `Response.body` aliases `target[0..content_length]`.
+/// parquet metadata. A successful `Response.body` aliases `target[0..content_length]`.
+/// An error response is buffered separately.
 ///
 /// On `error.BodyTooLarge`, unread response bytes remain on `conn`; the
 /// caller must discard the connection rather than returning it to a pool.
@@ -218,29 +219,44 @@ const MAX_HEADERS_BYTES: usize = 64 * 1024;
 /// longest body accepted (`bodyCap`); a longer one, declared or sent, is `BodyTooLarge` and leaves the connection
 /// unusable.
 fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: bool, max_body: usize, reject_header: ?[]const u8) Error!Response {
-    // Read until \r\n\r\n appears, then keep reading the body.
-    var stream: std.ArrayList(u8) = .empty;
+    return drainBuffered(arena, conn, head_only, max_body, reject_header, .{});
+}
+
+const BufferedResponse = struct {
+    stream: std.ArrayList(u8) = .empty,
+    first_byte_ns: i64 = 0,
+    received: usize = 0,
+};
+
+/// Takes ownership of any bytes already read while deciding whether to stream directly into a target.
+fn drainBuffered(
+    arena: std.mem.Allocator,
+    conn: *tls.Connection,
+    head_only: bool,
+    success_cap: usize,
+    reject_header: ?[]const u8,
+    buffered: BufferedResponse,
+) Error!Response {
+    var stream = buffered.stream;
     errdefer stream.deinit(arena);
 
     var headers_end: ?usize = null;
     var content_length: ?usize = null;
     var chunked: bool = false;
     var status: ?u16 = null;
-    var first_byte_ns: i64 = 0;
-    var received: usize = 0;
+    var first_byte_ns = buffered.first_byte_ns;
+    var received = buffered.received;
+    var max_body = success_cap;
 
     while (true) {
-        var tmp: [16 * 1024]u8 = undefined;
-        const n = try recvResponseBytes(conn, &tmp, received);
-        if (n == 0) break;
-        received += n;
-        if (first_byte_ns == 0) first_byte_ns = clock.monoNs();
-        try stream.appendSlice(arena, tmp[0..n]);
         if (headers_end == null) {
             if (try finalHeadEnd(&stream)) |i| {
                 if (i > MAX_HEADERS_BYTES) return error.HeadersTooLarge;
                 headers_end = i;
-                status = try parseStatus(stream.items[0..i]);
+                const code = try parseStatus(stream.items[0..i]);
+                status = code;
+                // Error documents are control-plane responses regardless of the size of the requested range.
+                if (code < 200 or code >= 300) max_body = max_unranged_body;
                 if (reject_header) |name| {
                     for (try parseHeaders(arena, stream.items[0..i])) |h| {
                         if (std.ascii.eqlIgnoreCase(h.name, name)) return error.RejectedResponseHeader;
@@ -279,6 +295,13 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: boo
             // whatever the framing, a body may not grow past its cap twice over.
             if (stream.items.len - (he + 4) > max_body +| max_body) return error.BodyTooLarge;
         } else if (stream.items.len > MAX_HEADERS_BYTES + 4) return error.HeadersTooLarge;
+
+        var tmp: [16 * 1024]u8 = undefined;
+        const n = try recvResponseBytes(conn, &tmp, received);
+        if (n == 0) break;
+        received += n;
+        if (first_byte_ns == 0) first_byte_ns = clock.monoNs();
+        try stream.appendSlice(arena, tmp[0..n]);
     }
 
     const he = headers_end orelse return error.BodyTruncated;
@@ -299,6 +322,7 @@ fn drainResponse(arena: std.mem.Allocator, conn: *tls.Connection, head_only: boo
     const raw_body = stream.items[body_start..raw_body_end];
     // The body is the buffer it arrived in, not a copy beside it: `arena` owns the response, and frees it whole.
     const body = if (chunked) try decodeChunked(arena, raw_body) else raw_body;
+    if (body.len > max_body) return error.BodyTooLarge;
 
     return .{ .status = final_status, .headers = headers, .body = body, .first_byte_ns = first_byte_ns };
 }
@@ -358,6 +382,11 @@ fn drainResponseInto(arena: std.mem.Allocator, conn: *tls.Connection, target: []
 
     const he = headers_end.?;
     const status = try parseStatus(stream.items[0..he]);
+    if (status < 200 or status >= 300) {
+        const buffered: BufferedResponse = .{ .stream = stream, .first_byte_ns = first_byte_ns, .received = received };
+        stream = .empty;
+        return drainBuffered(arena, conn, false, max_unranged_body, reject_header, buffered);
+    }
     const headers = try parseHeaders(arena, stream.items[0..he]);
     if (reject_header) |name| for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, name)) return error.RejectedResponseHeader;

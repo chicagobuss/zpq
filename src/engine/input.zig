@@ -88,7 +88,7 @@ pub const OpenedInputs = struct {
     inputs: []const scan.Input,
     metas: []schema.FileMetaData,
     snapshots: []const ?types.SourceSnapshot = &.{},
-    footer_rtts: []const u64 = &.{},
+    footer_rtt_ns: u64 = 0,
     meta_ready: []bool,
     /// `QueryArgs.row_groups`, applied to each footer as it is parsed (`restrictRowGroups`).
     row_groups: ?[]const ?types.RowGroupRange = null,
@@ -717,8 +717,7 @@ const RemoteInputs = struct {
         windowed: bool,
         account: *ByteAccount,
     ) !OpenedInputs {
-        const footer_rtts = try self.arena.alloc(u64, self.paths.len);
-        @memset(footer_rtts, 0);
+        var footer_rtt_ns: u64 = 0;
         for (specs, 0..) |*sp, k| {
             const idx = self.s3_indices.items[k];
             self.inputs[idx] = .{
@@ -727,7 +726,8 @@ const RemoteInputs = struct {
                 .logical_size = sp.total_size,
                 .gate = if (windowed) metadataGate() else null,
             };
-            footer_rtts[idx] = sp.rtt_ns;
+            // Use the fastest sample from the binder batch so a slow first response does not widen the gaps.
+            if (sp.rtt_ns != 0 and (footer_rtt_ns == 0 or sp.rtt_ns < footer_rtt_ns)) footer_rtt_ns = sp.rtt_ns;
             self.metas[idx] = sp.meta;
             if (!sp.reused_footer) {
                 // Copy borrowed footer strings into the arena, then release both responses.
@@ -746,7 +746,7 @@ const RemoteInputs = struct {
             .inputs = self.inputs,
             .metas = self.metas,
             .snapshots = self.snapshots,
-            .footer_rtts = footer_rtts,
+            .footer_rtt_ns = footer_rtt_ns,
             .meta_ready = self.meta_ready,
             .has_preparsed_meta = true,
             .mmaps = self.mmaps,

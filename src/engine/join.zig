@@ -76,9 +76,9 @@ pub const LocalSchemas = struct {
         defer opened.deinit();
         self.remote_seen = true;
         try self.remote.ensureUnusedCapacity(self.arena, @intCast(files.len));
-        for (files, opened.metas, opened.snapshots, opened.footer_rtts) |f, m, snapshot, rtt_ns| {
+        for (files, opened.metas, opened.snapshots) |f, m, snapshot| {
             const entry = try self.arena.create(types.RemoteFooter);
-            entry.* = .{ .meta = m, .snapshot = snapshot.?, .rtt_ns = rtt_ns };
+            entry.* = .{ .meta = m, .snapshot = snapshot.?, .rtt_ns = opened.footer_rtt_ns };
             self.remote.putAssumeCapacity(f, entry);
         }
     }

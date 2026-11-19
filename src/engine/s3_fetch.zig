@@ -991,9 +991,11 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
 /// them, and satisfy later ranges with no extra GET. The leading PAR1 is
 /// checked whenever a fetched range covers offset 0, including this suffix
 /// and a footer-prefix GET that itself starts at 0.
-/// The footer's time to first byte, when the exchange recorded one. Cold, stale and 304 responses all count.
+/// Keep the fastest recorded time to first byte for this footer.
 fn noteFooterRtt(sp: *FetchSpec, resp: http.Response) void {
-    if (resp.ttfb_ns > 0) sp.rtt_ns = @intCast(resp.ttfb_ns);
+    if (resp.ttfb_ns <= 0) return;
+    const rtt_ns: u64 = @intCast(resp.ttfb_ns);
+    if (sp.rtt_ns == 0 or rtt_ns < sp.rtt_ns) sp.rtt_ns = rtt_ns;
 }
 
 fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: http.Response) !void {
@@ -1033,6 +1035,7 @@ fn populateFromTailResponse(t: anytype, scratch: std.mem.Allocator, tail_resp: h
         if (need.body.len != missing_len) return error.BadResponse;
         // The prefix itself starts at offset 0. Check it here: nothing later re-reads these bytes.
         try ensureHeadMagic(footer_actual_start, need.body);
+        if (sp.footer_only) noteFooterRtt(sp, need);
         @memcpy(footer_region[0..missing_len], need.body);
         @memcpy(footer_region[missing_len..], tail[0 .. footer_region_len - missing_len]);
     } else {

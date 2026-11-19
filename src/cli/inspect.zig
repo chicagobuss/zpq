@@ -18,6 +18,7 @@ const Source = struct {
     mapped: ?fs.Mapped = null,
     client: ?s3.Client = null,
     whole: ?[]const u8 = null,
+    etag: ?[]const u8 = null,
     key: []const u8 = "",
     size: usize = 0,
     footer_start: usize = 0,
@@ -35,11 +36,13 @@ const Source = struct {
             self.client = try s3.Client.init(arena, try s3.Credentials.fromEnv(env), url.bucket);
             const r = try self.client.?.head(arena, self.key);
             if (r.status != 200) return error.BadResponse;
+            self.etag = r.header("ETag");
             self.size = try std.fmt.parseInt(usize, r.header("Content-Length") orelse return error.BadResponse, 10);
             self.requests = 1;
             // Small files fit the existing detail budget; one GET avoids a separate round trip for each range.
             if (self.size <= detail_limit) {
                 const whole = try self.client.?.get(arena, self.key, null);
+                try s3.checkResponseEtag(whole, self.etag);
                 if (whole.status != 200 or whole.body.len != self.size) return error.BadResponse;
                 self.whole = whole.body;
                 self.requests += 1;
@@ -73,9 +76,11 @@ const Source = struct {
         self.bytes += len;
         self.requests += 1;
         const r = try self.client.?.get(self.arena, self.key, .span(start, start + len - 1));
+        try s3.checkResponseEtag(r, self.etag);
         if (r.status != 206 or r.body.len != len) return error.BadRangeResponse;
         const wanted = try std.fmt.allocPrint(self.arena, "bytes {d}-{d}/{d}", .{ start, start + len - 1, self.size });
         if (!std.mem.eql(u8, r.header("Content-Range") orelse "", wanted)) return error.BadRangeResponse;
+        if (self.etag == null) self.etag = r.header("ETag");
         return r.body;
     }
 
@@ -327,7 +332,7 @@ fn validateIndex(src: *Source, p: *Presence, is_column: bool) !void {
     if (!std.mem.eql(u8, p.state, "present")) return;
     const len = p.length orelse return;
     const bytes = src.range(@intCast(p.offset.?), @intCast(len), true) catch |e| {
-        if (e == error.OutOfMemory) return e;
+        if (e == error.OutOfMemory or e == error.InputChanged) return e;
         p.validation = if (e == error.DetailLimit) "unknown-limit" else "malformed";
         return;
     };
@@ -378,7 +383,7 @@ fn details(src: *Source, col: *Column, cm: schema.ColumnMetaData) !void {
                 col.bloom_filter.validation = if (r.skip(.Struct)) |_| "unsupported" else |_| "malformed";
             }
         } else |e| {
-            if (e == error.OutOfMemory) return e;
+            if (e == error.OutOfMemory or e == error.InputChanged) return e;
             col.bloom_filter.validation = if (e == error.DetailLimit) "unknown-limit" else "malformed";
         }
     }
@@ -397,7 +402,7 @@ fn details(src: *Source, col: *Column, cm: schema.ColumnMetaData) !void {
             break;
         }
         const bytes = src.range(off, @min(end - off, 64 << 10), true) catch |e| {
-            if (e == error.OutOfMemory) return e;
+            if (e == error.OutOfMemory or e == error.InputChanged) return e;
             col.detail_state = if (e == error.DetailLimit) "unknown-limit" else "malformed";
             break;
         };

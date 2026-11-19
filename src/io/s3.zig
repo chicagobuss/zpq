@@ -885,15 +885,23 @@ pub const ReadPolicy = struct {
 
 pub const ReadPin = struct {
     etag: []const u8,
+    path: ?[]const u8 = null,
+    send_if_match: bool = true,
     policy: ?*ReadPolicy = null,
     reused_footer: bool = false,
 
     pub fn header(self: ReadPin) !?[]const u8 {
+        if (!self.send_if_match) return null;
         if (self.policy) |p| if (p.omit_if_match.load(.acquire)) {
             if (self.reused_footer) return error.S3IfMatchRejected;
             return null;
         };
         return self.etag;
+    }
+
+    pub fn verify(self: ReadPin, response: http.Response) !void {
+        if (self.send_if_match) return checkIfMatch(response, self.etag);
+        return checkResponseEtag(response, self.etag);
     }
 
     /// Report a rejected precondition once. A fresh footer can still pin unconditional range responses.
@@ -916,19 +924,30 @@ pub fn etagValue(tag: []const u8) []const u8 {
     return tag;
 }
 
-/// A successful conditional read must identify the pinned generation even if the server ignores If-Match.
-pub fn checkIfMatch(response: http.Response, if_match: ?[]const u8) error{AlignedJoinSnapshotChanged}!void {
-    const want = if_match orelse return;
+/// A successful read must identify the pinned generation. An untagged initial footer keeps the old read behavior.
+pub fn checkResponseEtag(response: http.Response, expected: ?[]const u8) error{InputChanged}!void {
+    const want = expected orelse return;
     switch (response.status) {
-        412 => return error.AlignedJoinSnapshotChanged,
         200, 206, 304 => {
-            const got = response.header("ETag") orelse return error.AlignedJoinSnapshotChanged;
-            // Some intermediaries weaken the response tag without changing the object.
-            const got_tag = etagValue(if (std.mem.startsWith(u8, got, "W/")) got[2..] else got);
-            if (!std.mem.eql(u8, etagValue(want), got_tag)) return error.AlignedJoinSnapshotChanged;
+            const got = response.header("ETag") orelse return error.InputChanged;
+            if (!sameEtag(want, got)) return error.InputChanged;
         },
         else => {},
     }
+}
+
+pub fn sameEtag(left: []const u8, right: []const u8) bool {
+    return std.mem.eql(u8, opaqueEtag(left), opaqueEtag(right));
+}
+
+fn opaqueEtag(tag: []const u8) []const u8 {
+    return etagValue(if (std.mem.startsWith(u8, tag, "W/\"")) tag[2..] else tag);
+}
+
+/// Keep the CLI join's rebind signal for a failed precondition or unverifiable response.
+pub fn checkIfMatch(response: http.Response, if_match: ?[]const u8) error{AlignedJoinSnapshotChanged}!void {
+    if (if_match != null and response.status == 412) return error.AlignedJoinSnapshotChanged;
+    checkResponseEtag(response, if_match) catch return error.AlignedJoinSnapshotChanged;
 }
 
 test "If-Match verifies response ETags and preserves multipart suffixes" {
@@ -943,9 +962,13 @@ test "If-Match verifies response ETags and preserves multipart suffixes" {
     response.headers = &.{.{ .name = "ETag", .value = "W/\"abcdef-3\"" }};
     try checkIfMatch(response, "\"abcdef-3\"");
     try std.testing.expectError(error.AlignedJoinSnapshotChanged, checkIfMatch(response, "\"abcdef-2\""));
+    try checkResponseEtag(response, "abcdef-3");
+    try std.testing.expectError(error.InputChanged, checkResponseEtag(response, "abcdef"));
     response.headers = &.{};
     try std.testing.expectError(error.AlignedJoinSnapshotChanged, checkIfMatch(response, "\"abcdef-3\""));
     try checkIfMatch(response, null);
+    try std.testing.expectError(error.InputChanged, checkResponseEtag(response, "abcdef-3"));
+    try checkResponseEtag(response, null);
 }
 
 pub fn getViaPoolWithOpts(
@@ -1372,20 +1395,21 @@ pub fn fetchJobs(
     var fetched: u64 = 0;
     var failed: ?anyerror = null;
     var failed_failure: ?S3Failure = null;
-    var changed_path: ?[]const u8 = null;
     for (ctxs) |ctx| {
         if (ctx.ok) {
             fetched += ctx.target.len;
             continue;
         }
+        if (ctx.err) |err| if (err == error.AlignedJoinSnapshotChanged or err == error.InputChanged) {
+            if (ctx.pin) |pin| if (pin.path) |path| diag_mod.Diag.setInput(diag, path, err);
+            return err;
+        };
         if (failed == null or (failed_failure == null and ctx.failure != null)) {
             failed = ctx.err orelse error.RangeFetchFailed;
             failed_failure = ctx.failure;
-            changed_path = if (ctx.pin) |pin| if (pin.policy) |policy| policy.path else null else null;
         }
     }
     if (failed) |err| {
-        if (err == error.AlignedJoinSnapshotChanged) if (changed_path) |path| diag_mod.Diag.setInput(diag, path, err);
         if (failed_failure) |f| diag_mod.setS3Failure(diag, f);
         return err;
     }
@@ -1491,7 +1515,7 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
         }
         break response;
     };
-    checkIfMatch(resp, if (ctx.pin) |pin| pin.etag else null) catch |err| {
+    if (ctx.pin) |pin| pin.verify(resp) catch |err| {
         ctx.err = err;
         return;
     };
@@ -3155,11 +3179,10 @@ test "a ListObjectsV2 page's keys and continuation token are unescaped" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const page = try parseListV2Body(a,
-        "<ListBucketResult><IsTruncated>true</IsTruncated>" ++
-            "<Contents><Key>d/a&amp;b.parquet</Key><Size>7</Size></Contents>" ++
-            "<Contents><Key>d/&lt;x&gt;&#9;.parquet</Key><Size>8</Size></Contents>" ++
-            "<NextContinuationToken>t&amp;k</NextContinuationToken></ListBucketResult>");
+    const page = try parseListV2Body(a, "<ListBucketResult><IsTruncated>true</IsTruncated>" ++
+        "<Contents><Key>d/a&amp;b.parquet</Key><Size>7</Size></Contents>" ++
+        "<Contents><Key>d/&lt;x&gt;&#9;.parquet</Key><Size>8</Size></Contents>" ++
+        "<NextContinuationToken>t&amp;k</NextContinuationToken></ListBucketResult>");
     try testing.expectEqual(@as(usize, 2), page.entries.len);
     try testing.expectEqualStrings("d/a&b.parquet", page.entries[0].key);
     try testing.expectEqualStrings("d/<x>\t.parquet", page.entries[1].key);

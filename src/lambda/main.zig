@@ -226,6 +226,7 @@ fn handleS3(
     if (tail_resp.status != 206 and tail_resp.status != 200) {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"tail_status\",\"status\":{d}}}", .{tail_resp.status});
     }
+    const etag = tail_resp.header("ETag");
 
     const total_size = parseTotalFromContentRange(tail_resp.header("Content-Range")) catch |err| {
         return std.fmt.allocPrint(allocator, "{{\"error\":\"bad_content_range\",\"reason\":\"{s}\"}}", .{@errorName(err)});
@@ -254,6 +255,8 @@ fn handleS3(
     const footer_actual_start = total_size - 8 - footer_len;
     if (footer_actual_start < tail_start) {
         const need = try client.get(a, url.key, s3.Range.span(footer_actual_start, tail_start - 1));
+        s3.checkResponseEtag(need, etag) catch |err|
+            return service.rejectResponse(allocator, "engine", @errorName(err), "input", s3_url);
         if (need.status != 206) return error.RangeStatus;
         if (need.body.len != tail_start - footer_actual_start) return error.RangeStatus;
         // The prefix itself starts at offset 0. Check it here: nothing later re-reads these bytes.
@@ -328,6 +331,8 @@ fn handleS3(
             if (r.start >= tail_start) continue;
             const fetch_end_excl = @min(r.end, tail_start);
             const resp = try client.get(a, url.key, s3.Range.span(r.start, fetch_end_excl - 1));
+            s3.checkResponseEtag(resp, etag) catch |err|
+                return service.rejectResponse(allocator, "engine", @errorName(err), "input", s3_url);
             if (resp.status != 206) return error.RangeStatus;
             @memcpy(file_buf[r.start..fetch_end_excl], resp.body);
             if (r.start == 0 and !metadata.hasLeadingMagic(file_buf)) return error.NotParquet;

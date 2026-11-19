@@ -94,6 +94,7 @@ pub const RowGroupRange = struct {
 
 /// Immutable S3 generation used by a footer-derived physical selection (ETag without quotes).
 pub const SourceSnapshot = struct { etag: []const u8, size: u64 };
+pub const SourceSnapshots = std.StringHashMapUnmanaged(SourceSnapshot);
 
 pub const RemoteFooters = std.StringHashMapUnmanaged(*const RemoteFooter);
 pub const RemoteReadPolicies = std.StringHashMapUnmanaged(*s3.ReadPolicy);
@@ -229,6 +230,8 @@ pub const QueryArgs = struct {
     /// reads every row group. A coordinator splits one file across workers with it.
     row_groups: ?[]const ?RowGroupRange = null,
     input_snapshots: ?[]const ?SourceSnapshot = null,
+    /// Fan-out preparation pins the worker to the same generations as every other partition.
+    source_snapshots: ?*const SourceSnapshots = null,
     pin_input_generation: bool = false,
     /// The SQL join binder's raw footers, borrowed for this query.
     remote_footers: ?*const RemoteFooters = null,

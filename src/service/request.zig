@@ -70,18 +70,22 @@ const Wire = struct {
     partial: ?std.json.Value = null,
     join: ?std.json.Value = null,
     alignment: ?std.json.Value = null,
+    source_snapshots: ?std.json.Value = null,
+    source_snapshots_only: ?std.json.Value = null,
     workers: ?std.json.Value = null,
 };
 
 /// The fields `partial_aggregate` takes inside its `partial` object, and only there. A worker that predates the
 /// operation finds no `inputs`, `s3_url` or `sql` at the top level and refuses the request before opening anything.
-const partial_fields = .{ "inputs", "s3_url", "row_groups", "aggregate", "group_by", "filter", "join", "alignment" };
+const partial_fields = .{ "inputs", "s3_url", "row_groups", "aggregate", "group_by", "filter", "join", "alignment", "source_snapshots" };
 
 pub const Request = struct {
     operation: Operation = .query,
     plan: ?std.json.Value = null,
     join: ?std.json.Value = null,
     alignment: ?std.json.Value = null,
+    source_snapshots: ?std.json.Value = null,
+    prepare_sources_only: bool = false,
     workers: usize = 0,
     parsed: std.json.Parsed(Wire),
     sql: ?[]const u8 = null,
@@ -144,6 +148,7 @@ pub const Request = struct {
         var req: Request = .{ .parsed = parsed, .inputs = &.{} };
         if (try f.string("operation")) |op|
             req.operation = std.meta.stringToEnum(Operation, op) orelse return f.bad("operation");
+        if (req.operation == .prepare_aggregate) req.prepare_sources_only = try f.boolean("source_snapshots_only");
         const has_plan = if (parsed.value.plan) |v| v != .null else false;
         const version = if (parsed.value.plan_version) |v| (if (v == .null) null else v) else null;
         if (version) |v| {
@@ -157,9 +162,9 @@ pub const Request = struct {
             if (req.operation != .query) return error.ConflictingPlanFields;
             req.plan = v;
         };
-        // `partial_aggregate` reads its inputs and query from `partial` (`partial_fields`), which no other request has.
+        // Keep worker and snapshot-only preparation inputs inside the guarded envelope.
         var inner: Wire = .{};
-        const src: *const Wire = if (req.operation.isPartial()) blk: {
+        const src: *const Wire = if (req.operation.isPartial() or req.prepare_sources_only) blk: {
             inline for (partial_fields ++ .{ "sql", "plan", "select", "columns", "column_order", "output_url" }) |name| {
                 if (@field(parsed.value, name)) |v| if (v != .null) return error.ConflictingPlanFields;
             }
@@ -170,13 +175,14 @@ pub const Request = struct {
                 return f.bad("partial");
             };
             inline for (.{
-                "operation",      "plan_version",    "plan",              "sql",
-                "parallelism",    "columns",         "output_url",        "fsync",
-                "output_codec",   "parquet_version", "compress_priority", "select",
-                "column_order",   "scan_all",        "trust_stats",       "cache",
-                "ordered",        "max_memory",      "budget_wait_ms",    "max_result_bytes",
-                "profile",        "profile_url",     "bloom_filters",     "bloom_filters_enabled",
-                "row_group_size", "row_group_bytes", "partial",           "workers",
+                "operation",             "plan_version",    "plan",              "sql",
+                "parallelism",           "columns",         "output_url",        "fsync",
+                "output_codec",          "parquet_version", "compress_priority", "select",
+                "column_order",          "scan_all",        "trust_stats",       "cache",
+                "ordered",               "max_memory",      "budget_wait_ms",    "max_result_bytes",
+                "profile",               "profile_url",     "bloom_filters",     "bloom_filters_enabled",
+                "row_group_size",        "row_group_bytes", "partial",           "workers",
+                "source_snapshots_only",
             }) |name| {
                 if (@field(inner, name)) |v| if (v != .null) return error.ConflictingPlanFields;
             }
@@ -249,7 +255,12 @@ pub const Request = struct {
         if (req.operation == .partial_aligned_join_aggregate) {
             if (req.alignment == null or req.alignment.? != .object) return q.bad("alignment");
         } else if (req.alignment != null) return error.ConflictingPlanFields;
-        if (req.operation == .prepare_aggregate and req.join != null) {
+        if (src.source_snapshots) |v| if (v != .null) {
+            if (v != .object) return q.bad("source_snapshots");
+            if (!(req.operation.isPartial() or has_plan) or req.alignment != null) return error.ConflictingPlanFields;
+            req.source_snapshots = v;
+        };
+        if (req.operation == .prepare_aggregate and req.join != null and !req.prepare_sources_only) {
             const w = parsed.value.workers orelse return f.bad("workers");
             if (w != .integer or w.integer <= 0) return f.bad("workers");
             req.workers = @intCast(w.integer);

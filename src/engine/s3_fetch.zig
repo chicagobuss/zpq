@@ -381,6 +381,7 @@ pub fn orderFilterFirst(arena: std.mem.Allocator, jobs: []s3.FetchJob, filters: 
 /// buffer before consumers see the input.
 pub const FetchSpec = struct {
     url: s3.Url,
+    path: ?[]const u8 = null,
     /// Index into the query's inputs, for profile spans.
     file_index: usize = 0,
     footer_only: bool = false,
@@ -401,6 +402,7 @@ pub const FetchSpec = struct {
     etag_buf: [96]u8 = undefined,
     etag_len: usize = 0,
     if_match: ?[]const u8 = null,
+    planned_snapshot: ?types.SourceSnapshot = null,
     read_policy: ?*s3.ReadPolicy = null,
     pin_generation: bool = false,
     reused_footer: bool = false,
@@ -427,14 +429,26 @@ pub const FetchSpec = struct {
     }
 
     pub fn readPin(self: *const FetchSpec) ?s3.ReadPin {
-        return if (self.if_match) |tag| .{ .etag = tag, .policy = self.read_policy, .reused_footer = self.reused_footer } else null;
+        if (self.if_match) |tag| return .{
+            .etag = tag,
+            .path = self.path,
+            .policy = self.read_policy,
+            .reused_footer = self.reused_footer,
+        };
+        return self.responsePin();
+    }
+
+    fn responsePin(self: *const FetchSpec) ?s3.ReadPin {
+        const tag = if (self.planned_snapshot) |snapshot| snapshot.etag else self.etag();
+        if (tag.len == 0) return null;
+        return .{ .etag = tag, .path = self.path, .send_if_match = false };
     }
 
     pub fn reuseFooter(self: *FetchSpec, snapshot: @import("types.zig").SourceSnapshot, rtt_ns: u64) bool {
         const tag = snapshot.etag;
         if (tag.len == 0 or tag.len > self.etag_buf.len or std.mem.startsWith(u8, tag, "W/")) return false;
         for (tag) |c| if (std.ascii.isControl(c) or c == '"') return false;
-        self.noteEtag(tag);
+        self.noteEtag(tag) catch unreachable;
         self.pin_generation = true;
         self.reused_footer = true;
         self.total_size = snapshot.size;
@@ -443,9 +457,9 @@ pub const FetchSpec = struct {
         return true;
     }
 
-    fn noteEtag(self: *FetchSpec, raw: ?[]const u8) void {
+    fn noteEtag(self: *FetchSpec, raw: ?[]const u8) !void {
         const e = s3.etagValue(raw orelse return);
-        if (e.len > self.etag_buf.len) return;
+        if (e.len == 0 or e.len > self.etag_buf.len) return error.InputChanged;
         @memcpy(self.etag_buf[0..e.len], e);
         self.etag_len = e.len;
     }
@@ -591,7 +605,7 @@ pub const S3Membership = struct {
             if (s.start < fetch_end) try jobs.append(arena, .{
                 .bucket = sp.url.bucket,
                 .key = sp.url.key,
-                .pin = if (sp.reused_footer or sp.omitsIfMatch()) sp.readPin() else null,
+                .pin = if (sp.reused_footer or sp.omitsIfMatch()) sp.readPin() else sp.responsePin(),
                 .range = .{ .start = s.start, .end = fetch_end },
                 .target = buf[0..@intCast(fetch_end - s.start)],
             });
@@ -647,7 +661,7 @@ pub const S3Membership = struct {
             if (s.start < fetch_end) try jobs.append(arena, .{
                 .bucket = sp.url.bucket,
                 .key = sp.url.key,
-                .pin = if (sp.reused_footer or sp.omitsIfMatch()) sp.readPin() else null,
+                .pin = if (sp.reused_footer or sp.omitsIfMatch()) sp.readPin() else sp.responsePin(),
                 .range = .{ .start = s.start, .end = fetch_end },
                 .target = dest[0..@intCast(fetch_end - s.start)],
             });
@@ -867,9 +881,8 @@ pub fn fetchMetaBatch(
         try group.await(ctx.io);
     }
     for (specs) |sp| if (sp.err) |err| {
-        if (err == error.AlignedJoinSnapshotChanged) if (sp.read_policy) |p| {
-            diag_mod.Diag.setInput(ctx.diag, p.path, err);
-        };
+        if (err == error.AlignedJoinSnapshotChanged or err == error.InputChanged)
+            if (sp.path) |path| diag_mod.Diag.setInput(ctx.diag, path, err);
         if (sp.failure) |f| diag_mod.setS3Failure(ctx.diag, f);
         return err;
     };
@@ -894,9 +907,12 @@ fn getMetaObject(
     opts: s3.GetOpts,
 ) !http.Response {
     var pin = sp.readPin();
-    if (pin == null and sp.pin_generation and sp.etag_len > 0 and !std.mem.startsWith(u8, sp.etag(), "W/")) {
+    if (sp.if_match == null and sp.planned_snapshot == null and sp.pin_generation and
+        sp.etag_len > 0 and !std.mem.startsWith(u8, sp.etag(), "W/"))
+    {
         pin = .{
             .etag = try std.fmt.allocPrint(scratch, "\"{s}\"", .{sp.etag()}),
+            .path = sp.path,
             .policy = sp.read_policy,
         };
     }
@@ -909,7 +925,7 @@ fn getMetaObject(
             return err;
         };
         if (pin) |p| if (try p.rejected(request.if_match, response.status)) continue;
-        try s3.checkIfMatch(response, if (pin) |p| p.etag else null);
+        if (pin) |p| try p.verify(response);
         return response;
     }
 }
@@ -946,7 +962,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
             t.cache = if (cond.status == 304) 1 else 2;
             noteFooterRtt(sp, cond);
             if (cond.status == 304) {
-                sp.noteEtag(entry.etag);
+                try sp.noteEtag(entry.etag);
                 sp.total_size = entry.total_size;
                 sp.footer_offset = entry.footer_offset;
                 sp.tail_start = entry.footer_offset;
@@ -962,7 +978,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
             // and continue with the response we already have.
             cache.invalidate(t.ctx.io, sp.url.bucket, sp.url.key);
             if (cond.status == 206 or cond.status == 200) {
-                sp.noteEtag(cond.header("ETag"));
+                try sp.noteEtag(cond.header("ETag"));
                 try populateFromTailResponse(t, scratch, cond);
                 try maybeCacheMeta(t.ctx, sp, cond.header("ETag"));
                 return;
@@ -981,7 +997,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
     });
     if (tail_resp.status != 206 and tail_resp.status != 200) return refuseGet(sp, t.creds, tail_resp);
     noteFooterRtt(sp, tail_resp);
-    sp.noteEtag(tail_resp.header("ETag"));
+    try sp.noteEtag(tail_resp.header("ETag"));
     try populateFromTailResponse(t, scratch, tail_resp);
     try maybeCacheMeta(t.ctx, sp, tail_resp.header("ETag"));
 }

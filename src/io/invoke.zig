@@ -49,6 +49,7 @@ pub const Pool = struct {
     capability_key: [32]u8 = @splat(0),
     prepared_v1: bool = false,
     aligned_v1: bool = false,
+    changed_input: @import("../core/diag.zig").Text = .{},
     retry_counts: [retry_names.len]std.atomic.Value(u64) = @splat(.init(0)),
     failure_mutex: std.Io.Mutex = .init,
     http_failure: ?HttpFailure = null,
@@ -69,6 +70,7 @@ pub const Pool = struct {
         self.failure_mutex.lockUncancelable(io);
         defer self.failure_mutex.unlock(io);
         self.http_failure = null;
+        self.changed_input.len = 0;
         self.retry_start = 0;
         for (self.snapshotRetries()) |n| self.retry_start += n;
     }
@@ -80,6 +82,8 @@ pub const Pool = struct {
     pub fn errorMessage(self: *Pool, io: std.Io, err: anyerror, buffer: []u8) []const u8 {
         self.failure_mutex.lockUncancelable(io);
         defer self.failure_mutex.unlock(io);
+        if (err == error.InputChanged and self.changed_input.len > 0)
+            return std.fmt.bufPrint(buffer, "InputChanged: '{s}'", .{self.changed_input.get()}) catch @errorName(err);
         var total: u64 = 0;
         for (self.snapshotRetries()) |n| total += n;
         const retried = total -| self.retry_start;

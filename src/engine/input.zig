@@ -243,7 +243,7 @@ pub fn fetchS3Schema(
     var read_ctx = ctx;
     read_ctx.io = read_exec.io();
 
-    var specs = [_]FetchSpec{.{ .url = url }};
+    var specs = [_]FetchSpec{.{ .url = url, .path = path }};
     var account: ByteAccount = .{ .limit = std.math.maxInt(u64) };
     try fetchMetaBatch(read_ctx, arena, creds, pool, &specs, null, &account);
 
@@ -392,6 +392,7 @@ const RemoteInputs = struct {
         defer read_exec.deinit();
         var read_ctx = self.ctx;
         read_ctx.io = read_exec.io();
+        read_ctx.diag = self.args.diag orelse self.ctx.diag;
 
         // Parse and validate s3 URLs, group by bucket. The current rule:
         // all s3 inputs share one bucket per call (matches lambda's
@@ -424,11 +425,20 @@ const RemoteInputs = struct {
         var specs = try self.arena.alloc(FetchSpec, s3_urls.len);
         for (s3_urls, 0..) |u, k| specs[k] = .{
             .url = u,
+            .path = self.paths[self.s3_indices.items[k]],
             .file_index = self.s3_indices.items[k],
             .footer_only = self.fetch_window.footer_only,
             .retain_binder_tail = self.fetch_window.binder_tail_bytes != null,
             .footer_probe = self.fetch_window.footer_probe,
             .pin_generation = self.args.pin_input_generation or self.args.input_snapshots != null,
+        };
+        if (self.args.source_snapshots) |planned| for (specs) |*sp| {
+            const path = self.paths[sp.file_index];
+            const snapshot = planned.get(path) orelse {
+                Diag.setInput(self.args.diag, path, error.InputChanged);
+                return error.InputChanged;
+            };
+            if (snapshot.etag.len > 0) sp.planned_snapshot = snapshot;
         };
         if (self.args.input_snapshots == null) if (self.args.remote_read_policies) |policies| {
             for (specs) |*sp| {
@@ -447,7 +457,7 @@ const RemoteInputs = struct {
             .limit = @min(s3_window.windowFor(self.args.max_memory), @as(u64, self.args.max_memory)),
         };
         if (self.args.remote_footers) |footers| {
-            if (self.args.input_snapshots == null) for (specs) |*sp| {
+            if (self.args.input_snapshots == null and self.args.source_snapshots == null) for (specs) |*sp| {
                 if (sp.omitsIfMatch()) continue;
                 const entry = footers.get(self.paths[sp.file_index]) orelse continue;
                 if (!sp.reuseFooter(entry.snapshot, entry.rtt_ns)) continue;
@@ -484,15 +494,15 @@ const RemoteInputs = struct {
         };
 
         // A worker's row groups, before anything plans or fetches from the footers.
+        var seen: types.SourceSnapshots = .empty;
         for (self.s3_indices.items, specs) |idx, *sp| {
             const etag = sp.etag_buf[0..sp.etag_len];
-            const snapshot: types.SourceSnapshot = .{ .etag = try self.arena.dupe(u8, etag), .size = sp.total_size };
-            self.snapshots[idx] = snapshot;
+            var snapshot: types.SourceSnapshot = .{ .etag = etag, .size = sp.total_size };
             if (sp.pin_generation and sp.if_match == null and etag.len > 0 and !std.mem.startsWith(u8, etag, "W/"))
                 sp.if_match = try std.fmt.allocPrint(self.arena, "\"{s}\"", .{etag});
             if (!sp.reused_footer and sp.omitsIfMatch()) if (self.args.remote_footers) |footers| {
                 if (footers.get(self.paths[idx])) |entry| {
-                    if (sp.if_match == null or !std.mem.eql(u8, entry.snapshot.etag, etag) or entry.snapshot.size != sp.total_size) {
+                    if (sp.if_match == null or !s3.sameEtag(entry.snapshot.etag, etag) or entry.snapshot.size != sp.total_size) {
                         Diag.setInput(self.args.diag, self.paths[idx], error.AlignedJoinSnapshotChanged);
                         return error.AlignedJoinSnapshotChanged;
                     }
@@ -500,9 +510,34 @@ const RemoteInputs = struct {
             };
             if (self.args.input_snapshots) |expected| {
                 const want = expected[idx] orelse return error.AlignedJoinSnapshotChanged;
-                if (etag.len == 0 or std.mem.startsWith(u8, etag, "W/") or
-                    !std.mem.eql(u8, want.etag, etag) or want.size != sp.total_size) return error.AlignedJoinSnapshotChanged;
+                if (etag.len == 0 or !s3.sameEtag(want.etag, etag) or want.size != sp.total_size) {
+                    Diag.setInput(self.args.diag, self.paths[idx], error.AlignedJoinSnapshotChanged);
+                    return error.AlignedJoinSnapshotChanged;
+                }
+                snapshot = want;
             }
+            if (sp.planned_snapshot) |want| {
+                if (etag.len == 0 or !s3.sameEtag(want.etag, etag) or want.size != sp.total_size) {
+                    Diag.setInput(self.args.diag, self.paths[idx], error.InputChanged);
+                    return error.InputChanged;
+                }
+                snapshot = want;
+            }
+            // A repeated key is still one object, even when arguments or glob expansions name it twice.
+            if (specs.len > 1) {
+                const entry = try seen.getOrPut(self.arena, sp.url.key);
+                if (entry.found_existing) {
+                    const prior = entry.value_ptr.*;
+                    if ((prior.etag.len != 0 or snapshot.etag.len != 0) and
+                        (!s3.sameEtag(prior.etag, snapshot.etag) or prior.size != snapshot.size))
+                    {
+                        Diag.setInput(read_ctx.diag, self.paths[idx], error.InputChanged);
+                        return error.InputChanged;
+                    }
+                } else entry.value_ptr.* = snapshot;
+            }
+            snapshot.etag = try self.arena.dupe(u8, snapshot.etag);
+            self.snapshots[idx] = snapshot;
         }
         if (self.args.row_groups) |ranges| for (self.s3_indices.items, specs) |idx, *sp| {
             try restrictRowGroups(self.arena, &sp.meta, ranges[idx], self.args.diag, self.paths[idx]);
@@ -639,7 +674,7 @@ const RemoteInputs = struct {
                     .batch = @max(1, self.fetch_window.limit / 4),
                     // Only a reader that may stop early (`always`: a print with a limit) fetches its first rows first.
                     .slow_start = self.fetch_window.always,
-                    .diag = self.args.diag,
+                    .diag = read_ctx.diag,
                 },
                 .pool = pool,
                 .creds = creds,
@@ -677,7 +712,7 @@ const RemoteInputs = struct {
                 s3.inFlight(self.ctx.env),
                 self.args.profiler,
                 &data_wave,
-                self.ctx.diag,
+                read_ctx.diag,
             );
             fetch_span.end(.fetch, profile.args(.{ fetch_jobs.items.len, fetched }));
             for (fetch_jobs.items) |j| try ensureHeadMagic(j.range.start, j.target);

@@ -638,7 +638,7 @@ test "fanout joins: bounded replicated S3 dimensions, inner left semi anti, gene
             store.changing_dimension.store(true, .release);
             const changed = zpq.engine.fanout.run(scratch, a, client.transport(), req, .{ .workers = 4, .concurrency = 4 });
             store.changing_dimension.store(false, .release);
-            try std.testing.expectError(error.SchemaMismatch, changed);
+            try std.testing.expectError(error.InputChanged, changed);
         }
     }
     const dim_null = try zpq.test_scratch.filePath(scratch, "zig-out/fanout-join-dimension-null.parquet");
@@ -719,7 +719,7 @@ test "fanout aligned joins: boundaries, both sides split, oversized source, smal
             store.change_on_match.store(true, .release);
             const changed = zpq.engine.fanout.run(scratch, a, client.transport(), req, .{ .workers = 3 });
             store.change_on_match.store(false, .release);
-            try std.testing.expectError(error.AlignedJoinSnapshotChanged, changed);
+            try std.testing.expectError(error.InputChanged, changed);
             var replica = req;
             replica.object = try req.object.clone(scratch);
             try replica.object.put(scratch, "join_strategy", .{ .string = "replicated" });

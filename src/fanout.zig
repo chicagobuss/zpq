@@ -58,6 +58,7 @@ fn handleOver(io: std.Io, gpa: std.mem.Allocator, env: std.process.Environ, pool
         .counts = event.counts orelse event.row_group_counts,
         .order_by = event.order_by,
         .limit = event.limit,
+        .changed_input = &pool.changed_input,
     });
     const after = pool.connections.snapshotStats();
     var transport: std.json.Value = .{ .object = .{} };

@@ -341,6 +341,13 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
             profiler = try zpq.profile.Profiler.create(allocator, prof_opts, meta);
         }
 
+        var planned_sources = if (req.source_snapshots) |value|
+            engine.fanout_plan.decodeSnapshots(req.parsed.arena.allocator(), value) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return rejectResponse(allocator, "bad_json", "BadFieldType", "field", "source_snapshots");
+            }
+        else
+            null;
         var qa: engine.QueryArgs = .{
             .inputs = req.inputs,
             .plan_source = if (decoded_plan) |*plan| engine.syntax_plan.source(plan) else null,
@@ -366,6 +373,7 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
             .bloom_filters = bloom_filters,
             .bloom_filters_enabled = req.bloom_filters_enabled,
             .row_groups = req.row_groups,
+            .source_snapshots = if (planned_sources != null) &planned_sources.? else null,
         };
         qa.profiler = profiler;
         qa.columnar_sink = columns;
@@ -391,30 +399,30 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
             qa.inputs = inputs.items;
             var registry = persistentPoolAdapter(pool);
             qa.diag = &diag;
-            if (req.join) |value| {
-                const j = engine.fanout_plan.decodeJoin(arena, value) catch |err| return engineError(allocator, err, &diag);
-                return engine.fanout_plan.prepareAligned(.{
-                    .gpa = allocator,
-                    .env = env,
-                    .io = io,
-                    .pool_registry = &registry,
-                    .meta_cache = pool.metaCache(),
-                    .worker_io = pool.worker_io,
-                }, qa, j, req.workers, result_cap.bytes) catch |err| return engineError(allocator, err, &diag);
-            }
-            return engine.fanout_plan.prepare(.{
+            const ctx: engine.Context = .{
                 .gpa = allocator,
                 .env = env,
                 .io = io,
                 .pool_registry = &registry,
                 .meta_cache = pool.metaCache(),
                 .worker_io = pool.worker_io,
-            }, qa, result_cap.bytes, request.plan_version) catch |err| return engineError(allocator, err, &diag);
+            };
+            const join = if (req.join) |value|
+                engine.fanout_plan.decodeJoin(arena, value) catch |err| return engineError(allocator, err, &diag)
+            else
+                null;
+            if (req.prepare_sources_only)
+                return engine.fanout_plan.prepareSources(ctx, qa, join, result_cap.bytes) catch |err|
+                    return engineError(allocator, err, &diag);
+            if (join) |j| {
+                return engine.fanout_plan.prepareAligned(ctx, qa, j, req.workers, result_cap.bytes) catch |err|
+                    return engineError(allocator, err, &diag);
+            }
+            return engine.fanout_plan.prepare(ctx, qa, result_cap.bytes, request.plan_version) catch |err|
+                return engineError(allocator, err, &diag);
         }
         if (req.operation.isPartial()) {
-            // The worker prepares the query itself, as `prepare_aggregate` would, and answers its partial with what
-            // the coordinator merges by and checks across workers (`fanout_plan.partialMembers`, the schema
-            // fingerprint), so the coordinator reads no footer and makes no call before the scatter.
+            // The worker binds the partial query against the input versions the coordinator prepared.
             var arena_state = std.heap.ArenaAllocator.init(allocator);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
@@ -463,7 +471,9 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
         }
         if (columns != null) {
             var registry = persistentPoolAdapter(pool);
-            _ = engine.runPrintSink(.{ .gpa = allocator, .env = env, .io = io, .pool_registry = &registry, .meta_cache = pool.metaCache(), .worker_io = pool.worker_io }, qa, .jsonl, null, -1, 0, null) catch |err| return engineError(allocator, err, &zpq.core.diag.Diag{});
+            var diag: Diag = .{};
+            qa.diag = &diag;
+            _ = engine.runPrintSink(.{ .gpa = allocator, .env = env, .io = io, .pool_registry = &registry, .meta_cache = pool.metaCache(), .worker_io = pool.worker_io }, qa, .jsonl, null, -1, 0, null) catch |err| return engineError(allocator, err, &diag);
             return allocator.dupe(u8, "{}");
         }
         const f = legacy orelse return rejectResponse(
@@ -687,6 +697,10 @@ fn executeSqlOnce(
     }
     var qa = options;
     qa.inputs = inputs;
+    var bound_sources: engine.types.SourceSnapshots = .empty;
+    var remote = schemas.local.remote.iterator();
+    while (remote.next()) |entry| try bound_sources.put(arena, entry.key_ptr.*, entry.value_ptr.*.snapshot);
+    if (bound_sources.count() > 0) qa.source_snapshots = &bound_sources;
     qa.plan_source = engine.syntax_plan.source(pq.syntax.?);
     qa.filter = pq.filter_str;
     qa.select = pq.select_str;
@@ -924,6 +938,7 @@ fn engineError(allocator: std.mem.Allocator, err: anyerror, diag: *const Diag) !
     // Sink details are CLI diagnostics; keep the public service/ABI error vocabulary stable.
     const public_err = switch (err) {
         error.NoSpaceLeft, error.BrokenPipe, error.CloseFailed => error.WriteFailed,
+        error.AlignedJoinSnapshotChanged => error.InputChanged,
         else => err,
     };
     try w.print("{{\"error\":\"engine\",\"reason\":\"{s}\"", .{@errorName(public_err)});
@@ -1038,17 +1053,24 @@ fn runAggregate(
         started: i64,
         pool: *PersistentPool,
         partial: ?[]const u8,
+        pinned: bool,
         failure: ?anyerror = null,
         fn write(ctx: *anyopaque, ar: engine.AggResult) !void {
             const e: *@This() = @ptrCast(@alignCast(ctx));
             const total_ms = @divTrunc(nowMonoNs() - e.started, std.time.ns_per_ms);
-            aggregateResponse(e.writer, ar, total_ms, e.pool, e.partial) catch |err| {
+            aggregateResponse(e.writer, ar, total_ms, e.pool, e.partial, e.pinned) catch |err| {
                 e.failure = err;
                 return err;
             };
         }
     };
-    var envelope: Envelope = .{ .writer = &aw.writer, .started = t_start, .pool = pool, .partial = partial };
+    var envelope: Envelope = .{
+        .writer = &aw.writer,
+        .started = t_start,
+        .pool = pool,
+        .partial = partial,
+        .pinned = qa.source_snapshots != null,
+    };
     args.aggregate_sink = .{ .ctx = &envelope, .write_fn = Envelope.write };
     if (pool.per_call_stats) pool.resetStats();
     var result = engine.runQuery(.{
@@ -1070,6 +1092,7 @@ fn runAggregate(
         @divTrunc(nowMonoNs() - t_start, std.time.ns_per_ms),
         pool,
         partial,
+        qa.source_snapshots != null,
     ) catch |err| {
         if (capped.hit) return resultTooLarge(allocator, result_cap);
         return err;
@@ -1101,7 +1124,7 @@ fn writeDecimalList(w: *std.Io.Writer, names: []const []const u8) !void {
 }
 
 /// `runAggregate`'s response for `ar`, onto `w`.
-fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, pool: *PersistentPool, partial: ?[]const u8) !void {
+fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, pool: *PersistentPool, partial: ?[]const u8, pinned: bool) !void {
     if (ar.output.group_cols != null) {
         try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"rows_scanned\":{d},\"rows_matched\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":", .{
             ar.files_in,      ar.rows_in,           ar.rows_scanned,          ar.rows_matched,
@@ -1140,6 +1163,7 @@ fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, poo
     try engine.writeMembershipJson(w, ar.membership);
     try w.writeByte(',');
     try writePoolStats(w, pool.stats());
+    if (pinned) try w.writeAll(",\"source_snapshots_checked\":true");
     if (partial) |members| {
         try w.print(",\"partial_version\":{d},", .{request.partial_version});
         try w.writeAll(members);
@@ -1346,7 +1370,7 @@ test "a released grouped Parquet answer has no phantom object in the service env
     };
     var writer: std.Io.Writer.Allocating = .init(a);
     defer writer.deinit();
-    try aggregateResponse(&writer.writer, ar, 0, &pool, null);
+    try aggregateResponse(&writer.writer, ar, 0, &pool, null, false);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, writer.written(), .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("agg").?.array.items.len);

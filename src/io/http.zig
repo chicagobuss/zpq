@@ -75,10 +75,8 @@ pub const Response = struct {
     status: u16,
     headers: []const Header,
     body: []const u8,
-    /// The error document could not be read in full. The connection must not be reused.
+    /// The error document could not be read in full. Discard the connection and stop retrying.
     body_failure: ?Error = null,
-    /// Retry only when the error body fit the original range budget.
-    retry_after_body: bool = true,
     /// Borrowed from the request arena; used only to redact an error response.
     request_secrets: ?RequestSecrets = null,
     /// `clock.monoNs` when the first response byte arrived (0 when not read off a connection): splits a request's
@@ -339,7 +337,6 @@ fn drainBuffered(
     }
     if (body_failure) |err| if (!error_status or !buffered.keep_error_status) return err;
     const headers = try parseHeaders(arena, stream.items[0..he]);
-    const wire_body_len = content_length orelse stream.items.len - body_start;
     var body: []const u8 = &.{};
     if (body_failure == null) {
         const body_end = if (content_length) |clen| body_start + clen else stream.items.len;
@@ -364,8 +361,6 @@ fn drainBuffered(
         .headers = headers,
         .body = body,
         .body_failure = body_failure,
-        .retry_after_body = body_failure == null and !(error_status and buffered.keep_error_status and
-            wire_body_len > success_cap),
         .first_byte_ns = first_byte_ns,
     };
 }

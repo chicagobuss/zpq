@@ -909,7 +909,7 @@ pub const ReadPin = struct {
     /// Report a rejected precondition once. A fresh footer can still pin unconditional range responses.
     pub fn rejected(self: ReadPin, sent: ?[]const u8, response: http.Response) !bool {
         const p = self.policy orelse return false;
-        if (sent == null or !response.retry_after_body or !ifMatchRejected(response.status)) return false;
+        if (sent == null or response.body_failure != null or !ifMatchRejected(response.status)) return false;
         p.omit_if_match.store(true, .release);
         if (self.reused_footer) return error.S3IfMatchRejected;
         return true;
@@ -1118,7 +1118,7 @@ pub fn requestViaPool(
                     trace.ttfb_ns = first - t_send;
                     trace.body_ns = t_done - first;
                 }
-                if (!out.retry_after_body or !retry.retryableStatus(out.status) or
+                if (out.body_failure != null or !retry.retryableStatus(out.status) or
                     (opts.detect_if_match_rejection and ifMatchRejected(out.status)))
                     return out;
                 retry_status = out.status;
@@ -2781,7 +2781,6 @@ test "fake S3 reports oversized ranged GET errors with their object, code and me
     for ([_]struct { status: u16, code: []const u8, err: anyerror }{
         .{ .status = 403, .code = "AccessDenied", .err = error.AccessDenied },
         .{ .status = 404, .code = "NoSuchKey", .err = error.NoSuchKey },
-        .{ .status = 503, .code = "SlowDown", .err = error.SlowDown },
         .{ .status = 206, .code = "", .err = error.BodyTooLarge },
     }) |case| {
         var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2837,6 +2836,36 @@ test "fake S3 reports oversized ranged GET errors with their object, code and me
         try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &target);
         try testing.expectEqual(@as(u32, 2), fake.requests_seen.load(.monotonic));
     }
+}
+
+test "fake S3 retries SlowDown larger than the requested range and fetches the tiny range" {
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(testing.allocator);
+    defer fake.deinit();
+    try fake.serveBytes("obj", "abcdefgh");
+    fake.fail = "GET /bkt/obj";
+    fake.fail_status = 503;
+    fake.fail_code = "SlowDown";
+    fake.fails_left = 2;
+
+    var endpoint: [64]u8 = undefined;
+    var creds = test_creds;
+    creds.endpoint = try std.fmt.bufPrint(&endpoint, "http://127.0.0.1:{d}", .{fake.port});
+    creds.timeouts = test_timeouts;
+    var pool: Pool(4) = undefined;
+    try pool.init(testing.allocator);
+    defer pool.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var target: [4]u8 = undefined;
+    const job: FetchJob = .{ .bucket = "bkt", .key = "obj", .range = .{ .start = 2, .end = 6 }, .target = &target };
+    const fetched = try fetchJobs(testing.io, &pool, testing.allocator, arena.allocator(), creds, &.{job}, 1, null, null, null);
+    try testing.expectEqual(@as(u64, target.len), fetched);
+    try testing.expectEqualStrings("cdef", &target);
+    try testing.expectEqual(@as(u32, 3), fake.requests_seen.load(.monotonic));
+    const stats = pool.snapshotStats();
+    try testing.expectEqual(@as(u64, 2), stats.backoff_retries);
+    try testing.expectEqual(@as(u64, 2), stats.slow_down_retries);
 }
 
 test "fake S3 caps unterminated ranged GET errors and discards without retry" {

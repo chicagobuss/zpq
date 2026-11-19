@@ -1253,9 +1253,11 @@ fn classifyQuery(
     // window functions are rejected too.
     var has_agg = false;
     var has_bare = false;
+    var has_star = false;
     var i: usize = 0;
     while (i < @as(usize, @intCast(root.*.u.select.result_columns.count))) : (i += 1) {
         const rc = root.*.u.select.result_columns.items[i] orelse continue;
+        has_star = has_star or (selectExpr(root.*.u.select, i) orelse rc).*.kind == c.LP_EXPR_STAR;
         const info = analyzeExpr(rc);
         if (info.has_window) {
             diagnosticPrint("sql: window functions (OVER) are not supported yet\n", .{});
@@ -1274,6 +1276,11 @@ fn classifyQuery(
     }
     const has_group_by = root.*.u.select.group_by.count > 0;
     const is_aggregate = has_agg or has_group_by;
+    // The star would drop every other item (and `SELECT a, *` its own copy of `a`), under GROUP BY ... ORDER BY too.
+    if (has_star and root.*.u.select.result_columns.count > 1) {
+        diagnosticPrint("sql: SELECT * beside other select items is not supported yet (list the columns instead)\n", .{});
+        return error.StarWithItemsNotSupported;
+    }
 
     if (is_aggregate) {
         if (has_bare and !has_group_by) {
@@ -3003,6 +3010,18 @@ test "regression: a HAVING literal operand is a value, not a SELECT position" {
         "SELECT g, count(*) AS c FROM 't' GROUP BY g HAVING 9 IS NULL",
     }) |sql| try std.testing.expectError(error.HavingNotSupported, parseSqlQuery(a, sql));
     var q = try parseSqlQuery(a, "SELECT g, count(*) AS c FROM 't' GROUP BY g HAVING c BETWEEN 2 AND 3");
+    q.deinit(a);
+}
+
+test "a star beside other select items is refused by name; a lone star still parses" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT *, x + 1 AS one FROM 't'",
+        "SELECT x, * FROM 't'",
+        "SELECT *, * FROM 't'",
+        "SELECT t.*, x + 1 AS one FROM 't'",
+    }) |sql| try std.testing.expectError(error.StarWithItemsNotSupported, parseSqlQuery(a, sql));
+    var q = try parseSqlQuery(a, "SELECT * FROM 't' WHERE x > 1");
     q.deinit(a);
 }
 

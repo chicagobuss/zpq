@@ -1,0 +1,20 @@
+{
+  "fixtures": [
+    {"name": "st", "copy": "COPY (SELECT k::BIGINT AS id, (k % 3)::BIGINT AS g, 'x' || k AS s FROM range(0, 48) t(k)) TO '{path}' (FORMAT PARQUET)"},
+    {"name": "std", "copy": "COPY (SELECT k::BIGINT AS id, 'd' || k AS name FROM range(0, 20) t(k)) TO '{path}' (FORMAT PARQUET)"}
+  ],
+  "cases": [
+    {"id": "sql_star:refuse:star-then-expr", "fixture": "st", "cli": ["query", "--query", "SELECT *, id + 1 AS one FROM '{path}'", "--summary=json"], "refuse": {"error": "StarWithItemsNotSupported", "diag": "SELECT * beside other select items", "exit": 2, "no_output": true}},
+    {"id": "sql_star:refuse:column-then-star", "fixture": "st", "cli": ["query", "--query", "SELECT id, * FROM '{path}'", "--summary=json"], "refuse": {"error": "StarWithItemsNotSupported", "diag": "SELECT * beside other select items", "exit": 2, "no_output": true}},
+    {"id": "sql_star:refuse:star-twice", "fixture": "st", "cli": ["query", "--query", "SELECT *, * FROM '{path}'", "--summary=json"], "refuse": {"error": "StarWithItemsNotSupported", "diag": "SELECT * beside other select items", "exit": 2, "no_output": true}},
+    {"id": "sql_star:refuse:qualified-star-then-expr", "fixture": "st", "cli": ["query", "--query", "SELECT t.*, id + 1 AS one FROM '{path}' t", "--summary=json"], "refuse": {"error": "StarWithItemsNotSupported", "diag": "SELECT * beside other select items", "exit": 2, "no_output": true}},
+    {"id": "sql_star:lone", "fixture": "st", "cli": ["query", "--query", "SELECT * FROM '{path}' WHERE id > 5 ORDER BY id LIMIT 7"], "axes": [{"jobs": 1}, {"jobs": 3}, {"jobs": 16}], "oracle": {"compare": "ordered", "sql": "SELECT * FROM '{path}' WHERE id > 5 ORDER BY id LIMIT 7"}},
+    {"id": "sql_star:cte", "fixture": "st", "cli": ["query", "--query", "WITH c AS (SELECT * FROM '{path}' WHERE id > 5) SELECT * FROM c ORDER BY id"], "axes": [{"jobs": 1}, {"jobs": 3}, {"jobs": 16}], "oracle": {"compare": "ordered", "sql": "WITH c AS (SELECT * FROM '{path}' WHERE id > 5) SELECT * FROM c ORDER BY id"}},
+    {"id": "sql_star:derived", "fixture": "st", "cli": ["query", "--query", "SELECT * FROM (SELECT * FROM '{path}' WHERE id > 5) t ORDER BY id"], "axes": [{"jobs": 1}, {"jobs": 3}, {"jobs": 16}], "oracle": {"compare": "ordered", "sql": "SELECT * FROM (SELECT * FROM '{path}' WHERE id > 5) t ORDER BY id"}},
+    {"id": "sql_star:window", "fixture": "st", "cli": ["query", "--query", "SELECT *, row_number() OVER (ORDER BY id) AS rn FROM '{path}' ORDER BY id"], "axes": [{"jobs": 1}, {"jobs": 3}, {"jobs": 16}], "oracle": {"compare": "ordered", "sql": "SELECT *, row_number() OVER (ORDER BY id) AS rn FROM '{path}' ORDER BY id"}},
+    {"id": "sql_star:join-derived", "fixture": "st", "cli": ["query", "--query", "SELECT count(*) AS n, sum(f.id) AS s FROM '{path}' f JOIN (SELECT * FROM '{fixture:std}') d ON f.id = d.id"], "axes": [{"jobs": 1}, {"jobs": 3}, {"jobs": 16}], "oracle": {"compare": "ordered", "sql": "SELECT count(*) AS n, sum(f.id) AS s FROM '{path}' f JOIN (SELECT * FROM '{fixture:std}') d ON f.id = d.id"}},
+    {"id": "sql_star:refuse:column-star-aggregate", "fixture": "st", "cli": ["query", "--query", "SELECT id, *, count(*) AS n FROM '{path}' GROUP BY id, g, s", "--summary=json"], "refuse": {"error": "StarWithItemsNotSupported", "diag": "SELECT * beside other select items", "exit": 2, "no_output": true}},
+    {"id": "sql_star:refuse:star-aggregate-0", "fixture": "st", "cli": ["query", "--query", "SELECT *, count(*) AS n FROM '{path}' GROUP BY id, g, s ORDER BY id", "--summary=json"], "refuse": {"error": "StarWithItemsNotSupported", "diag": "SELECT * beside other select items", "exit": 2, "no_output": true}},
+    {"id": "sql_star:refuse:star-aggregate-1", "fixture": "st", "cli": ["query", "--query", "SELECT *, count(*) AS n FROM '{path}'", "--summary=json"], "refuse": {"error": "StarWithItemsNotSupported", "diag": "SELECT * beside other select items", "exit": 2, "no_output": true}}
+  ]
+}

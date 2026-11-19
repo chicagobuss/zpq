@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`SELECT *` beside other items is refused instead of answered incorrectly.** `SELECT *, a + 1 AS one` silently dropped `one` (since 0.5.1); zpq now refuses it by name. List the columns instead.
+
 - **A GROUP BY scan no longer pays for code it doesn't run.** The lone-key dictionary filter is compiled only into the scans that use it, which brings the long-string COUNT(DISTINCT) cells back to 0.5.2's speed while keeping 0.6.0's gains on filtered lone-key counts.
 
 - **A small S3 read that fails reports the store's error.** A ranged GET whose error response was larger than the requested range reported BodyTooLarge. zpq now reads up to 1 MiB of the error document and names the store's code, message and object path, an endless error stream fails within about 2 MiB, and a SlowDown on a small read backs off and retries.

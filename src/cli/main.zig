@@ -1343,6 +1343,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "SetOperationAll",             "SetOperationByName",    "SetOperationOrder",            "SetOperationNesting",         "SetOperationColumns",        "SetOperationTypes",
         "SetOperationNullability",     "GroupingSetsKey",       "GroupingSetsDistinct",         "GroupingSetsNesting",         "GroupingSetsGrouping",       "GroupingSetsTooMany",
         "CteRecursive",                "CteDuplicate",          "CteCircular",                  "LateralNotSupported",         "JoinRowsNotSupported",       "JoinRowsShape",
+        "StarWithItemsNotSupported",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

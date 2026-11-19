@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Scans count and group faster, and footers parse in place.** Histogram columns fold their entries once and count codes in cache-sized lanes, a lone GROUP BY key is filtered once per dictionary entry, and a footer parses in place into one block. On granite, ClickBench q7 runs 39% faster hot and 28% cold, q2 25% and 17%, and q29 23% and 14%.
+
 - **Every S3 read checks the object's version.** A Parquet object replaced while zpq reads it now fails with a named error (`InputChanged`) instead of returning a mix of old and new data. This covers every query shape, including fan-out and Lambda, where workers must agree on each object's ETag before their results are merged. A store or proxy that drops the ETag from range responses now fails the query instead of risking a mixed answer.
 
 - **S3 joins start sooner and never mix object versions.** zpq reuses the footers and file tails its binder already read and checks every later read's ETag against them. A join over many small S3 files makes about half the requests, and an object replaced mid-query makes the join bind again once or fail with a named error. Stores that reject If-Match fall back to plain reads that are still checked.

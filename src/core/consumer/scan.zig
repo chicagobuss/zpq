@@ -493,8 +493,8 @@ pub fn scanRGForAgg(
         (join or target != .grouped or exactTileTarget(in, target) or (decode_options.encoded and
             target.grouped.part == null and target.grouped.records == null)))
         execution.decode_batch_rows = automaticCacheRows(in, target, ws.scan_workers) catch 0;
-    if (ws.defer_decode_errors) return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution);
-    return scanRGForAggImpl(gpa, in, stats, decode_options, target, execution) catch |err| {
+    if (ws.defer_decode_errors) return scanRGForAggSpecialized(gpa, in, stats, decode_options, target, execution);
+    return scanRGForAggSpecialized(gpa, in, stats, decode_options, target, execution) catch |err| {
         if (!isDecodeError(err)) return err;
         const site = decodeFailure() orelse return err;
         const failure = canonicalDecodeFailure(
@@ -925,7 +925,25 @@ fn planDecode(
     return plan;
 }
 
+/// Only a lone GROUP BY key under a filter can take the histogram filter (`filterHist`), so only that query gets the
+/// instantiation that carries it: every other aggregate scan keeps the code it had without the branch, and its fold
+/// loops do not move with it (grouped COUNT(DISTINCT) over long strings read 8% slower with the branch in).
+fn scanRGForAggSpecialized(
+    gpa: std.mem.Allocator,
+    in: AggRowGroup,
+    stats: agg_plan.StatsUse,
+    decode_options: DecodeOptions,
+    target: AggTarget,
+    ws: AggWorkspace,
+) !u64 {
+    if (in.filter != null and target == .grouped and
+        agg_coded.histGroupKey(target.grouped.calls, target.grouped.keys) != null)
+        return scanRGForAggImpl(true, gpa, in, stats, decode_options, target, ws);
+    return scanRGForAggImpl(false, gpa, in, stats, decode_options, target, ws);
+}
+
 fn scanRGForAggImpl(
+    comptime hist_filter: bool,
     gpa: std.mem.Allocator,
     in: AggRowGroup,
     stats: agg_plan.StatsUse,
@@ -1106,7 +1124,7 @@ fn scanRGForAggImpl(
     };
     // A lone GROUP BY key read as a histogram is filtered by that key alone (`planCodeUses`): per entry, not per row.
     var hist_rows: ?usize = null;
-    if (in.filter) |f| if (!filtered and target == .grouped) {
+    if (hist_filter) if (in.filter) |f| if (!filtered) {
         if (agg_coded.histGroupKey(target.grouped.calls, target.grouped.keys)) |key| if (lookup[key]) |pos| {
             if (batch_cols.items[pos].hist() != null)
                 hist_rows = try agg_coded.filterHist(ra, f, &batch_cols.items[pos], key, lookup.len);

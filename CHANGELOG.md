@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A small S3 read that fails reports the store's error.** A ranged GET whose error response was larger than the requested range reported BodyTooLarge. zpq now reads up to 1 MiB of the error document and names the store's code, message and object path, an endless error stream fails within about 2 MiB, and a SlowDown on a small read backs off and retries.
+
 - **Fan-out and footer-only S3 queries no longer crash on large footers.** A footer-only S3 open kept its plan bound to a footer it had already freed. A Lambda fan-out over files with large footers could crash its workers, and `--explain` or `LIMIT 0` over S3 could crash or print freed memory. The footer cache also hands out copies now, so a concurrent update can't free an entry still in use.
 
 - **Scans count and group faster, and footers parse in place.** Histogram columns fold their entries once and count codes in cache-sized lanes, a lone GROUP BY key is filtered once per dictionary entry, and a footer parses in place into one block. On granite, ClickBench q7 runs 39% faster hot and 28% cold, q2 25% and 17%, and q29 23% and 14%.

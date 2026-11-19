@@ -59,7 +59,7 @@ test "binder: a join's footers come in one GET each, whatever their size, and ar
     var schemas = schemasFor(a, try fakeEnv(a, &fake), &diag);
     defer schemas.deinit();
     const paths = [_][]const u8{ "s3://bkt/t/tiny.parquet", "s3://bkt/t/mid.parquet", "s3://bkt/t/wide.parquet" };
-    frontend.JoinSchemas.prefetch(&schemas, &paths);
+    try frontend.JoinSchemas.prefetch(&schemas, &paths);
     try std.testing.expectEqual(@as(u32, 4), fake.gets);
     const want = [_]@TypeOf(tiny){ tiny, mid, wide };
     for (paths, want) |path, expect| {
@@ -117,7 +117,7 @@ test "binder: a glob is listed once, a one-file glob works, and an empty one fai
     var schemas = schemasFor(a, try fakeEnv(a, &fake), &diag);
     defer schemas.deinit();
     const pattern = "s3://bkt/g/*.parquet";
-    frontend.JoinSchemas.prefetch(&schemas, &.{pattern});
+    try frontend.JoinSchemas.prefetch(&schemas, &.{pattern});
     const meta = try frontend.JoinSchemas.footer(&schemas, pattern);
     try std.testing.expectEqual(only.rows, meta.num_rows);
     const again = try schemas.listing(pattern);
@@ -126,7 +126,7 @@ test "binder: a glob is listed once, a one-file glob works, and an empty one fai
     try std.testing.expectEqual(@as(u32, 2), fake.requests_seen.load(.monotonic));
 
     const none = "s3://bkt/nothing/*.parquet";
-    frontend.JoinSchemas.prefetch(&schemas, &.{none});
+    try frontend.JoinSchemas.prefetch(&schemas, &.{none});
     try std.testing.expectError(error.NoMatches, frontend.JoinSchemas.footer(&schemas, none));
     const said = Capture.bytes[0..Capture.len];
     const listed_empty = std.mem.count(u8, said, "matched no objects");
@@ -156,7 +156,7 @@ test "binder: a missing object in a batch is the same named error, on the same o
     var batch_diag: Diag = .{};
     var batched = schemasFor(a, env, &batch_diag);
     defer batched.deinit();
-    frontend.JoinSchemas.prefetch(&batched, &.{ good, missing });
+    try frontend.JoinSchemas.prefetch(&batched, &.{ good, missing });
     // The batch failed as a whole; the good table is still read, singly, and the bad one reports itself.
     const meta = try frontend.JoinSchemas.footer(&batched, good);
     try std.testing.expectEqual(ok.rows, meta.num_rows);
@@ -190,7 +190,7 @@ test "binder: a local table in a join reads as it did, and only the S3 table goe
     try std.testing.expectEqual(@as(u32, 0), fake.gets);
     try std.testing.expectEqual(@as(usize, 1), schemas.local.seen.count());
 
-    frontend.JoinSchemas.prefetch(&schemas, &.{ local_path, "s3://bkt/t/mid.parquet" });
+    try frontend.JoinSchemas.prefetch(&schemas, &.{ local_path, "s3://bkt/t/mid.parquet" });
     try std.testing.expectEqual(@as(u32, 1), fake.gets);
     try std.testing.expectEqual(@as(usize, 1), schemas.local.seen.count());
     try std.testing.expectEqual(@as(usize, 1), schemas.local.remote.count());
@@ -216,7 +216,7 @@ test "binder: the retry's bind reads nothing, lists nothing, and still reports a
         attempt.restore(&memo);
         defer attempt.save(&memo);
         defer attempt.deinit();
-        frontend.JoinSchemas.prefetch(&attempt, &.{"s3://bkt/g/*.parquet"});
+        try frontend.JoinSchemas.prefetch(&attempt, &.{"s3://bkt/g/*.parquet"});
         _ = try frontend.JoinSchemas.footer(&attempt, "s3://bkt/g/*.parquet");
     }
     const requests = fake.requests_seen.load(.monotonic);
@@ -225,7 +225,7 @@ test "binder: the retry's bind reads nothing, lists nothing, and still reports a
     var retry = schemasFor(a, env, &diag);
     retry.restore(&memo);
     defer retry.deinit();
-    frontend.JoinSchemas.prefetch(&retry, &.{"s3://bkt/g/*.parquet"});
+    try frontend.JoinSchemas.prefetch(&retry, &.{"s3://bkt/g/*.parquet"});
     const meta = try frontend.JoinSchemas.footer(&retry, "s3://bkt/g/*.parquet");
     try std.testing.expectEqual(first.rows, meta.num_rows);
     try std.testing.expectEqual(requests, fake.requests_seen.load(.monotonic));
@@ -267,7 +267,7 @@ test "binder: a glob of many files keeps no more footer reads in flight than the
     var diag: Diag = .{};
     var schemas = schemasFor(a, try fakeEnv(a, &fake), &diag);
     defer schemas.deinit();
-    frontend.JoinSchemas.prefetch(&schemas, &names);
+    try frontend.JoinSchemas.prefetch(&schemas, &names);
     watcher.join();
     try std.testing.expectEqual(@as(u32, s3_fetch.READ_CONCURRENCY), peak);
     try std.testing.expectEqual(@as(u32, files), fake.gets);
@@ -428,7 +428,7 @@ test "glob: keys the listing escapes come back as they were written, and read" {
     // The binder reads every one of them: the footers' rows add up, with no 404.
     var schemas = schemasFor(a, env, &diag);
     defer schemas.deinit();
-    frontend.JoinSchemas.prefetch(&schemas, &.{"s3://bkt/amp/p*.parquet"});
+    try frontend.JoinSchemas.prefetch(&schemas, &.{"s3://bkt/amp/p*.parquet"});
     const meta = try frontend.JoinSchemas.footer(&schemas, "s3://bkt/amp/p*.parquet");
     try std.testing.expectEqual(5 * rows, meta.num_rows);
 }
@@ -481,4 +481,75 @@ test "binder: execution reuses its footer and a replaced object needs a fresh fo
     var reopened = try input.openInputs(ctx, a, args, .{ .limit = 1 << 24 });
     defer reopened.deinit();
     try std.testing.expectEqual(replacement.rows, reopened.metas[0].num_rows);
+}
+
+test "binder: If-Match requires the response ETag even if fake S3 ignores the precondition or omits the tag" {
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "POSIX environment fixture");
+    const input = @import("engine/input.zig");
+    const types = @import("engine/types.zig");
+    const key = "t/input.parquet";
+    const path = "s3://bkt/" ++ key;
+
+    for ([_]enum { ignores_match, omits_conditional_tag, omits_all_tags }{
+        .ignores_match, .omits_conditional_tag, .omits_all_tags,
+    }) |mode| {
+        var fake: fake_s3.FakeS3 = undefined;
+        try fake.start(std.testing.allocator);
+        defer fake.deinit();
+        fake.ignore_if_match = mode == .ignores_match;
+        fake.get_etag = switch (mode) {
+            .ignores_match => .always,
+            .omits_conditional_tag => .omit_conditional,
+            .omits_all_tags => .omit,
+        };
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var diag: Diag = .{};
+        var schemas = schemasFor(a, try fakeEnv(a, &fake), &diag);
+        defer schemas.deinit();
+
+        // Keep the old byte offsets in bounds in the larger replacement so the unchecked range GET succeeds.
+        const old = try serve(&fake, a, key, "decimal_precision40.parquet");
+        _ = try frontend.JoinSchemas.footer(&schemas, path);
+        const ctx = schemas.local.ctx.?;
+        const args: types.QueryArgs = .{ .inputs = &.{path}, .remote_footers = &schemas.local.remote };
+        if (mode == .ignores_match) _ = try serve(&fake, a, key, "group_order.parquet");
+
+        if (mode == .omits_all_tags) {
+            // No ETag at bind time means the memo is ineligible, so the engine fetches its own footer.
+            var opened = try input.openInputs(ctx, a, args, .{
+                .limit = 1 << 24,
+                .footer_only = true,
+                .footer_probe = s3_fetch.FOOTER_PROBE_MIN,
+            });
+            defer opened.deinit();
+            try std.testing.expectEqual(@as(u32, 2), fake.gets);
+            try std.testing.expectEqual(old.rows, opened.metas[0].num_rows);
+        } else {
+            try std.testing.expectError(error.AlignedJoinSnapshotChanged, input.openInputs(ctx, a, args, .{ .limit = 1 << 24 }));
+            try std.testing.expect(fake.gets > 1);
+        }
+    }
+}
+
+test "binder: If-Match rejects a split footer with a missing ETag in the second response" {
+    if (comptime test_skip.lacks(.posix)) return test_skip.skipNeeding(.posix, "POSIX environment fixture");
+    const key = "t/wide.parquet";
+    var fake: fake_s3.FakeS3 = undefined;
+    try fake.start(std.testing.allocator);
+    defer fake.deinit();
+    fake.get_etag = .omit_conditional;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diag = .{};
+    var schemas = schemasFor(a, try fakeEnv(a, &fake), &diag);
+    defer schemas.deinit();
+
+    _ = try serve(&fake, a, key, "many_tiny.parquet");
+    try std.testing.expectError(error.AlignedJoinSnapshotChanged, frontend.JoinSchemas.prefetch(&schemas, &.{"s3://bkt/" ++ key}));
+    try std.testing.expectEqual(@as(u32, 2), fake.gets);
+    try std.testing.expectEqual(@as(usize, 0), schemas.local.remote.count());
 }

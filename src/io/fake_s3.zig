@@ -60,6 +60,8 @@ pub const FakeS3 = struct {
     /// When set, object GETs past this many are refused (403), as a revoked credential or a deleted object would be.
     gets_allowed: ?u32 = null,
     gets: u32 = 0,
+    ignore_if_match: bool = false,
+    get_etag: enum { always, omit, omit_conditional } = .always,
     /// Object byte ranges served by GETs, for metadata-only and range-planning assertions.
     get_bytes: u64 = 0,
     lowest_get_offset: ?usize = null,
@@ -517,10 +519,15 @@ pub const FakeS3 = struct {
             if (self.gets_allowed) |n| if (self.gets > n) {
                 return self.reply(fd, lose, 403, "", "<Error><Code>AccessDenied</Code></Error>", null);
             };
-            if (header(head, "If-Match")) |tag| {
+            const if_match = header(head, "If-Match");
+            if (!self.ignore_if_match) if (if_match) |tag| {
                 const quoted = try std.fmt.allocPrint(a, "\"{s}\"", .{o.etag});
                 if (!std.mem.eql(u8, tag, quoted)) return self.reply(fd, lose, 412, "", "", null);
-            }
+            };
+            const etag_header = if (self.get_etag == .always or (self.get_etag == .omit_conditional and if_match == null))
+                try std.fmt.allocPrint(a, "ETag: \"{s}\"\r\n", .{o.etag})
+            else
+                "";
             const no_key = "<Error><Code>NoSuchKey</Code></Error>";
             const data = o.data orelse return self.reply(fd, lose, 404, "", no_key, null);
             var lo: usize = 0;
@@ -538,12 +545,12 @@ pub const FakeS3 = struct {
                     }
                 }
                 status = 206;
-                extra = try std.fmt.allocPrint(a, "ETag: \"{s}\"\r\nContent-Range: bytes {d}-{d}/{d}\r\n", .{
-                    o.etag, lo, hi -| 1, data.len,
+                extra = try std.fmt.allocPrint(a, "{s}Content-Range: bytes {d}-{d}/{d}\r\n", .{
+                    etag_header, lo, hi -| 1, data.len,
                 });
             };
             if (lo > hi) return self.reply(fd, lose, 416, "", "", null);
-            if (status == 200) extra = try std.fmt.allocPrint(a, "ETag: \"{s}\"\r\n", .{o.etag});
+            if (status == 200) extra = etag_header;
             self.get_bytes += hi - lo;
             self.lowest_get_offset = @min(self.lowest_get_offset orelse lo, lo);
             resp_body = data[lo..hi];

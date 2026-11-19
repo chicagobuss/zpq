@@ -678,7 +678,7 @@ fn runParsed(
             return;
         };
         // A failed If-Match precedes the aggregate answer. Bind again against fresh footers before reading any data.
-        if (err != error.AlignedJoinSnapshotChanged or memo.remote.count() == 0 or attempt != 0) return err;
+        if (err != error.AlignedJoinSnapshotChanged or attempt != 0) return err;
         memo.remote = .empty;
         diag.* = .{};
     }

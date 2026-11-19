@@ -53,7 +53,7 @@ pub const JoinSchemas = struct {
 
     /// `Schemas.prefetch`: the footers of every S3 file the join's tables name, in one batch. A failure leaves them to
     /// `footer`, which reads them one by one and reports the first bad object by name, as it always did.
-    pub fn prefetch(raw: *const anyopaque, paths: []const []const u8) void {
+    pub fn prefetch(raw: *const anyopaque, paths: []const []const u8) error{AlignedJoinSnapshotChanged}!void {
         const self: *JoinSchemas = @ptrCast(@alignCast(@constCast(raw)));
         var want: std.ArrayList([]const u8) = .empty;
         var dedup: std.StringHashMapUnmanaged(void) = .empty;
@@ -66,7 +66,10 @@ pub const JoinSchemas = struct {
                 want.append(self.arena, name) catch return;
             }
         }
-        if (want.items.len > 0) self.local.fetchMany(want.items) catch {};
+        if (want.items.len > 0) self.local.fetchMany(want.items) catch |err| {
+            // Rebind the whole join if a split footer changed while the batch was being fetched.
+            if (err == error.AlignedJoinSnapshotChanged) return error.AlignedJoinSnapshotChanged;
+        };
     }
 
     pub fn footer(raw: *const anyopaque, path: []const u8) anyerror!*const zpq.core.schema.FileMetaData {

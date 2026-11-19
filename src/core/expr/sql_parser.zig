@@ -1300,7 +1300,7 @@ pub const Schemas = struct {
     footer: *const fn (ctx: *const anyopaque, path: []const u8) anyerror!*const schema.FileMetaData,
     /// Best effort, called once with every table of a join before the first `footer`: a remote reader fetches their
     /// footers together (one round trip) instead of one after another. What it cannot fetch, `footer` reports.
-    prefetch: ?*const fn (ctx: *const anyopaque, paths: []const []const u8) void = null,
+    prefetch: ?*const fn (ctx: *const anyopaque, paths: []const []const u8) error{AlignedJoinSnapshotChanged}!void = null,
 };
 
 /// A two-table N:1 join (`sql_join.zig`): the probe side's single-table query, with the resolved join on its syntax
@@ -1372,7 +1372,7 @@ const Owners = struct {
 fn resolveJoin(a: std.mem.Allocator, sql: [:0]const u8, paths: []const []const u8, schemas: Schemas, markers: literals.Markers, unique_ins: bool, root_path: ?[]const u8, user_from: bool) anyerror!Resolved {
     const metas = try a.alloc(*const schema.FileMetaData, paths.len);
     const rows = try a.alloc(u64, paths.len);
-    if (schemas.prefetch) |prefetch| prefetch(schemas.ctx, paths);
+    if (schemas.prefetch) |prefetch| try prefetch(schemas.ctx, paths);
     for (paths, metas, rows) |path, *m, *r| {
         m.* = try schemas.footer(schemas.ctx, path);
         r.* = @intCast(m.*.num_rows);

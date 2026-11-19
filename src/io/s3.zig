@@ -876,6 +876,39 @@ pub const GetOpts = struct {
     prof: ?*profile.Thread = null,
 };
 
+/// An ETag is opaque, including its multipart suffix. Only the enclosing quotes are optional.
+pub fn etagValue(tag: []const u8) []const u8 {
+    if (tag.len >= 2 and tag[0] == '"' and tag[tag.len - 1] == '"') return tag[1 .. tag.len - 1];
+    return tag;
+}
+
+/// A successful conditional read must identify the pinned generation even if the server ignores If-Match.
+pub fn checkIfMatch(response: http.Response, if_match: ?[]const u8) error{AlignedJoinSnapshotChanged}!void {
+    const want = if_match orelse return;
+    switch (response.status) {
+        412 => return error.AlignedJoinSnapshotChanged,
+        200, 206, 304 => {
+            const got = response.header("ETag") orelse return error.AlignedJoinSnapshotChanged;
+            if (!std.mem.eql(u8, etagValue(want), etagValue(got))) return error.AlignedJoinSnapshotChanged;
+        },
+        else => {},
+    }
+}
+
+test "If-Match verifies response ETags and preserves multipart suffixes" {
+    var response: http.Response = .{
+        .status = 206,
+        .headers = &.{.{ .name = "etag", .value = "abcdef-3" }},
+        .body = &.{},
+    };
+    try checkIfMatch(response, "\"abcdef-3\"");
+    try std.testing.expectError(error.AlignedJoinSnapshotChanged, checkIfMatch(response, "\"abcdef-2\""));
+    try std.testing.expectError(error.AlignedJoinSnapshotChanged, checkIfMatch(response, "\"abcdef\""));
+    response.headers = &.{};
+    try std.testing.expectError(error.AlignedJoinSnapshotChanged, checkIfMatch(response, "\"abcdef-3\""));
+    try checkIfMatch(response, null);
+}
+
 pub fn getViaPoolWithOpts(
     io: Io,
     p: anytype,
@@ -1397,11 +1430,13 @@ fn fetchOneTask(io: Io, ctx: *FetchCtx) Io.Cancelable!void {
             return;
         },
     };
+    checkIfMatch(resp, ctx.if_match) catch |err| {
+        ctx.err = err;
+        return;
+    };
     // Any status but a full 200/206 (including a throttle that outlasted the budget) fails this fetch.
     if (resp.status == 206 or resp.status == 200) {
         ctx.ok = resp.body.len == ctx.target.len;
-    } else if (resp.status == 412 and ctx.if_match != null) {
-        ctx.err = error.AlignedJoinSnapshotChanged;
     } else {
         const r = refusal(.GetObject, ctx.bucket, ctx.key, resp, ctx.creds);
         ctx.failure = r.failure;

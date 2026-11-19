@@ -432,8 +432,7 @@ pub const FetchSpec = struct {
     }
 
     fn noteEtag(self: *FetchSpec, raw: ?[]const u8) void {
-        var e = raw orelse return;
-        if (e.len >= 2 and e[0] == '"' and e[e.len - 1] == '"') e = e[1 .. e.len - 1];
+        const e = s3.etagValue(raw orelse return);
         if (e.len > self.etag_buf.len) return;
         @memcpy(self.etag_buf[0..e.len], e);
         self.etag_len = e.len;
@@ -887,7 +886,7 @@ fn getMetaObject(
         sp.failure = s3.transportFailure(.GetObject, sp.url.bucket, sp.url.key, err);
         return err;
     };
-    if (response.status == 412 and conditional.if_match != null) return error.AlignedJoinSnapshotChanged;
+    try s3.checkIfMatch(response, conditional.if_match);
     return response;
 }
 
@@ -1050,14 +1049,7 @@ pub fn ensureHeadMagic(start: u64, bytes: []const u8) !void {
 /// (4-byte length + PAR1).
 fn maybeCacheMeta(ctx: Context, sp: *FetchSpec, etag_opt: ?[]const u8) !void {
     const cache = ctx.meta_cache orelse return;
-    const etag_raw = etag_opt orelse return;
-
-    // S3 ETags arrive double-quoted in the response header
-    // (`ETag: "abc123"`). Strip them so cache keys are stable.
-    var etag = etag_raw;
-    if (etag.len >= 2 and etag[0] == '"' and etag[etag.len - 1] == '"') {
-        etag = etag[1 .. etag.len - 1];
-    }
+    const etag = s3.etagValue(etag_opt orelse return);
 
     if (sp.footer_region.len < 8) return;
 

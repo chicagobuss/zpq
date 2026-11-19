@@ -1022,7 +1022,7 @@ fn snapshotObject(hash: *std.crypto.hash.sha2.Sha256, origin: []const u8, path: 
     snapshotWord(hash, path.len);
     hash.update(path);
     // Whole-object and footer ETags have the same canonical representation in agreement.
-    const canonical = std.mem.trim(u8, etag, "\"");
+    const canonical = s3.etagValue(etag);
     snapshotWord(hash, canonical.len);
     hash.update(canonical);
     snapshotWord(hash, size);

@@ -305,10 +305,8 @@ fn readFile(path: [:0]const u8, buf: []u8) ?[]const u8 {
 /// L2's, checked on the seed), and the list and size per L3 group: about 25 files for 16 cores, where reading every
 /// CPU's caches took ~300 (~1 ms). False, with `out` as it was, when the host is not that: the caller reads every CPU.
 fn scanSysfsUniform(online: CpuSet, out: []Cpu, seeded: usize) bool {
-    const x86 = builtin.target.cpu.arch == .x86 or builtin.target.cpu.arch == .x86_64;
-    if (comptime builtin.target.os.tag != .linux or !x86) return false;
+    if (!uniform()) return false;
     if (seeded >= out.len or !online.isSet(seeded)) return false;
-    if (cpuid(0, 0)[0] >= 7 and cpuid(7, 0)[3] & (1 << 15) != 0) return false; // hybrid: core types differ
     const index = cpuidIndexes();
     const l1, const l2 = .{ index[0] orelse return false, index[1] orelse return false };
     const seed = out[seeded];
@@ -354,6 +352,20 @@ fn scanSysfsUniform(online: CpuSet, out: []Cpu, seeded: usize) bool {
     out[seeded].l2.max_sharing = seed.l2.max_sharing;
     out[seeded].l3.max_sharing = seed.l3.max_sharing;
     return true;
+}
+
+/// x86 Linux that is not hybrid (CPUID leaf 7 EDX bit 15: core types differ): where `scanSysfsUniform` applies.
+fn uniform() bool {
+    const x86 = builtin.target.cpu.arch == .x86 or builtin.target.cpu.arch == .x86_64;
+    if (comptime builtin.target.os.tag != .linux or !x86) return false;
+    return !(cpuid(0, 0)[0] >= 7 and cpuid(7, 0)[3] & (1 << 15) != 0);
+}
+
+/// Discover now, on the calling thread, where it is cheap (`scanSysfsUniform`, ~25 sysfs files): a query's first
+/// cache-sized decision is often taken inside a scan, where the other workers would wait on it. Elsewhere (hybrid
+/// x86, aarch64, macOS) the full scan reads hundreds of files, and stays lazy: paid only by a query that asks.
+pub fn discoverIfCheap() void {
+    if (uniform()) _ = forCpu(0);
 }
 
 /// Undo a partial `scanSysfsUniform`: the full scan reads into records it expects empty, the seed's CPUID one aside.

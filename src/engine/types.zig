@@ -338,8 +338,8 @@ pub const Context = struct {
     /// The context one query runs in, for every entry point and query kind alike: only a `--max-memory` the caller
     /// set pays for promptly released buffer mappings (`memory.queryAllocator`).
     pub fn forQuery(self: Context, args: *const QueryArgs) Context {
-        // Cache topology on this thread, before any worker starts: a worker that needed it first held the others.
-        _ = @import("../core/hw.zig").forCpu(0);
+        // Cache topology on this thread, before any worker starts, where that is cheap (`hw.discoverIfCheap`).
+        @import("../core/hw.zig").discoverIfCheap();
         var ctx = self;
         ctx.gpa = core_memory.queryAllocator(self.gpa, args.max_memory_explicit != null);
         ctx.diag = args.diag;

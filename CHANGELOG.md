@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Every S3 read checks the object's version.** A Parquet object replaced while zpq reads it now fails with a named error (`InputChanged`) instead of returning a mix of old and new data. This covers every query shape, including fan-out and Lambda, where workers must agree on each object's ETag before their results are merged. A store or proxy that drops the ETag from range responses now fails the query instead of risking a mixed answer.
+
 - **S3 joins start sooner and never mix object versions.** zpq reuses the footers and file tails its binder already read and checks every later read's ETag against them. A join over many small S3 files makes about half the requests, and an object replaced mid-query makes the join bind again once or fail with a named error. Stores that reject If-Match fall back to plain reads that are still checked.
 
 - **Joins over S3 read about a third fewer bytes.** Outside Lambda, zpq sizes the gap it bridges between column chunks from the link's bandwidth shared across its requests in flight, so large S3 joins read about what DuckDB reads, and the joins suite runs 17% faster over S3. Lambda keeps its previous gap.

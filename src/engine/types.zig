@@ -93,8 +93,20 @@ pub const RowGroupRange = struct {
 };
 
 /// Immutable S3 generation used by a footer-derived physical selection (ETag without quotes).
-pub const SourceSnapshot = struct { etag: []const u8, size: u64 };
+pub const SourceSnapshot = struct {
+    etag: []const u8,
+    size: u64,
+
+    pub fn same(self: SourceSnapshot, other: SourceSnapshot) bool {
+        return self.size == other.size and s3.sameEtag(self.etag, other.etag);
+    }
+};
 pub const SourceSnapshots = std.StringHashMapUnmanaged(SourceSnapshot);
+
+pub const ObservedSources = struct {
+    arena: std.mem.Allocator,
+    snapshots: std.json.ArrayHashMap(SourceSnapshot) = .{},
+};
 
 pub const RemoteFooters = std.StringHashMapUnmanaged(*const RemoteFooter);
 pub const RemoteReadPolicies = std.StringHashMapUnmanaged(*s3.ReadPolicy);
@@ -232,6 +244,7 @@ pub const QueryArgs = struct {
     input_snapshots: ?[]const ?SourceSnapshot = null,
     /// Fan-out preparation pins the worker to the same generations as every other partition.
     source_snapshots: ?*const SourceSnapshots = null,
+    observed_sources: ?*ObservedSources = null,
     pin_input_generation: bool = false,
     /// The SQL join binder's raw footers, borrowed for this query.
     remote_footers: ?*const RemoteFooters = null,

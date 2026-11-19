@@ -927,6 +927,7 @@ pub fn etagValue(tag: []const u8) []const u8 {
 /// A successful read must identify the pinned generation. An untagged initial footer keeps the old read behavior.
 pub fn checkResponseEtag(response: http.Response, expected: ?[]const u8) error{InputChanged}!void {
     const want = expected orelse return;
+    if (opaqueEtag(want).len == 0) return;
     switch (response.status) {
         200, 206, 304 => {
             const got = response.header("ETag") orelse return error.InputChanged;
@@ -969,6 +970,7 @@ test "If-Match verifies response ETags and preserves multipart suffixes" {
     try checkIfMatch(response, null);
     try std.testing.expectError(error.InputChanged, checkResponseEtag(response, "abcdef-3"));
     try checkResponseEtag(response, null);
+    try checkResponseEtag(response, "\"\"");
 }
 
 pub fn getViaPoolWithOpts(

@@ -411,9 +411,6 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
                 engine.fanout_plan.decodeJoin(arena, value) catch |err| return engineError(allocator, err, &diag)
             else
                 null;
-            if (req.prepare_sources_only)
-                return engine.fanout_plan.prepareSources(ctx, qa, join, result_cap.bytes) catch |err|
-                    return engineError(allocator, err, &diag);
             if (join) |j| {
                 return engine.fanout_plan.prepareAligned(ctx, qa, j, req.workers, result_cap.bytes) catch |err|
                     return engineError(allocator, err, &diag);
@@ -422,7 +419,7 @@ pub fn handleWithColumns(io: std.Io, allocator: std.mem.Allocator, env: std.proc
                 return engineError(allocator, err, &diag);
         }
         if (req.operation.isPartial()) {
-            // The worker binds the partial query against the input versions the coordinator prepared.
+            // Aligned partials use coordinator pins; named partials report their own versions.
             var arena_state = std.heap.ArenaAllocator.init(allocator);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
@@ -1048,17 +1045,23 @@ fn runAggregate(
     var capped: Capped = .{ .parent = allocator, .cap = result_cap.memory() };
     var aw: std.Io.Writer.Allocating = .init(capped.allocator());
     defer aw.deinit();
+    var source_arena = std.heap.ArenaAllocator.init(allocator);
+    defer source_arena.deinit();
+    var observed: engine.ObservedSources = .{ .arena = source_arena.allocator() };
+    if (partial != null and qa.aligned_join == null and qa.source_snapshots == null)
+        args.observed_sources = &observed;
     const Envelope = struct {
         writer: *std.Io.Writer,
         started: i64,
         pool: *PersistentPool,
         partial: ?[]const u8,
         pinned: bool,
+        observed: ?*const engine.ObservedSources,
         failure: ?anyerror = null,
         fn write(ctx: *anyopaque, ar: engine.AggResult) !void {
             const e: *@This() = @ptrCast(@alignCast(ctx));
             const total_ms = @divTrunc(nowMonoNs() - e.started, std.time.ns_per_ms);
-            aggregateResponse(e.writer, ar, total_ms, e.pool, e.partial, e.pinned) catch |err| {
+            aggregateResponse(e.writer, ar, total_ms, e.pool, e.partial, e.pinned, e.observed) catch |err| {
                 e.failure = err;
                 return err;
             };
@@ -1070,6 +1073,7 @@ fn runAggregate(
         .pool = pool,
         .partial = partial,
         .pinned = qa.source_snapshots != null,
+        .observed = args.observed_sources,
     };
     args.aggregate_sink = .{ .ctx = &envelope, .write_fn = Envelope.write };
     if (pool.per_call_stats) pool.resetStats();
@@ -1093,6 +1097,7 @@ fn runAggregate(
         pool,
         partial,
         qa.source_snapshots != null,
+        args.observed_sources,
     ) catch |err| {
         if (capped.hit) return resultTooLarge(allocator, result_cap);
         return err;
@@ -1124,7 +1129,7 @@ fn writeDecimalList(w: *std.Io.Writer, names: []const []const u8) !void {
 }
 
 /// `runAggregate`'s response for `ar`, onto `w`.
-fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, pool: *PersistentPool, partial: ?[]const u8, pinned: bool) !void {
+fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, pool: *PersistentPool, partial: ?[]const u8, pinned: bool, observed: ?*const engine.ObservedSources) !void {
     if (ar.output.group_cols != null) {
         try w.print("{{\"ok\":true,\"files_in\":{d},\"rows_in\":{d},\"rows_scanned\":{d},\"rows_matched\":{d},\"row_groups_in\":{d},\"row_groups_pruned\":{d},\"row_groups_full_match\":{d},\"cols_stat_pruned\":{d},\"bytes_in\":{d},\"agg\":", .{
             ar.files_in,      ar.rows_in,           ar.rows_scanned,          ar.rows_matched,
@@ -1164,6 +1169,10 @@ fn aggregateResponse(w: *std.Io.Writer, ar: engine.AggResult, total_ms: i64, poo
     try w.writeByte(',');
     try writePoolStats(w, pool.stats());
     if (pinned) try w.writeAll(",\"source_snapshots_checked\":true");
+    if (observed) |sources| {
+        try w.writeAll(",\"source_snapshots\":");
+        try std.json.Stringify.value(sources.snapshots, .{}, w);
+    }
     if (partial) |members| {
         try w.print(",\"partial_version\":{d},", .{request.partial_version});
         try w.writeAll(members);

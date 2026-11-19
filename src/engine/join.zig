@@ -533,6 +533,12 @@ pub const Prepared = struct {
     }
 
     /// Deferred build strings are read at the result cut, after `build` checked its file: one changed since refuses.
+    pub fn recordSources(self: *const Prepared, observed: *types.ObservedSources, diag: ?*Diag) !void {
+        for (self.tasks) |task| {
+            for (task.opened.items) |opened| try opened.recordSources(observed, diag);
+        }
+    }
+
     pub fn intact(self: *const Prepared) error{InputChanged}!void {
         for (self.tasks) |t| for (t.maps.items) |h| try h.map.intact(h.path);
     }

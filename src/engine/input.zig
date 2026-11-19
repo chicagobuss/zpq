@@ -115,6 +115,22 @@ pub const OpenedInputs = struct {
 
     /// `error.InputChanged` when a local input was truncated while it was mapped (`local_fs.Mapped.intact`): checked
     /// before an answer is returned or published.
+    pub fn recordSources(self: OpenedInputs, observed: *types.ObservedSources, diag: ?*Diag) !void {
+        for (self.inputs, self.snapshots) |file, maybe_snapshot| {
+            const snapshot = maybe_snapshot orelse continue;
+            const entry = try observed.snapshots.map.getOrPut(observed.arena, file.name);
+            if (entry.found_existing) {
+                if (!entry.value_ptr.same(snapshot)) {
+                    Diag.setInput(diag, file.name, error.InputChanged);
+                    return error.InputChanged;
+                }
+            } else {
+                entry.key_ptr.* = try observed.arena.dupe(u8, file.name);
+                entry.value_ptr.* = .{ .etag = try observed.arena.dupe(u8, snapshot.etag), .size = snapshot.size };
+            }
+        }
+    }
+
     pub fn intact(self: *const OpenedInputs) error{InputChanged}!void {
         for (self.inputs, self.mmaps) |in, m_opt| if (m_opt) |m| try m.intact(in.name);
     }
@@ -496,7 +512,7 @@ const RemoteInputs = struct {
         // A worker's row groups, before anything plans or fetches from the footers.
         var seen: types.SourceSnapshots = .empty;
         for (self.s3_indices.items, specs) |idx, *sp| {
-            const etag = sp.etag_buf[0..sp.etag_len];
+            const etag = sp.etag;
             var snapshot: types.SourceSnapshot = .{ .etag = etag, .size = sp.total_size };
             if (sp.pin_generation and sp.if_match == null and etag.len > 0 and !std.mem.startsWith(u8, etag, "W/"))
                 sp.if_match = try std.fmt.allocPrint(self.arena, "\"{s}\"", .{etag});
@@ -536,7 +552,6 @@ const RemoteInputs = struct {
                     }
                 } else entry.value_ptr.* = snapshot;
             }
-            snapshot.etag = try self.arena.dupe(u8, snapshot.etag);
             self.snapshots[idx] = snapshot;
         }
         if (self.args.row_groups) |ranges| for (self.s3_indices.items, specs) |idx, *sp| {

@@ -157,6 +157,7 @@ pub fn failureMessage(err: anyerror) []const u8 {
         error.NoRegion => "the S3 region is missing; set AWS_REGION (or S3_REGION)",
         error.DirectoryBucketInvalidPrefix => "S3 Express directory bucket listing prefixes must be empty or end in /",
         error.DirectoryBucketOperationUnsupported => "this S3 operation is not supported for directory buckets",
+        error.InputChanged => "an input changed during the query",
         error.BadRangeResponse => "S3 did not return the requested byte range; check the endpoint and access",
         error.OutOfMemory => "not enough memory; reduce workers with -j 1 or use a host with more memory",
         error.NoSpaceLeft => "output storage is full; free space or choose another output path",

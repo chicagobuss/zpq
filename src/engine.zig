@@ -53,6 +53,7 @@ pub const OutputLane = types.OutputLane;
 pub const Error = types.Error;
 pub const ColumnarSink = types.ColumnarSink;
 pub const QueryArgs = types.QueryArgs;
+pub const ObservedSources = types.ObservedSources;
 pub const CompressPriority = types.CompressPriority;
 pub const BloomSpec = types.BloomSpec;
 pub const Context = types.Context;

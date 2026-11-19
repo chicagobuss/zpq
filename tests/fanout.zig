@@ -658,6 +658,46 @@ test "fanout joins: bounded replicated S3 dimensions, inner left semi anti, gene
     try std.testing.expectEqual(@as(f64, 0), try numeric(try get(null_reference.array.items[0], "n")));
 }
 
+test "named fanout compares successful worker snapshots, including long and empty ETags" {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const bytes = try fake.paddedParquet(scratch, full, 2 << 20);
+    // Both workers read stable responses for the same path; only the coordinator can detect the disagreement.
+    const tag: [200]u8 = @splat('x');
+    var tagged: fake.FakeS3 = undefined;
+    try tagged.startTagged(bytes, &tag);
+    defer tagged.deinit();
+    var untagged: fake.FakeS3 = undefined;
+    try untagged.startTagged(bytes, "");
+    defer untagged.deinit();
+    var tagged_fixture: Fixture = undefined;
+    try tagged_fixture.startS3(scratch, &tagged);
+    defer tagged_fixture.stop();
+    var untagged_fixture: Fixture = undefined;
+    try untagged_fixture.startS3(scratch, &untagged);
+    defer untagged_fixture.stop();
+    const path = "s3://test/fact.parquet";
+    const event = try zpq.engine.fanout.parse(scratch, "{\"inputs\":[\"" ++ path ++ "\"],\"aggregate\":\"sum(n) AS total\"}");
+    var first = tagged_fixture.client();
+    var second = untagged_fixture.client();
+    const tagged_result = try zpq.engine.fanout.run(scratch, a, first.transport(), event, .{ .workers = 2 });
+    const untagged_result = try zpq.engine.fanout.run(scratch, a, second.transport(), event, .{ .workers = 2 });
+    try std.testing.expect(same(try get(tagged_result, "agg"), try get(untagged_result, "agg")));
+
+    const endpoints = [_]zpq.io.invoke.Endpoint{ tagged_fixture.endpoints[0], untagged_fixture.endpoints[0] };
+    first.endpoints = &endpoints;
+    var changed: zpq.core.diag.Text = .{};
+    try std.testing.expectError(error.InputChanged, zpq.engine.fanout.run(
+        scratch,
+        a,
+        first.transport(),
+        event,
+        .{ .workers = 2, .changed_input = &changed },
+    ));
+    try std.testing.expectEqualStrings(path, changed.get());
+}
+
 test "fanout aligned joins: boundaries, both sides split, oversized source, small dimensions and snapshot refusal" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

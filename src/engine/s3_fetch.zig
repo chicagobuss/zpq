@@ -398,9 +398,8 @@ pub const FetchSpec = struct {
     tail_start: u64 = 0,
     /// Per row group, the columns fetched from it; null where statistics prune it.
     rg_columns: []?[]const bool = &.{},
-    /// The object's ETag (quotes stripped), when S3 sent one that fits: what cached Bloom filters are keyed by.
-    etag_buf: [96]u8 = undefined,
-    etag_len: usize = 0,
+    /// The object's ETag (quotes stripped), owned by the query or SQL binder arena.
+    etag: []const u8 = &.{},
     if_match: ?[]const u8 = null,
     planned_snapshot: ?types.SourceSnapshot = null,
     read_policy: ?*s3.ReadPolicy = null,
@@ -420,10 +419,6 @@ pub const FetchSpec = struct {
         self.tail = &.{};
     }
 
-    fn etag(self: *const FetchSpec) []const u8 {
-        return self.etag_buf[0..self.etag_len];
-    }
-
     pub fn omitsIfMatch(self: *const FetchSpec) bool {
         return if (self.read_policy) |p| p.omit_if_match.load(.acquire) else false;
     }
@@ -439,29 +434,22 @@ pub const FetchSpec = struct {
     }
 
     fn responsePin(self: *const FetchSpec) ?s3.ReadPin {
-        const tag = if (self.planned_snapshot) |snapshot| snapshot.etag else self.etag();
+        const tag = if (self.planned_snapshot) |snapshot| snapshot.etag else self.etag;
         if (tag.len == 0) return null;
         return .{ .etag = tag, .path = self.path, .send_if_match = false };
     }
 
     pub fn reuseFooter(self: *FetchSpec, snapshot: @import("types.zig").SourceSnapshot, rtt_ns: u64) bool {
         const tag = snapshot.etag;
-        if (tag.len == 0 or tag.len > self.etag_buf.len or std.mem.startsWith(u8, tag, "W/")) return false;
+        if (tag.len == 0 or std.mem.startsWith(u8, tag, "W/")) return false;
         for (tag) |c| if (std.ascii.isControl(c) or c == '"') return false;
-        self.noteEtag(tag) catch unreachable;
+        self.etag = tag;
         self.pin_generation = true;
         self.reused_footer = true;
         self.total_size = snapshot.size;
         self.tail_start = snapshot.size;
         self.rtt_ns = rtt_ns;
         return true;
-    }
-
-    fn noteEtag(self: *FetchSpec, raw: ?[]const u8) !void {
-        const e = s3.etagValue(raw orelse return);
-        if (e.len == 0 or e.len > self.etag_buf.len) return error.InputChanged;
-        @memcpy(self.etag_buf[0..e.len], e);
-        self.etag_len = e.len;
     }
 };
 
@@ -696,33 +684,33 @@ pub const S3Membership = struct {
         const self: *S3Membership = @ptrCast(@alignCast(ctx));
         const cache = self.ctx.meta_cache orelse return null;
         const sp = &self.specs[s.file];
-        if (sp.etag_len == 0) return null;
+        if (sp.etag.len == 0) return null;
         const len: usize = @intCast(s.end - s.start);
-        return cache.getBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag(), s.start, len, arena);
+        return cache.getBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag, s.start, len, arena);
     }
 
     fn hasCached(ctx: *anyopaque, s: membership.Span) bool {
         const self: *S3Membership = @ptrCast(@alignCast(ctx));
         const cache = self.ctx.meta_cache orelse return false;
         const sp = &self.specs[s.file];
-        if (sp.etag_len == 0 or s.end < s.start) return false;
-        return cache.hasBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag(), s.start, @intCast(s.end - s.start));
+        if (sp.etag.len == 0 or s.end < s.start) return false;
+        return cache.hasBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag, s.start, @intCast(s.end - s.start));
     }
 
     fn copyCached(ctx: *anyopaque, s: membership.Span, dest: []u8) bool {
         const self: *S3Membership = @ptrCast(@alignCast(ctx));
         const cache = self.ctx.meta_cache orelse return false;
         const sp = &self.specs[s.file];
-        if (sp.etag_len == 0) return false;
-        return cache.copyBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag(), s.start, dest);
+        if (sp.etag.len == 0) return false;
+        return cache.copyBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag, s.start, dest);
     }
 
     fn retain(ctx: *anyopaque, s: membership.Span, bytes: []const u8) void {
         const self: *S3Membership = @ptrCast(@alignCast(ctx));
         const cache = self.ctx.meta_cache orelse return;
         const sp = &self.specs[s.file];
-        if (sp.etag_len == 0) return;
-        cache.putBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag(), s.start, bytes);
+        if (sp.etag.len == 0) return;
+        cache.putBlob(self.ctx.io, sp.url.bucket, sp.url.key, sp.etag, s.start, bytes);
     }
 };
 
@@ -830,8 +818,11 @@ pub fn fetchMetaBatch(
 ) !void {
     const permits = @min(READ_CONCURRENCY, @max(specs.len, 1));
     const probe = if (specs.len > 0 and specs[0].footer_only) specs[0].footer_probe else footerProbeFor(ctx.env, account.limit, permits);
+    var arena_mutex: std.Io.Mutex = .init;
     const TaskCtx = struct {
         ctx: Context,
+        arena: std.mem.Allocator,
+        arena_mutex: *std.Io.Mutex,
         creds: s3.Credentials,
         pool: *s3.Pool(POOL_SIZE),
         sp: *FetchSpec,
@@ -842,6 +833,14 @@ pub fn fetchMetaBatch(
         prof: ?*profile.Thread = null,
         /// 0 cold, 1 cached footer revalidated, 2 cached footer stale.
         cache: u8 = 0,
+
+        fn noteEtag(t: *@This(), raw: ?[]const u8) !void {
+            const tag = raw orelse return;
+            if (s3.sameEtag(tag, "")) return;
+            t.arena_mutex.lockUncancelable(t.ctx.io);
+            defer t.arena_mutex.unlock(t.ctx.io);
+            t.sp.etag = try t.arena.dupe(u8, s3.etagValue(tag));
+        }
     };
     const Task = struct {
         fn run(t: *TaskCtx) std.Io.Cancelable!void {
@@ -859,6 +858,8 @@ pub fn fetchMetaBatch(
     var task_ctxs = try arena.alloc(TaskCtx, specs.len);
     for (specs, 0..) |*sp, i| task_ctxs[i] = .{
         .ctx = ctx,
+        .arena = arena,
+        .arena_mutex = &arena_mutex,
         .creds = creds,
         .pool = pool,
         .sp = sp,
@@ -908,10 +909,10 @@ fn getMetaObject(
 ) !http.Response {
     var pin = sp.readPin();
     if (sp.if_match == null and sp.planned_snapshot == null and sp.pin_generation and
-        sp.etag_len > 0 and !std.mem.startsWith(u8, sp.etag(), "W/"))
+        sp.etag.len > 0 and !std.mem.startsWith(u8, sp.etag, "W/"))
     {
         pin = .{
-            .etag = try std.fmt.allocPrint(scratch, "\"{s}\"", .{sp.etag()}),
+            .etag = try std.fmt.allocPrint(scratch, "\"{s}\"", .{sp.etag}),
             .path = sp.path,
             .policy = sp.read_policy,
         };
@@ -962,7 +963,7 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
             t.cache = if (cond.status == 304) 1 else 2;
             noteFooterRtt(sp, cond);
             if (cond.status == 304) {
-                try sp.noteEtag(entry.etag);
+                try t.noteEtag(entry.etag);
                 sp.total_size = entry.total_size;
                 sp.footer_offset = entry.footer_offset;
                 sp.tail_start = entry.footer_offset;
@@ -978,9 +979,9 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
             // and continue with the response we already have.
             cache.invalidate(t.ctx.io, sp.url.bucket, sp.url.key);
             if (cond.status == 206 or cond.status == 200) {
-                try sp.noteEtag(cond.header("ETag"));
+                try t.noteEtag(cond.header("ETag"));
                 try populateFromTailResponse(t, scratch, cond);
-                try maybeCacheMeta(t.ctx, sp, cond.header("ETag"));
+                try maybeCacheMeta(t.ctx, sp);
                 return;
             }
             return refuseGet(sp, t.creds, cond);
@@ -997,9 +998,9 @@ fn doFetchMeta(t: anytype, scratch: std.mem.Allocator) !void {
     });
     if (tail_resp.status != 206 and tail_resp.status != 200) return refuseGet(sp, t.creds, tail_resp);
     noteFooterRtt(sp, tail_resp);
-    try sp.noteEtag(tail_resp.header("ETag"));
+    try t.noteEtag(tail_resp.header("ETag"));
     try populateFromTailResponse(t, scratch, tail_resp);
-    try maybeCacheMeta(t.ctx, sp, tail_resp.header("ETag"));
+    try maybeCacheMeta(t.ctx, sp);
 }
 
 /// Shared "we have the suffix response, finish the metadata fetch" path
@@ -1090,17 +1091,15 @@ pub fn ensureHeadMagic(start: u64, bytes: []const u8) !void {
 /// and we got an ETag back from S3). Bytes captured cover
 /// `[footer_offset, total_size)` — the thrift footer plus the trailer
 /// (4-byte length + PAR1).
-fn maybeCacheMeta(ctx: Context, sp: *FetchSpec, etag_opt: ?[]const u8) !void {
+fn maybeCacheMeta(ctx: Context, sp: *FetchSpec) !void {
     const cache = ctx.meta_cache orelse return;
-    const etag = s3.etagValue(etag_opt orelse return);
-
-    if (sp.footer_region.len < 8) return;
+    if (sp.etag.len == 0 or sp.footer_region.len < 8) return;
 
     cache.put(
         ctx.io,
         sp.url.bucket,
         sp.url.key,
-        etag,
+        sp.etag,
         sp.total_size,
         sp.footer_offset,
         sp.footer_region,

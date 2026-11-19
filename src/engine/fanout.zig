@@ -1,6 +1,9 @@
 //! Coordinator primitives. Transport owns connections; query arenas own every decoded value.
 const std = @import("std");
 const diag = @import("../core/diag.zig");
+const fanout_plan = @import("fanout_plan.zig");
+const syntax = @import("../core/expr/syntax.zig");
+const types = @import("types.zig");
 const V = std.json.Value;
 const A = std.mem.Allocator;
 
@@ -84,10 +87,6 @@ fn equal(a: A, left: V, right: V) !bool {
 }
 
 pub fn partialPayload(a: A, request: V, part: Split) ![]const u8 {
-    return partialWithSnapshots(a, request, part, null);
-}
-
-fn partialWithSnapshots(a: A, request: V, part: Split, snapshots: ?V) ![]const u8 {
     const inputs = try array(try member(request, "inputs"));
     var top = object();
     for (request.object.keys(), request.object.values()) |key, value| {
@@ -114,9 +113,6 @@ fn partialWithSnapshots(a: A, request: V, part: Split, snapshots: ?V) ![]const u
         if (request.object.get(key)) |v| try put(a, &partial, key, v);
     }
     const joined = if (request.object.get("join")) |v| v != .null else false;
-    if (snapshots) |sources| {
-        try put(a, &partial, "source_snapshots", if (joined) sources else try selectSnapshots(a, sources, urls.array.items));
-    }
     try put(a, &top, "operation", text(if (joined) "partial_join_aggregate" else "partial_aggregate"));
     try put(a, &top, "plan_version", try number(a, 1));
     try put(a, &top, "partial", partial);
@@ -167,6 +163,41 @@ fn checkWorkerInput(answer: V, changed: ?*diag.Text) !void {
         };
         return err;
     };
+}
+
+/// Each named worker pins its own reads. Require every partition to agree before any partial is merged.
+fn agreeSources(a: A, answers: []const V, inputs: []const V, parts: []const Split, join: ?syntax.Join, changed: ?*diag.Text) !void {
+    var seen: types.SourceSnapshots = .empty;
+    for (answers, parts) |answer, part| {
+        const reports = answer.object.get("source_snapshots") orelse return error.UnsupportedPlanVersion;
+        const snapshots = try fanout_plan.decodeSnapshots(a, reports);
+        for (part.runs) |r| try requireSource(snapshots, try string(inputs[r.input]));
+        if (join) |j| {
+            try requireBuildSources(snapshots, j.build);
+            for (j.semis) |semi| try requireBuildSources(snapshots, semi.build);
+            for (j.dims) |dim| try requireBuildSources(snapshots, dim.build);
+        }
+        var it = snapshots.iterator();
+        while (it.next()) |snapshot| {
+            const entry = try seen.getOrPut(a, snapshot.key_ptr.*);
+            if (entry.found_existing) {
+                if (!entry.value_ptr.same(snapshot.value_ptr.*)) {
+                    if (changed) |out| out.set(snapshot.key_ptr.*);
+                    return error.InputChanged;
+                }
+            } else entry.value_ptr.* = snapshot.value_ptr.*;
+        }
+    }
+}
+
+fn requireSource(snapshots: types.SourceSnapshots, path: []const u8) !void {
+    if (std.mem.startsWith(u8, path, "s3://") and !snapshots.contains(path)) return error.InvalidWorkerResponse;
+}
+
+fn requireBuildSources(snapshots: types.SourceSnapshots, build: syntax.Build) error{InvalidWorkerResponse}!void {
+    try requireSource(snapshots, build.path);
+    for (build.semis) |semi| try requireBuildSources(snapshots, semi.build);
+    for (build.dims) |dim| try requireBuildSources(snapshots, dim.build);
 }
 
 pub fn agree(a: A, answers: []const V) !void {
@@ -517,6 +548,7 @@ pub fn run(a: A, backing: A, transport: Transport, request: V, opts: Options) !V
     var payloads: std.ArrayList([]const u8) = .empty;
     var prepared: ?V = null;
     var pinned = false;
+    var named_parts: ?[]const Split = null;
     const joined = if (request.object.get("join")) |v| v != .null else false;
     const strategy = if (request.object.get("join_strategy")) |v| try string(v) else "auto";
     if (!std.mem.eql(u8, strategy, "auto") and !std.mem.eql(u8, strategy, "aligned") and !std.mem.eql(u8, strategy, "replicated")) return error.UnsupportedJoinStrategy;
@@ -613,31 +645,14 @@ pub fn run(a: A, backing: A, transport: Transport, request: V, opts: Options) !V
             try payloads.append(a, try std.json.Stringify.valueAlloc(a, payload, .{}));
         }
     } else {
-        const snapshots = if (remote or joined) blk: {
-            var prep = object();
-            var sources = object();
-            for (request.object.keys(), request.object.values()) |key, value| {
-                const nested = std.mem.eql(u8, key, "inputs") or std.mem.eql(u8, key, "aggregate") or
-                    std.mem.eql(u8, key, "group_by") or std.mem.eql(u8, key, "filter") or std.mem.eql(u8, key, "join");
-                try put(a, if (nested) &sources else &prep, key, value);
-            }
-            // An older worker must refuse without seeing any top-level inputs it could accidentally execute.
-            try put(a, &prep, "partial", sources);
-            try put(a, &prep, "operation", text("prepare_aggregate"));
-            try put(a, &prep, "plan_version", try number(a, 1));
-            try put(a, &prep, "source_snapshots_only", .{ .bool = true });
-            const plan = try parse(a, try transport.invoke(transport.ctx, a, 0, try std.json.Stringify.valueAlloc(a, prep, .{})));
-            try checkWorkerInput(plan, opts.changed_input);
-            break :blk try member(plan, "source_snapshots");
-        } else null;
-        pinned = snapshots != null;
         const counts = opts.counts orelse blk: {
             const hints = try a.alloc(u64, inputs.len);
             @memset(hints, @intCast(opts.workers / inputs.len + @intFromBool(opts.workers % inputs.len != 0)));
             break :blk hints;
         };
         if (counts.len != inputs.len) return error.InvalidCounts;
-        for (try split(a, counts, opts.workers)) |part| try payloads.append(a, try partialWithSnapshots(a, request, part, snapshots));
+        named_parts = try split(a, counts, opts.workers);
+        for (named_parts.?) |part| try payloads.append(a, try partialPayload(a, request, part));
     }
     const planned_ns = @import("../clock.zig").monoNs();
     const scattered = try scatter(a, backing, transport, payloads.items, opts.concurrency);
@@ -650,6 +665,10 @@ pub fn run(a: A, backing: A, transport: Transport, request: V, opts: Options) !V
         }
     }
     const scattered_ns = @import("../clock.zig").monoNs();
+    if (named_parts) |parts| if (remote or joined) {
+        const join = if (joined) try fanout_plan.decodeJoin(a, request.object.get("join").?) else null;
+        try agreeSources(a, answers, inputs, parts, join, opts.changed_input);
+    };
     // Structured-plan responses predate partial metadata: attach the preparation's merge contract.
     if (prepared) |p| for (answers) |*answer| {
         _ = try member(answer.*, "agg");

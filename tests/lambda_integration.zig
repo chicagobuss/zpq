@@ -237,6 +237,7 @@ pub const FakeS3 = struct {
     changing_dimension: std.atomic.Value(bool) = .init(false),
     dimension_generation: std.atomic.Value(u32) = .init(0),
     idle_close_ms: i32,
+    etag: []const u8 = ETAG,
     accept_thread: std.Thread = undefined,
     conn_fds: [MAX_CONNS]linux.fd_t = @splat(-1),
     conn_threads: [MAX_CONNS]?std.Thread = @splat(null),
@@ -252,6 +253,12 @@ pub const FakeS3 = struct {
         return self.startTriple(object, secondary, null, idle_close_ms);
     }
     pub fn startTriple(self: *FakeS3, object: []const u8, secondary: ?[]const u8, tertiary: ?[]const u8, idle_close_ms: i32) !void {
+        return self.startObjects(object, secondary, tertiary, idle_close_ms, ETAG);
+    }
+    pub fn startTagged(self: *FakeS3, object: []const u8, etag: []const u8) !void {
+        return self.startObjects(object, null, null, 0, etag);
+    }
+    fn startObjects(self: *FakeS3, object: []const u8, secondary: ?[]const u8, tertiary: ?[]const u8, idle_close_ms: i32, etag: []const u8) !void {
         const fd = try sysSocket();
         errdefer sysClose(fd);
         const yes: i32 = 1;
@@ -272,6 +279,7 @@ pub const FakeS3 = struct {
             .secondary = secondary,
             .tertiary = tertiary,
             .idle_close_ms = idle_close_ms,
+            .etag = etag,
         };
         self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
     }
@@ -355,7 +363,7 @@ pub const FakeS3 = struct {
         const etag = if (dimension and self.changing_dimension.load(.acquire))
             try std.fmt.bufPrint(&etag_buffer, "generation-{d}", .{self.dimension_generation.fetchAdd(1, .monotonic)})
         else
-            ETAG;
+            self.etag;
         var range: ?[]const u8 = null;
         var if_none_match: ?[]const u8 = null;
         var if_match: ?[]const u8 = null;
@@ -368,7 +376,7 @@ pub const FakeS3 = struct {
             if (std.ascii.eqlIgnoreCase(line[0..colon], "if-none-match")) if_none_match = value;
             if (std.ascii.eqlIgnoreCase(line[0..colon], "if-match")) if_match = value;
         }
-        var hdr_buf: [256]u8 = undefined;
+        var hdr_buf: [512]u8 = undefined;
         if (if_match) |v| {
             _ = self.matched_requests.fetchAdd(1, .monotonic);
             const data_range = if (range) |r| !std.mem.startsWith(u8, r, "bytes=-") else false;

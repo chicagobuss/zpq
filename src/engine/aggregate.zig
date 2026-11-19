@@ -350,6 +350,10 @@ fn executeAggregateOver(
         .footer_only = explain or empty_result,
     });
     defer opened.deinit();
+    if (args.observed_sources) |observed| {
+        try opened.recordSources(observed, args.diag);
+        if (joined) |j| try j.recordSources(observed, args.diag);
+    }
     errdefer changed.* = !opened.whole() or if (joined) |j| std.meta.isError(j.intact()) else false;
     const t_open_end = nowMonoNs();
     t.read_ns = @intCast(t_open_end - t_open);

@@ -131,55 +131,6 @@ fn prepareOver(ctx: types.Context, args: types.QueryArgs, result_limit: usize, v
     return ctx.gpa.dupe(u8, json);
 }
 
-/// Fractional partitions bind on their workers. Pin their probes and any replicated builds first.
-pub fn prepareSources(ctx: types.Context, args: types.QueryArgs, join: ?syntax.Join, result_limit: usize) ![]u8 {
-    var ledger: memory.SharedBudget = .{ .limit = args.max_memory };
-    var charged: memory.Charged = .{ .child = ctx.gpa, .budget = &ledger };
-    return prepareSourcesOver(ctx, args, join, result_limit, charged.allocator()) catch |err| {
-        // Footer parsing can wrap an allocation error as BadMetadata. A refused charge still names the budget.
-        if (charged.refused.load(.monotonic))
-            return if (join != null) error.JoinBuildExceedsBudget else error.ExceededMemoryBudget;
-        return err;
-    };
-}
-
-fn prepareSourcesOver(ctx: types.Context, args: types.QueryArgs, join: ?syntax.Join, result_limit: usize, scratch: std.mem.Allocator) ![]u8 {
-    var state = std.heap.ArenaAllocator.init(scratch);
-    defer state.deinit();
-    const a = state.allocator();
-    var paths: std.StringArrayHashMapUnmanaged(void) = .empty;
-    for (args.inputs) |path| try paths.put(a, path, {});
-    if (join) |j| {
-        try addBuildPaths(a, &paths, j.build);
-        for (j.semis) |s| try addBuildPaths(a, &paths, s.build);
-        for (j.dims) |d| try addBuildPaths(a, &paths, d.build);
-    }
-    var snapshots: std.json.ArrayHashMap(types.SourceSnapshot) = .{};
-    for (paths.keys()) |path| {
-        if (!std.mem.startsWith(u8, path, "s3://")) continue;
-        var file = std.heap.ArenaAllocator.init(scratch);
-        defer file.deinit();
-        var opened = try input.openInputs(ctx, file.allocator(), .{
-            .inputs = &.{path},
-            .diag = args.diag,
-            .max_memory = args.max_memory,
-        }, .{ .limit = args.max_memory, .footer_only = true });
-        defer opened.deinit();
-        var snapshot = opened.snapshots[0].?;
-        snapshot.etag = try a.dupe(u8, snapshot.etag);
-        try snapshots.map.put(a, path, snapshot);
-    }
-    const json = try std.json.Stringify.valueAlloc(a, .{ .source_snapshots = snapshots }, .{});
-    if (json.len > result_limit) return error.ResultTooLarge;
-    return ctx.gpa.dupe(u8, json);
-}
-
-fn addBuildPaths(a: std.mem.Allocator, paths: *std.StringArrayHashMapUnmanaged(void), b: syntax.Build) !void {
-    try paths.put(a, b.path, {});
-    for (b.semis) |s| try addBuildPaths(a, paths, s.build);
-    for (b.dims) |d| try addBuildPaths(a, paths, d.build);
-}
-
 pub fn decodeSnapshots(a: std.mem.Allocator, value: std.json.Value) !types.SourceSnapshots {
     if (value != .object) return error.InvalidSourceSnapshots;
     var out: types.SourceSnapshots = .empty;

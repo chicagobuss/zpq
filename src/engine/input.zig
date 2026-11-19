@@ -223,24 +223,20 @@ pub fn materializeMetas(
 }
 
 /// `metadata.open` into one block of the query arena, by a bump allocator: the parse runs on this thread alone, and
-/// the arena's thread-safe step (an atomic per allocation) and the block's first-touch faults were half of a large
-/// footer's parse (hits.parquet: 2.4 MB of footer, 12.6 MB parsed). The block is sized from the footer and advised
-/// for huge pages where the host has them free; what outgrows it goes to the arena. Its last byte stays unused: no
-/// parsed slice then ends where the arena's newest allocation does, so the arena never resizes or frees into it.
-/// A footer whose block would be under two huge pages parses in the arena itself: its own block buys nothing
-/// measurable there, and a scan of thousands of small files paid one in address space for each.
+/// the arena's thread-safe step (an atomic per allocation) was a large footer's (hits.parquet: 2.4 MB of footer,
+/// 12.6 MB parsed). What outgrows the block goes to the arena. Its last byte stays unused: no parsed slice then ends
+/// where the arena's newest allocation does, so the arena never resizes or frees into it. A footer whose block would
+/// be under 4 MiB parses in the arena itself: its own block buys nothing measurable there, and a scan of thousands of
+/// small files paid one in address space for each. No huge pages: under defrag=madvise a fault in an advised block can
+/// stall on direct compaction, a poor trade for a block that lives one query. A block that cannot be had (the footer
+/// is not yet validated: its length may be bogus) leaves the parse to the arena, which reports what the footer is.
 fn parseFooter(arena: std.mem.Allocator, bytes: []const u8) !schema.FileMetaData {
     if (bytes.len < 12) return metadata.open(arena, bytes);
     const footer_len = @min(std.mem.readInt(u32, bytes[bytes.len - 8 ..][0..4], .little), bytes.len);
     // hits.parquet parses to 5.2 bytes per footer byte.
     const len = footer_len *| 6 +| 1;
-    if (len < 2 * huge_pages.huge_page_size) return metadata.open(arena, bytes);
-    // Huge-page alignment only for a block advised for huge pages: the arena reserves alignment - 1 bytes past it.
-    const block = if (huge_pages.worthAdvising(len)) huge: {
-        const b = try arena.alignedAlloc(u8, .fromByteUnits(huge_pages.huge_page_size), len);
-        huge_pages.adviseBlock(b);
-        break :huge b;
-    } else try arena.alloc(u8, len);
+    if (len < 4 << 20) return metadata.open(arena, bytes);
+    const block = arena.alloc(u8, len) catch return metadata.open(arena, bytes);
     var region: huge_pages.Region = .{ .child = arena, .buf = block[0 .. block.len - 1] };
     return metadata.open(region.allocator(), bytes);
 }

@@ -111,7 +111,10 @@ pub fn openFooter(
     footer_bytes: []const u8,
 ) !schema.FileMetaData {
     var reader = thrift.Reader.init(footer_bytes);
-    var meta = schema.FileMetaData.read(allocator, &reader) catch return error.BadMetadata;
+    var meta = schema.FileMetaData.read(allocator, &reader) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadMetadata,
+    };
     errdefer meta.deinit(allocator);
     if (meta.encrypted) return error.EncryptedFile;
     for (meta.row_groups.items) |rg| for (rg.columns.items) |chunk| if (chunk.encrypted) return error.EncryptedFile;

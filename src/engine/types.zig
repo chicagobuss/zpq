@@ -316,9 +316,7 @@ pub const Context = struct {
     pool_gpa: ?std.mem.Allocator = null,
     env: std.process.Environ,
     io: std.Io,
-    /// Optional long-lived pool registry — set by Lambda for warm-
-    /// container connection reuse; null in CLI which builds a fresh
-    /// pool per invocation.
+    /// Borrowed pool registry. The SQL CLI shares one across query phases, and Lambda reuses one across invocations.
     pool_registry: ?*PoolRegistry = null,
     /// Optional context-owned worker runtime. Its threads and codec TLS survive this query.
     worker_io: ?std.Io = null,
@@ -358,13 +356,13 @@ pub const PoolRegistry = struct {
         creds: s3.Credentials,
         bucket: []const u8,
     ) anyerror!*s3.Pool(POOL_SIZE),
-    /// Upload permits over the pool `ensure_for_bucket` returns for `bucket`.
-    ensure_output: *const fn (
+    /// Upload permits over the pool `ensure_for_bucket` returns for `bucket`, when the registry also owns uploads.
+    ensure_output: ?*const fn (
         ctx: *anyopaque,
         gpa: std.mem.Allocator,
         creds: s3.Credentials,
         bucket: []const u8,
-    ) anyerror!*OutputLane,
+    ) anyerror!*OutputLane = null,
 };
 
 pub const QueryResult = union(enum) {

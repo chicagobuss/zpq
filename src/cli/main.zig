@@ -258,6 +258,7 @@ const QueryOptions = struct {
     /// False for a query after which the process goes on (a set operation's branches): its tables and mappings are
     /// released, not left for the process to drop at exit.
     exit_after: bool = true,
+    pool_registry: ?*engine.PoolRegistry = null,
     /// A set operation's final query: the branches' own input files, which its output may not name (its inputs are
     /// scratch files, so the ordinary check alone would not see them).
     protect: []const []const u8 = &.{},
@@ -599,6 +600,35 @@ test "a set operation's scratch queries release their resources and name the out
     try std.testing.expect(base.exit_after);
 }
 
+/// One CLI query owns its sockets across binding, execution and retries. The pool already keys idle sockets by host.
+const QueryPool = struct {
+    const Pool = s3.Pool(engine.POOL_SIZE);
+
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    pool: ?*Pool = null,
+
+    fn deinit(self: *QueryPool) void {
+        if (self.pool) |pool| {
+            pool.deinit();
+            self.gpa.destroy(pool);
+        }
+    }
+
+    fn ensure(raw: *anyopaque, _: std.mem.Allocator, _: s3.Credentials, _: []const u8) anyerror!*Pool {
+        const self: *QueryPool = @ptrCast(@alignCast(raw));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.pool) |pool| return pool;
+        const pool = try self.gpa.create(Pool);
+        errdefer self.gpa.destroy(pool);
+        try pool.init(self.gpa);
+        self.pool = pool;
+        return pool;
+    }
+};
+
 fn runQuery(
     init: std.process.Init,
     iter: *std.process.Args.Iterator,
@@ -609,6 +639,10 @@ fn runQuery(
     var options: QueryOptions = .{};
     defer options.deinit(gpa);
     if (!try options.parse(gpa, iter)) return;
+    var pool: QueryPool = .{ .gpa = gpa, .io = init.io };
+    defer pool.deinit();
+    var registry: engine.PoolRegistry = .{ .ctx = &pool, .ensure_for_bucket = QueryPool.ensure };
+    if (options.query != null) options.pool_registry = &registry;
     try runParsed(init, &options, diag, arena);
 }
 
@@ -709,6 +743,7 @@ fn runParsedOnce(
     const gpa = zpq.core.memory.processAllocator(init.gpa);
     const env = init.minimal.environ;
     const io = init.io;
+    var ctx: engine.Context = .{ .gpa = gpa, .env = env, .io = io, .diag = diag, .pool_registry = options.pool_registry };
     const inputs_raw = options.inputs_raw;
     const output = options.output;
     var filter = options.filter;
@@ -717,7 +752,7 @@ fn runParsedOnce(
     var aggregate = options.aggregate;
     const explain = options.explain;
     // `COLUMNS(...)` select items are written out once per column they name, which the footer says.
-    var column_schemas: engine.join.LocalSchemas = .{ .arena = arena, .ctx = .{ .gpa = gpa, .io = io, .env = env, .diag = diag } };
+    var column_schemas: engine.join.LocalSchemas = .{ .arena = arena, .ctx = ctx };
     defer column_schemas.deinit();
     // CTEs and subqueries in FROM run first, as queries of their own into scratch files the query then reads.
     if (comptime build_options.enable_sql) if (options.query) |q| {
@@ -906,7 +941,13 @@ fn runParsedOnce(
                 return runUpdate(io, gpa, arena, up, output, fsync, summary, max_memory orelse zpq.core.system.discoverAvailableMemory(env));
             }
             // A two-table join binds its column names against both footers; the engine reads the build.
-            var schemas: zpq.frontend.JoinSchemas = .{ .arena = arena, .io = io, .env = env, .diag = diag, .local = .{ .arena = arena, .pin_remote = true, .ctx = .{ .gpa = gpa, .io = io, .env = env, .diag = diag } } };
+            var schemas: zpq.frontend.JoinSchemas = .{
+                .arena = arena,
+                .io = io,
+                .env = env,
+                .diag = diag,
+                .local = .{ .arena = arena, .pin_remote = true, .ctx = ctx },
+            };
             schemas.local.max_memory = max_memory;
             schemas.restore(memo);
             defer schemas.save(memo);
@@ -1048,7 +1089,6 @@ fn runParsedOnce(
             .input_format = options.input_format,
             .csv = csv_opts,
         };
-        const ctx: engine.Context = .{ .gpa = gpa, .env = env, .io = io };
         var ws: StdoutWriter = if (@import("builtin").os.tag == .windows) .{} else .{ .fd = 1 };
         defer ws.flush() catch {};
         // A CSV input's aggregate folds during the parse (`csv_agg`): its own plan, not a Parquet scan's.
@@ -1110,7 +1150,7 @@ fn runParsedOnce(
         .diag = diag,
         .profiler = profiler,
     };
-    const ctx: engine.Context = .{ .gpa = gpa, .env = env, .io = io, .exit_after = options.exit_after };
+    ctx.exit_after = options.exit_after;
     const started = nowMonoNs();
     var rows: usize = 0;
     var stats: SummaryStats = .{};

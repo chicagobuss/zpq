@@ -1142,9 +1142,11 @@ pub const Output = struct {
             const out_url = s3.Url.parse(o.path) catch return error.BadOutputUrl;
             const creds = try credentialsFromEnv(ctx.env);
             const out_criteria = try s3.poolCriteria(arena, creds, out_url.bucket);
-            const out_pool: *OutputLane = if (ctx.pool_registry) |reg|
-                try reg.ensure_output(reg.ctx, ctx.gpa, creds, out_url.bucket)
-            else blk: {
+            const borrowed: ?*OutputLane = if (ctx.pool_registry) |reg| borrowed: {
+                const ensure = reg.ensure_output orelse break :borrowed null;
+                break :borrowed try ensure(reg.ctx, ctx.gpa, creds, out_url.bucket);
+            } else null;
+            const out_pool = borrowed orelse blk: {
                 const p = try arena.create(s3.Pool(POOL_SIZE));
                 try p.init(ctx.gpa);
                 o.owned_pool = p;

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **An S3 query keeps its connections for its whole run.** Binding, the join's lookup and probe, a re-planned join and CTE stages now share one set of S3 connections instead of each opening its own, so a query pays for each handshake once (a small Lahman join over S3: six connections to two, 15% faster).
+
 - **`SELECT *` beside other items is refused instead of answered incorrectly.** `SELECT *, a + 1 AS one` silently dropped `one` (since 0.5.1); zpq now refuses it by name. List the columns instead.
 
 - **A GROUP BY scan no longer pays for code it doesn't run.** The lone-key dictionary filter is compiled only into the scans that use it, which brings the long-string COUNT(DISTINCT) cells back to 0.5.2's speed while keeping 0.6.0's gains on filtered lone-key counts.

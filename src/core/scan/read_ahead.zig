@@ -16,7 +16,8 @@
 //!   only while the latest such reader found its gate keeping every page (`kept`). A gated column whose pages are
 //!   skipped is never advised ahead of the survivors that skip them;
 //! - how far: a few items per worker ahead of the latest claim, paced by the claims (each moves the cursor by about
-//!   one item), and a hard cap on the bytes advised and not yet claimed: the caller's window (`Config`: within what
+//!   one item; a pass's first advance instead runs from its first item through the lookahead at once, see "when"),
+//!   and a hard cap on the bytes advised and not yet claimed: the caller's window (`Config`: within what
 //!   one of the device's hardware queues holds), or what the query's ledger has free when it is less, whichever is
 //!   smaller each time it advances. The cap holds within an item too: a cursor advises an item block by block and
 //!   stops at the cap mid-chunk, the rest left to the next claim or to demand faults. A cap below one page advises
@@ -25,10 +26,14 @@
 //! - who: one caller at a time (the others go on decoding): several advising callers contend on the page cache;
 //! - when: only once workers run, from their claims, and only for pages not already resident (`cachestat`): a hot
 //!   scan issues no reads and makes no advice, and pages a worker's fault already has in flight count as resident.
-//!   Nothing is advised before the workers start: the first claims fault their own items in together, as many reads
-//!   in flight as there are workers, and a serial walk over the first items ahead of them only delayed every
-//!   worker's start (by about 10 ms at 32 workers) for little: where the workers already keep the device busy, the
-//!   delay is the whole cost.
+//!   Nothing is advised before the workers start: a serial walk over the first items ahead of them delayed every
+//!   worker's start (by about 10 ms at 32 workers). The pass's first claim instead advises from its first item, the
+//!   claimed ones too, up to the lookahead and the cap, while the other workers start; the claimed items' bytes are
+//!   given back at the next advance. Left to their own faults, the first claims read their items one read-around at
+//!   a time: on a cold 29-row-group scan with 16 workers and a 128 KiB device read-ahead, majflt rose from about
+//!   220-280 to about 366 and the scan took about 15% longer. (0.5.2 reached the fast case only some of the time:
+//!   a 0.5.2-era build with its THP gate's file reads turned off, `ZPQ_HUGEPAGE=off`, ran slow every time. The
+//!   likely mechanism, not measured directly, is that the gate's stall let this advice get ahead of the decoders.)
 //!
 //! Residency and advice go through each file's descriptor (`Config.fds`): `cachestat` and `fadvise`, where the
 //! mapping's `mincore` and `madvise` also take the address space's lock, which the workers' region maps write. That
@@ -85,8 +90,10 @@ pub const ReadAhead = struct {
     busy: std.atomic.Value(bool) = .init(false),
     /// One past the latest claimed item: claims arrive while another caller advises, and are released at its next turn.
     claimed_hi: std.atomic.Value(usize) = .init(0),
-    /// `claimed_hi` as the last advance saw it: each advance moves the cursor by at most the items claimed since, and
-    /// one, so advice keeps pace with the claims instead of falling on one worker in a burst.
+    /// `claimed_hi` as the last advance saw it (at least 1 once a pass's first advance ran): each later advance moves
+    /// the cursor by at most the items claimed since, and one, so advice keeps pace with the claims instead of falling
+    /// on one worker in a burst. The first advance of a pass (`paced == 0`) is the one burst: up to the lookahead from
+    /// item 0.
     paced: usize = 0,
     workers: usize,
     /// The cursor: the next bytes to advise are chunk `col` of item `item`, from `offset` into it.
@@ -103,8 +110,9 @@ pub const ReadAhead = struct {
     kept: []std.atomic.Value(bool) = &.{},
     /// Items before `released` are claimed, and their advice no longer counts.
     released: usize = 0,
-    /// Page-rounded bytes advised and not yet decoded, never past the cap: the cursor's for items not yet claimed, and
-    /// a gated column's for a claimed item its worker is decoding (`adviseClaimed`), until that worker's next claim.
+    /// Page-rounded bytes advised and not yet decoded, never past the cap: the cursor's for items not yet claimed (and,
+    /// after a pass's first advance, for the items claimed before it, until the next advance releases them), and a
+    /// gated column's for a claimed item its worker is decoding (`adviseClaimed`), until that worker's next claim.
     ahead: @import("../wasm_atomic.zig").Value(u64) = .init(0),
     /// The row group advised last and the item that advised it, so the items a row group was split into advise it
     /// once (and an item the cap stopped before its first block is not taken for one of them on return).
@@ -271,11 +279,14 @@ pub const ReadAhead = struct {
         if (self.busy.swap(true, .acquire)) return;
         defer self.busy.store(false, .release);
         const hi = @min(self.claimed_hi.load(.monotonic), self.work.len);
-        while (self.released < hi) : (self.released += 1) self.give(self.item_bytes[self.released]);
-        const claims = hi -| self.paced;
-        self.paced = hi;
-        // Never advise what a worker already claimed.
-        if (self.item < hi) {
+        // A pass's first advance starts at its first item, claimed or not: the first claims would otherwise fault
+        // their items in one read-around at a time. Their bytes are given back at the next advance.
+        const first = self.paced == 0 and self.item == 0;
+        if (!first) while (self.released < hi) : (self.released += 1) self.give(self.item_bytes[self.released]);
+        const claims = if (first) self.work.len else hi -| self.paced;
+        self.paced = @max(hi, 1);
+        // Never advise what a worker already claimed, past the first advance.
+        if (!first and self.item < hi) {
             self.item = hi;
             self.col = 0;
             self.offset = 0;
@@ -446,7 +457,7 @@ const Chunks = struct {
     }
 };
 
-test "a pass's start advises nothing, and each claim advises about one item past it" {
+test "a pass's start advises nothing, its first claim the lookahead from item 0, and each later claim about one item" {
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "page-cache advice (madvise, mincore)");
     const page = std.heap.pageSize();
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -461,17 +472,66 @@ test "a pass's start advises nothing, and each claim advises about one item past
     var ra = set.readAhead(&sources, 1 << 30, workers, null);
     ra.start();
     try std.testing.expectEqual(@as(u64, 0), ra.advised.load(.monotonic));
-    // Item 0 claimed: never item 0 itself, and the next item (and one for the claim) advised.
+    // Item 0 claimed, the pass's first claim: from item 0 itself through the lookahead.
     ra.claimed(0, null);
-    try std.testing.expectEqual(@as(u64, 0), set.item_bytes[0]);
-    try std.testing.expectEqual(@as(u64, 2 * page), ra.advised.load(.monotonic));
-    try std.testing.expect(set.item_bytes[1] == page and set.item_bytes[2] == page);
+    try std.testing.expectEqual(@as(u64, ra.lookahead * page), ra.advised.load(.monotonic));
+    for (0..ra.lookahead) |i| try std.testing.expectEqual(@as(u64, page), set.item_bytes[i]);
     // Paced: each later claim advises about one more item, never the whole lookahead at once.
     for (1..16) |idx| {
         const before = ra.advised.load(.monotonic);
         ra.claimed(idx, null);
         try std.testing.expect(ra.advised.load(.monotonic) - before <= 2 * page);
         try std.testing.expect(ra.item <= idx + 1 + ra.lookahead);
+    }
+}
+
+test "a first advance that finds several claims in advises from item 0, and the next gives back exactly what they hold" {
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "page-cache advice (madvise, mincore)");
+    const page = std.heap.pageSize();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const bytes = try std.heap.page_allocator.alloc(u8, 16 * page);
+    defer std.heap.page_allocator.free(bytes);
+    const sources = [_][]const u8{bytes};
+    var set: Chunks = undefined;
+    try set.init(arena_state.allocator(), 16, 0, page, page);
+    var ra = set.readAhead(&sources, 1 << 30, 4, null);
+    ra.start();
+    // Items 0-3 claimed before the first advance runs (the others found it busy): still from item 0, to the lookahead.
+    _ = ra.claimed_hi.fetchMax(3, .monotonic);
+    ra.claimed(3, null);
+    try std.testing.expectEqual(@as(usize, 8), ra.lookahead);
+    for (0..8) |i| try std.testing.expectEqual(@as(u64, page), set.item_bytes[i]);
+    try std.testing.expectEqual(@as(u64, 0), set.item_bytes[8]);
+    try std.testing.expectEqual(@as(u64, 8 * page), ra.ahead.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), ra.released);
+    // The next claim gives back items 0-4 (five pages, the burst's claimed items with it) and paces one item on.
+    ra.claimed(4, null);
+    try std.testing.expectEqual(@as(usize, 5), ra.released);
+    try std.testing.expect(set.item_bytes[8] == page and set.item_bytes[9] == page);
+    try std.testing.expectEqual(@as(u64, 0), set.item_bytes[10]);
+    try std.testing.expectEqual(@as(u64, (8 - 5 + 2) * page), ra.ahead.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 10 * page), ra.advised.load(.monotonic));
+}
+
+test "a one-item pass advises its item once, and the next pass starts from nothing" {
+    if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "page-cache advice (madvise, mincore)");
+    const page = std.heap.pageSize();
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const bytes = try std.heap.page_allocator.alloc(u8, 2 * page);
+    defer std.heap.page_allocator.free(bytes);
+    const sources = [_][]const u8{bytes};
+    var set: Chunks = undefined;
+    try set.init(arena_state.allocator(), 1, 0, page, page);
+    var ra = set.readAhead(&sources, 1 << 30, 4, null);
+    for (0..2) |pass| {
+        ra.start();
+        try std.testing.expectEqual(@as(u64, 0), ra.ahead.load(.monotonic));
+        ra.claimed(0, null);
+        try std.testing.expectEqual(@as(u64, page), set.item_bytes[0]);
+        try std.testing.expectEqual(@as(u64, page), ra.ahead.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, (pass + 1) * page), ra.advised.load(.monotonic));
     }
 }
 
@@ -515,10 +575,10 @@ test "a chunk's boundary page counts whole: one byte inside a page advises and c
     var ra = set.readAhead(&sources, 1 << 30, 1, null);
     ra.start();
     ra.claimed(0, null);
-    // The accepted contract: advice is page-granular, so the page each advised byte (items 1 and 2's) sits on is
-    // advised and counted whole.
+    // The accepted contract: advice is page-granular, so the page each advised byte (items 0 and 1's: the pass's
+    // first claim advises from its first item) sits on is advised and counted whole.
     try std.testing.expectEqual(@as(u64, 2 * page), ra.advised.load(.monotonic));
-    try std.testing.expect(set.item_bytes[1] == page and set.item_bytes[2] == page);
+    try std.testing.expect(set.item_bytes[0] == page and set.item_bytes[1] == page);
     try std.testing.expectEqual(@as(u64, 2 * page), ra.ahead.load(.monotonic));
     // A window below one page advises nothing.
     var narrow = set.readAhead(&sources, page - 1, 1, null);

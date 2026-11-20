@@ -255,8 +255,10 @@ class Lane:
                     self.session(self.cases[cid], e, rnd)
             return
         for rep in range(first, self.reps + 1):
+            # Balance first-position effects from the previous cell across engines.
+            order = engines_ if (rep - first) % 2 == 0 else engines_[::-1]
             for cid in ids:
-                for e in engines_:
+                for e in order:
                     if (cid, e, rep, rnd) not in self.done:
                         self.fresh(self.cases[cid], e, rep, rnd)
 

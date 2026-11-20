@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A cold scan reads its first row groups ahead.** The first claim now asks the kernel for the opening row groups up front instead of leaving the first workers to fault them in one read at a time, so short cold aggregates no longer depend on a lucky startup stall, as they did in 0.5.2: about 15% faster where the device reads ahead little (128 KiB), about 5% where it reads ahead 1 MiB.
+
 - **An S3 query keeps its connections for its whole run.** Binding, the join's lookup and probe, a re-planned join and CTE stages now share one set of S3 connections instead of each opening its own, so a query pays for each handshake once (a small Lahman join over S3: six connections to two, 15% faster).
 
 - **`SELECT *` beside other items is refused instead of answered incorrectly.** `SELECT *, a + 1 AS one` silently dropped `one` (since 0.5.1); zpq now refuses it by name. List the columns instead.

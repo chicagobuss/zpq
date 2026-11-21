@@ -33,6 +33,11 @@ usage:
             [\-o <other.parquet>] [\-\-fsync | \-\-no\-fsync] [\-\-summary=json]
             rewrites only the pages holding matched rows, in place unless \-o
             (docs/capabilities.md, UPDATE)
+  zpq fanout \-\-function NAME[:VERSION] \-\-input s3://bucket/file.parquet
+             \-\-aggregate "sum(x) AS total" [\-\-workers N] [\-\-counts N,...]
+             [\-\-endpoint http://host:port ...] [\-\-region REGION]
+             [\-\-group\-by EXPR] [\-\-filter EXPR] [\-\-order\-by EXPR] [\-\-limit N]
+             [\-\-concurrency N] [\-\-request JSON] [\-\-sign\-endpoints]
   zpq schema <file.parquet>
   zpq inspect FILE... [\-\-format json] [\-\-detail]
   zpq conform <file.parquet>
@@ -94,7 +99,11 @@ usage:
                  \-j or memory. Data pages target 1 MiB or 20,000
                  rows; dictionary pages can hold more rows within
                  their byte budgets. Each has a page index entry.
-                 A plain copy keeps its input's row groups.
+                 A plain copy coalesces small source row groups at
+                 whole\-group boundaries. Its byte target counts
+                 encoded uncompressed pages plus headers, while
+                 re\-encoding counts PLAIN values. Groups already at
+                 target copy whole; incompatible chunks end a run.
   \-\-threads / \-j N
                  Requested CPU parallelism. Re\-encoding shares CPU turns
                  between decode and encode, capped by the affinity's
@@ -127,7 +136,9 @@ usage:
                  ignored either way; a null count the bounds contradict
                  or fail to back is used only with this flag.
   \-\-no\-bloom\-filters
-                 Skip automatic dictionary Bloom filters (on by default).
+                 Skip automatic dictionary Bloom filters on newly
+                 encoded chunks (on by default). Copies create filters
+                 only for explicit requests.
                  Explicit \-\-bloom\-filter specs still apply; copied source
                  filters are preserved. Automatic filters use FPP 0.01.
   \-\-bloom\-filter write a split\-block Bloom filter for output column COL

@@ -1379,7 +1379,7 @@ test "a released grouped Parquet answer has no phantom object in the service env
     };
     var writer: std.Io.Writer.Allocating = .init(a);
     defer writer.deinit();
-    try aggregateResponse(&writer.writer, ar, 0, &pool, null, false);
+    try aggregateResponse(&writer.writer, ar, 0, &pool, null, false, null);
     var parsed = try std.json.parseFromSlice(std.json.Value, a, writer.written(), .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("agg").?.array.items.len);
@@ -1412,13 +1412,13 @@ test "uploads take permits of their own over the warm pool's connections" {
     var pool: PersistentPool = .{};
     var registry = persistentPoolAdapter(&pool);
     const creds: s3.Credentials = .{ .access_key = "ak", .secret_key = "sk", .region = "us-east-1" };
-    const out = try registry.ensure_output(registry.ctx, std.testing.allocator, creds, "bkt");
+    const out = try registry.ensure_output.?(registry.ctx, std.testing.allocator, creds, "bkt");
     defer pool.inner.deinit();
     defer pool.cache.deinit();
     try std.testing.expectEqual(&pool.inner, out.pool);
     const in = try registry.ensure_for_bucket(registry.ctx, std.testing.allocator, creds, "bkt");
     try std.testing.expectEqual(&pool.inner, in);
-    try std.testing.expectEqual(out, try registry.ensure_output(registry.ctx, std.testing.allocator, creds, "bkt"));
+    try std.testing.expectEqual(out, try registry.ensure_output.?(registry.ctx, std.testing.allocator, creds, "bkt"));
 
     // Reads holding every input permit leave every upload permit free.
     var permits: [PersistentPool.Inner.capacity]usize = undefined;

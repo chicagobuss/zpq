@@ -2,47 +2,9 @@
 
 ## Unreleased
 
-- **A cold scan reads its first row groups ahead.** The first claim now asks the kernel for the opening row groups up front instead of leaving the first workers to fault them in one read at a time, so short cold aggregates no longer depend on a lucky startup stall, as they did in 0.5.2: about 15% faster where the device reads ahead little (128 KiB), about 5% where it reads ahead 1 MiB.
-
-- **An S3 query keeps its connections for its whole run.** Binding, the join's lookup and probe, a re-planned join and CTE stages now share one set of S3 connections instead of each opening its own, so a query pays for each handshake once (a small Lahman join over S3: six connections to two, 15% faster).
-
-- **`SELECT *` beside other items is refused instead of answered incorrectly.** `SELECT *, a + 1 AS one` silently dropped `one` (since 0.5.1); zpq now refuses it by name. List the columns instead.
-
-- **A GROUP BY scan no longer pays for code it doesn't run.** The lone-key dictionary filter is compiled only into the scans that use it, which brings the long-string COUNT(DISTINCT) cells back to 0.5.2's speed while keeping 0.6.0's gains on filtered lone-key counts.
-
-- **A small S3 read that fails reports the store's error.** A ranged GET whose error response was larger than the requested range reported BodyTooLarge. zpq now reads up to 1 MiB of the error document and names the store's code, message and object path, an endless error stream fails within about 2 MiB, and a SlowDown on a small read backs off and retries.
-
-- **Fan-out and footer-only S3 queries no longer crash on large footers.** A footer-only S3 open kept its plan bound to a footer it had already freed. A Lambda fan-out over files with large footers could crash its workers, and `--explain` or `LIMIT 0` over S3 could crash or print freed memory. The footer cache also hands out copies now, so a concurrent update can't free an entry still in use.
-
-- **Scans count and group faster, and footers parse in place.** Histogram columns fold their entries once and count codes in cache-sized lanes, a lone GROUP BY key is filtered once per dictionary entry, and a footer parses in place into one block. On granite, ClickBench q7 runs 39% faster hot and 28% cold, q2 25% and 17%, and q29 23% and 14%.
-
-- **Every S3 read checks the object's version.** A Parquet object replaced while zpq reads it now fails with a named error (`InputChanged`) instead of returning a mix of old and new data. This covers every query shape, including fan-out and Lambda, where workers must agree on each object's ETag before their results are merged. A store or proxy that drops the ETag from range responses now fails the query instead of risking a mixed answer.
-
-- **S3 joins start sooner and never mix object versions.** zpq reuses the footers and file tails its binder already read and checks every later read's ETag against them. A join over many small S3 files makes about half the requests, and an object replaced mid-query makes the join bind again once or fail with a named error. Stores that reject If-Match fall back to plain reads that are still checked.
-
-- **Joins over S3 read about a third fewer bytes.** Outside Lambda, zpq sizes the gap it bridges between column chunks from the link's bandwidth shared across its requests in flight, so large S3 joins read about what DuckDB reads, and the joins suite runs 17% faster over S3. Lambda keeps its previous gap.
-
-- **Joins spend less CPU per row.** A small dimension table keeps its columns dictionary-coded, composite-key probes prefetch their hash slots, and DECIMAL columns compare with each other in 128-bit integers. On TPC-DS SF10, ds19 runs in 62 ms instead of 162 and ds23 in 83 ms instead of 153.
-
-- **S3 globs read keys with `&`, `<` or `>`.** zpq decodes the XML escapes in S3 listings, so such a key no longer fails the glob with a 404, and a listing of more than 1,000 keys pages on when its continuation token holds such a character.
-
-- **Joins over S3 start sooner.** zpq reads each remote footer with one request, fetches a join's footers together and lists each glob once, so a small S3 join makes about half as many requests before it starts. The joins suite runs 9% faster over S3.
-
-- **An S3 glob no longer reads files in subdirectories.** `*` stops at `/`, as it does for local files. Before, `s3://b/dir/p*.parquet` also read `dir/sub/p1.parquet` and counted its rows.
-
-- **A join skips probe row groups its dimension's keys cannot match.** An inner or semi join on one integer or DATE key compares each probe row group's corroborated statistics with the range of keys the filtered dimension kept, and skips the groups wholly outside it. The TPC-DS inventory join reads 217 of 1,084 row groups instead of all of them, and over S3 sends 149 requests instead of 733. `--scan-all` turns it off.
-
-- **zpq builds for the browser again.** The wasm32-wasi build that runs the site's Playground now comes from mainline zpq, single-threaded or with a shared-memory thread pool. Native builds are unchanged.
+## 0.6.0 — 2026-11-21
 
 - **Joins return rows, join on several key columns, and keep same-named columns apart.** A join without an aggregate answers its rows as DuckDB does, duplicates included, with ORDER BY, LIMIT and OFFSET; FLOAT and DOUBLE row items are refused by name for now. A join on two or more key columns binds them together, and falls back to its first key when the packed key would not fit in 63 bits. Two tables' same-named columns stay apart by their qualifiers. An ORDER BY name that is both a select alias and a qualified column sorts by the column, as DuckDB does, in joins and on single tables.
-
-- **Lambda cold starts read less of the binary.** The Lambda build links the code a cold start runs first, in the order it runs, so a cold start touches about half as many blocks of the binary. Init falls by about 7 ms on arm64 and 16 ms on x86_64.
-
-- **EXISTS and NOT EXISTS subqueries run as joins.** A correlated EXISTS becomes a semi join and NOT EXISTS an anti join, with SQL's NULL rules: NOT EXISTS ignores NULL keys where NOT IN does not.
-
-- **Joins read NULLs in a dimension's columns, and join on string keys.** A build-side column holding NULLs answers as DuckDB does, and a join on a VARCHAR key matches by bytes. A fetched DATE or TIMESTAMP key keeps its type in CSV and Parquet output.
-
-- **Joins run over S3.** Tables on S3, or a mix of local and S3 tables, join as local ones do, with the same answers. A build side larger than the query's memory budget is refused by name.
 
 - **Joins accept more of the queries people write.** A glob or several files can be a join's probe table, EXTRACT works inside a join, USING joins two tables on one column, and a build side that isn't unique on its key no longer refuses when the other side is. Every join refusal now names the feature it lacks.
 
@@ -50,37 +12,92 @@
 
 - **Joins carry dimension strings to the result cut, compare numeric dictionary codes across files, and probe dense keys in one pass.** Only the rows that survive LIMIT fetch their dimension strings, a numeric comparison reads each side's own dictionary, and a dense INNER or SEMI probe captures slots and narrows the selection together. An expression over two copies of a self-joined table's same-named column is refused by name.
 
-- **An unordered GROUP BY … LIMIT builds only the groups it returns.** Without ORDER BY or HAVING, a dense GROUP BY with LIMIT n [OFFSET m] keeps the first n+m groups in first-appearance order straight from its lanes instead of building them all.
+- **Joins read NULLs in a dimension's columns, and join on string keys.** A build-side column holding NULLs answers as DuckDB does, and a join on a VARCHAR key matches by bytes. A fetched DATE or TIMESTAMP key keeps its type in CSV and Parquet output.
 
-- **Compaction keeps merged row groups within the row and byte targets, and copies a group that can't merge as it stands.** Rewriting DuckDB's 122,880-row groups no longer pairs them into 245,760-row groups.
+- **EXISTS and NOT EXISTS subqueries run as joins.** A correlated EXISTS becomes a semi join and NOT EXISTS an anti join, with SQL's NULL rules: NOT EXISTS ignores NULL keys where NOT IN does not.
 
-- **Re-encoding writes of wide rows are faster again.** A write with more columns than encode workers used to encode only a quarter of the workers' row groups at a time, so most turns sat idle behind each group's slowest column. It now encodes one row group per worker, within the same memory share. Output bytes don't change. On a 16-thread placement, bench100 W4 (14 columns, filter, zstd) went from 218 to 173 ms, and an SF10 lineitem re-encode from 6.2 to 4.5 s (zstd).
+- **Joins spend less CPU per row.** A small dimension table keeps its columns dictionary-coded, composite-key probes prefetch their hash slots, and DECIMAL columns compare with each other in 128-bit integers. On TPC-DS SF10, ds19 runs in 62 ms instead of 162 and ds23 in 83 ms instead of 153.
+
+- **Joins keep a plain key plain.** A numeric build-side column stored PLAIN is no longer run through a dictionary just because the build's filter reads it.
+
+- **Joins fetch later.** A dependent column is fetched as the scan reads it, and a fetched GROUP BY value waits for the LIMIT cut, so fewer rows are copied.
+
+- **A join skips probe row groups its dimension's keys cannot match.** An inner or semi join on one integer or DATE key compares each probe row group's corroborated statistics with the range of keys the filtered dimension kept, and skips the groups wholly outside it. The TPC-DS inventory join reads 217 of 1,084 row groups instead of all of them, and over S3 sends 149 requests instead of 733. `--scan-all` turns it off.
+
+- **Joins run over S3.** Tables on S3, or a mix of local and S3 tables, join as local ones do, with the same answers. A build side larger than the query's memory budget is refused by name.
+
+- **Joins over S3 start sooner.** zpq reads each remote footer with one request, fetches a join's footers together and lists each glob once, so a small S3 join makes about half as many requests before it starts. The joins suite runs 9% faster over S3.
+
+- **S3 joins start sooner and never mix object versions.** zpq reuses the footers and file tails its binder already read and checks every later read's ETag against them. A join over many small S3 files makes about half the requests, and an object replaced mid-query makes the join bind again once or fail with a named error. Stores that reject If-Match fall back to plain reads that are still checked.
+
+- **Joins over S3 read about a third fewer bytes.** Outside Lambda, zpq sizes the gap it bridges between column chunks from the link's bandwidth shared across its requests in flight, so large S3 joins read about what DuckDB reads, and the joins suite runs 17% faster over S3. Lambda keeps its previous gap.
+
+- **An S3 query keeps its connections for its whole run.** Binding, the join's lookup and probe, a re-planned join and CTE stages now share one set of S3 connections instead of each opening its own, so a query pays for each handshake once (a small Lahman join over S3: six connections to two, 15% faster).
+
+- **Every S3 read checks the object's version.** A Parquet object replaced while zpq reads it now fails with a named error (`InputChanged`) instead of returning a mix of old and new data. This covers every query shape, including fan-out and Lambda, where workers must agree on each object's ETag before their results are merged. A store or proxy that drops the ETag from range responses now fails the query instead of risking a mixed answer.
+
+- **S3 Express One Zone: directory buckets on zonal endpoints, CreateSession session credentials with one shared refresh, reads, writes and multipart with CRC32, and unsorted directory listings handled.**
 
 - **S3 Express: a failed refresh thread no longer fails requests.** If the background session refresh can't start a thread, zpq keeps serving the still-valid cached session instead of failing the request.
 
-- **Zig 0.17.1: the pins name it.** `build.zig.zon`'s minimum, `.zig-version`, the CI and release workflows, `just bootstrap` and the docs move from 0.17.0, and bootstrap now checks the tarball against ziglang.org's published sha256 before unpacking it. Still any 0.17.x release, not only 0.17.1.
-
-- **SQL: non-recursive `WITH` CTEs and subqueries in FROM (derived tables), with column lists, nesting and joins.** A `SELECT *` filter of one file is inlined into the query that reads it; anything else read runs once into a scratch Parquet file. `WITH RECURSIVE`, `LATERAL` and circular or duplicate CTEs are refused by name.
-- **S3 Express One Zone: directory buckets on zonal endpoints, CreateSession session credentials with one shared refresh, reads, writes and multipart with CRC32, and unsorted directory listings handled.**
-- **Tests honor ZPQ_TEST_PARQUET_DIR: every place zpq's tests write Parquet scratch goes under it.**
-- **Fan-out is native: `zpq fanout` and the Lambda coordinator mode plan, invoke and merge in Zig, replacing the Python coordinator.** Joins fan out too, by aligned key ranges from footer statistics or with a replicated small side. Invoke retries transient failures.
-- **Native Windows x86_64: the CLI, Parquet reads and writes, S3 and TLS with system certificates, Unicode and verbatim (`\\?\`) paths, and a release zip.**
-- **Compaction coalesces small row groups by merging their pages, without re-encoding: DuckDB-like row groups at 2-4x DuckDB's speed.** Row groups already near the target are still byte-copied.
-- **Copy and compaction no longer add Bloom filters nobody asked for.**
-- **Fixed: statistics for variable-width BYTE_ARRAY DECIMAL were compared in the wrong byte order, which could make readers skip matching rows.** zpq now ignores BYTE_ARRAY DECIMAL statistics written by zpq before 0.6.0, on read, copy and recompression.
-- **zpq-check no longer crashes printing errors in fresh-case runs.**
-- **macOS: CSV reads no longer hit SIGSYS.**
-- **UPDATE reports RollbackFailed and InputChanged correctly.**
-- **A parallel top-k cut that runs out of memory retries on one worker instead of refusing.**
-- **Release archives ship every guide the manual references.**
-- **A WHERE comparing two columns no longer fails when the output is Parquet and either column is dictionary-encoded.**
-- **Fewer memory-map calls in hot loops, so cold scans don't stall behind their own reads.**
-- **Local reads share one admission budget per device, so spinning and unknown storage read in order. Outputs sync their directory after the atomic rename. A failing disk ends a query with a clear error naming the file and offset.**
 - **S3 errors name the operation, bucket and key, report S3's own code and message with credentials redacted, and tell a missing multipart upload apart from a missing bucket.**
+
+- **A small S3 read that fails reports the store's error.** A ranged GET whose error response was larger than the requested range reported BodyTooLarge. zpq now reads up to 1 MiB of the error document and names the store's code, message and object path, an endless error stream fails within about 2 MiB, and a SlowDown on a small read backs off and retries.
+
+- **S3 globs read keys with `&`, `<` or `>`.** zpq decodes the XML escapes in S3 listings, so such a key no longer fails the glob with a 404, and a listing of more than 1,000 keys pages on when its continuation token holds such a character.
+
+- **An S3 glob no longer reads files in subdirectories.** `*` stops at `/`, as it does for local files. Before, `s3://b/dir/p*.parquet` also read `dir/sub/p1.parquet` and counted its rows.
+
+- **zpq builds for the browser again.** The wasm32-wasi build that runs the site's Playground now comes from mainline zpq, single-threaded or with a shared-memory thread pool. Native builds are unchanged.
+
+- **Fan-out is native: `zpq fanout` and the Lambda coordinator mode plan, invoke and merge in Zig, replacing the Python coordinator.** Joins fan out too, by aligned key ranges from footer statistics or with a replicated small side. Invoke retries transient failures.
+
+- **Lambda cold starts read less of the binary.** The Lambda build links the code a cold start runs first, in the order it runs, so a cold start touches about half as many blocks of the binary. Init falls by about 7 ms on arm64 and 16 ms on x86_64.
+
+- **Fan-out and footer-only S3 queries no longer crash on large footers.** A footer-only S3 open kept its plan bound to a footer it had already freed. A Lambda fan-out over files with large footers could crash its workers, and `--explain` or `LIMIT 0` over S3 could crash or print freed memory. The footer cache also hands out copies now, so a concurrent update can't free an entry still in use.
+
+- **A cold scan reads its first row groups ahead.** The first claim now asks the kernel for the opening row groups up front instead of leaving the first workers to fault them in one read at a time, so short cold aggregates no longer depend on a lucky startup stall, as they did in 0.5.2: about 15% faster where the device reads ahead little (128 KiB), about 5% where it reads ahead 1 MiB.
+
+- **Scans count and group faster, and footers parse in place.** Histogram columns fold their entries once and count codes in cache-sized lanes, a lone GROUP BY key is filtered once per dictionary entry, and a footer parses in place into one block. On granite, ClickBench q7 runs 39% faster hot and 28% cold, q2 25% and 17%, and q29 23% and 14%.
+
+- **A GROUP BY scan no longer pays for code it doesn't run.** The lone-key dictionary filter is compiled only into the scans that use it, which brings the long-string COUNT(DISTINCT) cells back to 0.5.2's speed while keeping 0.6.0's gains on filtered lone-key counts.
+
+- **An unordered GROUP BY … LIMIT builds only the groups it returns.** Without ORDER BY or HAVING, a dense GROUP BY with LIMIT n [OFFSET m] keeps the first n+m groups in first-appearance order straight from its lanes instead of building them all.
+
 - **q06-style composite GROUP BY with SUM is faster: dense keys sum straight into lanes.**
+
 - **Joins decode in L2-sized slices, and cold scans no longer stall on memory mapping.**
-- **Faster CSV aggregates.** A CSV aggregate's chunks parse into pooled per-worker arenas, fold without copies and drop their pages behind them, and a one-byte string's dictionary code is its byte.
-- **Joins keep a plain key plain.** A numeric build-side column stored PLAIN is no longer run through a dictionary just because the build's filter reads it.
+
+- **Fewer memory-map calls in hot loops, so cold scans don't stall behind their own reads.**
+
+- **Local reads share one admission budget per device, so spinning and unknown storage read in order. Outputs sync their directory after the atomic rename. A failing disk ends a query with a clear error naming the file and offset.**
+
+- **Re-encoding writes of wide rows are faster again.** A write with more columns than encode workers used to encode only a quarter of the workers' row groups at a time, so most turns sat idle behind each group's slowest column. It now encodes one row group per worker, within the same memory share. Output bytes don't change. On a 16-thread placement, bench100 W4 (14 columns, filter, zstd) went from 218 to 173 ms, and an SF10 lineitem re-encode from 6.2 to 4.5 s (zstd).
+
+- **Compaction keeps merged row groups within the row and byte targets, and copies a group that can't merge as it stands.** Rewriting DuckDB's 122,880-row groups no longer pairs them into 245,760-row groups.
+
+- **Compaction coalesces small row groups by merging their pages, without re-encoding: DuckDB-like row groups at 2-4x DuckDB's speed.** Row groups already near the target are still byte-copied.
+
+- **Copy and compaction no longer add Bloom filters nobody asked for.**
+
+- **`SELECT *` beside other items is refused instead of answered incorrectly.** `SELECT *, a + 1 AS one` silently dropped `one` (since 0.5.1); zpq now refuses it by name. List the columns instead.
+
+- **Fixed: statistics for variable-width BYTE_ARRAY DECIMAL were compared in the wrong byte order, which could make readers skip matching rows.** zpq now ignores BYTE_ARRAY DECIMAL statistics written by zpq before 0.6.0, on read, copy and recompression.
+
+- **UPDATE reports RollbackFailed and InputChanged correctly.**
+
+- **A parallel top-k cut that runs out of memory retries on one worker instead of refusing.**
+
+- **zpq-check no longer crashes printing errors in fresh-case runs.**
+
+- **Release archives ship every guide the manual references.**
+
+- **A WHERE comparing two columns no longer fails when the output is Parquet and either column is dictionary-encoded.**
+
+- **macOS: CSV reads no longer hit SIGSYS.**
+
+- **Native Windows x86_64: the CLI, Parquet reads and writes, S3 and TLS with system certificates, Unicode and verbatim (`\\?\`) paths, and a release zip.**
+
 - **zpq reads CSV.** A local `.csv`, `.tsv` or `.txt` file (or any file with `--input-format csv`) is parsed in parallel
   chunks. It can be written to Parquet whole or with `--columns`, `--filter`, `--select` and SQL `SELECT ... WHERE`, or
   aggregated with `GROUP BY`, `HAVING`, `FILTER (WHERE ...)` and `DISTINCT` as the file is parsed. The answer is the
@@ -94,7 +111,11 @@
     escapes are refused with the line, byte and column.
   - `ORDER BY`, `LIMIT`, `OFFSET`, joins, more than one input and S3 CSV input are refused by name; write the Parquet
     first. Everything a CSV query holds is drawn from `--max-memory`.
-- **Joins fetch later.** A dependent column is fetched as the scan reads it, and a fetched GROUP BY value waits for the LIMIT cut, so fewer rows are copied.
+
+- **Faster CSV aggregates.** A CSV aggregate's chunks parse into pooled per-worker arenas, fold without copies and drop their pages behind them, and a one-byte string's dictionary code is its byte.
+
+- **SQL: non-recursive `WITH` CTEs and subqueries in FROM (derived tables), with column lists, nesting and joins.** A `SELECT *` filter of one file is inlined into the query that reads it; anything else read runs once into a scratch Parquet file. `WITH RECURSIVE`, `LATERAL` and circular or duplicate CTEs are refused by name.
+
 - **`percent_rank`, `cume_dist` and RANGE frames with an offset.** `percent_rank()` and `cume_dist()` answer with DuckDB's
   formulas (the rows before the row's peers over the partition's other rows; the rows up to the last peer over all of them), and a
   `RANGE BETWEEN n PRECEDING / FOLLOWING` frame reaches by its ORDER BY key: a whole number or a decimal on an integer, DECIMAL,
@@ -105,6 +126,7 @@
   `WindowRangeCast`), and a DATE's offset is an INTEGER whose day delta stays within the days a DATE holds (`WindowRangeKey`,
   `WindowRangeOverflow`). Checked against DuckDB 2.0.0 on 2,150 fuzzed queries, 0 differences, and in
   `tools/check/cases/sql_windows.json`.
+
 - **Review fixes for the SQL scalar functions.** Integer overflow checks (`+ - * % //` at the SQL type DuckDB resolves)
   now apply in a GROUP BY key and under a function or `coalesce` too, as they do in a bare expression. The remainder
   or quotient of DECIMALs that falls back to DOUBLE converts each DECIMAL to the nearest double, so equal values stay
@@ -116,6 +138,7 @@
   does not have): `coalesce` of times of different kinds, `date_trunc`, `date_part`, `date_diff` and a cast to TIMESTAMP
   of a UTC-adjusted TIMESTAMP_NS, and `date_diff` between UTC-adjusted microseconds, nanoseconds and UTC-adjusted
   nanoseconds. Nested block comments are read whole, and an unterminated one is a parse error.
+
 - **WHERE compares two expressions in SQL.** `l_commitdate < l_receiptdate`, `l_extendedprice * (1 - l_discount) >
   50000`, `abs(a - 25) < z`, `30 < a + b`, and the same under AND, OR and NOT, in a single-table query, a join's probe
   or build side, a LEFT JOIN's ON and an `IN (SELECT ...)`, now run and match DuckDB (PDS-H q12 among them).
@@ -128,71 +151,86 @@
   - Each side is evaluated over the rows earlier conjuncts kept.
   - No statistic prunes such a comparison yet.
   - LIKE, IN and BETWEEN, FILTER clauses and CASE conditions still take literals on their value side.
+
 - **Row-level math and date parts in SQL.** `floor`, `ceil`, `sqrt`, `round(x, n)`, `least` and `greatest` over a column or
   expression, and `year`, `month`, `day`, `hour`, `minute`, `second`, `quarter`, `week`, `dayofweek`, `isodow` and
   `dayofyear` of a date or timestamp, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB (a DECIMAL keeps
   DECIMAL(p, 0) after `floor`, an integer floors to a DOUBLE, `least` skips NULLs, `sqrt` of a negative is NaN).
+
 - **Aggregate review fixes.** `approx_count_distinct` of a TIMESTAMP_MS column hashes it as the microsecond timestamp DuckDB
   reads it as (it hashed the raw milliseconds: 978 where DuckDB answers 991). Grouped `arg_max` and `arg_min` merge their
   partials in input order, so the first row of a tie wins at every `-j` (a later row won at `-j4` and up). A computed
   argument over a dictionary-coded column (`arg_max(coalesce(s, s), id)`) no longer aborts. A FLOAT computed from a
   column (`quantile_cont(coalesce(fl, fl), q)`, `arg_max(fl + fl, id)`), which would answer DOUBLE where DuckDB's is
   FLOAT, is refused by name.
+
 - **`arg_max` and `arg_min` in SQL.** `arg_max(arg, val)`, `arg_min(arg, val)` and their aliases `max_by`, `min_by`,
   `argmax`, `argmin` over integers, dates and times, DOUBLEs, FLOATs and text (ordered by those or a DECIMAL), scalar or
   per group, with a FILTER, answer in the type of `arg` what DuckDB does, with the first row of the scan winning a tie
   (the same at every `-j`; DuckDB's own tie varies with its threads). A DECIMAL `arg`, a BOOLEAN, an unsigned 64-bit
   `arg`, the three-argument list form and `DISTINCT` are refused by name.
+
 - **`string_agg` in SQL.** `string_agg(text [, sep])` (and `group_concat`, `listagg`) over a text column or expression,
   scalar or per group, with a FILTER, answers the texts of the group in the order of the file (the same at every `-j`),
   joined by a constant separator; NULL over none. A non-text argument, a non-constant separator and `DISTINCT` are
   refused by name.
+
 - **`median` and `quantile_cont` in SQL.** `median(x)` and `quantile_cont(x, q)` over an integer or DOUBLE column or
   expression, scalar or per group, with a FILTER, in a SELECT, HAVING or ORDER BY, answer the DOUBLE DuckDB does, bit for
   bit (NaN sorts last, infinities interpolate, NULLs are skipped), the same at every `-j`; equal to DuckDB on four
   columns of the 100-million-row ClickBench table. A FLOAT, DECIMAL, date, BOOLEAN or text argument, a negative,
   over-1 or non-constant quantile, and `quantile_disc` / `quantile` are refused by name. The values live in memory (8
   bytes each) against `--max-memory`.
+
 - **`approx_count_distinct` in SQL.** `approx_count_distinct(col)` over a bare column, scalar or per group, with a FILTER,
   in a SELECT, HAVING or ORDER BY, answers the number DuckDB does: the same HyperLogLog (1024 registers, DuckDB's hash
   of each type) and estimator, merged by register maximum, so it does not depend on `-j` (identical to DuckDB on all of
   ClickBench's hits for eight columns of seven types). An expression argument and TIME, UUID, INTERVAL and INT96 columns
   are refused by name. A grouped sketch is 1 KB per group and counts against `--max-memory`.
+
 - **`var_samp`, `var_pop`, `stddev_samp` and their aliases `variance` and `stddev` in SQL.** Over an integer, float or
   DECIMAL column or expression, scalar or per group, with a FILTER, in a SELECT, HAVING or ORDER BY. They fold Welford's
   running mean as DuckDB 2.0 does (bit for bit within a row group) and combine row groups in file order, so the answer
   is the same at every `-j`; across row groups DuckDB's own digits vary with its threads. `DISTINCT` and date, BOOLEAN
   and text arguments are refused by name.
+
 - **`bool_or` and `bool_and` in SQL.** Over a BOOLEAN column, in a SELECT, with a FILTER or per group, they match DuckDB
   (NULL over no values); any other argument is refused by name.
+
 - **`strftime` in SQL.** `strftime(t, format)` of a DATE or TIMESTAMP (a constant format of DuckDB's specifiers) runs in a
   SELECT, an aggregate argument or a GROUP BY key and matches DuckDB, including its year padding, week fields and
   `infinity`. An unknown specifier, an empty format and a TIMESTAMP_NS argument are refused by name.
+
 - **Three-argument `make_date` and `date_diff` in SQL.** `make_date(year, month, day)` and `date_diff(part, start, end)`
   (also `datediff`) run over dates and timestamps of any unit, in a SELECT, an aggregate argument or a GROUP BY key, and
   match DuckDB, including its boundary counting (a month between 01-31 and 02-01), its weeks and its error for a date
   that is not one.
+
 - **`split_part` and `regexp_extract` in SQL.** `split_part(s, sep, n)` and `regexp_extract(s, pattern [, group [,
   options]])` run over a text column or expression, in a SELECT, an aggregate or a GROUP BY key, and match DuckDB, each
   distinct text once. The separator, pattern, group and options are constants; the group-name list form is refused.
+
 - **`%`, `//` and integer arithmetic typed as DuckDB types it.** `a % b` and `a // b` (DuckDB's integer division) run
   over integers, DOUBLEs and DECIMALs in a SELECT, an aggregate argument or a GROUP BY key and match DuckDB. Integer `+`,
   `-`, `*`, `%` and `//` now take the SQL type DuckDB resolves for the pair and raise its overflow error where the
   result leaves it (`SMALLINT 32767 + TINYINT 127` was answered as 32894). **Changed answer:** `/` between integers is a
   DOUBLE division, as in DuckDB (`7 / 2` is 3.5, where it was truncated to 3); write `//` for the integer division.
   `%` or `//` in a WHERE predicate or over aggregates, and of a date or text, are still refused by name.
+
 - **Date and timestamp casts, and typed computed times.** `CAST(t AS DATE)` and `CAST(x AS TIMESTAMP)` (also `::` and
   `DATETIME`) convert between a DATE and a TIMESTAMP in any unit, in a SELECT, an aggregate argument or a GROUP BY key,
   and match DuckDB (a day is the floor, before 1970 too; TIMESTAMP_NS reaches microseconds to the nearest; a DATE past the
   TIMESTAMP range is a conversion error). A computed `date_trunc`, `epoch_ms`, cast or `coalesce` of timestamps used to
   leave as a plain INT64 in Parquet; it is now the TIMESTAMP it is (its unit, UTC-adjusted or not) in a row, a group key
   and a `min` or `max`, as a computed DATE already was.
+
 - **`TRY_CAST`, and text read as a number, in SQL.** `TRY_CAST(x AS type)` (any cast zpq makes) is NULL where `CAST` would
   stop the query, in a SELECT, an aggregate argument or a GROUP BY key. `CAST` and `TRY_CAST` of a text to TINYINT,
   SMALLINT, INTEGER, BIGINT or DOUBLE read it as DuckDB 2.0 does (whitespace, `+`, `0x`/`0b`, `_` between digits, `1.5`
   and `1e3` as integers rounded half away from zero, `inf`/`nan`), checked against DuckDB on 64,000 generated strings;
   a text that is no number is a `ConversionInvalid` error for `CAST`. A text to DECIMAL, DATE or TIMESTAMP is still
   refused by name.
+
 - **More scalar functions in SQL.** `t.g` for the query's one table (it failed as an unknown column); `epoch`, `epoch_ms`,
   `epoch_us`, `epoch_ns` and `EXTRACT(epoch FROM ...)` of a DATE or TIMESTAMP (the TIMESTAMP WITH TIME ZONE double differs
   from a TIMESTAMP's, as DuckDB's does); `cbrt`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `degrees`, `radians`, `atan2`, `sign`
@@ -200,10 +238,12 @@
   BOOLEANs, in WHERE too; `dayname`, `monthname`, `last_day`, `weekofyear`, `strpos`, `concat_ws` and `mod`; `ascii`, `chr`,
   `repeat` and `position(needle IN s)`. `ln`, `exp`, `pow`,
   `sin` and their kin stay refused: DuckDB's math library differs from a current one's in the last digit for many inputs.
+
 - **QUALIFY, `SELECT *` beside window calls, `ntile`, `first_value`, `last_value` and `nth_value`.** The usual `row_number() OVER (PARTITION
   BY g ORDER BY x) <= N` shape runs, with the aliases of select items usable in it, as DuckDB binds them (a column of the table first, then the
   last item of that alias; in a call or a window's argument too); `SELECT *` (and `* EXCLUDE (..)`) expands to
   the table's columns. Checked against DuckDB 2.0.0 on ~900 fuzzed queries.
+
 - **Window functions in SQL.** `row_number()`, `rank()`, `dense_rank()`, `lag` / `lead`, and `sum`, `count`, `avg`, `min`, `max`
   `OVER (PARTITION BY .. ORDER BY .. [ROWS BETWEEN ..])` (the default frame and `ROWS` frames), over rows or over a GROUP BY's
   output, in expressions, with ORDER BY / LIMIT, match DuckDB 2.0.0 (fuzzed on ~1,000 queries). The query runs as stages, as set
@@ -211,17 +251,21 @@
   over the result. Each pass sorts a view of the rows itself and writes them back in input order, so a query with no ORDER BY returns
   its rows as its input had them; the intermediate is held in memory, drawn on a ledger against `--max-memory`. `sum` / `avg` of a DOUBLE and the other frame
   shapes (`GROUPS`, `EXCLUDE`) are refused by name.
+
 - **Unaliased computed columns are named as DuckDB names them.** `SELECT id, id + 1, upper(s) FROM t ORDER BY id` was refused
   as `missing --output or --aggregate`; its columns are now `id`, `(id + 1)` and `upper(s)`. Names were checked against DuckDB on
   over 500 generated expressions. What zpq rewrites before it reads, or prints differently from DuckDB (`CASE`, `//`, `EXTRACT`,
   `POSITION`, `TRY_CAST`, a qualified column), is refused as `SelectAliasRequired` until it has an alias.
+
 - **`COLUMNS('regex')`, `COLUMNS(*)` and `COLUMNS(* EXCLUDE (...))` in SQL**: `SELECT max(COLUMNS('^l_.*date')) FROM lineitem`
   runs, each matching column an output named after it, as DuckDB's.
+
 - **`ROLLUP`, `CUBE`, `GROUPING SETS` and `GROUPING()` in SQL** (`zpq query --query`): `GROUP BY ROLLUP (a, b)`, `CUBE (a, b)`,
   `GROUPING SETS ((a), (b), ())` and their products with plain keys match DuckDB, including the NULL a key takes in a set
   that leaves it out (in the key's own type), `GROUPING` / `GROUPING_ID`, HAVING per set and the grand-total row over no
   input. Each set is one GROUP BY query and the sets are combined as a UNION ALL, so an input is scanned once per set.
   It was `ColumnMustBeGrouped` (ROLLUP, CUBE) or a parse error (GROUPING SETS).
+
 - **`UNION [ALL]`, `INTERSECT` and `EXCEPT` in SQL** (`zpq query --query`), of any SELECTs zpq runs alone, with DuckDB's
   precedence, parentheses, NULL, NaN and zero semantics and one ORDER BY / LIMIT / OFFSET for the whole result. Each SELECT
   runs to a scratch Parquet file and the operator is a query over those files; column types must be equal, integers of
@@ -229,6 +273,7 @@
   `-Nullability`, `-All`, `-ByName`, `-Order`, `-Nesting`). The result may not overwrite a file a branch reads (as for a plain
   query), each branch releases its tables before the next, and a trailing `OFFSET` may stand without a `LIMIT` or precede
   it. It was `UnsupportedStatement`. See docs/capabilities.md.
+
 - **`CAST(x AS VARCHAR)` of a number, BOOLEAN, DECIMAL, DATE or TIMESTAMP in SQL** (also `TEXT`, `STRING`, `VARCHAR(n)`,
   `x::VARCHAR` and `TRY_CAST`), in a SELECT, an aggregate argument (`min`, `max`, `count(DISTINCT ...)`) or a GROUP BY key,
   prints the value as DuckDB 2.0 does: a DOUBLE by its shortest digits (`1e+16`, `5e-324`, `nan`, `-0.0`), a DECIMAL at its
@@ -242,20 +287,24 @@
   TIMESTAMP that is not UTC-adjusted below 290309-12-22 (BC), are conversion errors in text, as in DuckDB (a UTC-adjusted
   one prints; the infinite millisecond counts are `infinity`); `approx_count_distinct` of the infinite millisecond counts
   hashes them as the infinite microsecond timestamps instead of failing. A `TRY_CAST` inside another (`TRY_CAST(TRY_CAST(s AS INTEGER) AS DOUBLE)`) was left as an unknown function.
+
 - **Numeric casts in SQL.** `CAST(x AS TINYINT | SMALLINT | INTEGER | BIGINT | DOUBLE | DECIMAL(p, s))` and `x::TYPE`
   over a number, in a SELECT, an aggregate argument or a GROUP BY key, match DuckDB, including its rounding (a DECIMAL
   half away from zero, a DOUBLE to an integer half to even) and its conversion error for a value that does not fit.
   `CAST(... AS FLOAT | TIMESTAMPTZ)` and a text cast to a number are still refused by name.
+
 - **String functions in SQL.** `length`, `substring` / `substr`, `left`, `right`, `upper` / `lower`, `trim` / `ltrim` /
   `rtrim`, `replace` and `lpad` / `rpad` run over a text column or expression, in a SELECT, an aggregate or a GROUP BY
   key, and match DuckDB (characters are code points; a negative `substring` length reads backwards; `upper` and `lower`
   map one code point to one with DuckDB's table, generated by `tools/gen_case_map.py`). `concat(a, b, ...)` (NULL as
   empty text), `ifnull(a, b)`, `substring(x FROM a FOR b)` and `coalesce(double_col, 0.0)` work too. Each distinct text is computed once, and
   a dictionary-coded column once per entry. Arguments after the text must be constants.
+
 - **`nullif` and `abs` in SQL.** `nullif(col, literal)` and `abs(x)` of an integer, DOUBLE or DECIMAL expression (in a
   SELECT, inside an aggregate or as a GROUP BY key) and `nullif(x, y)` and `abs(x)` over aggregates
   (`sum(a) / nullif(sum(b), 0)`) now run and match DuckDB, including its overflow error for the minimum of an integer
   type. A non-column or non-literal in `nullif`, and `abs` of text, are refused by name.
+
 - **Expressions over aggregates in SQL.** `sum(a) / sum(b)`, `100 * sum(CASE ...) / sum(...)`, `round(avg(x), 2)`,
   `sum(a) + sum(b)` and their kin now run as a SELECT item, in `HAVING` (`sum(a) > avg(a) * 1000`, also a result
   against another result) and in `ORDER BY` (`ORDER BY sum(a) / count(*) DESC`), with or without GROUP BY. Each is computed
@@ -266,11 +315,13 @@
   finalizer; otherwise the sum cast to a double, then divided), `round` keeps an infinity or NaN, and a DECIMAL `round`
   that leaves the result's precision (`round(sum(d), -1)` of 38 nines) is an overflow error. A scan strategy that cuts groups early stands aside for such
   a query. `%`, `||`, other functions and CASE inside the expression are refused by name.
+
 - **SELECT sugar in SQL.** `SELECT DISTINCT a, b` (one group per distinct row, NULLs together), `GROUP BY ALL`, `ORDER BY ... NULLS FIRST
   | LAST` (on aggregate results and on plain rows with a `LIMIT`; a row group whose statistics cannot bound its NULLs is
   read), `ORDER BY` an expression of the GROUP BY keys, the simple `CASE c WHEN v THEN ...` over a column and literals, and
   `[NOT] ILIKE` with an ASCII pattern now run and match DuckDB. `DISTINCT` with an aggregate, `*` or a GROUP BY, and
   `DISTINCT ON`, are refused by name.
+
 - **Typed literals and constant folding in SQL.** `DATE '1998-09-02'`, `TIMESTAMP '..'`, `CAST('..' AS date | timestamp |
   decimal)`, `'..'::DATE`, `DATE '1998-12-01' - INTERVAL '90' DAY` and constant arithmetic such as `.06 - 0.01` now fold at
   parse time into the literal a filter already takes, so row-group pruning is as before. TPC-H Q1 and Q6 in standard
@@ -278,6 +329,10 @@
   INTERVAL anywhere else and a fraction of a whole-number unit are refused by name, never answered. Constants keep DuckDB's
   types and ranges: an integer takes the narrowest type that holds it after its sign, an INTERVAL component its field's width,
   a TIMESTAMP its year-294247 limit, a decimal its 38 digits, and what DuckDB refuses is refused, never wrapped or aborted on.
+
+- **Zig 0.17.1: the pins name it.** `build.zig.zon`'s minimum, `.zig-version`, the CI and release workflows, `just bootstrap` and the docs move from 0.17.0, and bootstrap now checks the tarball against ziglang.org's published sha256 before unpacking it. Any 0.17.x release from 0.17.1 on builds zpq.
+
+- **Tests honor ZPQ_TEST_PARQUET_DIR: every place zpq's tests write Parquet scratch goes under it.**
 
 ## 0.5.2 — 2026-11-11
 

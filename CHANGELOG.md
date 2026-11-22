@@ -4,6 +4,8 @@
 
 ## 0.6.0 — 2026-11-21
 
+- **Performance against 0.5.2 and the other engines.** On the release benchmark, geometric mean wall time is 0.97× zpq 0.5.2 cold and 0.98× hot, with no confirmed regressions, and every write case beats DuckDB 2.0.0 and Polars 2.1.0 in both lanes. Against DuckDB 2.0.0 on AWS S3, Cloudflare R2 and Backblaze B2, geometric mean wall time is 0.72×, 0.70× and 0.69×, with every timed answer verified. On the joins suite against DuckDB 2.0.0, geometric mean wall time is 0.44× cold and 0.41× hot locally, and 0.56× over S3 (RustFS).
+
 - **Joins return rows, join on several key columns, and keep same-named columns apart.** A join without an aggregate answers its rows as DuckDB does, duplicates included, with ORDER BY, LIMIT and OFFSET; FLOAT and DOUBLE row items are refused by name for now. A join on two or more key columns binds them together, and falls back to its first key when the packed key would not fit in 63 bits. Two tables' same-named columns stay apart by their qualifiers. An ORDER BY name that is both a select alias and a qualified column sorts by the column, as DuckDB does, in joins and on single tables.
 
 - **Joins accept more of the queries people write.** A glob or several files can be a join's probe table, EXTRACT works inside a join, USING joins two tables on one column, and a build side that isn't unique on its key no longer refuses when the other side is. Every join refusal now names the feature it lacks.

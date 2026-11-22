@@ -140,9 +140,9 @@ the Parquet part: filter and project with zpq, write Parquet or NDJSON, and read
 ## How fast
 
 On 464 benchmark queries (ClickBench, PDS-H and 390 synthetic aggregation cases), run hot with a fresh process for
-every query, zpq 0.5.2 is faster than DuckDB 2.0.0 on 461 of them and faster than Polars 2.0.0 on 450 of the 455 where
-Polars' answer validated, the fastest of the three on 457, and never more than 1.5× behind (measured on a Ryzen 9 9950X). Every query, the method, and the few places zpq is still behind are on
-the site's [Benchmarks](https://zpq.chicagobuss.dev/numbers.html) page.
+every query on a Ryzen 9 9950X, zpq 0.6.0 is faster than DuckDB 2.0.0 on 457 of 464 and faster than Polars 2.1.0 on
+459 of the 461 where Polars' answer validated. Every query, the cold runs, the method and where zpq is still behind are
+on the site's [Benchmarks](https://zpq.chicagobuss.dev/numbers.html) page.
 
 ## Limits
 

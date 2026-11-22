@@ -47,10 +47,7 @@ with zpq.Zpq(max_memory="4GB") as z:
     print(r["agg"])
 ```
 
-## SQL (EXPERIMENTAL in 0.5.1)
-
-The SQL request and response shapes are **EXPERIMENTAL** and have no stability guarantee. This is a thin
-pass-through to the CLI frontend; Parquet I/O remains the engine's focus.
+## SQL
 
 `zpq_run` also accepts `{"sql":"SELECT ... FROM 'data.parquet'", "parallelism":3}`. It uses the CLI's SQL
 frontend, binder, planner, path expansion (local and S3 globs), and NDJSON serializers. Successful responses are
@@ -256,7 +253,7 @@ Outside the ceiling altogether:
   filter parsers are fuzzed. A broken internal invariant still aborts the process with a message, as it would the
   CLI; libzpq never unwinds into the caller. Build it `ReleaseSafe` to keep those checks, `ReleaseFast` for speed.
 
-## Stable and experimental in 0.5.1
+## Stable and experimental
 
 Stable: the seven non-Arrow functions, their signatures and ownership, the status codes and their meanings, the option names, and
 the request and response schema the Lambda documents. ABI version 1 only grows: new options, request fields and
@@ -330,7 +327,7 @@ large Parquet writes also start writeback in roughly 64 MiB ranges while later o
 is encoded. This hint does not wait for completion; the final data sync remains the fence.
 This applies to local files; S3 and standard output do not use this option. The parent
 directory is not synced, so this option does not guarantee rename survival after power loss.
-## Arrow C stream results (experimental)
+## Arrow C stream results
 
 `zpq_run_arrow(ctx, request, len, &stream, &error)` selects a columnar answer instead of JSON. It is an additive
 symbol in `LIBZPQ_1`; ABI version 1's existing functions and status codes retain their meanings. The request uses

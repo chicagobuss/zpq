@@ -31,6 +31,7 @@ export PATH="$PWD/zpq/bin:$PATH"
 | Linux arm64 | `zpq-aarch64-linux-musl.tar.gz` |
 | macOS, Apple silicon | `zpq-aarch64-macos.tar.gz` |
 | macOS, Intel | `zpq-x86_64-macos.tar.gz` |
+| Windows x86_64 | `zpq-x86_64-windows-gnu.zip` |
 
 **Debian, Ubuntu, Fedora, RHEL:** the release also carries `zpq_0.6.0_amd64.deb`, `zpq_0.6.0_arm64.deb`,
 `zpq-0.6.0-1.x86_64.rpm` and `zpq-0.6.0-1.aarch64.rpm`.
@@ -152,7 +153,7 @@ on the site's [Benchmarks](https://zpq.chicagobuss.dev/numbers.html) page.
   cgroup `memory.max` or `ulimit -v`.
 - Window functions run (see docs/capabilities.md); some other SQL is refused with exit 2 and a message.
 - JSON prints DATE and TIMESTAMP as their stored integers; CSV prints ISO text.
-- SQL through libzpq, Arrow results and the Spark data source are experimental; Windows is not built.
+- On Windows, only the x86_64 CLI is built; libzpq is not built for Windows (see docs/libzpq.md).
 
 The full list is under "Known limits" in [CHANGELOG.md](CHANGELOG.md).
 

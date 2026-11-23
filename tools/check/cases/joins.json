@@ -3586,6 +3586,7 @@
   {
    "id": "review:r7:string-topk:plan",
    "fixture": "review-fact",
+   "max_memory": "512M",
    "cli": [
     "query",
     "--query",

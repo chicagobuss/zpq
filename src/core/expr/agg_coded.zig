@@ -738,7 +738,7 @@ pub fn filterHist(ra: std.mem.Allocator, f: filter_ast.Filter, col: *Column, key
     var sel = try Sel.init(ra, hist.len);
     try filter_eval.evaluate(f, &.{ .cols = &cols, .num_rows = hist.len }, &sel, lookup, ra);
     const kept = try ra.alloc(u64, hist.len);
-    var rows: usize = 0;
+    var rows: u64 = 0;
     for (kept, hist, 0..) |*k, count, code| {
         k.* = if (sel.isActive(code)) count else 0;
         rows += k.*;
@@ -746,7 +746,8 @@ pub fn filterHist(ra: std.mem.Allocator, f: filter_ast.Filter, col: *Column, key
     switch (col.*) {
         inline else => |*c| c.hist = kept,
     }
-    return rows;
+    // The kept counts are a subset of the batch's rows, which are addressable, so the total fits a `usize`.
+    return @intCast(rows);
 }
 
 /// `groupedCoded` for a key decoded as a histogram with first rows (`histGroupKey`): each code a row holds becomes its

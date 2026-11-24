@@ -160,6 +160,7 @@ pub fn build(b: *std.Build) void {
     }
 
     addCrossMacos(b, cfg);
+    addWasmCompile(b);
     addTiers(b, cfg);
 }
 
@@ -456,6 +457,10 @@ fn addTiers(b: *std.Build, cfg: Config) void {
     // The shipped Macs still compile (nothing runs): the Linux gate is where a Linux-only std call must fail.
     if (tier != .edit) if (add(b, &stages, wanted, runner, dir, tier_name, "cross-macos", "plain", 900)) |r| {
         r.addArgs(&.{ "--", b.graph.zig_exe, "build", "cross-macos", "-j2" });
+    };
+    // The browser reactors still compile for wasm32, where `usize` is 32 bits (nothing runs).
+    if (tier != .edit) if (add(b, &stages, wanted, runner, dir, tier_name, "wasm-compile", "plain", 900)) |r| {
+        r.addArgs(&.{ "--", b.graph.zig_exe, "build", "wasm-compile", "-j2" });
     };
     const Cases = struct { name: []const u8, files: []const []const u8, fresh: bool, timeout: u32, data: ?[]const u8 = null };
     const case_stages: []const Cases = switch (tier) {
@@ -1166,11 +1171,10 @@ fn validPrerelease(pre: []const u8) bool {
     return true;
 }
 
-/// Browser reactor: a whole Parquet buffer and a JSON request, with no native I/O graph.
-fn addWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
-    const threaded = b.option(bool, "wasm-threads", "Build the shared-memory WASI browser reactor") orelse false;
-    if (threaded and !target.result.cpu.has(.wasm, .atomics))
-        @panic("-Dwasm-threads needs -Dcpu=baseline+atomics+bulk_memory");
+/// The browser reactor's engine module (`src/wasm.zig` over the core), serial or on shared memory.
+const WasmEngine = struct { root: *std.Build.Module, core: Core, deps: CoreDeps };
+
+fn wasmEngine(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, threaded: bool) WasmEngine {
     var deps = CoreDeps.init(b, target, optimize, false, false);
     deps.profile = false;
     const core = addCoreModule(b, deps, target, optimize, .{ .sql = true });
@@ -1183,6 +1187,36 @@ fn addWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.O
         .link_libc = true,
         .imports = &.{.{ .name = "zpq", .module = core.zpq }},
     });
+    return .{ .root = root, .core = core, .deps = deps };
+}
+
+/// `zig build wasm-compile`: type-check, without linking or installing, both browser reactors (serial, and shared-memory
+/// with atomics) for wasm32-wasi. Their integers are 32 bits wide, so a `usize` that holds a 64-bit count is a compile
+/// error here, on the host that wrote it, rather than in the site's playground build. The commit tier runs it as the
+/// `wasm-compile` stage. Each engine is an object nothing consumes, so Zig analyzes the code and skips code generation.
+fn addWasmCompile(b: *std.Build) void {
+    const step = b.step("wasm-compile", "Type-check the serial and threaded WASI browser reactors (no code generated)");
+    const serial = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
+    const atomics = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .wasi,
+        .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory }),
+    });
+    for ([_]struct { std.Build.ResolvedTarget, bool }{ .{ serial, false }, .{ atomics, true } }) |v| {
+        const engine = wasmEngine(b, v[0], .ReleaseSafe, v[1]);
+        step.dependOn(&b.addObject(.{ .name = "zpq-wasm-check", .root_module = engine.root }).step);
+    }
+}
+
+/// Browser reactor: a whole Parquet buffer and a JSON request, with no native I/O graph.
+fn addWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) void {
+    const threaded = b.option(bool, "wasm-threads", "Build the shared-memory WASI browser reactor") orelse false;
+    if (threaded and !target.result.cpu.has(.wasm, .atomics))
+        @panic("-Dwasm-threads needs -Dcpu=baseline+atomics+bulk_memory");
+    const built = wasmEngine(b, target, optimize, threaded);
+    const root = built.root;
+    const core = built.core;
+    const deps = built.deps;
     // Zig 0.17 cannot build its C heap in a threaded WASM compilation. Compile
     // the engine to an object, then link it with a separately locked serial heap.
     const exe = if (threaded) blk: {

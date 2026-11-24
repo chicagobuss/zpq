@@ -231,6 +231,7 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
     cli_zpq.root.addImport("cli_version", cli_version.createModule());
     const cli = b.addExecutable(.{ .name = "zpq", .root_module = cli_zpq.root });
     addCpuStart(b, cli, target);
+    declareLlvmMemory(cli, optimize, 5);
 
     // The correctness runner: JSON cases, in-process zpq, the DuckDB CLI as the oracle.
     const check_module = b.createModule(.{
@@ -241,10 +242,12 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
         .imports = &.{.{ .name = "zpq", .module = cli_zpq.zpq }},
     });
     const check = b.addExecutable(.{ .name = "zpq-check", .root_module = check_module });
+    declareLlvmMemory(check, optimize, 5);
 
     const lambda_zpq = addBinaryModules(b, deps, target, optimize, .lambda, cfg.sql, cfg.strip);
     const lambda = b.addExecutable(.{ .name = "zpq-lambda", .root_module = lambda_zpq.root });
     addCpuStart(b, lambda, target);
+    declareLlvmMemory(lambda, optimize, 5);
     // On Lambda the first touch of each 128 KiB of the binary is a read (docs/lambda_capabilities.md): the code a cold
     // start runs goes first, in the order it runs (src/lambda/layout.ld, made by tools/lambda/layout.sh).
     if (target.result.os.tag == .linux) {
@@ -357,6 +360,8 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
         }),
         .filters = &.{"fanout"},
     });
+    const core_tests = b.addTest(.{ .root_module = dev_core.zpq, .filters = filters });
+    declareLlvmMemory(core_tests, optimize, 6.5);
     return .{
         .deps = deps,
         .cli = cli,
@@ -366,13 +371,23 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
         .check = check,
         .check_tests = b.addTest(.{ .root_module = check_module }),
         .cli_tests = cli_tests,
-        .core_tests = b.addTest(.{ .root_module = dev_core.zpq, .filters = filters }),
+        .core_tests = core_tests,
         // LLVM-built: the coverage instrumentation the fuzzer reads comes from that backend, not Debug's default.
         .fuzz_tests = b.addTest(.{ .root_module = test_core.zpq, .filters = filters, .use_llvm = true }),
         .unit_tests = unit_tests,
         .integration_tests = integration_tests,
         .fanout_tests = fanout_tests,
     };
+}
+
+/// Declares what an optimized build of zpq takes from the host (peak resident set measured at 4.4 to 6.2 GB), so Zig's
+/// scheduler starts such a compile only while the declared sizes of those running fit the host's memory: on a 16 GB CI
+/// runner two run together instead of all four at once, which peaked past 20 GB and killed the runner. A host with
+/// memory to spare still runs them all together. Debug builds skip LLVM and take far less, and macOS hosts keep the
+/// scheduler's default, so neither declares.
+fn declareLlvmMemory(exe: *std.Build.Step.Compile, optimize: std.lang.Optimize, gib: f64) void {
+    if (@import("builtin").os.tag != .linux or optimize == .debug) return;
+    exe.step.max_rss = @intFromFloat(gib * (1 << 30));
 }
 
 /// `zig build check -Dtier=edit|commit|full [-Dshard=NAME]`: the gates. Each stage runs through `zpq-check stage`,

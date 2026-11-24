@@ -339,6 +339,9 @@ pub const Func = enum {
     strlen,
     /// `make_date(days)`: the DATE `days` after 1970-01-01, as DuckDB's one-argument form (an INTEGER argument).
     make_date,
+    /// The TIMESTAMP `us` microseconds after the epoch, as DuckDB's one-argument `make_timestamp`. No query names it: a
+    /// constant `TIMESTAMP '..'` or `CAST('..' AS TIMESTAMP)` binds to it over the literal, so it is always in range.
+    make_timestamp,
     /// `epoch_ms(ms)`: the TIMESTAMP `ms` milliseconds after the epoch, held in microseconds as DuckDB holds it.
     epoch_ms,
     /// `epoch(t)`, which `date_part('epoch', t)` and `EXTRACT(epoch FROM t)` are: the seconds since the epoch of a DATE or
@@ -903,7 +906,7 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .floor, .ceil, .sqrt, .round, .sign, .trunc, .ascii, .chr, .repeat => c.args[0].mayBeNull(),
+                .strlen, .epoch_ms, .make_timestamp, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .floor, .ceil, .sqrt, .round, .sign, .trunc, .ascii, .chr, .repeat => c.args[0].mayBeNull(),
                 .math => for (c.args) |a| {
                     if (a.mayBeNull()) break true;
                 } else false,

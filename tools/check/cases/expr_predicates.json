@@ -1089,7 +1089,7 @@
    ],
    "refuse": {
     "error": "exit 2",
-    "diag": "type mismatch in expression"
+    "diag": "type mismatch in expression `DATE < TIMESTAMP`"
    }
   },
   {
@@ -1110,7 +1110,7 @@
    ],
    "refuse": {
     "error": "exit 2",
-    "diag": "type mismatch in expression"
+    "diag": "type mismatch in expression `VARCHAR < INTEGER`"
    }
   },
   {

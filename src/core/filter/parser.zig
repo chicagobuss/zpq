@@ -86,10 +86,12 @@ fn bindExprCompare(arena: std.mem.Allocator, left: syntax.Expr, op: ast.Operator
     const sides = try arena.alloc(expr_ast.Expr, 2);
     sides[0] = expr_parser.bindSyntax(arena, left, file, diag) catch |err| return intoError(err);
     sides[1] = expr_parser.bindSyntax(arena, right, file, diag) catch |err| return intoError(err);
-    if (expr_ast.Type.promote(sides[0].typeOf(), sides[1].typeOf()) == null) return error.TypeMismatch;
+    if (expr_ast.Type.promote(sides[0].typeOf(), sides[1].typeOf()) == null)
+        return expr_parser.noteCompare(diag, file, op, sides[0], sides[1]);
     // DuckDB rounds FLOAT arithmetic to FLOAT at every step; zpq's DOUBLE lane would compare other values.
     for (sides) |e| if (e.float32() == .computed) return error.FloatArithmeticComparison;
-    if (!std.meta.eql(sides[0].temporal(), sides[1].temporal())) return error.TypeMismatch;
+    if (!std.meta.eql(sides[0].temporal(), sides[1].temporal()))
+        return expr_parser.noteCompare(diag, file, op, sides[0], sides[1]);
     return .{ .expr = .{ .op = op, .left = &sides[0], .right = &sides[1] } };
 }
 

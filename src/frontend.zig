@@ -299,7 +299,13 @@ pub fn queryError(err: anyerror, diag: *const Diag) void {
             diagnosticPrint("zpq query: ambiguous column name\n", .{}),
         error.UnsupportedColumnType => diagnosticPrint("zpq query: unsupported column type\n", .{}),
         error.UnterminatedString => diagnosticPrint("zpq query: unterminated string literal in expression\n", .{}),
-        error.TypeMismatch => diagnosticPrint("zpq query: type mismatch in expression\n", .{}),
+        error.TypeMismatch => switch (diag.detail) {
+            .type_mismatch => |m| diagnosticPrint("zpq query: type mismatch in expression `{s}`:\n  {s}\n", .{
+                m.what.get(),
+                if (m.hint.len > 0) m.hint else "not supported for these types",
+            }),
+            else => diagnosticPrint("zpq query: type mismatch in expression\n", .{}),
+        },
         error.UnknownFunction => diagnosticPrint("zpq query: unknown scalar function in expression\n", .{}),
         error.UnsupportedDatePart => diagnosticPrint("zpq query: unsupported part for date_trunc/date_part\n", .{}),
         error.DateOutOfRange => diagnosticPrint("zpq query: make_date is outside DATE's range, or not a date\n", .{}),
@@ -897,7 +903,7 @@ fn printDetail(diag: *const Diag) void {
             .{name},
         ),
         // Printed with the error itself.
-        .nested_selected => {},
+        .nested_selected, .type_mismatch => {},
         .bare_non_boolean => |b| diagnosticPrint(
             "filter: `{s}` alone is a predicate only if it is BOOLEAN (it is {s}); compare it, e.g. `{s} != 0`\n",
             .{ name, b.type_name, name },

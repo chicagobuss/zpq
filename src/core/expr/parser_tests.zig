@@ -791,6 +791,51 @@ test "parse: date/time functions bind DuckDB's argument types and carry their un
     try testing.expectError(error.WrongArity, parseExprOnly(a, "date_part('minute')", &file, null));
 }
 
+test "parse: a DATE or TIMESTAMP constant is a value of its type; time arithmetic names what it refuses" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var file = try fakeFile(a, &.{ "d", "ts", "n" }, &.{ .INT32, .INT64, .INT32 });
+    file.schema.items[1].logical_type = .{ .DATE = .{} };
+    file.schema.items[2].logical_type = .{ .TIMESTAMP = .{ .isAdjustedToUTC = false, .unit = .{ .MICROS = .{} } } };
+
+    // `DATE '..'` and `TIMESTAMP '..'` reach the binder as these casts of a text constant.
+    const day: syntax.Expr = .{ .string = "2024-01-01" };
+    const d = try bindSyntax(a, .{ .call = .{ .name = "cast$date", .args = &.{&day} } }, &file, null);
+    try testing.expectEqual(ast.Temporal.date, d.temporal().?);
+    try testing.expectEqual(@as(i64, 19723), d.call.args[0].literal.i64);
+    const stamp: syntax.Expr = .{ .string = "2024-01-01 06:30:00.25" };
+    const t = try bindSyntax(a, .{ .call = .{ .name = "try_cast$timestamp", .args = &.{&stamp} } }, &file, null);
+    try testing.expectEqual(ast.Temporal.ts_us, t.temporal().?);
+    try testing.expectEqual(@as(i64, 1704090600250000), t.call.args[0].literal.i64);
+
+    // DATE - DATE is the BIGINT number of days; a DATE plus or minus an integer keeps its day count.
+    for ([_][]const u8{ "d - d", "d - make_date(19723)", "d + 1", "1 + d", "d - n" }) |src| {
+        const e = try parseExprOnly(a, src, &file, null);
+        try testing.expect(e.temporal() == null);
+    }
+    const refused = [_]struct { src: []const u8, what: []const u8 }{
+        .{ .src = "d - ts", .what = "DATE - TIMESTAMP" },
+        .{ .src = "ts - ts", .what = "TIMESTAMP - TIMESTAMP" },
+        .{ .src = "ts + 1", .what = "TIMESTAMP + INTEGER" },
+        .{ .src = "d * 2", .what = "DATE * INTEGER" },
+        .{ .src = "d + d", .what = "DATE + DATE" },
+        .{ .src = "1 - d", .what = "INTEGER - DATE" },
+        .{ .src = "-d", .what = "-DATE" },
+        .{ .src = "date_diff('day', '2024-01-01', d)", .what = "date_diff('day', '2024-01-01', DATE)" },
+        .{ .src = "strlen(n)", .what = "strlen(INTEGER)" },
+    };
+    for (refused) |r| {
+        var diag: Diag = .{};
+        try testing.expectError(error.TypeMismatch, parseExprOnly(a, r.src, &file, &diag));
+        try testing.expectEqualStrings(r.what, diag.detail.type_mismatch.what.get());
+    }
+    const bad: syntax.Expr = .{ .string = "2024-13-01" };
+    var diag: Diag = .{};
+    try testing.expectError(error.TypeMismatch, bindSyntax(a, .{ .call = .{ .name = "try_cast$date", .args = &.{&bad} } }, &file, &diag));
+    try testing.expectEqualStrings("TRY_CAST('2024-13-01' AS DATE)", diag.detail.type_mismatch.what.get());
+}
+
 test "parse: regexp_replace compiles its constant pattern, replacement and options once" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

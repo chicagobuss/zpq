@@ -84,6 +84,10 @@ pub const Detail = union(enum) {
     /// A filter names `Diag.column` alone as a predicate, which only a BOOLEAN column is; `type_name` (static) is its
     /// physical type.
     bare_non_boolean: struct { type_name: []const u8 },
+    /// An operator, function, cast or aggregate met operands of types it does not take: `what` is it over those
+    /// types (`DATE - TIMESTAMP`, `date_diff(VARCHAR, DATE, DATE)`), `hint` (static, may be empty) what to write
+    /// instead.
+    type_mismatch: struct { what: Text, hint: []const u8 = "" },
     /// Where this thread last decoded when the query failed: input `input`, row group `row_group` (0 the first), leaf
     /// `column`, page `page` (0 the first, a dictionary page counted) when known. Set on any failure past the first
     /// decode, so a frontend reads it only for a decode error (`consumer.isDecodeError`); it leaves `Diag.column` and

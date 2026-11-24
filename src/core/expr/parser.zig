@@ -25,7 +25,9 @@ const filter_parser = @import("../filter/parser.zig");
 const regex = @import("regex.zig");
 const calendar = @import("calendar.zig");
 const hll = @import("aggregate/hll.zig");
-const Diag = @import("../diag.zig").Diag;
+const diag_mod = @import("../diag.zig");
+const Diag = diag_mod.Diag;
+const sql_literals = @import("sql_literals.zig");
 
 pub const Error = error{
     EmptyExpr,
@@ -285,8 +287,8 @@ fn syntaxArgs(arena: std.mem.Allocator, args: []const *syntax.Expr) Error![]cons
     return out;
 }
 
-fn binaryNode(comptime bound: bool, arena: std.mem.Allocator, file: *const schema.FileMetaData, op: ast.Op, left: ExprNode(bound), right: ExprNode(bound)) Error!ExprNode(bound) {
-    if (bound) return makeBinopIn(arena, file, op, left, right);
+fn binaryNode(comptime bound: bool, arena: std.mem.Allocator, file: *const schema.FileMetaData, diag: ?*Diag, op: ast.Op, left: ExprNode(bound), right: ExprNode(bound)) Error!ExprNode(bound) {
+    if (bound) return bindBinop(arena, file, diag, op, left, right);
     const l = try arena.create(syntax.Expr);
     l.* = left;
     const r = try arena.create(syntax.Expr);
@@ -327,8 +329,8 @@ fn bindSyntaxAt(arena: std.mem.Allocator, node: syntax.Expr, file: *const schema
         .column => |name| bindColumn(arena, file, name, diag),
         .number => |n| bindSyntaxNumber(n.token, n.floating),
         .string => |value| .{ .literal = .{ .str = value } },
-        .negate => |inner| negateIn(arena, file, try bindSyntaxAt(arena, inner.*, file, diag, depth + 1)),
-        .binary => |b| makeBinopIn(arena, file, b.op, try bindSyntaxAt(arena, b.left.*, file, diag, depth + 1), try bindSyntaxAt(arena, b.right.*, file, diag, depth + 1)),
+        .negate => |inner| bindNegate(arena, file, diag, try bindSyntaxAt(arena, inner.*, file, diag, depth + 1)),
+        .binary => |b| bindBinop(arena, file, diag, b.op, try bindSyntaxAt(arena, b.left.*, file, diag, depth + 1), try bindSyntaxAt(arena, b.right.*, file, diag, depth + 1)),
         .call => |c| blk: {
             const func = resolveFunc(c.name) orelse return error.UnknownFunction;
             const args = try arena.alloc(*ast.Expr, c.args.len);
@@ -336,13 +338,13 @@ fn bindSyntaxAt(arena: std.mem.Allocator, node: syntax.Expr, file: *const schema
                 out.* = try arena.create(ast.Expr);
                 out.*.* = try bindSyntaxAt(arena, arg.*, file, diag, depth + 1);
             }
-            break :blk bindNamedCall(arena, file, c.name, func, args);
+            break :blk bindNamedCall(arena, file, diag, c.name, func, args);
         },
         .cast_text => |inner| blk: {
             const args = try arena.alloc(*ast.Expr, 1);
             args[0] = try arena.create(ast.Expr);
             args[0].* = try bindSyntaxAt(arena, inner.*, file, diag, depth + 1);
-            break :blk bindCall(arena, file, .cast_text, args);
+            break :blk bindCall(arena, file, .cast_text, args) catch |err| noteCall(err, diag, file, "CAST", .cast_text, args);
         },
         .case_ => |c| blk: {
             const whens = try arena.alloc(ast.Case.When, c.whens.len);
@@ -382,7 +384,19 @@ pub fn bindAggSyntax(arena: std.mem.Allocator, node: syntax.Aggregate, file: *co
     if (node.state and node.func != .avg) return error.BadAggArg;
     try checkSketchColumn(node.func, arg, file);
     const second = if (node.arg2) |a| try bindSyntax(arena, a, file, diag) else null;
-    return bindAggregate(node.func, arg, second, where, node.alias, node.default_name, node.state, node.boolean_only);
+    return bindAggregate(node.func, arg, second, where, node.alias, node.default_name, node.state, node.boolean_only) catch |err|
+        noteBooleanAgg(err, diag, file, node.func, arg);
+}
+
+/// `bool_and`/`bool_or` (`min`/`max` of a BOOLEAN) over another type, the one type mismatch an aggregate's binding has.
+fn noteBooleanAgg(err: Error, diag: ?*Diag, file: *const schema.FileMetaData, func: agg.AggFunc, arg: ?ast.Expr) Error {
+    if (err != error.TypeMismatch) return err;
+    const d = noteMismatch(diag) orelse return err;
+    d.what.append(if (func == .min) "bool_and(" else "bool_or(");
+    if (arg) |a| appendType(&d.what, file, a);
+    d.what.append(")");
+    d.hint = "bool_and and bool_or take a BOOLEAN";
+    return err;
 }
 
 fn parseSelectOf(
@@ -525,7 +539,7 @@ fn parseExpr(comptime bound: bool, arena: std.mem.Allocator, lex: *Lexer, file: 
         };
         _ = try lex.next();
         const right = try parseTerm(bound, arena, lex, file);
-        left = try binaryNode(bound, arena, file, op, left, right);
+        left = try binaryNode(bound, arena, file, lex.diag, op, left, right);
     }
 }
 
@@ -542,7 +556,7 @@ fn parseTerm(comptime bound: bool, arena: std.mem.Allocator, lex: *Lexer, file: 
         };
         _ = try lex.next();
         const right = try parseFactor(bound, arena, lex, file);
-        left = try binaryNode(bound, arena, file, op, left, right);
+        left = try binaryNode(bound, arena, file, lex.diag, op, left, right);
     }
 }
 
@@ -560,7 +574,7 @@ fn parseFactor(comptime bound: bool, arena: std.mem.Allocator, lex: *Lexer, file
             if (lex.depth > MAX_EXPR_DEPTH) return error.ExpressionTooDeep;
             const inner = try parseFactor(bound, arena, lex, file);
             lex.depth -= 1;
-            return if (bound) negateIn(arena, file, inner) else unaryNode(arena, inner);
+            return if (bound) bindNegate(arena, file, lex.diag, inner) else unaryNode(arena, inner);
         },
         .number_int => return if (bound) bindNumber(tk.text, false) else .{ .number = .{ .token = tk.text, .floating = false } },
         .number_float => return if (bound) bindNumber(tk.text, true) else .{ .number = .{ .token = tk.text, .floating = true } },
@@ -628,7 +642,7 @@ fn parseCall(
         }
     }
 
-    return if (bound) bindNamedCall(arena, file, name, func, args.items) else .{ .call = .{ .name = name, .args = try syntaxArgs(arena, args.items) } };
+    return if (bound) bindNamedCall(arena, file, lex.diag, name, func, args.items) else .{ .call = .{ .name = name, .args = try syntaxArgs(arena, args.items) } };
 }
 
 /// The unit a DATE or TIMESTAMP column's integers count; INT96 decodes to nanoseconds.
@@ -885,7 +899,7 @@ fn resolveCallType(func: ast.Func, args: []const *ast.Expr, file: *const schema.
                 return error.TypeMismatch;
             return .i64;
         },
-        .epoch_ms => {
+        .epoch_ms, .make_timestamp => {
             if (args.len != 1) return error.WrongArity;
             const a = args[0];
             if (a.typeOf() != .i64 or a.temporal() != null or a.isBoolean()) return error.TypeMismatch;
@@ -1128,6 +1142,7 @@ pub fn makeBinopIn(arena: std.mem.Allocator, file: ?*const schema.FileMetaData, 
     // DuckDB has no remainder or integer division of a date, a time or a BOOLEAN.
     if ((op == .mod or op == .intdiv) and (l.temporal() != null or r.temporal() != null or l.isBoolean() or r.isBoolean()))
         return error.TypeMismatch;
+    if (!temporalArithmetic(op, l, r)) return error.TypeMismatch;
     // DuckDB's `/` divides in DOUBLE whatever the operands (7 / 2 is 3.5), exact division having no closed result
     // scale; `//` is an integer division only between integers, and `/` with a zero-divisor error between the rest.
     // A remainder of DECIMALs is a DECIMAL unless it needs more than 38 digits, then a DOUBLE.
@@ -1171,6 +1186,210 @@ pub fn makeBinopIn(arena: std.mem.Allocator, file: ?*const schema.FileMetaData, 
         .dec = dec,
         .int = int,
     } };
+}
+
+/// Whether `l op r` is arithmetic zpq computes when either side is a time. DuckDB's `DATE - DATE` is the BIGINT number
+/// of days, the two integers' own difference (an infinite DATE's too). `DATE + INTEGER`, `INTEGER + DATE` and
+/// `DATE - INTEGER` keep the day count they always gave. Any other difference of times is an INTERVAL in DuckDB, which
+/// zpq has no type for, and the rest DuckDB refuses; computing them on the stored integers would mix units (a DATE's
+/// days with a TIMESTAMP's microseconds), so they are refused here too.
+fn temporalArithmetic(op: ast.Op, l: ast.Expr, r: ast.Expr) bool {
+    const lt = l.temporal();
+    const rt = r.temporal();
+    if (lt == null and rt == null) return true;
+    if (lt != null and rt != null) return op == .sub and lt.? == .date and rt.? == .date;
+    const days = if (lt == .date) r else if (rt == .date) l else return false;
+    if (days.typeOf() != .i64 or days.isBoolean()) return false;
+    return op == .add or (op == .sub and lt == .date);
+}
+
+/// `makeBinopIn`, a type mismatch named in `diag` by the operator over its operands' types.
+fn bindBinop(arena: std.mem.Allocator, file: *const schema.FileMetaData, diag: ?*Diag, op: ast.Op, l: ast.Expr, r: ast.Expr) Error!ast.Expr {
+    return makeBinopIn(arena, file, op, l, r) catch |err| {
+        if (err != error.TypeMismatch) return err;
+        const d = noteMismatch(diag) orelse return err;
+        appendType(&d.what, file, l);
+        d.what.append(switch (op) {
+            .add => " + ",
+            .sub => " - ",
+            .mul => " * ",
+            .div => " / ",
+            .intdiv => " // ",
+            .mod => " % ",
+            .concat => " || ",
+            .neg => " - ",
+        });
+        appendType(&d.what, file, r);
+        d.hint = binopHint(op, l, r);
+        return err;
+    };
+}
+
+/// `negateIn`, a type mismatch named in `diag`. DuckDB has no `-` of a DATE or TIMESTAMP, and zpq's would negate the
+/// stored integer.
+fn bindNegate(arena: std.mem.Allocator, file: *const schema.FileMetaData, diag: ?*Diag, inner: ast.Expr) Error!ast.Expr {
+    const e = if (inner.temporal() != null) error.TypeMismatch else negateIn(arena, file, inner);
+    return e catch |err| {
+        if (err != error.TypeMismatch) return err;
+        const d = noteMismatch(diag) orelse return err;
+        d.what.set("-");
+        appendType(&d.what, file, inner);
+        d.hint = temporal_hint;
+        return err;
+    };
+}
+
+/// The type mismatch `diag` names, set up empty; null without a `diag` or when it already describes the query's first
+/// failure, which ends it.
+fn noteMismatch(diag: ?*Diag) ?*@FieldType(diag_mod.Detail, "type_mismatch") {
+    const d = diag orelse return null;
+    if (d.detail != .none) return null;
+    d.detail = .{ .type_mismatch = .{ .what = .{} } };
+    return &d.detail.type_mismatch;
+}
+
+/// `err` from binding the call `name(args)`; a type mismatch is named in `diag` by the function over its arguments'
+/// types, a text constant shown as itself.
+pub fn noteCall(err: Error, diag: ?*Diag, file: *const schema.FileMetaData, name: []const u8, func: ast.Func, args: []const *ast.Expr) Error {
+    if (err != error.TypeMismatch) return err;
+    const d = noteMismatch(diag) orelse return err;
+    const cast_target: ?[]const u8 = switch (func) {
+        .cast_date => "DATE",
+        .cast_timestamp => "TIMESTAMP",
+        .cast_text => "VARCHAR",
+        .cast_i8 => "TINYINT",
+        .cast_i16 => "SMALLINT",
+        .cast_i32 => "INTEGER",
+        .cast_i64 => "BIGINT",
+        .cast_double => "DOUBLE",
+        .cast_dec => "DECIMAL",
+        else => null,
+    };
+    if (cast_target) |target| {
+        d.what.append(if (isTryCast(name)) "TRY_CAST(" else "CAST(");
+        if (args.len > 0) appendType(&d.what, file, args[0].*);
+        d.what.append(" AS ");
+        d.what.append(target);
+        d.what.append(")");
+    } else {
+        d.what.append(name);
+        d.what.append("(");
+        for (args, 0..) |a, i| {
+            if (i > 0) d.what.append(", ");
+            appendType(&d.what, file, a.*);
+        }
+        d.what.append(")");
+    }
+    d.hint = callHint(func, args);
+    return err;
+}
+
+/// The SQL type DuckDB gives `e`, as far as zpq knows it (an integer whose width zpq cannot prove is a BIGINT, the lane
+/// it computes in); a text constant is shown as itself.
+fn appendType(t: *diag_mod.Text, file: *const schema.FileMetaData, e: ast.Expr) void {
+    if (e == .literal and e.literal == .str) {
+        t.append("'");
+        t.append(e.literal.str);
+        t.append("'");
+        return;
+    }
+    if (e.temporal()) |unit| {
+        t.append(switch (unit) {
+            .date => "DATE",
+            .ts_ms => "TIMESTAMP_MS",
+            .ts_us => "TIMESTAMP",
+            .ts_ns => "TIMESTAMP_NS",
+        });
+        if (e.isUtc()) t.append(" WITH TIME ZONE");
+        return;
+    }
+    if (e.isBoolean()) return t.append("BOOLEAN");
+    switch (e.typeOf()) {
+        .str => t.append("VARCHAR"),
+        .f64 => t.append(if (e.float32() == .exact) "FLOAT" else "DOUBLE"),
+        .dec => {
+            var buf: [24]u8 = undefined;
+            const spec = e.decSpec().?;
+            t.append(std.fmt.bufPrint(&buf, "DECIMAL({d},{d})", .{ spec.precision, spec.scale }) catch "DECIMAL");
+        },
+        .i64 => t.append(switch (intTypeOf(file, e) orelse .i64) {
+            .i8 => "TINYINT",
+            .i16 => "SMALLINT",
+            .i32 => "INTEGER",
+            .i64 => "BIGINT",
+            .i128 => "HUGEINT",
+            .u8 => "UTINYINT",
+            .u16 => "USMALLINT",
+            .u32 => "UINTEGER",
+            .u64 => "UBIGINT",
+        }),
+    }
+}
+
+const temporal_hint = "a DATE takes only - DATE (whole days) and + or - an integer; a\n" ++
+    "  TIMESTAMP takes no arithmetic: use date_diff, date_trunc or date_part";
+
+fn binopHint(op: ast.Op, l: ast.Expr, r: ast.Expr) []const u8 {
+    const lt = l.temporal();
+    const rt = r.temporal();
+    if (lt != null and rt != null and op == .sub) return if (lt == .date or rt == .date)
+        "DuckDB gives an INTERVAL, which zpq does not compute; cast both to\n" ++
+            "  DATE for whole days, or use date_diff('unit', start, end)"
+    else
+        "DuckDB gives an INTERVAL, which zpq does not compute; use\n" ++
+            "  date_diff('unit', start, end)";
+    if (lt != null or rt != null) return temporal_hint;
+    if (op == .concat) return "|| joins text; cast the other side with CAST(x AS VARCHAR)";
+    return "";
+}
+
+fn callHint(func: ast.Func, args: []const *ast.Expr) []const u8 {
+    switch (func) {
+        .cast_date, .cast_timestamp => if (args.len == 1 and isStrLiteral(args[0].*))
+            return "the text is not a valid date or timestamp (YYYY-MM-DD [HH:MM:SS])"
+        else
+            return "only a DATE, a TIMESTAMP or a constant text casts to DATE or TIMESTAMP",
+        .date_diff, .date_trunc, .date_part, .strftime, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .date_name, .last_day => {
+            for (args) |a| if (isStrLiteral(a.*) and a != args[0]) return "a constant time is typed: write DATE '2024-01-01' or\n" ++
+                "  TIMESTAMP '2024-01-01 10:00:00', not the bare text";
+            return "";
+        },
+        else => return "",
+    }
+}
+
+/// A WHERE comparison of two expressions whose types do not compare (text with a number, a DATE with a TIMESTAMP):
+/// named in `diag` by the comparison over the sides' types.
+pub fn noteCompare(diag: ?*Diag, file: *const schema.FileMetaData, op: filter_ast.Operator, l: ast.Expr, r: ast.Expr) error{TypeMismatch} {
+    const d = noteMismatch(diag) orelse return error.TypeMismatch;
+    appendType(&d.what, file, l);
+    d.what.append(switch (op) {
+        .Eq => " = ",
+        .NotEq => " <> ",
+        .Lt => " < ",
+        .LtEq => " <= ",
+        .Gt => " > ",
+        .GtEq => " >= ",
+    });
+    appendType(&d.what, file, r);
+    if (l.temporal() != null and r.temporal() != null)
+        d.hint = "times compare only in one unit; cast both sides to DATE or both to TIMESTAMP";
+    return error.TypeMismatch;
+}
+
+/// `CAST('..' AS DATE | TIMESTAMP)` of a constant text, which `DATE '..'` and `TIMESTAMP '..'` fold to: the value as
+/// `make_date(days)` or `make_timestamp(us)` of it, so it is a DATE or TIMESTAMP wherever a column's would be. Null
+/// for any other call; a text that is no date or timestamp is a type mismatch.
+fn temporalConstant(arena: std.mem.Allocator, file: *const schema.FileMetaData, func: ast.Func, args: []const *ast.Expr) Error!?ast.Expr {
+    if ((func != .cast_date and func != .cast_timestamp) or args.len != 1 or !isStrLiteral(args[0].*)) return null;
+    const is_date = func == .cast_date;
+    // `parseMoment` keeps a TIMESTAMP within TIMESTAMP's range, so its microseconds fit an i64.
+    const m = sql_literals.parseMoment(args[0].literal.str, is_date) catch return error.TypeMismatch;
+    const value = try arena.alloc(ast.Expr, 1);
+    value[0] = .{ .literal = .{ .i64 = if (is_date) m.days else m.days * std.time.us_per_day + m.micros } };
+    const one = try arena.alloc(*ast.Expr, 1);
+    one[0] = &value[0];
+    return try bindCall(arena, file, if (is_date) .make_date else .make_timestamp, one);
 }
 
 /// `text` (digits with one `.`) as the exact DECIMAL SQL gives it: every digit counts toward the precision and those
@@ -1338,9 +1557,9 @@ fn parseAggCall(
 
     return if (bound) blk: {
         try checkSketchColumn(func, arg, file);
-        break :blk bindAggregate(func, arg, second, where, alias, default_name, state, boolean_only);
-    } else
-        .{ .func = func, .arg = arg, .arg2 = second, .where = where, .alias = alias, .default_name = default_name, .state = state, .boolean_only = boolean_only };
+        break :blk bindAggregate(func, arg, second, where, alias, default_name, state, boolean_only) catch |err|
+            noteBooleanAgg(err, lex.diag, file, func, arg);
+    } else .{ .func = func, .arg = arg, .arg2 = second, .where = where, .alias = alias, .default_name = default_name, .state = state, .boolean_only = boolean_only };
 }
 
 /// `sum(x + c)`, `sum(c + x)` or `sum(x - c)` as `x` and `c`, for `sum(x) + c·count(x)`: one pass over `x` instead of
@@ -1631,7 +1850,9 @@ fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
 }
 
 /// `bindCall` of the function `name` spells; a `TRY_CAST` (`try_cast$integer`...) is the cast, lenient.
-fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, name: []const u8, func_named: ast.Func, args_named: []const *ast.Expr) Error!ast.Expr {
+fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, diag: ?*Diag, name: []const u8, func_named: ast.Func, args_named: []const *ast.Expr) Error!ast.Expr {
+    if (temporalConstant(arena, file, func_named, args_named) catch |err| return noteCall(err, diag, file, name, func_named, args_named)) |c|
+        return c;
     var func = func_named;
     var args = args_named;
     // `epoch_ms` of a time counts milliseconds (of an integer it makes the TIMESTAMP); `date_part('epoch', t)` is `epoch(t)`.
@@ -1644,7 +1865,7 @@ fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, nam
     }
     const math: ?ast.MathFn = if (func == .math) ast.MathFn.parse(name) else null;
     if (math) |m| if (args.len != m.arity()) return error.WrongArity;
-    var e = try bindCall(arena, file, func, args);
+    var e = bindCall(arena, file, func, args) catch |err| return noteCall(err, diag, file, name, func, args);
     if (isTryCast(name)) e.call.lenient = true;
     e.call.math = math;
     if (func == .str_test) e.call.str_test = ast.StrTest.parse(name);
@@ -1688,7 +1909,7 @@ pub fn bindCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, func
             .dec = dec,
             .temporal = switch (func) {
                 .make_date, .cast_date, .last_day => .date,
-                .epoch_ms, .date_trunc, .cast_timestamp => .ts_us,
+                .epoch_ms, .make_timestamp, .date_trunc, .cast_timestamp => .ts_us,
                 // Values of one unit (and one time zone) keep it; `resolveCallType` refuses a mix.
                 .coalesce => args[0].temporal(),
                 .strlen, .date_part, .regexp_replace, .cast_text, .abs => null,

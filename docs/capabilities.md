@@ -33,7 +33,13 @@ component fits its field (32-bit months and days, 64-bit microseconds) before an
 within year 294247 (a DATE plus an INTERVAL included), a decimal stays within 38 digits, and a DATE or TIMESTAMP
 literal that does not convert to a column's timestamp type (`TemporalOutOfRange`: TIMESTAMP_NS stops at year 2262)
 compares with nothing, and a constant nested more deeply than the thread's stack allows folding (the budget is read from
-the thread, not fixed) is refused (`ConstantTooDeep`).
+the thread, not fixed) is refused (`ConstantTooDeep`). In a SELECT, an aggregate argument, a GROUP BY key or a WHERE
+expression, a DATE or TIMESTAMP literal (and `CAST` or `TRY_CAST` of a constant text to one) is a value of its type,
+as a column of it is: `date_diff('day', DATE '2024-01-01', d)`, `SELECT DATE '2024-01-01' AS x` (written as a DATE).
+`DATE - DATE` is the BIGINT number of days between them, as in DuckDB; `DATE + INTEGER` and `DATE - INTEGER` give
+the day count as an integer (DuckDB's is a DATE of that day). The difference of two times otherwise (`DATE - TIMESTAMP`, `TIMESTAMP - TIMESTAMP`) is an
+INTERVAL in DuckDB, which zpq does not compute, and the rest of arithmetic on a time (`-d`, `d * 2`, `ts + 1`) DuckDB
+refuses: both are refused (`TypeMismatch`), naming the operator and the operands' types.
 In SQL a WHERE comparison may also set two expressions against each other (`l_commitdate < l_receiptdate`,
 `l_extendedprice * (1 - l_discount) > 50000`, `abs(a - 25) < z`). Numbers of any lane compare exactly unless one side is
 DOUBLE, strings byte by byte, and times only with times in the same unit. A FLOAT column, or abs, coalesce, least,
@@ -202,7 +208,8 @@ here (NULL where `CAST` would stop the query, so the result can be NULL; a TIMES
 a TIMESTAMP in it, as DuckDB's does), a text read as TINYINT, SMALLINT, INTEGER, BIGINT or DOUBLE by `CAST` or
 `TRY_CAST` exactly as DuckDB reads it (surrounding whitespace, one `+`, `0x` and `0b` integers, a `_` between digits, a
 decimal point and an exponent in an integer, rounded half away from zero; `inf`, `infinity` and `nan` in any case; text
-that is no such number is `ConversionInvalid`, NULL for `TRY_CAST`; a text to DECIMAL, DATE or TIMESTAMP is refused by name),
+that is no such number is `ConversionInvalid`, NULL for `TRY_CAST`; a text column to DECIMAL, DATE or TIMESTAMP is refused
+by name, a constant text to DATE or TIMESTAMP is the value it spells),
 `CAST(x AS VARCHAR)` (also `TEXT`, `STRING`, `VARCHAR(n)` and `x::VARCHAR`) of an integer, BOOLEAN, DECIMAL (at its scale),
 DOUBLE, FLOAT column, DATE or TIMESTAMP as DuckDB 2.0 prints it (a DOUBLE by its shortest round-trip digits, fixed from
 `0.0001` to `1000000000000000.0` and `1e+16` beyond, `nan`, `inf`, `-0.0`; a FLOAT the way DuckDB's formatter settles on

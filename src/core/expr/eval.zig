@@ -1347,7 +1347,7 @@ fn evalCall(
         .coalesce => return evalCoalesce(arena, batch, column_lookup, c.args, c.result_type, c.dec),
         .strlen => return evalStrlen(arena, batch, column_lookup, c.args[0].*),
         .make_date => return if (c.args.len == 3) evalMakeDate3(arena, batch, column_lookup, c) else evalTemporal(arena, batch, column_lookup, c),
-        .epoch_ms, .date_trunc, .date_part => return evalTemporal(arena, batch, column_lookup, c),
+        .epoch_ms, .make_timestamp, .date_trunc, .date_part => return evalTemporal(arena, batch, column_lookup, c),
         .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => return evalEpoch(arena, batch, column_lookup, c),
         .date_diff => return evalDateDiff(arena, batch, column_lookup, c),
         .strftime => return evalStrftime(arena, batch, column_lookup, c),
@@ -3001,6 +3001,8 @@ fn evalTemporal(
                 return std.math.mul(i64, v, std.time.us_per_ms) catch error.TimestampOutOfRange;
             }
         }.f, t),
+        // Bound only over a TIMESTAMP literal's microseconds, which its parse kept in range.
+        .make_timestamp => @memcpy(out, in.values),
         .date_trunc => switch (c.part.?) {
             .dow, .isodow, .doy => unreachable,
             inline else => |p| try mapRows(col, batch.sel, out, struct {

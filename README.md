@@ -135,8 +135,9 @@ RLE_DICTIONARY, with a version 2 footer). For readers that only understand versi
 
 ## What zpq isn't
 
-zpq works on one table at a time: there are no joins and no dataframe API yet. Use DuckDB for those, and let zpq do
-the Parquet part: filter and project with zpq, write Parquet or NDJSON, and read that into DuckDB.
+zpq isn't a general SQL database or a dataframe library. Its joins cover N:1 star and snowflake queries over local or
+S3 Parquet, where each build table has unique keys and fits in `--max-memory`; other shapes are refused by name. For
+the rest, pair zpq with DuckDB, Polars or Spark, and let zpq do the Parquet part.
 
 ## How fast
 

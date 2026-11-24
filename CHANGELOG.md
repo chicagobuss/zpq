@@ -60,7 +60,7 @@
 
 - **A cold scan reads its first row groups ahead.** The first claim now asks the kernel for the opening row groups up front instead of leaving the first workers to fault them in one read at a time, so short cold aggregates no longer depend on a lucky startup stall, as they did in 0.5.2: about 15% faster where the device reads ahead little (128 KiB), about 5% where it reads ahead 1 MiB.
 
-- **Scans count and group faster, and footers parse in place.** Histogram columns fold their entries once and count codes in cache-sized lanes, a lone GROUP BY key is filtered once per dictionary entry, and a footer parses in place into one block. On granite, ClickBench q7 runs 39% faster hot and 28% cold, q2 25% and 17%, and q29 23% and 14%.
+- **Scans count and group faster, and footers parse in place.** Histogram columns fold their entries once and count codes in cache-sized lanes, a lone GROUP BY key is filtered once per dictionary entry, and a footer parses in place into one block. On a Ryzen 9 9950X desktop, ClickBench q7 runs 39% faster hot and 28% cold, q2 25% and 17%, and q29 23% and 14%.
 
 - **A GROUP BY scan no longer pays for code it doesn't run.** The lone-key dictionary filter is compiled only into the scans that use it, which brings the long-string COUNT(DISTINCT) cells back to 0.5.2's speed while keeping 0.6.0's gains on filtered lone-key counts.
 

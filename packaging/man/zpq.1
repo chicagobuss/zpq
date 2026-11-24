@@ -157,10 +157,13 @@ usage:
                  at every \-j.
   CSV input     a file that is not Parquet (PAR1 at both ends) and is named
                 .csv, .tsv or .txt, or any file with \-\-input\-format csv, is
-                written to Parquet: zpq query data.csv \-o data.parquet (or
-                SELECT * FROM 'data.csv' with \-o), whole, by column, filtered or
-                computed (\-\-columns, \-\-filter, \-\-select, SELECT ... WHERE).
-                ORDER BY, LIMIT and aggregates read the Parquet it writes.
+                read directly. Its rows are written to Parquet with \-o: zpq
+                query data.csv \-o data.parquet (or SELECT * FROM 'data.csv'
+                with \-o), whole, by column, filtered or computed (\-\-columns,
+                \-\-filter, \-\-select, SELECT ... WHERE). An aggregate, with or
+                without GROUP BY and HAVING, folds as the file is parsed and
+                answers like any query, \-o or not. ORDER BY, LIMIT and joins
+                are refused: write the Parquet first, then query it.
                 RFC 4180: quotes are doubled inside quoted fields; UTF\-8, a BOM
                 is skipped. The delimiter (, tab ; |) and the header are
                 detected. An unquoted empty field is NULL, a quoted one the

@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
             @import("tools/build_revision.zig").current(b),
         .test_filters = test_filters,
         .duckdb = b.option([]const u8, "duckdb", "DuckDB 2.0 CLI (the oracle)") orelse
-            b.fmt("{s}/.cache/zpq-duckdb2/bin-2.0.0/duckdb", .{b.graph.environ_map.get("HOME") orelse ""}),
+            b.fmt("{s}/.cache/zpq-duckdb2/bin-2.0.1/duckdb", .{b.graph.environ_map.get("HOME") orelse ""}),
         .lambda_layout = if (b.option([]const u8, "lambda-layout", "Linker script ordering zpq-lambda's code (default src/lambda/layout.ld)")) |p|
             .{ .cwd_relative = p }
         else

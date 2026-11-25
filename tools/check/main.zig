@@ -133,6 +133,8 @@ const Refuse = struct {
     /// With `binder_sql`, the start of DuckDB's refusal in place of "Binder Error:" (an overflow is an "Out of Range
     /// Error:", a failed conversion a "Conversion Error:").
     duck_error: ?[]const u8 = null,
+    /// With `binder_sql`, DuckDB answers it and zpq refuses on purpose; the text says why zpq keeps refusing.
+    duck_answers: ?[]const u8 = null,
 };
 
 const Case = struct {
@@ -318,7 +320,7 @@ pub fn main(init: std.process.Init) !void {
         zpq_bin = try std.fs.path.join(arena, &.{ try std.process.currentPathAlloc(io, arena), zpq_bin });
     }
     const home = std.mem.span(std.c.getenv("HOME") orelse return error.BadArgs);
-    if (duckdb.len == 0) duckdb = try std.fmt.allocPrint(arena, "{s}/.cache/zpq-duckdb2/bin-2.0.0/duckdb", .{home});
+    if (duckdb.len == 0) duckdb = try std.fmt.allocPrint(arena, "{s}/.cache/zpq-duckdb2/bin-2.0.1/duckdb", .{home});
     if (no_cache) cache = null else if (cache == null) cache =
         try std.fmt.allocPrint(arena, "{s}/.cache/zpq-check/oracle", .{home});
     const tz = if (std.c.getenv("TZ")) |t| std.mem.span(t) else "";
@@ -472,6 +474,10 @@ fn checkExpectation(c: Case) !void {
         return if (n == 0) error.NoExpectation else error.ConflictingExpectations;
     }
     if (c.same) |note| if (std.mem.trim(u8, note, " ").len == 0) return error.EmptyExpectation;
+    if (c.refuse) |r| if (r.duck_answers) |why| {
+        if (std.mem.trim(u8, why, " ").len == 0) return error.EmptyExpectation;
+        if (r.binder_sql == null or r.duck_error != null) return error.ConflictingExpectations;
+    };
     if (c.host_dependent) |why| if (std.mem.trim(u8, why, " ").len == 0) return error.EmptyExpectation;
     if (c.safe) |kinds| if (kinds.len == 0) return error.EmptyExpectation;
 }
@@ -843,12 +849,20 @@ fn checkCase(
         }
         if (r.binder_sql) |sql| {
             const ans = try run.oracle.ask(arena, sql);
-            const said = ans.refused orelse return try arena.dupe(u8, "duck answered, zpq refused");
-            if (!std.mem.startsWith(u8, said, r.duck_error orelse "Binder Error:")) return try std.fmt.allocPrint(
-                arena,
-                "duck refused otherwise: {s}",
-                .{said},
-            );
+            if (r.duck_answers) |why| {
+                if (ans.refused) |said| return try std.fmt.allocPrint(
+                    arena,
+                    "duck refused ({s}), declared as answering: {s}",
+                    .{ said, why },
+                );
+            } else {
+                const said = ans.refused orelse return try arena.dupe(u8, "duck answered, zpq refused");
+                if (!std.mem.startsWith(u8, said, r.duck_error orelse "Binder Error:")) return try std.fmt.allocPrint(
+                    arena,
+                    "duck refused otherwise: {s}",
+                    .{said},
+                );
+            }
         }
         run.refusals += points.len;
         std.debug.print("EXPECTED {s} {s} ({d} points)\n", .{ c.id, r.@"error", points.len });
@@ -924,7 +938,7 @@ fn compareMain(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !vo
     defer keep_state.deinit();
     const keep = keep_state.allocator();
     const home = std.mem.span(std.c.getenv("HOME") orelse return error.BadArgs);
-    var duckdb = try std.fmt.allocPrint(keep, "{s}/.cache/zpq-duckdb2/bin-2.0.0/duckdb", .{home});
+    var duckdb = try std.fmt.allocPrint(keep, "{s}/.cache/zpq-duckdb2/bin-2.0.1/duckdb", .{home});
     var python: []const u8 = ".venv/bin/python";
     var cache: ?[]const u8 = try std.fmt.allocPrint(keep, "{s}/.cache/zpq-check/oracle", .{home});
     var threads: u16 = 1;

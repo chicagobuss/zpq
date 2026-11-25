@@ -122,7 +122,7 @@ joins-suite *args="":
     zig build -Doptimize=ReleaseFast cli
     {{python}} tools/joins_suite/suite.py --zpq zig-out/bin/zpq {{args}}
 
-# The randomized join differential against DuckDB 2.0.0 (tools/joins_suite/differential.py). No gate runs it.
+# The randomized join differential against DuckDB 2.0.1 (tools/joins_suite/differential.py). No gate runs it.
 joins-diff seeds="1-12" queries="40" *args="":
     zig build -Doptimize=ReleaseFast cli
     {{python}} tools/joins_suite/differential.py --zpq zig-out/bin/zpq --seeds {{seeds}} --queries {{queries}} {{args}}

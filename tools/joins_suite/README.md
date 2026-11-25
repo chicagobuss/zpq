@@ -1,6 +1,6 @@
 # Joins suite and differential
 
-Two off-tier checks for zpq's joins. No gate runs them. Both need Python 3 (standard library only) and the DuckDB 2.0.0 CLI. The differential always needs DuckDB, and the suite needs it only for `--record` and `--engine duckdb`.
+Two off-tier checks for zpq's joins. No gate runs them. Both need Python 3 (standard library only) and the DuckDB 2.0.1 CLI. The differential always needs DuckDB, and the suite needs it only for `--record` and `--engine duckdb`.
 
 ## `suite.py`: 104 analyst queries on real public data
 

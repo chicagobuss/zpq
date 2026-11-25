@@ -165,10 +165,10 @@ jobs:
       # The oracle: DuckDB 2.0's CLI, pinned by the archive's sha256.
       - name: Install DuckDB 2.0
         run: |
-          mkdir -p ~/.cache/zpq-duckdb2/bin-2.0.0 && cd ~/.cache/zpq-duckdb2
-          curl -fsSLo cli.tar.gz https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz
-          echo "c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc  cli.tar.gz" | sha256sum -c -
-          tar -xzf cli.tar.gz -C bin-2.0.0 duckdb
+          mkdir -p ~/.cache/zpq-duckdb2/bin-2.0.1 && cd ~/.cache/zpq-duckdb2
+          curl -fsSLo cli.tar.gz https://github.com/duckdb/duckdb/releases/download/v2.0.1/duckdb-cli-linux-amd64.tar.gz
+          echo "b676268be4d39e4e41a904442c9796c9914e645cc085c7505f048f2c992b5eca  cli.tar.gz" | sha256sum -c -
+          tar -xzf cli.tar.gz -C bin-2.0.1 duckdb
 
       # The commit tier. It writes receipts, and the step fails unless its verdict passes for this SHA.
       - name: Commit tier
@@ -217,10 +217,10 @@ jobs:
 
       - name: Install DuckDB 2.0
         run: |
-          mkdir -p ~/.cache/zpq-duckdb2/bin-2.0.0 && cd ~/.cache/zpq-duckdb2
-          curl -fsSLo cli.tar.gz https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-cli-linux-amd64.tar.gz
-          echo "c6507206baf7793c6013dbd82368469a45f20dc0e17a6f92f204602f652ed2bc  cli.tar.gz" | sha256sum -c -
-          tar -xzf cli.tar.gz -C bin-2.0.0 duckdb
+          mkdir -p ~/.cache/zpq-duckdb2/bin-2.0.1 && cd ~/.cache/zpq-duckdb2
+          curl -fsSLo cli.tar.gz https://github.com/duckdb/duckdb/releases/download/v2.0.1/duckdb-cli-linux-amd64.tar.gz
+          echo "b676268be4d39e4e41a904442c9796c9914e645cc085c7505f048f2c992b5eca  cli.tar.gz" | sha256sum -c -
+          tar -xzf cli.tar.gz -C bin-2.0.1 duckdb
 
       - name: Full tier shard
         run: zig build check -Dtier=full -Dshard=${{ matrix.shard }} -j8

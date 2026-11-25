@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Exact answers vs DuckDB 2.0.0 on the same SQL text, at -j 1/4/16. usage: check.sh <zpq> <sf...>
+# Exact answers vs DuckDB 2.0.1 on the same SQL text, at -j 1/4/16. usage: check.sh <zpq> <sf...>
 set -u
 here=$(cd "$(dirname "$0")" && pwd); . "$here/queries.sh"
 Z=$1; shift
-D=$HOME/.cache/zpq-duckdb2/bin-2.0.0/duckdb
+D=$HOME/.cache/zpq-duckdb2/bin-2.0.1/duckdb
 out=/mnt/fast/zpq-out/joins-060/r3/check; mkdir -p $out
 for sf in "$@"; do
   T=$HOME/bench/data/pdsh-publisher/source/data/tables/scale-$sf; [ $sf = 100 ] && T=$HOME/bench/data/pdsh-sf100

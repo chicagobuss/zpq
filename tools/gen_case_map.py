@@ -4,7 +4,7 @@
 DuckDB maps case one code point at a time (utf8proc's simple mapping), so zpq's upper() and lower() must apply the
 same table to give the same text. Run with a DuckDB CLI of the version zpq is checked against:
 
-    tools/gen_case_map.py ~/.cache/zpq-duckdb2/bin-2.0.0/duckdb > src/core/expr/case_map.zig
+    tools/gen_case_map.py ~/.cache/zpq-duckdb2/bin-2.0.1/duckdb > src/core/expr/case_map.zig
 """
 import csv, subprocess, sys, tempfile, os
 

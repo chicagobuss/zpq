@@ -5,7 +5,7 @@ import csv, datetime, hashlib, hmac, io, os, re, subprocess, time, urllib.error,
 import xml.etree.ElementTree as ET
 from decimal import Decimal, InvalidOperation
 
-DEFAULT_DUCKDB = os.path.expanduser('~/.cache/zpq-duckdb2/bin-2.0.0/duckdb')
+DEFAULT_DUCKDB = os.path.expanduser('~/.cache/zpq-duckdb2/bin-2.0.1/duckdb')
 
 # ---------------------------------------------------------------- answers
 _TS = re.compile(r'^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)(\.\d+)?(Z|\+00(:00)?)?$')

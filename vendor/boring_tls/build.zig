@@ -12,11 +12,6 @@ const std = @import("std");
 ///     `tools/r2-fetch-artifacts.sh` fills it with verified downloads.
 ///   - Otherwise a build step downloads the pinned URL, checks the digest,
 ///     and keeps the result in the Zig cache, so it runs once per cache.
-///
-/// The previous incarnation also had source-build paths (~500 lines).
-/// They were ripped out when migrating to Zig 0.16.0 — the project has
-/// always shipped prebuilt artifacts in practice, and the dead path was
-/// dragging multiple 0.16.0 incompatibilities.
 const manifest = @embedFile("prebuilt.sha256");
 
 pub fn build(b: *std.Build) !void {

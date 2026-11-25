@@ -418,7 +418,7 @@ fn evalGroupKeyBinOp(
 
     // The same SQL-width checks as `evalBinOp`: a key, or an argument of a function, overflows as the bare expression does.
     const consumed: Consumed = .{ .sel = batch.sel };
-    if (b.result_type == .i64 and (b.op == .mod or b.op == .intdiv)) if (b.int) |t| switch (t) {
+    if (b.result_type == .i64 and b.op == .intdiv) if (b.int) |t| switch (t) {
         .i8, .i16, .i32 => try narrowMinOverflow(@intCast(t.minValue()), l_col, r_col, consumed),
         else => {},
     };
@@ -577,7 +577,7 @@ pub fn applyScalarKernel(comptime T: type, op: ast.Op, a: T, b: T) Error!T {
         .sub => a - b,
         .mul => a * b,
         .div, .intdiv => @divTrunc(a, b),
-        .mod => @rem(a, b),
+        .mod => if (b == -1) 0 else @rem(a, b),
         .concat, .neg => error.TypeMismatch,
     };
 }
@@ -596,7 +596,7 @@ const Consumed = struct {
 };
 
 /// What `a op b` raises on signed integers, if anything: an overflow, or a zero divisor. The one definition the
-/// kernels check rows against.
+/// kernels check rows against. The remainder of the minimum by -1 is 0, which fits; its quotient does not.
 fn rowFault(comptime T: type, op: ast.Op, a: T, b: T) ?Error {
     return switch (op) {
         .add => if (@addWithOverflow(a, b)[1] != 0) error.IntegerOverflowAdd else null,
@@ -604,7 +604,7 @@ fn rowFault(comptime T: type, op: ast.Op, a: T, b: T) ?Error {
         .mul => if (@mulWithOverflow(a, b)[1] != 0) error.IntegerOverflowMul else null,
         .div, .mod, .intdiv => if (b == 0)
             error.DivisionByZero
-        else if (a == std.math.minInt(T) and b == -1)
+        else if (op != .mod and a == std.math.minInt(T) and b == -1)
             error.IntegerOverflowDiv
         else
             null,
@@ -759,7 +759,7 @@ fn evalBinOp(
 
     const consumed: Consumed = .{ .sel = batch.sel };
     // The rows are computed in the i64 lane; the minimum of a narrower SQL type over -1 overflows in that type.
-    if (b.result_type == .i64 and (b.op == .mod or b.op == .intdiv)) if (b.int) |t| switch (t) {
+    if (b.result_type == .i64 and b.op == .intdiv) if (b.int) |t| switch (t) {
         .i8, .i16, .i32 => try narrowMinOverflow(@intCast(t.minValue()), l_col, r_col, consumed),
         else => {},
     };
@@ -816,8 +816,8 @@ fn narrowRange(b: ast.BinOp, res: Batch.Column, l: Batch.Column, r: Batch.Column
     return res;
 }
 
-/// `minimum % -1` and `minimum // -1` of a SQL integer type narrower than the i64 lane the rows are computed in: an
-/// overflow DuckDB raises, in a row the query consumes and that is not NULL.
+/// `minimum // -1` of a SQL integer type narrower than the i64 lane the rows are computed in: an overflow DuckDB
+/// raises, in a row the query consumes and that is not NULL. (`minimum % -1` is 0, which fits.)
 fn narrowMinOverflow(min: i64, l: Batch.Column, r: Batch.Column, consumed: Consumed) Error!void {
     for (l.i64.values, r.i64.values, 0..) |x, y, i| {
         if (x != min or y != -1) continue;
@@ -3397,11 +3397,12 @@ fn applyKernel(
         },
         .div, .intdiv, .mod => if (@typeInfo(T) == .int) {
             // A zero divisor or minInt / -1 leaves a 0 and a flag; then, as for + - *, only a consumed row fails.
+            // (minInt % -1 is 0 and no fault.)
             var faulted = false;
             for (a, b, 0..) |x, y, i| {
-                const bad = y == 0 or (x == std.math.minInt(T) and y == -1);
+                const bad = y == 0 or (op != .mod and x == std.math.minInt(T) and y == -1);
                 faulted = faulted or bad;
-                out[i] = if (bad) 0 else if (op == .mod) @rem(x, y) else @divTrunc(x, y);
+                out[i] = if (bad or (op == .mod and y == -1)) 0 else if (op == .mod) @rem(x, y) else @divTrunc(x, y);
             }
             if (faulted) try firstConsumedFault(T, op, a, b, consumed);
         } else if (op == .mod) {

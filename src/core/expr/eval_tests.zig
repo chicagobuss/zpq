@@ -188,7 +188,7 @@ fn evalI64Binop(a: std.mem.Allocator, op: ast.Op, xs: []const i64, ys: []const i
     return evalExpr(a, &batch, &lookup, e);
 }
 
-test "% and // on integers take the sign of the dividend, truncate, and fault on a zero divisor or minimum over -1" {
+test "% and // on integers take the sign of the dividend, truncate, and fault on a zero divisor or // of the minimum by -1" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -200,8 +200,12 @@ test "% and // on integers take the sign of the dividend, truncate, and fault on
     try testing.expectEqualSlices(i64, &.{ 2, -2, -2, 2, 0, 2 }, quot.i64.values);
     for ([_]ast.Op{ .mod, .intdiv }) |op| {
         try testing.expectError(error.DivisionByZero, evalI64Binop(a, op, &.{ 1, 2 }, &.{ 1, 0 }));
-        try testing.expectError(error.IntegerOverflowDiv, evalI64Binop(a, op, &.{ std.math.minInt(i64), 1 }, &.{ -1, 1 }));
     }
+    try testing.expectError(error.IntegerOverflowDiv, evalI64Binop(a, .intdiv, &.{ std.math.minInt(i64), 1 }, &.{ -1, 1 }));
+    // The remainder of the minimum by -1 is 0, in the kernel and the scalar path alike.
+    const min_rem = try evalI64Binop(a, .mod, &.{ std.math.minInt(i64), 5, -7 }, &.{ -1, -1, -1 });
+    try testing.expectEqualSlices(i64, &.{ 0, 0, 0 }, min_rem.i64.values);
+    try testing.expectEqual(@as(i64, 0), try applyScalarKernel(i64, .mod, std.math.minInt(i64), -1));
     // The scalar kernel the NULL-aware path runs agrees, and a DOUBLE takes fmod and a `//` that is `/` but for zero.
     try testing.expectEqual(@as(i64, -1), try applyScalarKernel(i64, .mod, -7, 3));
     try testing.expectEqual(@as(f64, -1.5), try applyScalarKernel(f64, .mod, -7.5, 2));
@@ -230,7 +234,6 @@ test "+ - * and % // of a narrow SQL integer type fail where the type overflows,
         .{ .op = .add, .x = 32767, .y = 1, .err = error.IntegerOverflowAdd },
         .{ .op = .sub, .x = -32768, .y = 1, .err = error.IntegerOverflowSub },
         .{ .op = .mul, .x = 32767, .y = 2, .err = error.IntegerOverflowMul },
-        .{ .op = .mod, .x = -32768, .y = -1, .err = error.IntegerOverflowDiv },
         .{ .op = .intdiv, .x = -32768, .y = -1, .err = error.IntegerOverflowDiv },
     }) |c| {
         const cols = [_]Batch.Column{ col_i64(&.{ c.x, 5, 7 }), col_i64(&.{ c.y, 5, 7 }) };
@@ -246,6 +249,11 @@ test "+ - * and % // of a narrow SQL integer type fail where the type overflows,
         wide.binop.int = .i64;
         _ = try evalExpr(a, &batch, &lookup, wide);
     }
+    // % of the SMALLINT minimum by -1 is 0, which fits the type.
+    const cols = [_]Batch.Column{ col_i64(&.{ -32768, 5, 7 }), col_i64(&.{ -1, 5, 7 }) };
+    const batch: Batch = .{ .cols = &cols, .num_rows = 3 };
+    const mod: ast.Expr = .{ .binop = .{ .op = .mod, .left = lp, .right = rp, .result_type = .i64, .depth = 2, .int = .i16 } };
+    try testing.expectEqualSlices(i64, &.{ 0, 0, 0 }, (try evalExpr(a, &batch, &lookup, mod)).i64.values);
 }
 
 test "integer + - * / that overflow the i64 lane fail the query, in a vector or the tail after it" {

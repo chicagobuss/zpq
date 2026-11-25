@@ -231,7 +231,7 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
     cli_zpq.root.addImport("cli_version", cli_version.createModule());
     const cli = b.addExecutable(.{ .name = "zpq", .root_module = cli_zpq.root });
     addCpuStart(b, cli, target);
-    declareLlvmMemory(cli, optimize, 6.1);
+    declareLlvmMemory(cli, optimize, .{ .x86_64 = 6.1, .aarch64 = 8.8 });
 
     // The correctness runner: JSON cases, in-process zpq, the DuckDB CLI as the oracle.
     const check_module = b.createModule(.{
@@ -242,12 +242,12 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
         .imports = &.{.{ .name = "zpq", .module = cli_zpq.zpq }},
     });
     const check = b.addExecutable(.{ .name = "zpq-check", .root_module = check_module });
-    declareLlvmMemory(check, optimize, 5.9);
+    declareLlvmMemory(check, optimize, .{ .x86_64 = 5.9, .aarch64 = 8.7 });
 
     const lambda_zpq = addBinaryModules(b, deps, target, optimize, .lambda, cfg.sql, cfg.strip);
     const lambda = b.addExecutable(.{ .name = "zpq-lambda", .root_module = lambda_zpq.root });
     addCpuStart(b, lambda, target);
-    declareLlvmMemory(lambda, optimize, 5.5);
+    declareLlvmMemory(lambda, optimize, .{ .x86_64 = 5.5, .aarch64 = 8.1 });
     // On Lambda the first touch of each 128 KiB of the binary is a read (docs/lambda_capabilities.md): the code a cold
     // start runs goes first, in the order it runs (src/lambda/layout.ld, made by tools/lambda/layout.sh).
     if (target.result.os.tag == .linux) {
@@ -361,7 +361,7 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
         .filters = &.{"fanout"},
     });
     const core_tests = b.addTest(.{ .root_module = dev_core.zpq, .filters = filters });
-    declareLlvmMemory(core_tests, optimize, 8.2);
+    declareLlvmMemory(core_tests, optimize, .{ .x86_64 = 8.2, .aarch64 = 13.1 });
     return .{
         .deps = deps,
         .cli = cli,
@@ -381,15 +381,20 @@ fn artifacts(b: *std.Build, cfg: Config, optimize: std.lang.Optimize) Artifacts 
 }
 
 /// Declares what an optimized build of zpq takes from the host, so Zig's scheduler starts such a compile only while the
-/// declared sizes of those running fit the host's memory: on a 16 GB CI runner two run together instead of all four at
-/// once, which peaked past 20 GB and killed the runner. A host with memory to spare still runs them all together. Each
-/// declares its cold peak resident set plus a fifth (peaks measured at 4.6 GiB for zpq-lambda, 4.9 for zpq-check, 5.1
-/// for zpq in ReleaseSafe or ReleaseFast, 6.8 for the core tests): a compile that exceeds its declaration fails its
-/// step, so a declaration at the peak fails builds by chance. Any two of them fit in 16 GB and no three. Debug builds
+/// declared sizes of those running fit the host's memory (`--maxrss`, physical memory by default): on a 16 GB CI runner
+/// all four at once peaked past 20 GB and killed the runner. A host with memory to spare still runs them all together.
+/// Each declares its cold peak resident set plus a fifth: a compile that exceeds its declaration fails its step, so a
+/// declaration at the peak fails builds by chance. The peaks differ by architecture (in GiB, zpq-lambda, zpq-check, zpq
+/// in ReleaseSafe or ReleaseFast, the core tests): 4.6, 4.9, 5.1 and 6.8 on x86_64, 6.7, 7.2, 7.3 and 10.9 on aarch64.
+/// They were measured with the host's architecture the target's, so an aarch64 host or target takes the aarch64
+/// figure. In 16 GiB, any two x86_64 compiles run together and no three; aarch64 ones run one at a time. Debug builds
 /// skip LLVM and take far less, and macOS hosts keep the scheduler's default, so neither declares.
-fn declareLlvmMemory(exe: *std.Build.Step.Compile, optimize: std.lang.Optimize, gib: f64) void {
+const LlvmMemory = struct { x86_64: f64, aarch64: f64 };
+
+fn declareLlvmMemory(exe: *std.Build.Step.Compile, optimize: std.lang.Optimize, gib: LlvmMemory) void {
     if (@import("builtin").os.tag != .linux or optimize == .debug) return;
-    exe.step.max_rss = @intFromFloat(gib * (1 << 30));
+    const arm = @import("builtin").cpu.arch.isAarch64() or exe.rootModuleTarget().cpu.arch.isAarch64();
+    exe.step.max_rss = @intFromFloat((if (arm) gib.aarch64 else gib.x86_64) * (1 << 30));
 }
 
 /// `zig build check -Dtier=edit|commit|full [-Dshard=NAME]`: the gates. Each stage runs through `zpq-check stage`,

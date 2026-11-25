@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Generate shell completions and the manual from the CLI's embedded help source."""
 import argparse
+import hashlib
 from pathlib import Path
 import re
 
@@ -60,6 +61,13 @@ def main():
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
+    # The release pins the manual's gzip (tools/package_release.py); a manual change must re-pin it, so a stale pin fails
+    # here, at every check, rather than first in a release build.
+    page = hashlib.sha256(outputs()["packaging/man/zpq.1"].encode()).hexdigest()
+    pin = (ROOT / "packaging/man/zpq.1.gz.sha256").read_text().splitlines()
+    if pin[0] != f"{page}  zpq.1":
+        raise SystemExit(f"packaging/man/zpq.1.gz.sha256 is stale: zpq.1 is now {page}; re-pin both lines with a "
+                         "stock-zlib python3 (tools/package_release.py prints them)")
     print("CLI help, completions and manual are in sync")
 
 

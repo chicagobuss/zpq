@@ -600,7 +600,8 @@ pub const Call = struct {
     format: ?*const calendar.Format = null,
     /// The SQL integer type `abs` overflows at, or a cast's target: the type of the argument the i64 lane has lost.
     int: ?IntType = null,
-    /// A `TRY_CAST`: a value that does not convert is NULL, not an error.
+    /// A `TRY_CAST`: a value that does not convert is NULL, not an error. On `make_date` or `make_timestamp`, the
+    /// constant a `TRY_CAST` of text bound to was no date or timestamp, so the call is NULL in every row.
     lenient: bool = false,
     /// Which DOUBLE function a `math` call is.
     math: ?MathFn = null,
@@ -906,7 +907,7 @@ pub const Expr = union(enum) {
                 break :blk false;
             },
             .call => |c| switch (c.func) {
-                .strlen, .epoch_ms, .make_timestamp, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .floor, .ceil, .sqrt, .round, .sign, .trunc, .ascii, .chr, .repeat => c.args[0].mayBeNull(),
+                .strlen, .epoch_ms, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .strftime, .floor, .ceil, .sqrt, .round, .sign, .trunc, .ascii, .chr, .repeat => c.args[0].mayBeNull(),
                 .math => for (c.args) |a| {
                     if (a.mayBeNull()) break true;
                 } else false,
@@ -916,9 +917,11 @@ pub const Expr = union(enum) {
                 .concat_ws => false,
                 .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp => c.lenient or c.args[0].mayBeNull(),
                 // Any of the three can be NULL (a literal year over a nullable month).
-                .make_date => for (c.args) |a| {
+                // A lenient one is a TRY_CAST's text that was no time: NULL throughout.
+                .make_date => c.lenient or (for (c.args) |a| {
                     if (a.mayBeNull()) break true;
-                } else false,
+                } else false),
+                .make_timestamp => c.lenient or c.args[0].mayBeNull(),
                 .date_trunc, .date_part => c.args[1].mayBeNull(),
                 // Infinite times give NULL whatever the columns say.
                 .date_diff, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => true,

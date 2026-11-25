@@ -35,7 +35,8 @@ literal that does not convert to a column's timestamp type (`TemporalOutOfRange`
 compares with nothing, and a constant nested more deeply than the thread's stack allows folding (the budget is read from
 the thread, not fixed) is refused (`ConstantTooDeep`). In a SELECT, an aggregate argument, a GROUP BY key or a WHERE
 expression, a DATE or TIMESTAMP literal (and `CAST` or `TRY_CAST` of a constant text to one) is a value of its type,
-as a column of it is: `date_diff('day', DATE '2024-01-01', d)`, `SELECT DATE '2024-01-01' AS x` (written as a DATE).
+as a column of it is: `date_diff('day', DATE '2024-01-01', d)`, `SELECT DATE '2024-01-01' AS x` (written as a DATE);
+a `TRY_CAST` of text that is no date or timestamp is NULL of that type, as in DuckDB, and `CAST` of it is refused.
 `DATE - DATE` is the BIGINT number of days between them, as in DuckDB; `DATE + INTEGER` and `DATE - INTEGER` give
 the day count as an integer (DuckDB's is a DATE of that day). The difference of two times otherwise (`DATE - TIMESTAMP`, `TIMESTAMP - TIMESTAMP`) is an
 INTERVAL in DuckDB, which zpq does not compute, and the rest of arithmetic on a time (`-d`, `d * 2`, `ts + 1`) DuckDB

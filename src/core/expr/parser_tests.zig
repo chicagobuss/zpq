@@ -810,7 +810,7 @@ test "parse: a DATE or TIMESTAMP constant is a value of its type; time arithmeti
     try testing.expectEqual(@as(i64, 1704090600250000), t.call.args[0].literal.i64);
 
     // DATE - DATE is the BIGINT number of days; a DATE plus or minus an integer keeps its day count.
-    for ([_][]const u8{ "d - d", "d - make_date(19723)", "d + 1", "1 + d", "d - n" }) |src| {
+    for ([_][]const u8{ "d - d", "d - make_date(19723)", "d + 1", "1 + d", "d - n", "abs(d - d)", "abs(d - d) + 1" }) |src| {
         const e = try parseExprOnly(a, src, &file, null);
         try testing.expect(e.temporal() == null);
     }
@@ -830,10 +830,15 @@ test "parse: a DATE or TIMESTAMP constant is a value of its type; time arithmeti
         try testing.expectError(error.TypeMismatch, parseExprOnly(a, r.src, &file, &diag));
         try testing.expectEqualStrings(r.what, diag.detail.type_mismatch.what.get());
     }
+    // A text that is no date: CAST refuses it, TRY_CAST is a DATE that is NULL in every row.
     const bad: syntax.Expr = .{ .string = "2024-13-01" };
     var diag: Diag = .{};
-    try testing.expectError(error.TypeMismatch, bindSyntax(a, .{ .call = .{ .name = "try_cast$date", .args = &.{&bad} } }, &file, &diag));
-    try testing.expectEqualStrings("TRY_CAST('2024-13-01' AS DATE)", diag.detail.type_mismatch.what.get());
+    try testing.expectError(error.TypeMismatch, bindSyntax(a, .{ .call = .{ .name = "cast$date", .args = &.{&bad} } }, &file, &diag));
+    try testing.expectEqualStrings("CAST('2024-13-01' AS DATE)", diag.detail.type_mismatch.what.get());
+    const null_date = try bindSyntax(a, .{ .call = .{ .name = "try_cast$date", .args = &.{&bad} } }, &file, null);
+    try testing.expectEqual(ast.Temporal.date, null_date.temporal().?);
+    try testing.expect(null_date.call.lenient and null_date.mayBeNull());
+    try testing.expect(!d.call.lenient and !d.mayBeNull());
 }
 
 test "parse: regexp_replace compiles its constant pattern, replacement and options once" {

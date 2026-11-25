@@ -338,6 +338,12 @@ pub const Lower = struct {
     /// constant (`CAST('1998-09-02' AS date)`, `0.06 - 0.01`) is folded to the literal it equals first, a typed one
     /// spelled `DATE '..'` so the filter binder compares it with the column's own kind.
     fn literal(self: *Lower, node: *const c.LpNode) ![]const u8 {
+        return (try self.literalOrNull(node)) orelse error.BadValue;
+    }
+
+    /// `literal`, or null for a constant DuckDB makes NULL (`TRY_CAST('2024-13-01' AS DATE)`), which no filter literal
+    /// spells: a comparison binds that side as the expression it is instead.
+    fn literalOrNull(self: *Lower, node: *const c.LpNode) !?[]const u8 {
         switch (node.kind) {
             c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT, c.LP_EXPR_LITERAL_NULL, c.LP_EXPR_LITERAL_STRING, c.LP_EXPR_LITERAL_BOOL => {},
             c.LP_EXPR_UNARY_OP => {
@@ -350,7 +356,7 @@ pub const Lower = struct {
         }
         const value = c.lp_ast_to_sql(@constCast(node), self.lp_arena);
         if (value == null) return error.UnparseError;
-        return self.copy(std.mem.span(value));
+        return try self.copy(std.mem.span(value));
     }
 
     /// An integer constant's DuckDB type: INTEGER, BIGINT or HUGEINT.
@@ -378,6 +384,8 @@ pub const Lower = struct {
     /// A constant tree's value. Integers keep DuckDB's width (INTEGER, BIGINT, HUGEINT) so an overflow DuckDB would
     /// raise is refused here, not folded to a value; a number with a fraction is an exact decimal; `/` is DOUBLE there
     /// and `%` is no operator here, so both refuse.
+    const ConstError = error{ BadValue, ConstantTooDeep, NullConstant };
+
     const Const = union(enum) {
         int: struct { v: i128, width: Width },
         dec: lits.Dec,
@@ -396,7 +404,7 @@ pub const Lower = struct {
         };
     }
 
-    fn constant(self: *Lower, node: *const c.LpNode) error{ BadValue, ConstantTooDeep }!Const {
+    fn constant(self: *Lower, node: *const c.LpNode) ConstError!Const {
         // Each level of the tree is a frame: refuse by name before the thread's stack runs out, not after.
         if (!(self.stack orelse return error.BadValue).ok()) return error.ConstantTooDeep;
         return switch (node.kind) {
@@ -430,6 +438,9 @@ pub const Lower = struct {
                 if (op != c.LP_OP_ADD and op != c.LP_OP_SUB and op != c.LP_OP_MUL) return error.BadValue;
                 const l = try self.constant(node.u.binary.left orelse return error.BadValue);
                 const r = try self.constant(node.u.binary.right orelse return error.BadValue);
+                // `DATE - DATE` is the BIGINT number of days between them.
+                if (op == c.LP_OP_SUB and l == .date and r == .date)
+                    break :blk .{ .int = .{ .v = l.date.days - r.date.days, .width = .i64 } };
                 if (l == .int and r == .int) {
                     const v = (switch (op) {
                         c.LP_OP_ADD => std.math.add(i128, l.int.v, r.int.v),
@@ -454,16 +465,18 @@ pub const Lower = struct {
         };
     }
 
-    fn castConstant(self: *Lower, node: *const c.LpNode) error{ BadValue, ConstantTooDeep }!Const {
+    fn castConstant(self: *Lower, node: *const c.LpNode) ConstError!Const {
         const child = try self.constant(node.u.cast.expr orelse return error.BadValue);
-        const type_text = std.mem.trim(u8, std.mem.span(node.u.cast.type_name orelse return error.BadValue), " ");
+        const marked = withoutMarker(std.mem.span(node.u.cast.type_name orelse return error.BadValue));
+        const type_text = std.mem.trim(u8, marked.text, " ");
         const open = std.mem.indexOfScalar(u8, type_text, '(');
         const base = std.mem.trim(u8, type_text[0 .. open orelse type_text.len], " ");
-        if (std.ascii.eqlIgnoreCase(base, "date") or std.ascii.eqlIgnoreCase(base, "timestamp")) {
+        const is_date = std.ascii.eqlIgnoreCase(base, "date");
+        if (is_date or std.ascii.eqlIgnoreCase(base, "timestamp") or std.ascii.eqlIgnoreCase(base, "datetime")) {
             if (open != null) return error.BadValue;
-            const is_date = std.ascii.eqlIgnoreCase(base, "date");
             const at: lits.Moment = switch (child) {
-                .text => |t| lits.parseMoment(t, is_date) catch return error.BadValue,
+                // A TRY_CAST of text that is no time is NULL, which no literal spells.
+                .text => |t| lits.parseMoment(t, is_date) catch return if (marked.lenient) error.NullConstant else error.BadValue,
                 .date, .timestamp => |m| .{ .days = m.days, .micros = if (is_date) 0 else m.micros },
                 else => return error.BadValue,
             };
@@ -471,6 +484,8 @@ pub const Lower = struct {
             if (!is_date and !lits.inTimestampRange(at)) return error.BadValue;
             return if (is_date) .{ .date = at } else .{ .timestamp = at };
         }
+        // A TRY_CAST to a DECIMAL folds to no literal here.
+        if (marked.lenient) return error.BadValue;
         const is_dec = std.ascii.eqlIgnoreCase(base, "decimal") or std.ascii.eqlIgnoreCase(base, "numeric") or std.ascii.eqlIgnoreCase(base, "dec");
         if (!is_dec) return error.BadValue;
         var precision: u32 = 18;
@@ -493,10 +508,14 @@ pub const Lower = struct {
         return .{ .typed_dec = at_scale };
     }
 
-    fn folded(self: *Lower, node: *const c.LpNode) ![]const u8 {
+    fn folded(self: *Lower, node: *const c.LpNode) !?[]const u8 {
         self.stack = if (self.stack_limit) |bytes| .within(bytes) else .start();
         defer self.stack = null;
-        return switch (try self.constant(node)) {
+        const value = self.constant(node) catch |err| switch (err) {
+            error.NullConstant => return null,
+            error.BadValue, error.ConstantTooDeep => |e| return e,
+        };
+        return try switch (value) {
             .int => |i| std.fmt.allocPrint(self.arena, "{d}", .{i.v}),
             .dec => |d| d.format(self.arena),
             .typed_dec => |d| blk: {
@@ -557,11 +576,10 @@ pub const Lower = struct {
                     break :blk .{ .comparison = .{ .operand = try self.operand(left), .op = op, .value = try self.literal(right) } };
                 // A constant side folds as it always has, refusing what DuckDB refuses (`i > 2147483647 + 1`); a column
                 // against it keeps the leaf whose statistics prune.
-                if (!readsColumn(right)) {
-                    const value = try self.literal(right);
+                if (!readsColumn(right)) if (try self.literalOrNull(right)) |value| {
                     if (self.operand(left)) |column| break :blk .{ .comparison = .{ .operand = column, .op = op, .value = value } } else |_| {}
-                }
-                if (!readsColumn(left)) _ = try self.literal(left);
+                };
+                if (!readsColumn(left)) _ = try self.literalOrNull(left);
                 const sides = try self.arena.alloc(syntax.Expr, 2);
                 sides[0] = try self.expression(left, depth + 1);
                 sides[1] = try self.expression(right, depth + 1);

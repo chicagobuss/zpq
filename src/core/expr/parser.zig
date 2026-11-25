@@ -1343,16 +1343,22 @@ fn binopHint(op: ast.Op, l: ast.Expr, r: ast.Expr) []const u8 {
     return "";
 }
 
+const untyped_time_hint = "a constant time is typed: write DATE '2024-01-01' or\n" ++
+    "  TIMESTAMP '2024-01-01 10:00:00', not the bare text";
+
 fn callHint(func: ast.Func, args: []const *ast.Expr) []const u8 {
     switch (func) {
         .cast_date, .cast_timestamp => if (args.len == 1 and isStrLiteral(args[0].*))
             return "the text is not a valid date or timestamp (YYYY-MM-DD [HH:MM:SS])"
         else
             return "only a DATE, a TIMESTAMP or a constant text casts to DATE or TIMESTAMP",
-        .date_diff, .date_trunc, .date_part, .strftime, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .date_name, .last_day => {
-            for (args) |a| if (isStrLiteral(a.*) and a != args[0]) return "a constant time is typed: write DATE '2024-01-01' or\n" ++
-                "  TIMESTAMP '2024-01-01 10:00:00', not the bare text";
+        // The part comes first and the times after it; the other functions take the time first.
+        .date_diff, .date_trunc, .date_part => {
+            for (args[@min(1, args.len)..]) |a| if (isStrLiteral(a.*)) return untyped_time_hint;
             return "";
+        },
+        .strftime, .epoch, .epoch_ms, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .date_name, .last_day => {
+            return if (args.len > 0 and isStrLiteral(args[0].*)) untyped_time_hint else "";
         },
         else => return "",
     }
@@ -1379,17 +1385,21 @@ pub fn noteCompare(diag: ?*Diag, file: *const schema.FileMetaData, op: filter_as
 
 /// `CAST('..' AS DATE | TIMESTAMP)` of a constant text, which `DATE '..'` and `TIMESTAMP '..'` fold to: the value as
 /// `make_date(days)` or `make_timestamp(us)` of it, so it is a DATE or TIMESTAMP wherever a column's would be. Null
-/// for any other call; a text that is no date or timestamp is a type mismatch.
-fn temporalConstant(arena: std.mem.Allocator, file: *const schema.FileMetaData, func: ast.Func, args: []const *ast.Expr) Error!?ast.Expr {
+/// for any other call. A text that is no date or timestamp is a type mismatch for `CAST`; for `TRY_CAST` (`lenient`) it
+/// is NULL of the type, the same call marked lenient over a placeholder 0, which evaluates to NULL in every row.
+fn temporalConstant(arena: std.mem.Allocator, file: *const schema.FileMetaData, func: ast.Func, args: []const *ast.Expr, lenient: bool) Error!?ast.Expr {
     if ((func != .cast_date and func != .cast_timestamp) or args.len != 1 or !isStrLiteral(args[0].*)) return null;
     const is_date = func == .cast_date;
     // `parseMoment` keeps a TIMESTAMP within TIMESTAMP's range, so its microseconds fit an i64.
-    const m = sql_literals.parseMoment(args[0].literal.str, is_date) catch return error.TypeMismatch;
+    const parsed: ?sql_literals.Moment = sql_literals.parseMoment(args[0].literal.str, is_date) catch
+        if (lenient) null else return error.TypeMismatch;
     const value = try arena.alloc(ast.Expr, 1);
-    value[0] = .{ .literal = .{ .i64 = if (is_date) m.days else m.days * std.time.us_per_day + m.micros } };
+    value[0] = .{ .literal = .{ .i64 = if (parsed) |m| (if (is_date) m.days else m.days * std.time.us_per_day + m.micros) else 0 } };
     const one = try arena.alloc(*ast.Expr, 1);
     one[0] = &value[0];
-    return try bindCall(arena, file, if (is_date) .make_date else .make_timestamp, one);
+    var e = try bindCall(arena, file, if (is_date) .make_date else .make_timestamp, one);
+    e.call.lenient = parsed == null;
+    return e;
 }
 
 /// `text` (digits with one `.`) as the exact DECIMAL SQL gives it: every digit counts toward the precision and those
@@ -1795,6 +1805,8 @@ const IntBranches = struct {
 /// The SQL integer type of `l op r` for `+ - * % //` as DuckDB resolves it (`ast.IntType.combine`), or null where an
 /// operand's cannot be proved. A literal takes the other operand's type when it fits (`tinyint_col + 0` is a TINYINT).
 fn arithInt(file: *const schema.FileMetaData, l: ast.Expr, r: ast.Expr) ?ast.IntType {
+    // `DATE - DATE` is a BIGINT (`temporalArithmetic` lets no other operator join two DATEs).
+    if (l.temporal() == .date and r.temporal() == .date) return .i64;
     const lit_l = if (l == .literal and l.literal == .i64) l.literal.i64 else null;
     const lit_r = if (r == .literal and r.literal == .i64) r.literal.i64 else null;
     if (lit_l == null or lit_r == null) {
@@ -1851,8 +1863,8 @@ fn intTypeOf(file: *const schema.FileMetaData, e: ast.Expr) ?ast.IntType {
 
 /// `bindCall` of the function `name` spells; a `TRY_CAST` (`try_cast$integer`...) is the cast, lenient.
 fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, diag: ?*Diag, name: []const u8, func_named: ast.Func, args_named: []const *ast.Expr) Error!ast.Expr {
-    if (temporalConstant(arena, file, func_named, args_named) catch |err| return noteCall(err, diag, file, name, func_named, args_named)) |c|
-        return c;
+    if (temporalConstant(arena, file, func_named, args_named, isTryCast(name)) catch |err|
+        return noteCall(err, diag, file, name, func_named, args_named)) |c| return c;
     var func = func_named;
     var args = args_named;
     // `epoch_ms` of a time counts milliseconds (of an integer it makes the TIMESTAMP); `date_part('epoch', t)` is `epoch(t)`.
@@ -1865,7 +1877,8 @@ fn bindNamedCall(arena: std.mem.Allocator, file: *const schema.FileMetaData, dia
     }
     const math: ?ast.MathFn = if (func == .math) ast.MathFn.parse(name) else null;
     if (math) |m| if (args.len != m.arity()) return error.WrongArity;
-    var e = bindCall(arena, file, func, args) catch |err| return noteCall(err, diag, file, name, func, args);
+    // Named as written: `date_part('epoch', x)` keeps its first argument.
+    var e = bindCall(arena, file, func, args) catch |err| return noteCall(err, diag, file, name, func_named, args_named);
     if (isTryCast(name)) e.call.lenient = true;
     e.call.math = math;
     if (func == .str_test) e.call.str_test = ast.StrTest.parse(name);

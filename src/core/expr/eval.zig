@@ -2989,6 +2989,13 @@ fn evalTemporal(
     if (in.max_rep > 0) return error.NestedNotSupported;
     const out = try arena.alloc(i64, in.values.len);
     const t = arg.temporal();
+    // A `make_date` or `make_timestamp` a TRY_CAST's text bound to when it was no time (`Call.lenient`).
+    if (c.lenient) {
+        @memset(out, 0);
+        const def = try arena.alloc(u32, out.len);
+        @memset(def, 0);
+        return .{ .i64 = .{ .values = out, .def_levels = def, .max_def = 1, .has_nulls = out.len > 0 } };
+    }
     // The function and part are fixed for the call, so each pair gets its own loop with constant divisors.
     switch (c.func) {
         .make_date => try mapRows(col, batch.sel, out, struct {

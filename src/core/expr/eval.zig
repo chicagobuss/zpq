@@ -2528,9 +2528,9 @@ fn evalDateDiff(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []
 
 /// The count `func` (`to_epoch_ms`, `_us` or `_ns`) gives for the time `v` counted in `unit`, as DuckDB 2.0 counts it, or
 /// null for an infinite time. A DATE counts its own days (an error where microseconds or nanoseconds overflow); a
-/// TIMESTAMP_MS and a TIMESTAMP_NS reach microseconds first (milliseconds exactly, nanoseconds to the nearest, a tie
-/// away from zero), and milliseconds round half away from zero from those; only a TIMESTAMP_NS gives its own
-/// nanoseconds.
+/// TIMESTAMP_MS and a TIMESTAMP_NS reach microseconds first (milliseconds exactly, nanoseconds floored for `epoch_us`
+/// and to the nearest, a tie away from zero, for `epoch_ms`), and milliseconds round half away from zero from those;
+/// only a TIMESTAMP_NS gives its own nanoseconds.
 fn epochCount(func: ast.Func, unit: ast.Temporal, v: i64) error{ConversionOutOfRange}!?i64 {
     if (unit == .date) {
         if (v == std.math.maxInt(i32) or v == -std.math.maxInt(i32)) return null;
@@ -2546,7 +2546,8 @@ fn epochCount(func: ast.Func, unit: ast.Temporal, v: i64) error{ConversionOutOfR
     const us: i64 = switch (unit) {
         .ts_us => v,
         .ts_ms => std.math.mul(i64, v, 1000) catch return error.ConversionOutOfRange,
-        .ts_ns => roundDivAway(v, 1000),
+        // `epoch_us` floors the nanoseconds; `epoch_ms` takes them to the nearest microsecond first, as a cast does.
+        .ts_ns => if (func == .to_epoch_us) @divFloor(v, 1000) else roundDivAway(v, 1000),
         .date => unreachable,
     };
     return switch (func) {
@@ -2673,7 +2674,13 @@ test "epoch counts and seconds are DuckDB 2.0.0's, an infinite time is NULL" {
     // Nanoseconds reach microseconds first, then milliseconds, each half away from zero.
     try T.expectEqual(@as(?i64, 0), try epochCount(.to_epoch_ms, .ts_ns, 499_499));
     try T.expectEqual(@as(?i64, 1), try epochCount(.to_epoch_ms, .ts_ns, 499_500));
+    // `epoch_us` of nanoseconds floors: 500 ns is 0 µs, -1 ns is -1 µs, the last nanosecond of a microsecond stays in it.
     try T.expectEqual(@as(?i64, -1), try epochCount(.to_epoch_us, .ts_ns, -500));
+    try T.expectEqual(@as(?i64, 0), try epochCount(.to_epoch_us, .ts_ns, 500));
+    try T.expectEqual(@as(?i64, 0), try epochCount(.to_epoch_us, .ts_ns, 999));
+    try T.expectEqual(@as(?i64, -1), try epochCount(.to_epoch_us, .ts_ns, -1));
+    try T.expectEqual(@as(?i64, 1), try epochCount(.to_epoch_us, .ts_ns, 1_999));
+    try T.expectEqual(@as(?f64, 2636275384.731065), try epochSeconds(.ts_ns, false, 2636275384731065826));
     try T.expectEqual(@as(?i64, 1577836800123456789), try epochCount(.to_epoch_ns, .ts_ns, 1577836800123456789));
     try T.expectEqual(@as(?i64, 1577836800000), try epochCount(.to_epoch_ms, .date, 18262));
     try T.expectEqual(@as(?i64, null), try epochCount(.to_epoch_us, .ts_us, inf));
@@ -3021,7 +3028,7 @@ fn evalTemporal(
         .date_part => switch (c.part.?) {
             inline else => |p| try mapRows(col, batch.sel, out, struct {
                 fn f(tt: ?ast.Temporal, v: i64) calendar.Error!i64 {
-                    return calendar.part(p, tt.?, v);
+                    return calendar.partOf(p, tt.?, v);
                 }
             }.f, t),
         },

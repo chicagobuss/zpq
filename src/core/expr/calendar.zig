@@ -319,6 +319,12 @@ pub inline fn trunc(comptime p: ast.DatePart, t: ast.Temporal, v: i64) Error!i64
     return std.math.add(i64, day_us, of_day) catch error.TimestampOutOfRange;
 }
 
+/// `date_part(part, v)` of a time: as `part`, but a TIMESTAMP_NS reaches microseconds by flooring, so a time just
+/// before a boundary stays before it (23:59:59.999999999 is in the second and the day it began, not the next one).
+pub inline fn partOf(comptime p: ast.DatePart, t: ast.Temporal, v: i64) Error!i64 {
+    return if (t == .ts_ns) part(p, .ts_us, @divFloor(v, std.time.ns_per_us)) else part(p, t, v);
+}
+
 /// `date_part(part, v)`. `second`, `millisecond` and `microsecond` count within the minute, as DuckDB's do, and a
 /// DATE's are 0; `week` is the ISO week number, `dow` 0 for Sunday, `isodow` 7 for it.
 pub inline fn part(comptime p: ast.DatePart, t: ast.Temporal, v: i64) Error!i64 {
@@ -494,3 +500,18 @@ test "strftime formats as DuckDB 2.0.0 does" {
 /// DuckDB's earliest TIMESTAMP in microseconds, 290309-12-22 (BC) 00:00:00: a TIMESTAMP or TIMESTAMP_MS below it is a
 /// conversion error wherever DuckDB converts it.
 pub const min_timestamp_us: i64 = -9_223_372_022_400_000_000;
+
+test "date_part of a TIMESTAMP_NS floors to microseconds, where date_trunc and the casts round" {
+    // 1969-12-31 23:59:59.999999999: the last nanosecond before the epoch.
+    try std.testing.expectEqual(@as(i64, 1969), try partOf(.year, .ts_ns, -1));
+    try std.testing.expectEqual(@as(i64, 59), try partOf(.second, .ts_ns, -1));
+    try std.testing.expectEqual(@as(i64, 59_999), try partOf(.millisecond, .ts_ns, -1));
+    try std.testing.expectEqual(@as(i64, 59_999_999), try partOf(.microsecond, .ts_ns, -1));
+    // Half a microsecond past the epoch is still the epoch's microsecond 0.
+    try std.testing.expectEqual(@as(i64, 0), try partOf(.microsecond, .ts_ns, 500));
+    try std.testing.expectEqual(@as(i64, 1), try partOf(.microsecond, .ts_ns, 1_000));
+    // The microsecond units are untouched.
+    try std.testing.expectEqual(@as(i64, 59_999_999), try partOf(.microsecond, .ts_us, -1));
+    // date_trunc still goes through the nearest microsecond, as DuckDB does.
+    try std.testing.expectEqual(@as(i64, 0), try trunc(.second, .ts_ns, -1));
+}

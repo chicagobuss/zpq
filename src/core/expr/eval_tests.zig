@@ -664,7 +664,7 @@ test "floor, ceil, sqrt and round of a DOUBLE column, and NaN below zero" {
     const ceil = try evalExpr(a, &batch, &lookup, .{ .call = .{ .func = .ceil, .args = &one_arg, .result_type = .f64, .depth = 2 } });
     try testing.expectEqualSlices(f64, &.{ 3, -2, 3, -1 }, ceil.f64.values);
     const rounded = try evalExpr(a, &batch, &lookup, .{ .call = .{ .func = .round, .args = &two_args, .result_type = .f64, .depth = 3 } });
-    try testing.expectEqualSlices(f64, &.{ 2.5, -2.5, 2.68, -1 }, rounded.f64.values);
+    try testing.expectEqualSlices(f64, &.{ 2.5, -2.5, 2.67, -1 }, rounded.f64.values);
     const root = try evalExpr(a, &batch, &lookup, .{ .call = .{ .func = .sqrt, .args = &one_arg, .result_type = .f64, .depth = 2 } });
     try testing.expect(std.math.isNan(root.f64.values[3]));
     try testing.expectEqual(@sqrt(@as(f64, 2.5)), root.f64.values[0]);

@@ -225,9 +225,11 @@ fn decimalMeanWide(sum: i192, scale: u8, count: i64) f64 {
     return @floatCast(mean);
 }
 
-/// `round(x, digits)` of a double as DuckDB computes it: scale, round half away from zero, scale back. A non-finite
-/// input stays as it is, and so does a finite one whose scaling overflows to a non-finite value for positive digits;
-/// for negative digits that overflow is 0.
+/// `round(x, digits)` of a double as DuckDB computes it: round the exact value half away from zero, so a double just
+/// under a halfway (0.015, 2.675) rounds down. The scaled product `x * 10^digits` is itself rounded, and only at an
+/// exact halfway can that hide the side the true product is on; there the fused product's error says which side
+/// (`10^digits` is exact up to 22). A non-finite input stays as it is, and so does a finite one whose scaling
+/// overflows to a non-finite value for positive digits; for negative digits that overflow is 0.
 pub fn roundDouble(x: f64, digits: i32) f64 {
     if (!std.math.isFinite(x)) return x;
     if (digits < 0) {
@@ -237,7 +239,13 @@ pub fn roundDouble(x: f64, digits: i32) f64 {
         return if (std.math.isFinite(r)) r else 0;
     }
     const m = std.math.pow(f64, 10, @floatFromInt(digits));
-    const r = @round(x * m) / m;
+    const t = x * m;
+    var scaled = @round(t);
+    if (digits <= 22 and @abs(t - @trunc(t)) == 0.5) {
+        const err = @mulAdd(f64, x, m, -t); // the exact product is t + err
+        if (err != 0 and (err > 0) != (t > 0)) scaled = @trunc(t);
+    }
+    const r = scaled / m;
     return if (std.math.isFinite(r)) r else x;
 }
 
@@ -1289,6 +1297,32 @@ pub const SelectColumn = struct {
 // ============================================================
 
 const testing = std.testing;
+
+test "round of a DOUBLE rounds its exact value half away from zero, even where the scaled product lands on a halfway" {
+    // The expected values are the exact binary value of each double, rounded half away from zero (DuckDB 2.0.1's).
+    const cases = [_]struct { x: f64, digits: i32, want: f64 }{
+        .{ .x = 0.015, .digits = 2, .want = 0.01 },
+        .{ .x = -0.015, .digits = 2, .want = -0.01 },
+        .{ .x = 2.675, .digits = 2, .want = 2.67 },
+        .{ .x = 1.005, .digits = 2, .want = 1.0 },
+        .{ .x = 0.145, .digits = 2, .want = 0.14 },
+        .{ .x = 0.285, .digits = 2, .want = 0.28 },
+        .{ .x = 8.345, .digits = 2, .want = 8.35 },
+        .{ .x = 0.0045, .digits = 3, .want = 0.004 },
+        .{ .x = 1234.5675, .digits = 3, .want = 1234.568 },
+        // An exactly representable halfway rounds away from zero, either sign.
+        .{ .x = 0.125, .digits = 2, .want = 0.13 },
+        .{ .x = -0.125, .digits = 2, .want = -0.13 },
+        .{ .x = 2.5, .digits = 0, .want = 3 },
+        .{ .x = -2.5, .digits = 0, .want = -3 },
+        .{ .x = 250, .digits = -2, .want = 300 },
+        .{ .x = 5e-324, .digits = 2, .want = 0 },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.want, roundDouble(c.x, c.digits));
+    try std.testing.expect(std.math.isNan(roundDouble(std.math.nan(f64), 2)));
+    try std.testing.expectEqual(std.math.inf(f64), roundDouble(std.math.inf(f64), 2));
+    try std.testing.expectEqual(@as(f64, 1e308), roundDouble(1e308, 5)); // the scaling overflows: x stays
+}
 
 test "IntType: DuckDB's operation types, ranges and literal types" {
     const T = IntType;

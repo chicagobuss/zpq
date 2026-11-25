@@ -1797,9 +1797,9 @@ test "post-aggregate arithmetic types and rounds as DuckDB does" {
     try std.testing.expect((try evalPostInts(.{ .binary = .{ .op = .mul, .left = &col0, .right = &.{ .number = "2" } } }, &types, &ints, &null_row)) == .null_val);
     try std.testing.expect(std.math.isInf((try evalPostInts(.{ .binary = .{ .op = .div, .left = &.{ .number = "1" }, .right = &.{ .number = "0" } } }, &types, &ints, &row)).f));
     try std.testing.expect(std.math.isNan((try evalPostInts(.{ .binary = .{ .op = .div, .left = &.{ .number = "0" }, .right = &.{ .number = "0.0" } } }, &types, &ints, &row)).f));
-    // round(x, n): half away from zero; a DOUBLE as DuckDB scales it (2.675 is 2.68 there), a DECIMAL exactly.
+    // round(x, n): half away from zero; a DOUBLE by its exact value (2.675 is just under, so 2.67), a DECIMAL exactly.
     const rounded_f = try evalPostInts(.{ .round = .{ .value = &.{ .number = "2.675e0" }, .digits = 2 } }, &types, &ints, &row);
-    try std.testing.expectEqual(@as(f64, 2.68), rounded_f.f);
+    try std.testing.expectEqual(@as(f64, 2.67), rounded_f.f);
     const rounded_neg = try evalPostInts(.{ .round = .{ .value = &.{ .neg = &.{ .number = "2.5e0" } }, .digits = 0 } }, &types, &ints, &row);
     try std.testing.expectEqual(@as(f64, -3), rounded_neg.f);
     const rounded_dec = try evalPostInts(.{ .round = .{ .value = &col0, .digits = 1 } }, &types, &ints, &row);

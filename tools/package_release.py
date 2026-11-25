@@ -51,6 +51,16 @@ def sha(path):
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
+def macho_weak_flags(path):
+    """The weak-symbol flags set in a 64-bit Mach-O's header (mach_header_64.flags). Either one has dyld bind weak
+    definitions across every loaded image on each launch; zpq exports none (vendor/boring_tls/build.zig)."""
+    with path.open("rb") as f:
+        magic, *_, flags = struct.unpack("<7I", f.read(28))
+    if magic != 0xFEEDFACF:
+        raise SystemExit(f"{path} is not a 64-bit Mach-O")
+    return [name for bit, name in ((0x8000, "WEAK_DEFINES"), (0x10000, "BINDS_TO_WEAK")) if flags & bit]
+
+
 def dangling_references(files):
     """References in the shipped man page and guides to docs the archive lacks: `docs/x.md` (help's spelling, which
     the archive keeps under share/doc/zpq/), relative Markdown links, and the README, which is not shipped."""
@@ -178,6 +188,8 @@ def main():
             version_output = subprocess.check_output([str(binary), "--version"], text=True, timeout=10)
             if version_output != f"zpq {version} ({revision})\n":
                 raise SystemExit(f"binary --version {version_output.strip()!r} differs from manifest {version}")
+        if target in MACOS_MINIMUM and (weak := macho_weak_flags(binary)):
+            raise SystemExit(f"{target} binary's Mach-O header has {' and '.join(weak)}")
         files = {("bin/zpq.exe" if windows else "bin/zpq"): binary, **SHARED_FILES}
         if windows:
             files["share/doc/zpq/windows.md"] = ROOT / "docs/windows.md"

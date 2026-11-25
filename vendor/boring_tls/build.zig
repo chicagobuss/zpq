@@ -131,6 +131,30 @@ pub fn build(b: *std.Build) !void {
     if (source_build) {
         for (try sourceLibraries(b, boringssl_dep, target, optimize)) |lib| boring_tls_mod.linkLibrary(lib);
     } else {
+        // A Mach-O executable exports every global symbol it links, and these archives were compiled with default
+        // visibility: the binary would export BoringSSL's API, weak inline definitions among it, and dyld binds weak
+        // definitions afresh on every launch. Nothing links against an executable, so hide them all, making the weak
+        // functions local (hide_symbols.zig), and libc++'s operator delete with them (src/macos_delete.cpp).
+        if (target.result.os.tag.isDarwin()) {
+            const hider = b.addExecutable(.{
+                .name = "hide_symbols",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("hide_symbols.zig"),
+                    .target = b.graph.host,
+                    .optimize = .Debug,
+                }),
+            });
+            const hide = b.addRunArtifact(hider);
+            hide.setName(b.fmt("hide symbols in {s}", .{triple}));
+            for (libs, &lib_paths) |lib, *path| {
+                hide.addFileArg(path.*);
+                path.* = hide.addOutputFileArg(lib);
+            }
+            boring_tls_mod.addCSourceFile(.{ .file = b.path("src/macos_delete.cpp"), .flags = &.{
+                "-std=c++17",
+                "-fvisibility-global-new-delete=force-hidden",
+            } });
+        }
         for (lib_paths) |path| boring_tls_mod.addObjectFile(path);
     }
     boring_tls_mod.linkSystemLibrary("c++", .{});

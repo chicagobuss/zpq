@@ -92,6 +92,15 @@ const Builder = struct {
         return self.input(try self.unparse(node));
     }
 
+    /// `column` for a key the window partitions or orders by, which compares its value: a bare AVG is staged as the
+    /// DOUBLE an AVG in an expression reads (`avg(x) + 0`), not as the rounded DECIMAL mean it prints for a DECIMAL.
+    fn key(self: *Builder, node: *c.LpNode, what: []const u8) Error![]const u8 {
+        const bare = node.kind == c.LP_EXPR_FUNCTION and node.u.function.over == null and node.u.function.name != null;
+        const avg = bare and std.ascii.eqlIgnoreCase(std.mem.span(node.u.function.name), "avg");
+        if (!avg) return self.column(node, what);
+        return self.input(try std.fmt.allocPrint(self.arena, "{s} + 0", .{try self.unparse(node)}));
+    }
+
     /// `node` for the final query: a window call its column, a window-free expression its input column, and an
     /// operation on those rebuilt around them.
     fn lower(self: *Builder, node: *c.LpNode) Error![]const u8 {
@@ -414,7 +423,7 @@ const Builder = struct {
         var sort: std.ArrayList(wp.SortKey) = .empty;
         var order: std.ArrayList([]const u8) = .empty;
         for (0..@intCast(wd.partition_by.count)) |i| {
-            const col = try self.column(wd.partition_by.items[i] orelse return error.SqlParseError, "PARTITION BY");
+            const col = try self.key(wd.partition_by.items[i] orelse return error.SqlParseError, "PARTITION BY");
             var seen = false;
             for (partition.items) |p| seen = seen or std.mem.eql(u8, p, col);
             if (seen) continue;
@@ -424,7 +433,7 @@ const Builder = struct {
         for (0..@intCast(wd.order_by.count)) |i| {
             const term: *c.LpNode = wd.order_by.items[i] orelse return error.SqlParseError;
             const t = term.u.order_term;
-            const col = try self.column(t.expr orelse return error.SqlParseError, "ORDER BY");
+            const col = try self.key(t.expr orelse return error.SqlParseError, "ORDER BY");
             try order.append(self.arena, col);
             try sort.append(self.arena, .{
                 .column = col,
@@ -749,6 +758,17 @@ test "QUALIFY is the final query's WHERE over the window columns, and a column o
     try std.testing.expect(std.mem.indexOf(u8, filtered.final_where, "\"w0\"") == null);
     // Without the table's columns the name cannot be told, and is refused rather than guessed.
     try std.testing.expectError(error.WindowNotSupported, build(a, text, &why, null));
+}
+
+test "a window partitions and orders by a bare AVG as the DOUBLE, and its argument reads the column as printed" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var why: Refusal = .{};
+    const plan = try build(a, "SELECT g, avg(d) AS m, rank() OVER (PARTITION BY avg(e) ORDER BY avg(d)) AS r, lag(avg(d)) OVER (ORDER BY g) AS p FROM t GROUP BY g", &why, &.{ "g", "d", "e" });
+    try std.testing.expect(std.mem.indexOf(u8, plan.input_sql, "avg(d) AS \"c1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.input_sql, "avg(e) + 0 AS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan.input_sql, "avg(d) + 0 AS") != null);
 }
 
 test "QUALIFY binds a name to the last select item of that alias, in any select item and anywhere in the condition" {

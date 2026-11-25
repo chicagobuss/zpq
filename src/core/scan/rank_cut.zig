@@ -80,7 +80,13 @@ pub fn rankValue(acc: expr_agg.Accumulator, call: expr_agg.AggCall) !SortKey {
         else
             .none,
         .sum_d => |d| decimalRank(try d.result(), call),
-        .avg_d => |d| decimalRank(try expr_agg.avgDecMean(call, d), call),
+        // A pair ranks as its cell does (`sortKey`): by the DOUBLE mean, not a rounded one.
+        .avg_d => |d| if (!call.state and !call.compared)
+            decimalRank(try expr_agg.avgDecMean(call, d), call)
+        else if (d.wide()) |sum|
+            .{ .float = expr_ast.decimalMean(sum, call.arg.?.decSpec().?, @intCast(d.n), false) }
+        else
+            .none,
         .min_d, .max_d => |v| decimalRank(v, call),
         else => unreachable,
     };
@@ -319,13 +325,17 @@ test "result cut extrema AVG DECIMAL: typed final ranks equal emitted sort keys 
         .alias = "a",
         .result = .avg_dec,
     };
-    // -0.00025: avg's mean at DECIMAL(22, 8); avg_state ranks by it rounded to the argument's scale.
+    // -0.00025: avg's mean at DECIMAL(22, 8); avg_state, and an avg HAVING or ORDER BY compares, rank by its DOUBLE,
+    // never by the mean rounded to the argument's scale (-0.0003).
     const exact = try rankValue(states[8], dec_call);
     try testing.expectEqual(@as(i128, -25000), exact.dec.v);
     try testing.expectEqual(@as(u8, 8), exact.dec.spec.scale);
     var state_call = dec_call;
     state_call.state = true;
-    const rounded = try rankValue(states[8], state_call);
-    try testing.expectEqual(@as(i128, -3), rounded.dec.v);
-    try testing.expectEqual(@as(u8, 4), rounded.dec.spec.scale);
+    try testing.expectEqual(@as(f64, -0.00025), (try rankValue(states[8], state_call)).float);
+    var compared = dec_call;
+    compared.compared = true;
+    try testing.expectEqual(@as(f64, -0.00025), (try rankValue(states[8], compared)).float);
+    const cell = try materializeOne(testing.allocator, compared, states[8]);
+    try testing.expectEqual(.eq, orderSortKeys(sortKey(cell), try rankValue(states[8], compared), false));
 }

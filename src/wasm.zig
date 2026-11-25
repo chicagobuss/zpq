@@ -65,6 +65,7 @@ pub fn run(file: []const u8, request: []const u8) ![]u8 {
     const program: zpq.core.result_program.ResultProgram = .{
         .order = query.result_order,
         .visible = result.visible_cols,
+        .calls = result.state.agg_calls,
     };
     try program.finish(gpa, &result.output, &result.state.group_col_types);
     const kinds = try zpq.engine.answerTextKinds(gpa, result.output, result.state, true, null);

@@ -16,8 +16,9 @@ pub const AggValue = union(enum) {
     s: []const u8,
     /// Exact DECIMAL: unscaled value and its type. Printed as exact text, written as DECIMAL. Also avg's mean.
     dec: DecValue,
-    /// avg_state over a DECIMAL: the exact sum and count, which re-aggregate, and the mean rounded to the argument's
-    /// type, which only ranks and filters (HAVING) the rows, never printed.
+    /// avg_state over a DECIMAL, or an avg HAVING or ORDER BY compares (`AggCall.compared`): the exact sum and count,
+    /// which re-aggregate, and the mean rounded to the argument's type, never printed. HAVING and the ranking read
+    /// the DOUBLE an expression reads (`expr_ast.decimalMean`), never a rounded mean.
     /// The sum may pass 38 digits while the mean fits (two values near 10^38); JSON prints it whole, and only `-o`,
     /// whose `__sum` column is DECIMAL(38, s), refuses it. `sum` and `mean` are NULL when count is 0.
     avg_dec: struct { sum: ?i192, count: i64, mean: ?i128, spec: expr_ast.Dec },
@@ -39,8 +40,11 @@ pub fn orderValues(a: AggValue, b: AggValue, descending: bool) std.math.Order {
 
 /// `orderValues` under an ORDER BY key: its direction, and NULLS FIRST when it says so.
 pub fn orderByKey(a: AggValue, b: AggValue, key: anytype) std.math.Order {
-    const ord = orderValues(a, b, key.descending);
-    if (!key.nulls_first or (a == .null_val) == (b == .null_val)) return ord;
+    // NULL as the sort key sees it: an avg pair over no values is NULL too.
+    const x = sortKey(a);
+    const y = sortKey(b);
+    const ord = orderSortKeys(x, y, key.descending);
+    if (!key.nulls_first or (x == .none) == (y == .none)) return ord;
     return ord.invert();
 }
 
@@ -57,6 +61,11 @@ test "orderByKey puts NULL last in either direction and first under NULLS FIRST"
     try t.expectEqual(std.math.Order.eq, orderByKey(nul, nul, Key{ .descending = false, .nulls_first = true }));
     try t.expectEqual(std.math.Order.lt, orderByKey(one, two, Key{ .descending = false, .nulls_first = true }));
     try t.expectEqual(std.math.Order.gt, orderByKey(one, two, Key{ .descending = true, .nulls_first = true }));
+    // An avg pair over no values is NULL, first under NULLS FIRST like any other.
+    const spec: expr_ast.Dec = .{ .precision = 4, .scale = 0 };
+    const empty: AggValue = .{ .avg_dec = .{ .sum = null, .count = 0, .mean = null, .spec = spec } };
+    try t.expectEqual(std.math.Order.lt, orderByKey(empty, one, Key{ .descending = true, .nulls_first = true }));
+    try t.expectEqual(std.math.Order.gt, orderByKey(empty, one, Key{ .descending = true }));
 }
 
 pub fn orderSortKeys(a: SortKey, b: SortKey, descending: bool) std.math.Order {
@@ -75,7 +84,10 @@ pub fn sortKey(v: AggValue) SortKey {
         .f => |f| .{ .float = f },
         .avg => |a| if (a.sum) |s| .{ .float = s / @as(f64, @floatFromInt(a.count)) } else .none,
         .dec => |d| .{ .dec = d },
-        .avg_dec => |a| if (a.mean) |m| .{ .dec = .{ .v = m, .spec = a.spec } } else .none,
+        .avg_dec => |a| if (a.sum != null and a.count > 0)
+            .{ .float = expr_ast.decimalMean(a.sum.?, a.spec, a.count, false) }
+        else
+            .none,
         .s => |s| .{ .bytes = s },
         .null_val => .none,
     };

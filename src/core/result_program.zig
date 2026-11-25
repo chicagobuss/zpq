@@ -18,6 +18,7 @@ const expr_ast = @import("expr/ast.zig");
 const expr_agg = @import("expr/agg.zig");
 const core_memory = @import("memory.zig");
 const BorrowedSpan = @import("scan/types.zig").BorrowedSpan;
+const decimalMean = expr_ast.decimalMean;
 
 pub const Error = error{
     OutOfMemory,
@@ -91,9 +92,12 @@ pub const ResultProgram = struct {
         col_types: ?*?[]const scan.GroupColType,
     ) Error!void {
         if (self.order.post) return self.finishPost(gpa, out, col_types);
-        if (self.order.having) |h| try applyHaving(gpa, out, h.*);
+        if (self.order.having) |h| {
+            try applyHaving(gpa, out, h.*, if (out.group_rows == null) .{ .calls = self.calls } else .{});
+        }
         const copies = try self.rank(gpa, out);
         defer if (copies) |c| gpa.free(c);
+        try self.printMeans(out, if (col_types) |ct| ct.* else null);
         if (out.group_rows == null) return self.projectScalar(gpa, out);
         try project(self.visible, self.workers, gpa, out, col_types);
         // After the hidden columns are gone: a copy holds only what is shown.
@@ -242,39 +246,88 @@ pub const ResultProgram = struct {
         out.aggs = kept;
     }
 
+    /// Which result columns DuckDB plans with no GROUP BY and no FILTER, where an AVG is its sum over its count
+    /// (`decimalMean`): by column (`finishPost`'s facts) or, for the scan's aggregates without GROUP BY, by call.
+    const Plans = struct {
+        rewritten: []const bool = &.{},
+        calls: []const expr_agg.AggCall = &.{},
+
+        fn of(self: Plans, c: usize) bool {
+            if (c < self.rewritten.len) return self.rewritten[c];
+            return c < self.calls.len and self.calls[c].where == null;
+        }
+    };
+
     /// Drop every group `having` does not make TRUE. The kept rows are listed before any is released.
-    fn applyHaving(gpa: std.mem.Allocator, out: *scan.AggOutput, having: expr_ast.Having) error{OutOfMemory}!void {
+    fn applyHaving(
+        gpa: std.mem.Allocator,
+        out: *scan.AggOutput,
+        having: expr_ast.Having,
+        plans: Plans,
+    ) error{OutOfMemory}!void {
         const rows = out.group_rows orelse {
             const Scalar = struct {
                 aggs: []const scan.AggOutputItem,
+                plans: Plans,
                 fn at(self: @This(), c: usize) scan.AggValue {
-                    return self.aggs[c].value;
+                    return planned(self.aggs[c].value, self.plans.of(c));
                 }
             };
-            out.no_row = truth(having, Scalar{ .aggs = out.aggs }) != true;
+            out.no_row = truth(having, Scalar{ .aggs = out.aggs, .plans = plans }) != true;
             return;
         };
         const Row = struct {
             row: []const scan.AggValue,
+            plans: Plans,
             fn at(self: @This(), c: usize) scan.AggValue {
-                return self.row[c];
+                return planned(self.row[c], self.plans.of(c));
             }
         };
         var n: usize = 0;
         for (rows) |row| {
-            if (truth(having, Row{ .row = row }) == true) n += 1;
+            if (truth(having, Row{ .row = row, .plans = plans }) == true) n += 1;
         }
         if (n == rows.len) return;
         const kept = try gpa.alloc([]const scan.AggValue, n);
         var k: usize = 0;
         for (rows) |row| {
-            if (truth(having, Row{ .row = row }) == true) {
+            if (truth(having, Row{ .row = row, .plans = plans }) == true) {
                 kept[k] = row;
                 k += 1;
             } else out.releaseRow(gpa, row);
         }
         gpa.free(rows);
         out.group_rows = kept;
+    }
+
+    /// A DECIMAL AVG's pair as the DOUBLE of the plan with no GROUP BY and no FILTER, when it is that plan's; any other
+    /// value as it is (`compareLiteral` reads a pair as the aggregate finalizes it).
+    fn planned(v: scan.AggValue, rewritten: bool) scan.AggValue {
+        if (!rewritten or v != .avg_dec) return v;
+        const a = v.avg_dec;
+        if (a.count == 0 or a.sum == null) return v;
+        return .{ .f = decimalMean(a.sum.?, a.spec, a.count, true) };
+    }
+
+    /// A bare AVG of a DECIMAL that HAVING or ORDER BY compared (`AggCall.compared`) kept its exact pair for them;
+    /// once they have, it answers what every bare one does: the exact mean rounded once to its DECIMAL type. Before
+    /// the rows are projected, so the hidden ones are dropped as they are.
+    fn printMeans(self: ResultProgram, out: *scan.AggOutput, col_types: ?[]const scan.GroupColType) Error!void {
+        const rows = out.group_rows orelse {
+            for (out.aggs, 0..) |*item, c| {
+                if (item.value != .avg_dec or c >= self.calls.len or !self.calls[c].compared) continue;
+                item.value = try printedMean(item.value.avg_dec, expr_agg.resultDec(self.calls[c]));
+            }
+            return;
+        };
+        const types = col_types orelse return;
+        if (rows.len == 0) return;
+        // A column is a compared AVG's when its pair sits in a DECIMAL lane (avg_state's lane is its own).
+        for (types, 0..) |t, j| {
+            if (t.lane != .dec or j >= rows[0].len or rows[0][j] != .avg_dec) continue;
+            // The rows are the answer's own (its slab or its copies), so their cells may be rewritten in place.
+            for (rows) |row| @constCast(row)[j] = try printedMean(row[j].avg_dec, t.dec.?);
+        }
     }
 
     /// Three-valued truth of `h` for one result row (`row.at(column)` its value): null is UNKNOWN.
@@ -388,12 +441,13 @@ pub const ResultProgram = struct {
             };
             h.eachColumn(Reads{ .wanted = wanted }, Reads.mark);
             try computeDerived(out.group_rows.?, programs, wanted, computed, self.workers);
-            try applyHaving(gpa, out, h.*);
+            try applyHaving(gpa, out, h.*, .{ .rewritten = rewritten });
         }
         @memset(wanted, true);
         try computeDerived(out.group_rows.?, programs, wanted, computed, self.workers);
         const copies = try self.rank(gpa, out);
         defer if (copies) |c| gpa.free(c);
+        try self.printMeans(out, col_types.?.*);
         try project(self.select.len, self.workers, gpa, out, col_types);
         if (copies) |c| try self.repeatRows(gpa, out, c);
         out.compactRows(gpa) catch {};
@@ -589,6 +643,15 @@ pub const ResultProgram = struct {
     }
 };
 
+/// A compared AVG's pair as a bare AVG answers it: the exact mean rounded once to `spec`, its DECIMAL type.
+fn printedMean(a: @FieldType(scan.AggValue, "avg_dec"), spec: expr_ast.Dec) Error!scan.AggValue {
+    if (a.count == 0 or a.sum == null) return .null_val;
+    var sum: expr_agg.DecSum = .{};
+    sum.add(a.sum.?, @intCast(a.count));
+    const v = (sum.meanAt(spec.scale - a.spec.scale) catch return error.DecimalOverflow) orelse return .null_val;
+    return .{ .dec = .{ .v = v, .spec = spec } };
+}
+
 /// A HAVING number literal, typed by its text: an integer, an exact decimal (unscaled digits and scale), or a double.
 pub const Number = union(enum) {
     int: i128,
@@ -639,7 +702,7 @@ fn wideAsFloat(v: i192) f64 {
 /// How `v` orders against `lit`, or null when the comparison is UNKNOWN: `v` NULL, a NULL literal, or kinds that do
 /// not compare (refused when the query binds, see `checkHaving`). Integers and DECIMALs compare exactly against
 /// integer and decimal literals; anything with a double compares as doubles, NaN above every number as zpq orders
-/// floats; an AVG compares its mean as a double, as SQL types it.
+/// floats; an AVG compares its mean as the double an expression reads (`decimalMean`), as SQL types it.
 pub fn compareLiteral(v: scan.AggValue, lit: expr_ast.HavingLiteral) ?std.math.Order {
     if (lit == .null) return null;
     if (lit == .string) return switch (v) {
@@ -653,11 +716,10 @@ pub fn compareLiteral(v: scan.AggValue, lit: expr_ast.HavingLiteral) ?std.math.O
         .dec => |d| exactOrder(d.v, d.spec.scale, num),
         .f => |f| floatOrder(f, num.asF64()),
         .avg => |a| if (a.count == 0 or a.sum == null) null else floatOrder(a.sum.? / @as(f64, @floatFromInt(a.count)), num.asF64()),
-        .avg_dec => |a| if (a.count == 0 or a.sum == null) null else floatOrder(
-            wideAsFloat(a.sum.?) / std.math.pow(f64, 10, @floatFromInt(a.spec.scale)) /
-                @as(f64, @floatFromInt(a.count)),
-            num.asF64(),
-        ),
+        .avg_dec => |a| if (a.count == 0 or a.sum == null)
+            null
+        else
+            floatOrder(decimalMean(a.sum.?, a.spec, a.count, false), num.asF64()),
     };
 }
 
@@ -693,8 +755,10 @@ const CellNumber = union(enum) {
             .dec => |d| .{ .exact = .{ .v = d.v, .scale = d.spec.scale } },
             .f => |f| .{ .float = f },
             .avg => |a| if (a.count == 0 or a.sum == null) null else .{ .float = a.sum.? / @as(f64, @floatFromInt(a.count)) },
-            .avg_dec => |a| if (a.count == 0 or a.sum == null) null else .{ .float = wideAsFloat(a.sum.?) /
-                std.math.pow(f64, 10, @floatFromInt(a.spec.scale)) / @as(f64, @floatFromInt(a.count)) },
+            .avg_dec => |a| if (a.count == 0 or a.sum == null)
+                null
+            else
+                .{ .float = decimalMean(a.sum.?, a.spec, a.count, false) },
         };
     }
 
@@ -1033,44 +1097,9 @@ fn inPrecision(spec: expr_ast.Dec, v: i128) error{DecimalOverflow}!i128 {
     return if (@abs(v) >= @as(u128, @intCast(expr_ast.pow10(spec.precision)))) error.DecimalOverflow else v;
 }
 
-/// The DOUBLE an AVG over a DECIMAL(p, s) is, bit for bit as DuckDB 2.0 computes it from its exact sum and count (a
-/// last-bit difference flips a ROUND at a cent and a HAVING with it). Two plans compute it differently:
-///   - with no GROUP BY and no FILTER, DuckDB plans `CAST(sum AS DOUBLE) / CAST(count AS DOUBLE)`: the sum over 10^s
-///     rounded once to double (the cast is exact to the last bit), then divided by the count in double;
-///   - otherwise the aggregate finalizes it (`avg.cpp`): the sum is converted to a double from its two 64-bit words,
-///     divided by the count times the double 10^s. Up to 4 digits of precision (a SMALLINT inside) that is in double,
-///     above it in x87 `long double`, whose quotient rounds to 64 bits before the double's 53.
-/// A sum past 128 bits is no HUGEINT: DuckDB raises an overflow there, zpq answers with the mean from 113 bits.
-fn decimalMean(sum: i192, spec: expr_ast.Dec, count: i64, rewritten: bool) f64 {
-    const n: u64 = @intCast(count);
-    if (rewritten) return decimalAsDouble(sum, spec.scale) / @as(f64, @floatFromInt(n));
-    const wide = std.math.cast(i128, sum) orelse return decimalMeanWide(sum, spec.scale, count);
-    const scale = hugeintAs(f64, expr_ast.pow10(spec.scale));
-    if (spec.precision <= 4) return @as(f64, @floatFromInt(wide)) / (@as(f64, @floatFromInt(n)) * scale);
-    const divident: f80 = @as(f80, @floatFromInt(n)) * @as(f80, scale);
-    return @floatCast(hugeintAs(f80, wide) / divident);
-}
-
-/// `Hugeint::Cast<T>` of DuckDB: the low and the high word converted apart and added, so the only rounding is the add's
-/// (and the multiplication's, for a `double` high word; a power of ten below 2^53 words is exact in both).
-fn hugeintAs(comptime T: type, v: i128) T {
-    const lower: u64 = @truncate(@as(u128, @bitCast(v)));
-    const upper: i64 = @intCast(v >> 64);
-    const max_word: T = @floatFromInt(std.math.maxInt(u64));
-    if (upper == -1) return -@as(T, @floatFromInt(std.math.maxInt(u64) - lower)) - 1;
-    return @as(T, @floatFromInt(lower)) + @as(T, @floatFromInt(upper)) * (max_word + 1);
-}
-
 /// The double nearest `sum / 10^scale`, ties to even: DuckDB's cast of a DECIMAL to DOUBLE.
 fn decimalAsDouble(sum: i192, scale: u8) f64 {
     return expr_ast.decimalToDouble(sum, scale);
-}
-
-/// A mean of a sum beyond 128 bits, which DuckDB cannot make: the sum over 10^scale over the count in 113 bits.
-fn decimalMeanWide(sum: i192, scale: u8, count: i64) f64 {
-    const per: f128 = @floatFromInt(expr_ast.pow10(scale));
-    const mean: f128 = wideAsFloat(sum) / per / @as(f128, @floatFromInt(count));
-    return @floatCast(mean);
 }
 
 /// How two values of `PostType`s order: exactly when both are integers or DECIMALs (at the larger scale), else as
@@ -1426,6 +1455,45 @@ test "HAVING keeps only TRUE groups before the cut; without GROUP BY it may leav
     try global.finish(gpa, &scalar, null);
     try std.testing.expect(scalar.no_row);
     try std.testing.expectEqual(@as(usize, 1), scalar.aggs.len);
+}
+
+test "a compared AVG over a DECIMAL filters and ranks by its DOUBLE, then answers its rounded mean" {
+    const gpa = std.testing.allocator;
+    var out: scan.AggOutput = .{};
+    defer out.deinit(gpa);
+    // Rows (g, avg of a DECIMAL(4, 0)): one 1 among g values. 1/200, 1/201 and 1/202 all print 0.0050 at DECIMAL(8, 4);
+    // only the DOUBLE tells them apart, as DuckDB's does.
+    const groups = [_]i64{ 200, 201, 202 };
+    const rows = try gpa.alloc([]const scan.AggValue, groups.len);
+    @memset(rows, &.{});
+    out.group_rows = rows;
+    for (rows, groups) |*row, g| {
+        const r = try gpa.alloc(scan.AggValue, 2);
+        r[0] = .{ .i = g };
+        r[1] = .{ .avg_dec = .{ .sum = 1, .count = g, .mean = 0, .spec = .{ .precision = 4, .scale = 0 } } };
+        row.* = r;
+    }
+    const cols = try gpa.alloc([]const u8, 2);
+    @memset(cols, "");
+    out.group_cols = cols;
+    const types = [_]scan.GroupColType{
+        .{ .lane = .i64, .nullable = true },
+        .{ .lane = .dec, .dec = .{ .precision = 8, .scale = 4 }, .nullable = true },
+    };
+    var col_types: ?[]const scan.GroupColType = &types;
+    const below: expr_ast.Having = .{ .cmp = .{ .column = 1, .op = .lt, .literal = .{ .number = "0.005" } } };
+    const program: ResultProgram = .{ .order = .{
+        .keys = &.{.{ .column = 1, .descending = false }},
+        .having = &below,
+    } };
+    try program.finish(gpa, &out, &col_types);
+    const got = out.group_rows.?;
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    for (got, [_]i128{ 202, 201 }) |row, g| {
+        try std.testing.expectEqual(g, row[0].i);
+        const printed: scan.AggValue = .{ .dec = .{ .v = 50, .spec = .{ .precision = 8, .scale = 4 } } };
+        try std.testing.expectEqual(printed, row[1]);
+    }
 }
 
 test "slab rows: a cut keeps a few, compaction releases the rest, strings stay owned" {

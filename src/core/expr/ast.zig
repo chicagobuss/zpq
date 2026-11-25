@@ -190,6 +190,41 @@ pub fn decimalToDouble(sum: i192, scale: u8) f64 {
     return if (sum < 0) -magnitude else magnitude;
 }
 
+/// The DOUBLE an AVG over a DECIMAL(p, s) is, bit for bit as DuckDB 2.0 computes it from its exact sum and count (a
+/// last-bit difference flips a ROUND at a cent and a HAVING with it). Two plans compute it differently:
+///   - with no GROUP BY and no FILTER, DuckDB plans `CAST(sum AS DOUBLE) / CAST(count AS DOUBLE)`: the sum over 10^s
+///     rounded once to double (the cast is exact to the last bit), then divided by the count in double;
+///   - otherwise the aggregate finalizes it (`avg.cpp`): the sum is converted to a double from its two 64-bit words,
+///     divided by the count times the double 10^s. Up to 4 digits of precision (a SMALLINT inside) that is in double,
+///     above it in x87 `long double`, whose quotient rounds to 64 bits before the double's 53.
+/// A sum past 128 bits is no HUGEINT: DuckDB raises an overflow there, zpq answers with the mean from 113 bits.
+pub fn decimalMean(sum: i192, spec: Dec, count: i64, rewritten: bool) f64 {
+    const n: u64 = @intCast(count);
+    if (rewritten) return decimalToDouble(sum, spec.scale) / @as(f64, @floatFromInt(n));
+    const wide = std.math.cast(i128, sum) orelse return decimalMeanWide(sum, spec.scale, count);
+    const scale = hugeintAs(f64, pow10(spec.scale));
+    if (spec.precision <= 4) return @as(f64, @floatFromInt(wide)) / (@as(f64, @floatFromInt(n)) * scale);
+    const divident: f80 = @as(f80, @floatFromInt(n)) * @as(f80, scale);
+    return @floatCast(hugeintAs(f80, wide) / divident);
+}
+
+/// `Hugeint::Cast<T>` of DuckDB: the low and the high word converted apart and added, so the only rounding is the add's
+/// (and the multiplication's, for a `double` high word; a power of ten below 2^53 words is exact in both).
+fn hugeintAs(comptime T: type, v: i128) T {
+    const lower: u64 = @truncate(@as(u128, @bitCast(v)));
+    const upper: i64 = @intCast(v >> 64);
+    const max_word: T = @floatFromInt(std.math.maxInt(u64));
+    if (upper == -1) return -@as(T, @floatFromInt(std.math.maxInt(u64) - lower)) - 1;
+    return @as(T, @floatFromInt(lower)) + @as(T, @floatFromInt(upper)) * (max_word + 1);
+}
+
+/// A mean of a sum beyond 128 bits, which DuckDB cannot make: the sum over 10^scale over the count in 113 bits.
+fn decimalMeanWide(sum: i192, scale: u8, count: i64) f64 {
+    const per: f128 = @floatFromInt(pow10(scale));
+    const mean: f128 = decimalToDouble(sum, 0) / per / @as(f128, @floatFromInt(count));
+    return @floatCast(mean);
+}
+
 /// `round(x, digits)` of a double as DuckDB computes it: scale, round half away from zero, scale back. A non-finite
 /// input stays as it is, and so does a finite one whose scaling overflows to a non-finite value for positive digits;
 /// for negative digits that overflow is 0.
@@ -1230,6 +1265,9 @@ pub const SelectColumn = struct {
     role: Role = .named,
     /// A `derived` column's expression over other result columns.
     post: ?*const PostExpr = null,
+    /// A bare AVG that HAVING or ORDER BY reads: they compare its value, the DOUBLE an expression reads
+    /// (`decimalMean`), not the rounded DECIMAL mean it prints for a DECIMAL (`AggCall.compared`).
+    compared: bool = false,
 
     /// `derived`: computed from the group's other result columns after aggregation (`sum(a) / sum(b)`), so the scan
     /// binds nothing for it; the aggregates it reads are hidden columns (`ResultOrder.hidden`).

@@ -587,6 +587,26 @@ fn validateAggregateSchemas(args: MultiAggArgs, metas: []const schema.FileMetaDa
     }
 }
 
+/// A bare AVG of a DECIMAL that HAVING or ORDER BY compares (`SelectColumn.compared`) keeps its exact sum and count
+/// for them (`AggCall.compared`). The SQL list binds as `bindSqlOutputs` does: the SELECT items, then the hidden terms,
+/// each aggregate one taking the next call (without GROUP BY every scanned item is one).
+fn markCompared(
+    calls: []expr_agg.AggCall,
+    select: []const expr_ast.SelectColumn,
+    hidden: []const expr_ast.SelectColumn,
+    grouped: bool,
+) void {
+    var next: usize = 0;
+    for (0..select.len + hidden.len) |i| {
+        const col = if (i < select.len) select[i] else hidden[i - select.len];
+        if (!(col.role == .agg or (!grouped and col.role == .named))) continue;
+        if (next >= calls.len) return;
+        const call = &calls[next];
+        next += 1;
+        if (col.compared and call.func == .avg and call.result == .avg_dec and !call.state) call.compared = true;
+    }
+}
+
 pub fn bindAggregateQuery(arena: std.mem.Allocator, args: MultiAggArgs, meta0: *const schema.FileMetaData) !BoundQueryPhase {
     // 2. Parse aggregate + filter against meta0 (column indexes resolved
     //    against file 0; valid for all files because schemas match).
@@ -620,6 +640,7 @@ pub fn bindAggregateQuery(arena: std.mem.Allocator, args: MultiAggArgs, meta0: *
     var key_names = try KeyNames.init(arena, meta0, group_by_items orelse &.{});
     key_names.sql = sqlBound(args.select_cols);
     if (args.bound_aggregate == null) try nameUnaliasedAggs(arena, agg_calls, &key_names);
+    if (args.select_cols) |cols| markCompared(agg_calls, cols, args.result_order.hidden, grouped);
     const agg_sources = try arena.alloc(?schema.SchemaElement, agg_calls.len);
     for (agg_calls, agg_sources) |call, *src| src.* = passThroughSource(call, meta0);
     var group_outputs: ?[]const BoundOutputColumn = if (args.bound_aggregate) |bound| bound.outputs else if (group_by_items != null)

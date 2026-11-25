@@ -1899,6 +1899,7 @@ fn parseFolded(comptime structured: bool, allocator: std.mem.Allocator, folded_s
         tree.* = try ctx.build(having, 0);
         result_order.having = tree;
     }
+    markCompared(select_cols, hidden.items, result_order);
     for (hidden.items) |h| any_derived = any_derived or h.role == .derived;
     result_order.post = any_derived;
     result_order.hidden = try hidden.toOwnedSlice(allocator);
@@ -2454,6 +2455,26 @@ fn hiddenTerm(
     hidden.appendAssumeCapacity(.{ .expr = try allocator.dupe(u8, text), .role = if (info.has_agg) .agg else .key });
     if (lower) |l| try l.hidden.append(l.arena, expr);
     return hidden.items.len - 1;
+}
+
+/// Mark each bare AVG an ORDER BY key or a HAVING comparison reads (`SelectColumn.compared`): they compare its
+/// value, which for a DECIMAL is the DOUBLE an AVG in an expression reads, not the rounded mean the column prints.
+fn markCompared(select_cols: []ast.SelectColumn, hidden: []ast.SelectColumn, order: ast.ResultOrder) void {
+    const Mark = struct {
+        select: []ast.SelectColumn,
+        hidden: []ast.SelectColumn,
+        fn mark(m: @This(), j: usize) void {
+            const col = if (j < m.select.len)
+                &m.select[j]
+            else if (j - m.select.len < m.hidden.len) &m.hidden[j - m.select.len] else return;
+            // A key or a derived column is no aggregate call; the text of one starts with its name.
+            const call = col.role != .key and col.role != .derived;
+            if (call and std.ascii.startsWithIgnoreCase(col.expr, "avg(")) col.compared = true;
+        }
+    };
+    const m: Mark = .{ .select = select_cols, .hidden = hidden };
+    for (order.keys) |k| m.mark(k.column);
+    if (order.having) |h| h.eachColumn(m, Mark.mark);
 }
 
 /// Whether `node` reads a result: an aggregate or a column, not a constant.
@@ -3340,6 +3361,23 @@ test "sql_parser hands NOT over groups on as the predicate written" {
         defer q.deinit(a);
         try std.testing.expectEqualStrings(case.filter, q.filter_str.?);
     }
+}
+
+test "sql_parser marks the bare AVGs HAVING and ORDER BY compare, by alias, position or a hidden term" {
+    const a = std.testing.allocator;
+    const q = try parseSqlQuery(a, "SELECT k, avg(x) AS m, AVG(y), avg(z), avg(w) + 1 AS e FROM 't' GROUP BY k HAVING avg(v) > 1 AND m < 2 ORDER BY 3, e");
+    defer q.deinit(a);
+    const marked = [_]bool{ false, true, true, false, false };
+    for (q.select_cols, marked) |col, want| try std.testing.expectEqual(want, col.compared);
+    // `avg(v)` is a hidden term; `e` reads its own `avg_state(w)`, which no comparison reads bare.
+    var hidden_avg = false;
+    for (q.result_order.hidden) |h| {
+        if (std.mem.eql(u8, h.expr, "avg(v)")) hidden_avg = h.compared else try std.testing.expect(!h.compared);
+    }
+    try std.testing.expect(hidden_avg);
+    const scalar = try parseSqlQuery(a, "SELECT avg(x) FROM 't' HAVING avg(x) > 1");
+    defer scalar.deinit(a);
+    try std.testing.expect(scalar.select_cols[0].compared);
 }
 
 test "sql_parser lowers HAVING to result columns, hidden terms and literals" {

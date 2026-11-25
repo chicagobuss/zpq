@@ -42,7 +42,7 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
             .dec => decValue(state.max_d, expr_agg.resultDec(call)),
             .avg_f64, .avg_dec => unreachable,
         },
-        .avg => if (call.state)
+        .avg => if (call.state or (call.compared and call.result == .avg_dec))
             try avgStateValue(call, state)
         else if (call.result == .avg_dec)
             decValue(try expr_agg.avgDecMean(call, state.avg_d), expr_agg.resultDec(call))
@@ -65,7 +65,8 @@ pub fn materializeOne(gpa: std.mem.Allocator, call: expr_agg.AggCall, state: exp
     };
 }
 
-/// avg_state's mergeable pair. A DECIMAL one keeps its mean at the argument's scale only to rank and filter by.
+/// avg_state's mergeable pair, also the cell of a `compared` avg over a DECIMAL: the exact sum and count, at the
+/// argument's type.
 fn avgStateValue(call: expr_agg.AggCall, state: expr_agg.Accumulator) !AggValue {
     if (call.result != .avg_dec)
         return .{ .avg = .{ .sum = expr_agg.avgSum(state.avg), .count = @intCast(state.avg.count) } };
@@ -73,7 +74,7 @@ fn avgStateValue(call: expr_agg.AggCall, state: expr_agg.Accumulator) !AggValue 
         .sum = state.avg_d.wide(),
         .count = @intCast(state.avg_d.n),
         .mean = try state.avg_d.mean(),
-        .spec = expr_agg.resultDec(call),
+        .spec = call.arg.?.decSpec().?,
     } };
 }
 

@@ -157,6 +157,10 @@ pub const AggCall = struct {
     /// `avg_state(x)`: an avg that answers its mergeable sum and count instead of the mean. It folds exactly as
     /// `avg(x)` does (same `func` and `result`); only what it answers differs.
     state: bool = false,
+    /// An avg over a DECIMAL that HAVING or ORDER BY compares (`SelectColumn.compared`): its cell keeps the exact sum
+    /// and count, as avg_state's does, so they read the DOUBLE an expression reads; the result program then answers
+    /// the rounded DECIMAL mean every bare avg does.
+    compared: bool = false,
     /// `min`/`max` of `make_date(col)`, folded over `col` itself (`arg`): the answer is the DATE those days are.
     as_date: bool = false,
     /// The quantile `quantile_cont` takes (`median` is 0.5), a constant in [0, 1].

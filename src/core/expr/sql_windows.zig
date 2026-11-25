@@ -95,9 +95,7 @@ const Builder = struct {
     /// `column` for a key the window partitions or orders by, which compares its value: a bare AVG is staged as the
     /// DOUBLE an AVG in an expression reads (`avg(x) + 0`), not as the rounded DECIMAL mean it prints for a DECIMAL.
     fn key(self: *Builder, node: *c.LpNode, what: []const u8) Error![]const u8 {
-        const bare = node.kind == c.LP_EXPR_FUNCTION and node.u.function.over == null and node.u.function.name != null;
-        const avg = bare and std.ascii.eqlIgnoreCase(std.mem.span(node.u.function.name), "avg");
-        if (!avg) return self.column(node, what);
+        if (!bareAvg(node)) return self.column(node, what);
         return self.input(try std.fmt.allocPrint(self.arena, "{s} + 0", .{try self.unparse(node)}));
     }
 
@@ -517,6 +515,31 @@ fn sameSort(a: []const wp.SortKey, b: []const wp.SortKey) bool {
     return true;
 }
 
+/// Whether `node` is a bare `avg(...)`, an aggregate call and no window function.
+fn bareAvg(node: *const c.LpNode) bool {
+    if (node.kind != c.LP_EXPR_FUNCTION or node.u.function.over != null or node.u.function.name == null) return false;
+    return std.ascii.eqlIgnoreCase(std.mem.span(node.u.function.name), "avg");
+}
+
+/// The expression an outer ORDER BY term sorts by: the select item a position or an output name gives, else itself.
+fn orderedItem(sel: anytype, names: []const []const u8, expr: *c.LpNode) *c.LpNode {
+    const at: ?usize = if (expr.kind == c.LP_EXPR_LITERAL_INT) blk: {
+        const pos = std.fmt.parseInt(usize, std.mem.span(expr.u.literal.value), 10) catch break :blk null;
+        break :blk if (pos >= 1) pos - 1 else null;
+    } else if (expr.kind == c.LP_EXPR_COLUMN_REF and expr.u.column_ref.table == null) blk: {
+        const col = std.mem.span(expr.u.column_ref.column);
+        for (names, 0..) |al, idx| {
+            const bare = if (al.len >= 2 and al[0] == '"') al[1 .. al.len - 1] else al;
+            if (std.ascii.eqlIgnoreCase(bare, col)) break :blk idx;
+        }
+        break :blk null;
+    } else null;
+    const idx = at orelse return expr;
+    if (idx >= @as(usize, @intCast(sel.result_columns.count))) return expr;
+    const rc: *c.LpNode = sel.result_columns.items[idx] orelse return expr;
+    return if (rc.kind == c.LP_RESULT_COLUMN) rc.u.result_column.expr orelse expr else rc;
+}
+
 fn hasWindow(node: *c.LpNode) bool {
     var found = false;
     const Visit = struct {
@@ -672,7 +695,12 @@ pub fn build(arena: std.mem.Allocator, full_text: [:0]const u8, why: *Refusal, c
             const expr: *c.LpNode = t.expr orelse return error.SqlParseError;
             if (i > 0) try tail.appendSlice(arena, ", ");
             var named = false;
-            if (expr.kind == c.LP_EXPR_LITERAL_INT) {
+            // A bare AVG, written or named by position or alias, sorts by its value (`key`); the item still shows it.
+            const item = orderedItem(sel, aliases.items, expr);
+            if (bareAvg(item)) {
+                try tail.print(arena, "\"{s}\"", .{try b.key(item, "ORDER BY")});
+                named = true;
+            } else if (expr.kind == c.LP_EXPR_LITERAL_INT) {
                 try tail.appendSlice(arena, std.mem.span(expr.u.literal.value));
                 named = true;
             } else if (expr.kind == c.LP_EXPR_COLUMN_REF and expr.u.column_ref.table == null) {
@@ -769,6 +797,17 @@ test "a window partitions and orders by a bare AVG as the DOUBLE, and its argume
     try std.testing.expect(std.mem.indexOf(u8, plan.input_sql, "avg(d) AS \"c1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan.input_sql, "avg(e) + 0 AS") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan.input_sql, "avg(d) + 0 AS") != null);
+    // The query's own ORDER BY sorts a bare AVG, written, by position or by alias, by that DOUBLE too.
+    for ([_][:0]const u8{
+        "SELECT g, avg(d) AS m, count(*) OVER () AS n FROM t GROUP BY g ORDER BY avg(d), g DESC",
+        "SELECT g, avg(d) AS m, count(*) OVER () AS n FROM t GROUP BY g ORDER BY m, g DESC",
+        "SELECT g, avg(d) AS m, count(*) OVER () AS n FROM t GROUP BY g ORDER BY 2, g DESC",
+    }) |sql| {
+        const sorted = try build(a, sql, &why, &.{ "g", "d" });
+        try std.testing.expect(std.mem.indexOf(u8, sorted.input_sql, "avg(d) AS \"c1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, sorted.input_sql, "avg(d) + 0 AS \"c2\"") != null);
+        try std.testing.expect(std.mem.startsWith(u8, sorted.final_tail, "ORDER BY \"c2\", "));
+    }
 }
 
 test "QUALIFY binds a name to the last select item of that alias, in any select item and anywhere in the condition" {

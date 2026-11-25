@@ -48,9 +48,9 @@ const Worker = struct {
         }
     }
     fn stop(self: *Worker) void {
-        _ = std.os.linux.shutdown(self.endpoint.listen_fd, std.os.linux.SHUT.RDWR);
+        self.endpoint.stop();
         fake.killChild(&self.child);
-        _ = std.os.linux.shutdown(self.runtime.listen_fd, std.os.linux.SHUT.RDWR);
+        self.runtime.stop();
         if (self.thread) |t| t.join();
         self.endpoint.deinit();
         self.runtime.deinit();
@@ -185,7 +185,6 @@ fn oracleWithOrder(scratch: std.mem.Allocator, c: Case, suffix: []const u8) !V {
 }
 
 test "fanout parity: eight query shapes, wrong counts, globs, real Invoke and DuckDB" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     var fixture: Fixture = undefined;
     try fixture.start();
     defer fixture.stop();
@@ -256,7 +255,7 @@ test "fanout Invoke retries transient failures exactly once per split and report
                                 "HTTP/1.1 200 OK\r\nX-Amz-Function-Error: Unhandled\r\nContent-Length: 100\r\n\r\n{"
                             else
                                 "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{";
-                            _ = std.os.linux.sendto(req.conn, raw.ptr, raw.len, std.os.linux.MSG.NOSIGNAL, null, 0);
+                            fake.writeAllFd(req.conn, raw) catch {};
                         }
                         req.deinit();
                         continue;
@@ -296,7 +295,7 @@ test "fanout Invoke retries transient failures exactly once per split and report
         defer server.server.deinit();
         const thread = try std.Thread.spawn(.{}, Server.serve, .{&server});
         defer {
-            _ = std.os.linux.shutdown(server.server.listen_fd, std.os.linux.SHUT.RDWR);
+            server.server.stop();
             thread.join();
         }
         var pool: zpq.io.invoke.Pool = undefined;
@@ -362,17 +361,16 @@ test "fanout Invoke permits function execution beyond S3 first-byte and body idl
             defer req.deinit();
             zpq.clock.sleepNs(11 * std.time.ns_per_s);
             const header = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
-            const linux = std.os.linux;
-            if (linux.sendto(req.conn, header.ptr, header.len, linux.MSG.NOSIGNAL, null, 0) != header.len) return;
+            fake.writeAllFd(req.conn, header) catch return;
             zpq.clock.sleepNs(11 * std.time.ns_per_s);
-            _ = linux.sendto(req.conn, "{}".ptr, 2, linux.MSG.NOSIGNAL, null, 0);
+            fake.writeAllFd(req.conn, "{}") catch {};
         }
     };
     var server = try fake.FakeServer.start();
     defer server.deinit();
     const thread = try std.Thread.spawn(.{}, Slow.serve, .{&server});
     defer {
-        _ = std.os.linux.shutdown(server.listen_fd, std.os.linux.SHUT.RDWR);
+        server.stop();
         thread.join();
     }
     var pool: zpq.io.invoke.Pool = undefined;

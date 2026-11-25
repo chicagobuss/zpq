@@ -16,7 +16,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const linux = std.os.linux;
+const posix = std.posix;
+const sys = posix.system;
 const integration_opts = @import("integration_opts");
 
 const LAMBDA_BIN = integration_opts.lambda_bin;
@@ -27,35 +28,23 @@ const CLI_BIN = integration_opts.cli_bin;
 // ============================================================
 
 pub const FakeServer = struct {
-    listen_fd: linux.fd_t,
+    listen_fd: posix.fd_t,
     port: u16,
+    stopping: std.atomic.Value(bool) = .init(false),
 
     pub fn start() !FakeServer {
-        const fd = try sysSocket();
-        errdefer sysClose(fd);
-
-        // SO_REUSEADDR so re-running tests doesn't hit TIME_WAIT.
-        const yes: i32 = 1;
-        _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&yes).ptr, @sizeOf(i32));
-
-        var addr = std.mem.zeroes(linux.sockaddr.in);
-        addr.family = linux.AF.INET;
-        addr.port = 0; // kernel picks
-        addr.addr = std.mem.nativeToBig(u32, 0x7f000001); // 127.0.0.1
-        if (errIs(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in)))) return error.BindFailed;
-        if (errIs(linux.listen(fd, 8))) return error.ListenFailed;
-
-        // Read back the assigned port.
-        var bound = std.mem.zeroes(linux.sockaddr.in);
-        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
-        if (errIs(linux.getsockname(fd, @ptrCast(&bound), &len))) return error.GetsocknameFailed;
-        const port = std.mem.bigToNative(u16, bound.port);
-
-        return .{ .listen_fd = fd, .port = port };
+        const listener = try listenLocal(8);
+        return .{ .listen_fd = listener.fd, .port = listener.port };
     }
 
     pub fn deinit(self: *FakeServer) void {
         sysClose(self.listen_fd);
+    }
+
+    /// Fails the `acceptRequest` a thread is blocked in, and every later one.
+    pub fn stop(self: *FakeServer) void {
+        self.stopping.store(true, .release);
+        wakeAccept(self.port);
     }
 
     /// Accept one connection, read the request, return the parsed
@@ -63,6 +52,7 @@ pub const FakeServer = struct {
     pub fn acceptRequest(self: *FakeServer, allocator: std.mem.Allocator) !Request {
         const conn = try sysAccept(self.listen_fd);
         errdefer sysClose(conn);
+        if (self.stopping.load(.acquire)) return error.Stopped;
 
         const raw = try readUntilHeadersOrBody(allocator, conn);
         const parsed = try parseRequest(allocator, raw);
@@ -78,7 +68,7 @@ pub const FakeServer = struct {
 };
 
 pub const Request = struct {
-    conn: linux.fd_t,
+    conn: posix.fd_t,
     method: []const u8,
     path: []const u8,
     body: []const u8,
@@ -110,14 +100,7 @@ pub const Request = struct {
             .{ status, status_text, body.len, extra_headers, body },
         );
         defer allocator.free(resp);
-        var off: usize = 0;
-        while (off < resp.len) {
-            const r = linux.write(self.conn, resp[off..].ptr, resp.len - off);
-            if (errIs(r)) return error.WriteFailed;
-            const n: usize = @intCast(r);
-            if (n == 0) break;
-            off += n;
-        }
+        try writeAllFd(self.conn, resp);
     }
 };
 
@@ -177,7 +160,7 @@ fn parseRequest(allocator: std.mem.Allocator, raw: []const u8) !ParsedRequest {
 /// Read until we have at least the headers + Content-Length-many body bytes.
 /// HTTP/1.1 with Connection: close usually lets the kernel deliver everything
 /// before the recv loop ends, but we don't rely on that.
-fn readUntilHeadersOrBody(allocator: std.mem.Allocator, fd: linux.fd_t) ![]u8 {
+fn readUntilHeadersOrBody(allocator: std.mem.Allocator, fd: posix.fd_t) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     var tmp: [4096]u8 = undefined;
@@ -185,8 +168,8 @@ fn readUntilHeadersOrBody(allocator: std.mem.Allocator, fd: linux.fd_t) ![]u8 {
     var headers_end: ?usize = null;
 
     while (true) {
-        const r = linux.read(fd, &tmp, tmp.len);
-        if (errIs(r)) return error.ReadFailed;
+        const r = sys.read(fd, &tmp, tmp.len);
+        if (posix.errno(r) != .SUCCESS) return error.ReadFailed;
         const n: usize = @intCast(r);
         if (n == 0) break;
         try buf.appendSlice(allocator, tmp[0..n]);
@@ -227,8 +210,9 @@ pub const FakeS3 = struct {
     const MAX_CONNS = 256;
     const ETAG = "fake-etag";
 
-    listen_fd: linux.fd_t,
+    listen_fd: posix.fd_t,
     port: u16,
+    stopping: std.atomic.Value(bool) = .init(false),
     object: []const u8,
     secondary: ?[]const u8 = null,
     tertiary: ?[]const u8 = null,
@@ -239,7 +223,7 @@ pub const FakeS3 = struct {
     idle_close_ms: i32,
     etag: []const u8 = ETAG,
     accept_thread: std.Thread = undefined,
-    conn_fds: [MAX_CONNS]linux.fd_t = @splat(-1),
+    conn_fds: [MAX_CONNS]posix.fd_t = @splat(-1),
     conn_threads: [MAX_CONNS]?std.Thread = @splat(null),
     /// Written only by the accept thread; read by `deinit` after joining it.
     conns: usize = 0,
@@ -259,22 +243,11 @@ pub const FakeS3 = struct {
         return self.startObjects(object, null, null, 0, etag);
     }
     fn startObjects(self: *FakeS3, object: []const u8, secondary: ?[]const u8, tertiary: ?[]const u8, idle_close_ms: i32, etag: []const u8) !void {
-        const fd = try sysSocket();
-        errdefer sysClose(fd);
-        const yes: i32 = 1;
-        _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, std.mem.asBytes(&yes).ptr, @sizeOf(i32));
-        var addr = std.mem.zeroes(linux.sockaddr.in);
-        addr.family = linux.AF.INET;
-        addr.addr = std.mem.nativeToBig(u32, 0x7f000001);
-        if (errIs(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in)))) return error.BindFailed;
-        if (errIs(linux.listen(fd, 64))) return error.ListenFailed;
-        var bound = std.mem.zeroes(linux.sockaddr.in);
-        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
-        if (errIs(linux.getsockname(fd, @ptrCast(&bound), &len))) return error.GetsocknameFailed;
-
+        const listener = try listenLocal(64);
+        errdefer sysClose(listener.fd);
         self.* = .{
-            .listen_fd = fd,
-            .port = std.mem.bigToNative(u16, bound.port),
+            .listen_fd = listener.fd,
+            .port = listener.port,
             .object = object,
             .secondary = secondary,
             .tertiary = tertiary,
@@ -286,10 +259,11 @@ pub const FakeS3 = struct {
 
     /// Call after the Lambda child is gone, so every connection thread has seen its peer close.
     pub fn deinit(self: *FakeS3) void {
-        _ = linux.shutdown(self.listen_fd, linux.SHUT.RDWR);
+        self.stopping.store(true, .release);
+        wakeAccept(self.port);
         self.accept_thread.join();
         for (self.conn_fds[0..self.conns], self.conn_threads[0..self.conns]) |fd, thread| {
-            _ = linux.shutdown(fd, linux.SHUT.RDWR);
+            _ = sys.shutdown(fd, posix.SHUT.RDWR);
             if (thread) |t| t.join();
             sysClose(fd);
         }
@@ -299,13 +273,14 @@ pub const FakeS3 = struct {
     fn acceptLoop(self: *FakeS3) void {
         while (self.conns < MAX_CONNS) {
             const fd = sysAccept(self.listen_fd) catch return;
+            if (self.stopping.load(.acquire)) return sysClose(fd);
             self.conn_fds[self.conns] = fd;
             self.conn_threads[self.conns] = std.Thread.spawn(.{}, serveConn, .{ self, fd }) catch null;
             self.conns += 1;
         }
     }
 
-    fn serveConn(self: *FakeS3, fd: linux.fd_t) void {
+    fn serveConn(self: *FakeS3, fd: posix.fd_t) void {
         var buf: [16 * 1024]u8 = undefined;
         var len: usize = 0;
         while (true) {
@@ -318,23 +293,23 @@ pub const FakeS3 = struct {
             }
             if (len == buf.len) return;
             if (self.idle_close_ms > 0 and len == 0) {
-                var pfd = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
-                const r = linux.poll(&pfd, 1, self.idle_close_ms);
-                if (errIs(r)) return;
+                var pfd = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+                const r = sys.poll(&pfd, 1, self.idle_close_ms);
+                if (posix.errno(r) != .SUCCESS) return;
                 if (r == 0) {
                     // FIN now; `deinit` closes the descriptor.
                     _ = self.idle_closes.fetchAdd(1, .monotonic);
-                    _ = linux.shutdown(fd, linux.SHUT.RDWR);
+                    _ = sys.shutdown(fd, posix.SHUT.RDWR);
                     return;
                 }
             }
-            const r = linux.read(fd, buf[len..].ptr, buf.len - len);
-            if (errIs(r) or r == 0) return;
-            len += r;
+            const r = sys.read(fd, buf[len..].ptr, buf.len - len);
+            if (posix.errno(r) != .SUCCESS or r == 0) return;
+            len += @intCast(r);
         }
     }
 
-    fn respond(self: *FakeS3, fd: linux.fd_t, head: []const u8) !void {
+    fn respond(self: *FakeS3, fd: posix.fd_t, head: []const u8) !void {
         _ = self.requests.fetchAdd(1, .monotonic);
         const first_line = head[0 .. std.mem.indexOf(u8, head, "\r\n") orelse head.len];
         if (std.mem.indexOf(u8, first_line, "/missing.parquet") != null or
@@ -409,12 +384,14 @@ pub const FakeS3 = struct {
     }
 };
 
-fn writeAllFd(fd: linux.fd_t, bytes: []const u8) !void {
+/// Writes all of `bytes`; a peer that has gone is an error, never SIGPIPE (MSG_NOSIGNAL, or SO_NOSIGPIPE from `sysAccept`).
+pub fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
+    const flags = if (@hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0;
     var off: usize = 0;
     while (off < bytes.len) {
-        const r = linux.write(fd, bytes[off..].ptr, bytes.len - off);
-        if (errIs(r) or r == 0) return error.WriteFailed;
-        off += r;
+        const r = sys.sendto(fd, bytes[off..].ptr, bytes.len - off, flags, null, 0);
+        if (posix.errno(r) != .SUCCESS or r == 0) return error.WriteFailed;
+        off += @intCast(r);
     }
 }
 
@@ -446,10 +423,13 @@ fn spawnLambdaForS3(allocator: std.mem.Allocator, runtime_endpoint: []const u8, 
 }
 
 /// Pin `pid` (and the threads it starts afterwards) to one CPU. The read stage's worker hand-off races are easiest to
-/// lose on a single CPU, which is also what a small Lambda gets.
-fn pinToOneCpu(pid: linux.pid_t) void {
+/// lose on a single CPU, which is also what a small Lambda gets. Linux only: Darwin cannot pin a process to a CPU, so there
+/// the test runs unpinned.
+fn pinToOneCpu(pid: posix.pid_t) void {
+    if (builtin.os.tag != .linux) return;
+    const linux = std.os.linux;
     var set: linux.cpu_set_t = @splat(0);
-    if (errIs(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &set))) return;
+    if (linux.errno(linux.sched_getaffinity(0, @sizeOf(linux.cpu_set_t), &set)) != .SUCCESS) return;
     for (set, 0..) |word, i| if (word != 0) {
         var one: linux.cpu_set_t = @splat(0);
         one[i] = @as(usize, 1) << @intCast(@ctz(word));
@@ -1092,8 +1072,8 @@ test "lambda reopens S3 connections the server dropped while it sat idle, withou
 
     const Step = struct { idle_ms: u64, stale: bool };
     for ([_]Step{ .{ .idle_ms = 400, .stale = true }, .{ .idle_ms = 4300, .stale = false } }) |step| {
-        const ts: linux.timespec = .{ .sec = @intCast(step.idle_ms / 1000), .nsec = @intCast((step.idle_ms % 1000) * std.time.ns_per_ms) };
-        _ = linux.nanosleep(&ts, null);
+        const ts: posix.timespec = .{ .sec = @intCast(step.idle_ms / 1000), .nsec = @intCast((step.idle_ms % 1000) * std.time.ns_per_ms) };
+        _ = sys.nanosleep(&ts, null);
         const resp = try invoke(&server, a, body);
         defer a.free(resp);
         const parsed = try std.json.parseFromSlice(std.json.Value, a, resp, .{});
@@ -1182,62 +1162,64 @@ test "lambda prunes S3 row groups on Bloom filters and reuses the filters warm" 
 }
 
 fn readFileSlice(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var path_z: [256]u8 = undefined;
-    if (path.len + 1 > path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-
-    const r_open = linux.openat(linux.AT.FDCWD, @ptrCast(&path_z[0]), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    const fd: linux.fd_t = blk: {
-        if (errIs(r_open)) return error.FileNotFound;
-        break :blk @intCast(@as(isize, @bitCast(r_open)));
-    };
-    defer _ = linux.close(fd);
-
-    const SEEK_END: usize = 2;
-    const SEEK_SET: usize = 0;
-    const end_pos = linux.lseek(fd, 0, SEEK_END);
-    if (errIs(end_pos)) return error.SeekFailed;
-    _ = linux.lseek(fd, 0, SEEK_SET);
-    const size: usize = @intCast(end_pos);
-
-    const buf = try allocator.alloc(u8, size);
-    errdefer allocator.free(buf);
-    var off: usize = 0;
-    while (off < size) {
-        const n = linux.read(fd, buf[off..].ptr, size - off);
-        if (errIs(n)) return error.ReadFailed;
-        const bytes: usize = @intCast(n);
-        if (bytes == 0) break;
-        off += bytes;
-    }
-    return buf;
+    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .unlimited);
 }
 
 // ============================================================
 // Raw syscall helpers
 // ============================================================
 
-fn sysSocket() !linux.fd_t {
-    const r = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
-    if (errIs(r)) return error.SocketFailed;
-    return @intCast(@as(isize, @bitCast(r)));
+/// A TCP socket listening on a kernel-chosen 127.0.0.1 port.
+fn listenLocal(backlog: u31) !struct { fd: posix.fd_t, port: u16 } {
+    const fd = try sysSocket();
+    errdefer sysClose(fd);
+    // SO_REUSEADDR so re-running tests doesn't hit TIME_WAIT.
+    const yes: c_int = 1;
+    _ = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&yes), @sizeOf(c_int));
+    var addr: posix.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    if (posix.errno(sys.bind(fd, @ptrCast(&addr), len)) != .SUCCESS) return error.BindFailed;
+    if (posix.errno(sys.listen(fd, backlog)) != .SUCCESS) return error.ListenFailed;
+    if (posix.errno(sys.getsockname(fd, @ptrCast(&addr), &len)) != .SUCCESS) return error.GetsocknameFailed;
+    return .{ .fd = fd, .port = std.mem.bigToNative(u16, addr.port) };
 }
 
-fn sysAccept(listen_fd: linux.fd_t) !linux.fd_t {
-    const r = linux.accept4(listen_fd, null, null, linux.SOCK.CLOEXEC);
-    if (errIs(r)) return error.AcceptFailed;
-    return @intCast(@as(isize, @bitCast(r)));
+/// Returns a thread blocked in `accept` on the 127.0.0.1 `port` by connecting to it once; the acceptor checks its stop
+/// flag first. Shutting the listening socket down would wake it on Linux only: on Darwin it fails and `accept` waits on.
+fn wakeAccept(port: u16) void {
+    const fd = sysSocket() catch return;
+    defer sysClose(fd);
+    const addr: posix.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    _ = sys.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
 }
 
-fn sysClose(fd: linux.fd_t) void {
-    _ = linux.close(fd);
+// Darwin has no SOCK_CLOEXEC or accept4: the flag is set after. Either way no spawned child inherits a test socket.
+const cloexec = if (builtin.os.tag == .linux) posix.SOCK.CLOEXEC else 0;
+
+fn sysSocket() !posix.fd_t {
+    const r = sys.socket(posix.AF.INET, posix.SOCK.STREAM | cloexec, posix.IPPROTO.TCP);
+    if (posix.errno(r) != .SUCCESS) return error.SocketFailed;
+    const fd: posix.fd_t = @intCast(r);
+    if (builtin.os.tag != .linux) _ = sys.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
+    return fd;
 }
 
-fn errIs(r: usize) bool {
-    const signed: isize = @bitCast(r);
-    return signed >= -4095 and signed < 0;
+fn sysAccept(listen_fd: posix.fd_t) !posix.fd_t {
+    const r = if (builtin.os.tag == .linux) sys.accept4(listen_fd, null, null, cloexec) else sys.accept(listen_fd, null, null);
+    if (posix.errno(r) != .SUCCESS) return error.AcceptFailed;
+    const fd: posix.fd_t = @intCast(r);
+    if (builtin.os.tag != .linux) _ = sys.fcntl(fd, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
+    if (@hasDecl(posix.SO, "NOSIGPIPE")) {
+        const one: c_int = 1;
+        _ = sys.setsockopt(fd, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&one), @sizeOf(c_int));
+    }
+    return fd;
 }
+
+fn sysClose(fd: posix.fd_t) void {
+    _ = sys.close(fd);
+}
+
 
 test "lambda profiles an S3 query: requests, coalescing and footer fetches land in the summary" {
     const a = std.testing.allocator;

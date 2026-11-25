@@ -85,8 +85,7 @@ pub fn main(init: std.process.Init) !void {
     while (true) {
         var inv = client.nextInvocation() catch |err| {
             std.debug.print("zpq lambda: poll error {s}\n", .{@errorName(err)});
-            const ts: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };
-            _ = std.os.linux.nanosleep(&ts, null);
+            zpq.clock.sleepNs(std.time.ns_per_s);
             continue;
         };
         defer inv.deinit(allocator);
@@ -96,7 +95,7 @@ pub fn main(init: std.process.Init) !void {
         const left_ms: ?u64 = if (inv.deadline_ms) |d| @intCast(@max(0, d - zpq.clock.realtimeMs() - 1000)) else null;
         zpq.io.tls.setInvocationDeadline(left_ms);
         defer zpq.io.tls.setInvocationDeadline(null);
-        var watchdog: Watchdog = .{ .client = &client, .request_id = inv.request_id };
+        var watchdog: Watchdog = .{ .io = io, .client = &client, .request_id = inv.request_id };
         const watcher: ?std.Thread = if (left_ms) |ms| std.Thread.spawn(.{}, Watchdog.run, .{ &watchdog, ms }) catch
             null else null;
         defer if (watcher) |t| watchdog.stop(t);
@@ -139,6 +138,7 @@ pub fn main(init: std.process.Init) !void {
 /// still computing then was stopped with the sandbox, and the caller was told nothing. Whichever of it and the loop
 /// claims the invocation first posts for it.
 const Watchdog = struct {
+    io: std.Io,
     client: *runtime.Client,
     request_id: []const u8,
     /// 0 unanswered, 1 claimed by the loop, 2 by the watchdog.
@@ -151,11 +151,7 @@ const Watchdog = struct {
         while (self.done.load(.acquire) == 0) {
             const left = until - zpq.clock.monoNs();
             if (left <= 0) break;
-            const ts: std.os.linux.timespec = .{
-                .sec = @intCast(@divTrunc(left, std.time.ns_per_s)),
-                .nsec = @intCast(@mod(left, std.time.ns_per_s)),
-            };
-            _ = std.os.linux.futex_4arg(&self.done.raw, .{ .cmd = .WAIT, .private = true }, 0, &ts);
+            self.io.futexWaitTimeout(u32, &self.done.raw, 0, .{ .duration = .{ .raw = .fromNanoseconds(left), .clock = .awake } }) catch {};
         }
         if (self.done.load(.acquire) != 0) return;
         if (self.owner.cmpxchgStrong(0, 2, .acq_rel, .acquire) != null) return;
@@ -170,7 +166,7 @@ const Watchdog = struct {
 
     fn stop(self: *Watchdog, t: std.Thread) void {
         self.done.store(1, .release);
-        _ = std.os.linux.futex_3arg(&self.done.raw, .{ .cmd = .WAKE, .private = true }, 1);
+        self.io.futexWake(u32, &self.done.raw, 1);
         t.join();
     }
 };

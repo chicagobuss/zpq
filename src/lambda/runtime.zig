@@ -27,6 +27,10 @@
 
 const std = @import("std");
 const test_skip = @import("zpq").test_skip;
+const builtin = @import("builtin");
+const posix = std.posix;
+const sys = posix.system;
+/// The unit tests' fake runtime API only.
 const linux = std.os.linux;
 
 pub const Error = error{
@@ -70,7 +74,7 @@ pub const Invocation = struct {
 
 pub const Client = struct {
     /// Dotted-quad IPv4 address. Lambda always provides numeric host.
-    addr: linux.sockaddr.in,
+    addr: posix.sockaddr.in,
     /// Original "host:port" string — kept for diagnostics and the
     /// `Host:` HTTP header.
     host_header: []u8,
@@ -98,8 +102,7 @@ pub const Client = struct {
         }
         if (i != 4) return error.BadAddress;
 
-        var addr = std.mem.zeroes(linux.sockaddr.in);
-        addr.family = linux.AF.INET;
+        var addr: posix.sockaddr.in = .{ .port = 0, .addr = 0 };
         addr.port = std.mem.nativeToBig(u16, port);
         const ip: u32 = (@as(u32, parts[0]) << 24) | (@as(u32, parts[1]) << 16) | (@as(u32, parts[2]) << 8) | parts[3];
         addr.addr = std.mem.nativeToBig(u32, ip);
@@ -168,20 +171,24 @@ pub const Client = struct {
 
         // Its answer says whether the post was taken; a refused one leaves the invocation open for an /error.
         var answer: [1024]u8 = undefined;
-        const r = linux.read(sock, &answer, answer.len);
-        if (isErr(r)) return;
-        const got = answer[0..r];
+        const r = sys.read(sock, &answer, answer.len);
+        if (posix.errno(r) != .SUCCESS) return;
+        const got = answer[0..@intCast(r)];
         if (got.len < 12 or !std.mem.startsWith(u8, got, "HTTP/1.")) return;
         if (got[9] != '2') return error.PostRefused;
     }
 
-    fn connect(self: *const Client) Error!linux.fd_t {
-        const r = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
-        const sock = fdOrErr(r) catch return error.SocketFailed;
+    /// Lambda runs on Linux; the local worker processes the fanout tests start run on any POSIX host. Darwin has no
+    /// SOCK_CLOEXEC, so the flag is set after there.
+    fn connect(self: *const Client) Error!posix.fd_t {
+        const cloexec = if (builtin.os.tag == .linux) posix.SOCK.CLOEXEC else 0;
+        const r = sys.socket(posix.AF.INET, posix.SOCK.STREAM | cloexec, posix.IPPROTO.TCP);
+        if (posix.errno(r) != .SUCCESS) return error.SocketFailed;
+        const sock: posix.fd_t = @intCast(r);
         errdefer close(sock);
+        if (builtin.os.tag != .linux) _ = sys.fcntl(sock, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
 
-        const cr = linux.connect(sock, @ptrCast(&self.addr), @sizeOf(linux.sockaddr.in));
-        if (isErr(cr)) return error.ConnectFailed;
+        if (posix.errno(sys.connect(sock, @ptrCast(&self.addr), @sizeOf(posix.sockaddr.in))) != .SUCCESS) return error.ConnectFailed;
         return sock;
     }
 };
@@ -287,28 +294,28 @@ fn decodeChunked(allocator: std.mem.Allocator, raw: []const u8) Error![]u8 {
 // Raw socket helpers — same shape as the probe binary.
 // ============================================================
 
-fn close(fd: linux.fd_t) void {
-    _ = linux.close(fd);
+fn close(fd: posix.fd_t) void {
+    _ = sys.close(fd);
 }
 
-fn writeAll(fd: linux.fd_t, buf: []const u8) Error!void {
+fn writeAll(fd: posix.fd_t, buf: []const u8) Error!void {
     var off: usize = 0;
     while (off < buf.len) {
-        const r = linux.write(fd, buf[off..].ptr, buf.len - off);
-        if (isErr(r)) return error.WriteFailed;
+        const r = sys.write(fd, buf[off..].ptr, buf.len - off);
+        if (posix.errno(r) != .SUCCESS) return error.WriteFailed;
         const n: usize = @intCast(r);
         if (n == 0) return error.WriteFailed;
         off += n;
     }
 }
 
-fn readAll(allocator: std.mem.Allocator, fd: linux.fd_t) Error![]u8 {
+fn readAll(allocator: std.mem.Allocator, fd: posix.fd_t) Error![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(allocator);
     var tmp: [8192]u8 = undefined;
     while (true) {
-        const r = linux.read(fd, &tmp, tmp.len);
-        if (isErr(r)) return error.ReadFailed;
+        const r = sys.read(fd, &tmp, tmp.len);
+        if (posix.errno(r) != .SUCCESS) return error.ReadFailed;
         const n: usize = @intCast(r);
         if (n == 0) break;
         if (n > MAX_RESPONSE_BYTES - list.items.len) return error.ResponseTooLarge;
@@ -459,7 +466,7 @@ test "regression: a response the runtime API refuses is an error, not taken as p
 }
 
 test "nextInvocation reads a large event the runtime API sends chunked" {
-    // The client makes Linux syscalls directly, as Lambda runs only on Linux.
+    // The fake runtime API makes Linux syscalls directly.
     if (comptime test_skip.lacks(.linux)) return test_skip.skipNeeding(.linux, "Linux socket syscalls");
     const a = std.testing.allocator;
 

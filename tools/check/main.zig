@@ -728,6 +728,10 @@ fn runCase(
     run.matched += checks;
     if (c.refuse != null) run.expected += checks;
     if (c.same) |note| std.debug.print("BYTE-PARITY {s}: {s}\n", .{ c.id, note });
+    if (c.oracle) |o| if (std.mem.eql(u8, o.compare, "pinned")) std.debug.print("PINNED {s}: {s}\n", .{
+        c.id,
+        if (o.sql != null and verdict.pinned_by_oracle) "rows, and the oracle" else "rows",
+    });
 }
 
 fn checkCase(

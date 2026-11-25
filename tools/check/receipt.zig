@@ -18,6 +18,8 @@ pub const Counts = struct {
     skipped: u64 = 0,
     /// Unit tests that skipped; any one the verdict cannot excuse fails it (fixtures are a tier prerequisite).
     skips: []const Skip = &.{},
+    /// Cases that passed against pinned rows rather than an oracle's answer (`PINNED` lines), named in the verdict.
+    pinned: []const []const u8 = &.{},
 };
 
 /// A unit test that skipped. `need` is the host capability its own `test_skip.skipNeeding` named, as the runner's
@@ -84,6 +86,7 @@ pub const Receipt = struct {
 pub fn parseCounts(arena: Allocator, kind: Kind, log: []const u8, rc: u8) !Counts {
     var c: Counts = .{};
     var skips: std.ArrayList(Skip) = .empty;
+    var pinned: std.ArrayList([]const u8) = .empty;
     var lines = std.mem.splitScalar(u8, log, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \r");
@@ -106,7 +109,9 @@ pub fn parseCounts(arena: Allocator, kind: Kind, log: []const u8, rc: u8) !Count
                     c = .{ .total = p + s + f, .passed = p, .skipped = s, .failed = f };
                 }
             },
-            .cases => if (std.mem.startsWith(u8, line, "check: ") and std.mem.endsWith(u8, line, " checks match")) {
+            .cases => if (std.mem.startsWith(u8, line, "PINNED ")) {
+                try pinned.append(arena, line["PINNED ".len .. std.mem.indexOf(u8, line, ": ") orelse line.len]);
+            } else if (std.mem.startsWith(u8, line, "check: ") and std.mem.endsWith(u8, line, " checks match")) {
                 const body = line["check: ".len .. line.len - " checks match".len];
                 const slash = std.mem.indexOfScalar(u8, body, '/') orelse continue;
                 const m = try std.fmt.parseInt(u64, body[0..slash], 10);
@@ -129,6 +134,7 @@ pub fn parseCounts(arena: Allocator, kind: Kind, log: []const u8, rc: u8) !Count
     }
     if (kind == .plain) c = .{ .total = 1, .passed = @intFromBool(rc == 0), .failed = @intFromBool(rc != 0) };
     c.skips = skips.items;
+    c.pinned = pinned.items;
     return c;
 }
 
@@ -143,8 +149,9 @@ pub fn judge(arena: Allocator, io: std.Io, dir: []const u8, name: []const u8, sh
     return (try assess(arena, io, dir, name, sha)).why;
 }
 
-/// `why` as `judge`; `note` names a pass's hardware and platform skips, which a tier reports apart from its passes.
-pub const Assessment = struct { why: ?[]const u8 = null, note: ?[]const u8 = null };
+/// `why` as `judge`; `note` names a pass's hardware and platform skips, which a tier reports apart from its passes;
+/// `pinned` the cases it checked against pinned rows, which ran and are no skips.
+pub const Assessment = struct { why: ?[]const u8 = null, note: ?[]const u8 = null, pinned: ?[]const u8 = null };
 
 pub fn assess(arena: Allocator, io: std.Io, dir: []const u8, name: []const u8, sha: []const u8) !Assessment {
     const path = try std.fmt.allocPrint(arena, "{s}/{s}.json", .{ dir, name });
@@ -192,7 +199,8 @@ pub fn assess(arena: Allocator, io: std.Io, dir: []const u8, name: []const u8, s
         by_os += 1;
         unmet.insert(named);
     }
-    if (by_hardware == 0 and by_os == 0) return .{};
+    const pinned = if (c.pinned.len == 0) null else try std.mem.join(arena, ", ", c.pinned);
+    if (by_hardware == 0 and by_os == 0) return .{ .pinned = pinned };
     var note: std.ArrayList(u8) = .empty;
     if (by_hardware != 0) {
         try note.print(arena, "{d} skipped on {s}, which lacks", .{ by_hardware, r.header.host });
@@ -205,7 +213,7 @@ pub fn assess(arena: Allocator, io: std.Io, dir: []const u8, name: []const u8, s
         var it = unmet.iterator();
         while (it.next()) |n| try note.print(arena, " {t}", .{n});
     }
-    return .{ .note = note.items };
+    return .{ .note = note.items, .pinned = pinned };
 }
 
 /// `zpq-check verdict --dir DIR --expect a,b,c [--sha SHA]`: every expected stage judged; exit 1 on any failure.
@@ -234,6 +242,7 @@ pub fn verdictMain(arena: Allocator, io: std.Io, args: []const []const u8) !u8 {
             noted += 1;
             std.debug.print("PASS {s} (skips: {s})\n", .{ name, note });
         } else std.debug.print("PASS {s}\n", .{name});
+        if (v.why == null) if (v.pinned) |cases| std.debug.print("     {s} pinned: {s}\n", .{ name, cases });
     }
     const hw = if (noted == 0) "" else try std.fmt.allocPrint(arena, ", {d} with named skips", .{noted});
     const result = if (failed == 0 and n != 0) "pass" else "fail";
@@ -607,6 +616,11 @@ test "counts come from each runner's own summary, and a log without one ran noth
     try testing.expectEqual(@as(u64, 5), (try parseCounts(a, .units, "All 5 tests passed.\n", 0)).passed);
     const cases = try parseCounts(a, .cases, "check: 41/42 checks match\n", 1);
     try testing.expectEqual(@as(u64, 1), cases.failed);
+    // A case checked against pinned rows ran: it counts as a pass, by name, never as a skip.
+    const pinned = try parseCounts(a, .cases, "PINNED f:x: rows\ncheck: 5/5 checks match\n", 0);
+    try testing.expectEqual(@as(u64, 5), pinned.passed);
+    try testing.expectEqual(@as(u64, 0), pinned.skipped);
+    try testing.expectEqualStrings("f:x", pinned.pinned[0]);
     const contracts = try parseCounts(a, .contracts, "contracts: 13 passed, 3 skipped by named need, 0 failed\n", 0);
     try testing.expectEqual(@as(u64, 13), contracts.total);
     try testing.expectEqual(@as(u64, 0), (try parseCounts(a, .cases, "zpq-check: crashed\n", 134)).total);

@@ -2,6 +2,7 @@
 //! file (tools/check/readback.py). Every mode returns null on a match and a one-line reason otherwise.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const compare = @import("compare.zig");
 const oracle_mod = @import("oracle.zig");
 
@@ -45,7 +46,8 @@ pub const Spec = struct {
     max_scans: ?usize = null,
     /// Statements DuckDB runs first (a view over the input), as part of the question.
     setup: ?[]const u8 = null,
-    /// `pinned`: the expected rows, and why no rival reader is the oracle for them.
+    /// `pinned`: the expected rows, and why no rival reader is the oracle for them. With `sql`, the oracle's own
+    /// answer where it is the reference (`pinnedByOracle`).
     rows: ?[]const std.json.Value = null,
     why: ?[]const u8 = null,
     /// `tied_rows`: the positions of the ORDER BY columns in the answer. A tie at the cut may pick other rows, never
@@ -1366,7 +1368,13 @@ fn modeCorpusArrow(in: Inputs, _: Spec) !Reason {
     return corpusRows(in, got, want, widths);
 }
 
-/// Rows pinned in the case, where the rival readers are known to be wrong (`why` says how).
+/// Where a pinned case's `sql` is the oracle too: DuckDB finalizes a wide AVG in C `long double`, which is x87's 80
+/// bits only on x86_64, so its answer is the reference there and a platform's own elsewhere (64 bits on macOS arm64).
+pub const pinned_by_oracle = builtin.cpu.arch == .x86_64;
+
+/// Rows pinned in the case, where the rival readers are known to be wrong (`why` says how). A case with `sql` as well
+/// is also checked as `ordered` against the oracle where that is the reference (`pinned_by_oracle`), so a pin that
+/// stops equalling the reference engine fails there.
 fn modePinned(in: Inputs, spec: Spec) !Reason {
     if (spec.why == null) return error.PinnedRowsNeedAReason;
     const want_rows = spec.rows orelse return error.MissingRows;
@@ -1388,6 +1396,7 @@ fn modePinned(in: Inputs, spec: Spec) !Reason {
             ), compare.show(in.arena, e) });
         }
     }
+    if (spec.sql != null and pinned_by_oracle) if (try modeOrdered(in, spec)) |why| return fail(in, "oracle: {s}", .{why});
     return null;
 }
 

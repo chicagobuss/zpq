@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## 0.6.1 — 2026-11-26
+
+Bug fixes for zpq 0.6. For what 0.6 introduced, see 0.6.0 below.
+
+- **A bare `avg()` of a DECIMAL column compares its exact average in HAVING, ORDER BY, the LIMIT cut, window PARTITION BY/ORDER BY and QUALIFY.** In those clauses (including ORDER BY expressions, aliases and positions), zpq compares the DOUBLE from the exact sum and count, as documented, and `ORDER BY avg_state(x)` over a DECIMAL ranks by the same value; before, it compared the mean rounded to the printed scale, so `HAVING avg(x) = 0.005` kept a group whose average was 1/201. What a bare `avg()` prints is unchanged, and an outer query that reads an average column from a CTE or subquery still sees the printed DECIMAL.
+
+- **`round(x, n)` of a DOUBLE rounds the double's exact value at a halfway, half away from zero.** `round(CAST(2.675 AS DOUBLE), 2)` is 2.67 because that double is just below 2.675 (a DECIMAL literal such as `round(2.675, 2)` is exact and gives 2.68); before, zpq scaled and rounded, which could round in the incorrect direction at a halfway.
+
+- **`date_part` and `epoch_us` of a TIMESTAMP_NS truncate to the microsecond instead of rounding.** The year of `1969-12-31 23:59:59.999999999` is 1969. Casts are unchanged.
+
+- **The remainder of an integer type's minimum by -1 is 0 instead of an overflow error.** For example, `CAST(-128 AS TINYINT) % -1` is 0. Integer division `//` of the minimum by -1 is still an overflow error.
+
+- **A timestamp earlier than about 290,309 BC prints and converts instead of being refused.** Values such as `290309-12-21 (BC) 23:59:59.999` print and convert.
+
+- **DATE and TIMESTAMP literals and `CAST('…' AS DATE)` work as values in SQL expressions, and `DATE - DATE` is a BIGINT count of days.** They work in projections and aggregates, for example `SELECT date_diff('day', DATE '2024-01-01', day)`. A type error in an expression names the expression and its types instead of a bare "type mismatch in expression".
+
+- **`zpq --help` describes CSV input accurately.** The help text states that aggregates read a CSV directly, instead of implying they need Parquet.
+
+- **macOS: the zpq binary no longer exports weak symbols, so macOS no longer re-binds them on every launch.** On Apple Silicon, `zpq --version` goes from about 3.0 ms to 1.3 ms, and a short query is about 2 ms faster per run. The macOS builds of the TLS library (BoringSSL) are rebuilt with hidden symbols and no embedded build paths.
+
+- **Builds: the build declares each optimized compile's memory per architecture, and the wasm32 build compiles again.** arm64 builds stay within a memory cap instead of being killed.
+
+- **Development: the test suite checks answers against DuckDB 2.0.1 and runs natively on macOS.** The fanout and Lambda test servers use portable socket calls.
+
 ## 0.6.0 — 2026-11-21
 
 - **Performance against 0.5.2 and the other engines.** On the release benchmark, geometric mean wall time is 0.97× zpq 0.5.2 cold and 0.98× hot, with no confirmed regressions, and every write case beats DuckDB 2.0.0 and Polars 2.1.0 in both lanes. Against DuckDB 2.0.0 on AWS S3, Cloudflare R2 and Backblaze B2, geometric mean wall time is 0.72×, 0.70× and 0.69×, with every timed answer verified. On the joins suite against DuckDB 2.0.0, geometric mean wall time is 0.44× cold and 0.41× hot locally, and 0.56× over S3 (RustFS).

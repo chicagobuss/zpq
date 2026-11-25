@@ -1711,7 +1711,7 @@ fn evalDateName(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []
                 else => month_names[@intCast(try calendar.part(.month, unit, v) - 1)],
             };
         } else {
-            const day = try temporalCast(true, unit, arg.isUtc(), false, v);
+            const day = try temporalCast(true, unit, arg.isUtc(), v);
             const civil = calendar.civilFromDays(day);
             const next = if (civil.m == 12) calendar.daysFromCivil(civil.y + 1, 1, 1) else calendar.daysFromCivil(civil.y, civil.m + 1, 1);
             // The first day of the next month must be a DATE, as DuckDB computes it.
@@ -2305,7 +2305,7 @@ fn evalCast(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []cons
                     const unit = arg.temporal().?;
                     const out = try arena.alloc(i64, n);
                     for (in.values, out, 0..) |v, *o, i| {
-                        o.* = temporalCast(c.func == .cast_date, unit, arg.isUtc(), !c.lenient, v) catch
+                        o.* = temporalCast(c.func == .cast_date, unit, arg.isUtc(), v) catch
                             try castFails(c, &nulls, batch, col, i, error.ConversionOutOfRange);
                     }
                     return .{ .i64 = .{ .values = out, .def_levels = nulls.defLevels(), .max_def = nulls.levels(in.max_def), .has_nulls = nulls.hasNulls(in.has_nulls) } };
@@ -2635,14 +2635,11 @@ const roundDivAway = calendar.roundDivAway;
 /// reach microseconds exactly, and one beyond the range of a TIMESTAMP is `ConversionOutOfRange`. Infinity stays infinity.
 /// A UTC-adjusted value is read in UTC, as the date parts do; but a UTC-adjusted nanosecond (TIMESTAMPTZ_NS) floors to
 /// its day from the nanosecond, not the microsecond nearest it.
-/// The earliest TIMESTAMP DuckDB converts a TIMESTAMP_MS to, 290309-12-22 (BC) 00:00:00; earlier ones are a conversion
-/// error as a TIMESTAMP, while as a DATE they floor to their day.
-const ts_min_us = calendar.min_timestamp_us;
 
 /// `unit` is the argument's, `utc` its time-zone flag: a UTC-adjusted nanosecond (DuckDB's TIMESTAMPTZ_NS) floors to
 /// its day from the nanosecond itself, a plain TIMESTAMP_NS from the microsecond nearest it. A TIMESTAMP_MS reaches
 /// microseconds first, an error past an i64 of them (the millisecond count of a day 2^31 from the epoch).
-fn temporalCast(to_date: bool, unit: ast.Temporal, utc: bool, check_min: bool, v: i64) error{ConversionOutOfRange}!i64 {
+fn temporalCast(to_date: bool, unit: ast.Temporal, utc: bool, v: i64) error{ConversionOutOfRange}!i64 {
     const ts_infinity: i64 = std.math.maxInt(i64);
     const date_infinity: i64 = std.math.maxInt(i32);
     if (unit == .date) {
@@ -2660,7 +2657,6 @@ fn temporalCast(to_date: bool, unit: ast.Temporal, utc: bool, check_min: bool, v
         .ts_ns => roundDivAway(v, 1000),
         .date => unreachable,
     };
-    if (check_min and unit == .ts_ms and !to_date and us < ts_min_us) return error.ConversionOutOfRange;
     return if (to_date) @divFloor(us, us_per_day) else us;
 }
 
@@ -2726,48 +2722,46 @@ test "negating a DOUBLE flips its sign bit, a zero's and a NaN's included" {
 test "casting between DATE and TIMESTAMP matches DuckDB 2.0.0" {
     const T = std.testing;
     // TIMESTAMP to DATE floors: the last microsecond of 1969 is 1969-12-31, the epoch is 1970-01-01.
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_us, false, true, -1));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_us, false, true, 0));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_us, false, true, us_per_day - 1));
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_us, false, true, -us_per_day));
-    try T.expectEqual(@as(i64, -2), try temporalCast(true, .ts_us, false, true, -us_per_day - 1));
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ms, false, true, -1));
-    try T.expectEqual(@as(i64, 1), try temporalCast(true, .ts_ms, false, true, ms_per_day));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_us, false, -1));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_us, false, 0));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_us, false, us_per_day - 1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_us, false, -us_per_day));
+    try T.expectEqual(@as(i64, -2), try temporalCast(true, .ts_us, false, -us_per_day - 1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ms, false, -1));
+    try T.expectEqual(@as(i64, 1), try temporalCast(true, .ts_ms, false, ms_per_day));
     // A TIMESTAMP_NS reaches microseconds half away from zero first: -1 ns is the epoch, -500 ns the microsecond before.
-    try T.expectEqual(@as(i64, 0), try temporalCast(false, .ts_ns, false, true, -1));
-    try T.expectEqual(@as(i64, -1), try temporalCast(false, .ts_ns, false, true, -999));
-    try T.expectEqual(@as(i64, -1), try temporalCast(false, .ts_ns, false, true, -500));
-    try T.expectEqual(@as(i64, 0), try temporalCast(false, .ts_ns, false, true, -499));
-    try T.expectEqual(@as(i64, 1), try temporalCast(false, .ts_ns, false, true, 500));
-    try T.expectEqual(@as(i64, 1), try temporalCast(false, .ts_ns, false, true, 999));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, false, true, -1));
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ns, false, true, -500));
+    try T.expectEqual(@as(i64, 0), try temporalCast(false, .ts_ns, false, -1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(false, .ts_ns, false, -999));
+    try T.expectEqual(@as(i64, -1), try temporalCast(false, .ts_ns, false, -500));
+    try T.expectEqual(@as(i64, 0), try temporalCast(false, .ts_ns, false, -499));
+    try T.expectEqual(@as(i64, 1), try temporalCast(false, .ts_ns, false, 500));
+    try T.expectEqual(@as(i64, 1), try temporalCast(false, .ts_ns, false, 999));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, false, -1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ns, false, -500));
     // DATE and TIMESTAMP_MS to TIMESTAMP are exact; one past the TIMESTAMP range is an error.
-    try T.expectEqual(@as(i64, 19782 * us_per_day), try temporalCast(false, .date, false, true, 19782));
-    try T.expectEqual(@as(i64, -999_000), try temporalCast(false, .ts_ms, false, true, -999));
-    try T.expectEqual(@as(i64, 106751991 * us_per_day), try temporalCast(false, .date, false, true, 106751991));
-    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .date, false, true, 106751992));
-    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .ts_ms, false, true, std.math.maxInt(i64) - 1));
+    try T.expectEqual(@as(i64, 19782 * us_per_day), try temporalCast(false, .date, false, 19782));
+    try T.expectEqual(@as(i64, -999_000), try temporalCast(false, .ts_ms, false, -999));
+    try T.expectEqual(@as(i64, 106751991 * us_per_day), try temporalCast(false, .date, false, 106751991));
+    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .date, false, 106751992));
+    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .ts_ms, false, std.math.maxInt(i64) - 1));
     // Infinity maps to infinity, both ways and in every unit.
-    try T.expectEqual(@as(i64, std.math.maxInt(i64)), try temporalCast(false, .date, false, true, std.math.maxInt(i32)));
-    try T.expectEqual(@as(i64, -std.math.maxInt(i32)), try temporalCast(true, .ts_ns, false, true, -std.math.maxInt(i64)));
-    try T.expectEqual(@as(i64, std.math.maxInt(i64)), try temporalCast(false, .ts_ms, false, true, std.math.maxInt(i64)));
+    try T.expectEqual(@as(i64, std.math.maxInt(i64)), try temporalCast(false, .date, false, std.math.maxInt(i32)));
+    try T.expectEqual(@as(i64, -std.math.maxInt(i32)), try temporalCast(true, .ts_ns, false, -std.math.maxInt(i64)));
+    try T.expectEqual(@as(i64, std.math.maxInt(i64)), try temporalCast(false, .ts_ms, false, std.math.maxInt(i64)));
     // Identity casts.
-    try T.expectEqual(@as(i64, -165), try temporalCast(true, .date, false, true, -165));
-    try T.expectEqual(@as(i64, -47524859999999), try temporalCast(false, .ts_us, false, true, -47524859999999));
-    // A TIMESTAMP_MS past the microsecond range is an error to a DATE too, not a wrapped day count; a TIMESTAMP only
-    // from 290309-12-22 (BC), where a DATE floors on.
-    try T.expectError(error.ConversionOutOfRange, temporalCast(true, .ts_ms, false, true, 185542587187200000));
-    try T.expectEqual(@as(i64, 106751991), try temporalCast(true, .ts_ms, false, true, 9223372036854775));
-    try T.expectEqual(@as(i64, -106751992), try temporalCast(true, .ts_ms, false, true, -9223372036854775));
-    try T.expectEqual(ts_min_us, try temporalCast(false, .ts_ms, false, true, -9223372022400000));
-    try T.expectError(error.ConversionOutOfRange, temporalCast(false, .ts_ms, false, true, -9223372022400001));
-    // TRY_CAST keeps it: DuckDB's TRY path has no lower bound there (the plain cast does).
-    try T.expectEqual(@as(i64, -9223372022400001000), try temporalCast(false, .ts_ms, false, false, -9223372022400001));
+    try T.expectEqual(@as(i64, -165), try temporalCast(true, .date, false, -165));
+    try T.expectEqual(@as(i64, -47524859999999), try temporalCast(false, .ts_us, false, -47524859999999));
+    // A TIMESTAMP_MS past the microsecond range is an error to a DATE too, not a wrapped day count; one below the
+    // TIMESTAMP minimum (290309-12-22 BC) is still a time, and a DATE floors on.
+    try T.expectError(error.ConversionOutOfRange, temporalCast(true, .ts_ms, false, 185542587187200000));
+    try T.expectEqual(@as(i64, 106751991), try temporalCast(true, .ts_ms, false, 9223372036854775));
+    try T.expectEqual(@as(i64, -106751992), try temporalCast(true, .ts_ms, false, -9223372036854775));
+    try T.expectEqual(@as(i64, -9223372022400000000), try temporalCast(false, .ts_ms, false, -9223372022400000));
+    try T.expectEqual(@as(i64, -9223372022400001000), try temporalCast(false, .ts_ms, false, -9223372022400001));
     // UTC-adjusted nanoseconds floor to their day: one before the epoch is the day before, not the epoch's.
-    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ns, true, true, -1));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, false, true, -1));
-    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, true, true, ns_per_day - 1));
+    try T.expectEqual(@as(i64, -1), try temporalCast(true, .ts_ns, true, -1));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, false, -1));
+    try T.expectEqual(@as(i64, 0), try temporalCast(true, .ts_ns, true, ns_per_day - 1));
 }
 
 /// `evalCast` of an exact DECIMAL argument, read at its own scale.

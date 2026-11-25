@@ -205,8 +205,7 @@ the minimum of an integer column's SQL type, `abs(-2147483648)` of an INTEGER, i
 rounds half away from zero to an integer or to fewer places, a DOUBLE half to even to an integer and as `round(x * 10^s)`
 to a DECIMAL; a value that does not fit stops the query with a conversion error, as DuckDB does, but only in rows that
 are read and not NULL; the result is written as INT64 for every integer type), `TRY_CAST(x AS type)` of every cast
-here (NULL where `CAST` would stop the query, so the result can be NULL; a TIMESTAMP_MS before 290309-12-22 (BC) stays
-a TIMESTAMP in it, as DuckDB's does), a text read as TINYINT, SMALLINT, INTEGER, BIGINT or DOUBLE by `CAST` or
+here (NULL where `CAST` would stop the query, so the result can be NULL), a text read as TINYINT, SMALLINT, INTEGER, BIGINT or DOUBLE by `CAST` or
 `TRY_CAST` exactly as DuckDB reads it (surrounding whitespace, one `+`, `0x` and `0b` integers, a `_` between digits, a
 decimal point and an exponent in an integer, rounded half away from zero; `inf`, `infinity` and `nan` in any case; text
 that is no such number is `ConversionInvalid`, NULL for `TRY_CAST`; a text column to DECIMAL, DATE or TIMESTAMP is refused
@@ -217,14 +216,13 @@ DOUBLE, FLOAT column, DATE or TIMESTAMP as DuckDB 2.0 prints it (a DOUBLE by its
 its digits, which is not always the shortest; a year before 1 as `0001-12-31 (BC)`; a TIMESTAMP with its fraction cut of
 trailing zeros in the unit's own 3, 6 or 9 digits, a UTC-adjusted one with `+00`), in a SELECT, an aggregate argument or a
 GROUP BY key (a NaN prints with its sign, `-nan` as well as `nan`, and `-x` of a DOUBLE flips the sign bit, a zero's and a
-NaN's too; a TIMESTAMP_MS whose microseconds overflow, and a TIMESTAMP that is not UTC-adjusted below 290309-12-22 (BC),
-are conversion errors, as in DuckDB, where ±9223372036854775807 milliseconds are the infinite timestamps); an expression computed from a FLOAT, which DuckDB evaluates in single precision, and an
+NaN's too; a TIMESTAMP_MS whose microseconds overflow is a conversion error, as in DuckDB, where ±9223372036854775807 milliseconds are the infinite timestamps); an expression computed from a FLOAT, which DuckDB evaluates in single precision, and an
 INT96 timestamp are refused by name,
 `CAST(t AS DATE)` and
 `CAST(x AS TIMESTAMP)` (also `::` and `DATETIME`) between a DATE and a TIMESTAMP of any unit (a time's day is its floor,
 before 1970 too; a TIMESTAMP_NS reaches microseconds to the nearest, a tie away from zero, in `date_trunc` and
-`date_part` as in a cast; a DATE past the TIMESTAMP range, a TIMESTAMP_MS past the range of microseconds (as a DATE
-too), and a TIMESTAMP_MS before 290309-12-22 (BC) as a TIMESTAMP, are conversion errors; a UTC-adjusted value is read
+a cast, and by flooring in `date_part` and `epoch_us`; a DATE past the TIMESTAMP range and a TIMESTAMP_MS past the
+range of microseconds (as a DATE too) are conversion errors; a UTC-adjusted value is read
 in UTC, as the date parts read it, so DuckDB's answer differs under another session time zone; a UTC-adjusted
 TIMESTAMP_NS, which DuckDB keeps as a type of its own, casts to a DATE from its nanosecond and has no `date_trunc`,
 `date_part`, `date_diff` or cast to TIMESTAMP here: those are refused by name), `floor`, `ceil`/`ceiling`, `sqrt` and

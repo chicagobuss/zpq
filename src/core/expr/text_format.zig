@@ -113,16 +113,9 @@ pub fn writeDate(out: *std.ArrayList(u8), gpa: std.mem.Allocator, days: i64) std
 pub fn writeTimestamp(out: *std.ArrayList(u8), gpa: std.mem.Allocator, unit: ast.Temporal, utc: bool, v: i64) error{ OutOfMemory, ConversionOutOfRange }!void {
     if (v == std.math.maxInt(i64)) return out.appendSlice(gpa, "infinity");
     if (v == -std.math.maxInt(i64)) return out.appendSlice(gpa, "-infinity");
-    // DuckDB reads Parquet milliseconds as microseconds, an error where they do not fit; its TIMESTAMP text then
-    // refuses a value below 290309-12-22 (BC), which a UTC-adjusted one prints. Nanoseconds print as they are.
-    switch (unit) {
-        .ts_ms => {
-            const us = std.math.mul(i64, v, 1000) catch return error.ConversionOutOfRange;
-            if (!utc and us < calendar.min_timestamp_us) return error.ConversionOutOfRange;
-        },
-        .ts_us => if (!utc and v < calendar.min_timestamp_us) return error.ConversionOutOfRange,
-        .ts_ns, .date => {},
-    }
+    // DuckDB reads Parquet milliseconds as microseconds, an error where they do not fit. Nothing else is refused: a
+    // time below its documented minimum (290309-12-22 BC) still prints, as a UTC-adjusted one always did.
+    if (unit == .ts_ms) _ = std.math.mul(i64, v, 1000) catch return error.ConversionOutOfRange;
     const per_sec: i64 = switch (unit) {
         .ts_ms => 1_000,
         .ts_us => 1_000_000,
@@ -262,11 +255,11 @@ test "DECIMAL, DATE and TIMESTAMP text is DuckDB 2.0.0's" {
     }
 }
 
-test "a TIMESTAMP DuckDB cannot hold is a conversion error in text, a UTC-adjusted one below the floor is not" {
+test "a millisecond count that overflows microseconds is a conversion error in text; a time below the TIMESTAMP minimum prints" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
     const a = testing.allocator;
-    const min_us = calendar.min_timestamp_us;
+    const min_us: i64 = -9_223_372_022_400_000_000; // DuckDB's documented earliest TIMESTAMP, 290309-12-22 (BC)
     // Milliseconds are read as microseconds first: a count that overflows is an error, the two infinite ones are not.
     try testing.expectError(error.ConversionOutOfRange, writeTimestamp(&out, a, .ts_ms, false, 9223372036854776));
     try testing.expectError(error.ConversionOutOfRange, writeTimestamp(&out, a, .ts_ms, true, 9223372036854776));
@@ -277,14 +270,18 @@ test "a TIMESTAMP DuckDB cannot hold is a conversion error in text, a UTC-adjust
     try writeTimestamp(&out, a, .ts_ms, false, 9223372036854775);
     try testing.expectEqualStrings("294247-01-10 04:00:54.775", out.items);
     out.clearRetainingCapacity();
-    // The earliest TIMESTAMP prints; one microsecond (or millisecond) below it is an error, except UTC-adjusted.
+    // The minimum and everything below it print, down to the smallest count; the same text, UTC-adjusted or not.
     try writeTimestamp(&out, a, .ts_us, false, min_us);
     try testing.expectEqualStrings("290309-12-22 (BC) 00:00:00", out.items);
     out.clearRetainingCapacity();
-    try testing.expectError(error.ConversionOutOfRange, writeTimestamp(&out, a, .ts_us, false, min_us - 1));
-    try testing.expectError(error.ConversionOutOfRange, writeTimestamp(&out, a, .ts_us, false, std.math.minInt(i64)));
-    try testing.expectError(error.ConversionOutOfRange, writeTimestamp(&out, a, .ts_ms, false, @divExact(min_us, 1000) - 1));
-    try writeTimestamp(&out, a, .ts_ms, false, @divExact(min_us, 1000));
+    try writeTimestamp(&out, a, .ts_us, false, min_us - 1);
+    try testing.expectEqualStrings("290309-12-21 (BC) 23:59:59.999999", out.items);
+    out.clearRetainingCapacity();
+    try writeTimestamp(&out, a, .ts_us, false, std.math.minInt(i64));
+    try testing.expectEqualStrings("290309-12-21 (BC) 19:59:05.224192", out.items);
+    out.clearRetainingCapacity();
+    try writeTimestamp(&out, a, .ts_ms, false, @divExact(min_us, 1000) - 1);
+    try testing.expectEqualStrings("290309-12-21 (BC) 23:59:59.999", out.items);
     out.clearRetainingCapacity();
     try writeTimestamp(&out, a, .ts_us, true, min_us - 1);
     try testing.expectEqualStrings("290309-12-21 (BC) 23:59:59.999999+00", out.items);
@@ -292,7 +289,7 @@ test "a TIMESTAMP DuckDB cannot hold is a conversion error in text, a UTC-adjust
     try writeTimestamp(&out, a, .ts_ms, true, @divExact(min_us, 1000) - 1);
     try testing.expectEqualStrings("290309-12-21 (BC) 23:59:59.999+00", out.items);
     out.clearRetainingCapacity();
-    // Nanoseconds have no floor: the earliest one is 1677.
+    // Nanoseconds have no floor of their own: the earliest one is 1677.
     try writeTimestamp(&out, a, .ts_ns, false, std.math.minInt(i64));
     try testing.expectEqualStrings("1677-09-21 00:12:43.145224192", out.items);
 }

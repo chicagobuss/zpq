@@ -133,8 +133,6 @@ const Refuse = struct {
     /// With `binder_sql`, the start of DuckDB's refusal in place of "Binder Error:" (an overflow is an "Out of Range
     /// Error:", a failed conversion a "Conversion Error:").
     duck_error: ?[]const u8 = null,
-    /// With `binder_sql`, DuckDB answers it and zpq refuses on purpose; the text says why zpq keeps refusing.
-    duck_answers: ?[]const u8 = null,
 };
 
 const Case = struct {
@@ -474,10 +472,6 @@ fn checkExpectation(c: Case) !void {
         return if (n == 0) error.NoExpectation else error.ConflictingExpectations;
     }
     if (c.same) |note| if (std.mem.trim(u8, note, " ").len == 0) return error.EmptyExpectation;
-    if (c.refuse) |r| if (r.duck_answers) |why| {
-        if (std.mem.trim(u8, why, " ").len == 0) return error.EmptyExpectation;
-        if (r.binder_sql == null or r.duck_error != null) return error.ConflictingExpectations;
-    };
     if (c.host_dependent) |why| if (std.mem.trim(u8, why, " ").len == 0) return error.EmptyExpectation;
     if (c.safe) |kinds| if (kinds.len == 0) return error.EmptyExpectation;
 }
@@ -849,20 +843,12 @@ fn checkCase(
         }
         if (r.binder_sql) |sql| {
             const ans = try run.oracle.ask(arena, sql);
-            if (r.duck_answers) |why| {
-                if (ans.refused) |said| return try std.fmt.allocPrint(
-                    arena,
-                    "duck refused ({s}), declared as answering: {s}",
-                    .{ said, why },
-                );
-            } else {
-                const said = ans.refused orelse return try arena.dupe(u8, "duck answered, zpq refused");
-                if (!std.mem.startsWith(u8, said, r.duck_error orelse "Binder Error:")) return try std.fmt.allocPrint(
-                    arena,
-                    "duck refused otherwise: {s}",
-                    .{said},
-                );
-            }
+            const said = ans.refused orelse return try arena.dupe(u8, "duck answered, zpq refused");
+            if (!std.mem.startsWith(u8, said, r.duck_error orelse "Binder Error:")) return try std.fmt.allocPrint(
+                arena,
+                "duck refused otherwise: {s}",
+                .{said},
+            );
         }
         run.refusals += points.len;
         std.debug.print("EXPECTED {s} {s} ({d} points)\n", .{ c.id, r.@"error", points.len });

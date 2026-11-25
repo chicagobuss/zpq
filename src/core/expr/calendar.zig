@@ -497,10 +497,6 @@ test "strftime formats as DuckDB 2.0.0 does" {
         try T.expectError(error.InvalidFormat, Format.compile(a, bad, false));
 }
 
-/// DuckDB's earliest TIMESTAMP in microseconds, 290309-12-22 (BC) 00:00:00: a TIMESTAMP or TIMESTAMP_MS below it is a
-/// conversion error wherever DuckDB converts it.
-pub const min_timestamp_us: i64 = -9_223_372_022_400_000_000;
-
 test "date_part of a TIMESTAMP_NS floors to microseconds, where date_trunc and the casts round" {
     // 1969-12-31 23:59:59.999999999: the last nanosecond before the epoch.
     try std.testing.expectEqual(@as(i64, 1969), try partOf(.year, .ts_ns, -1));

@@ -1,10 +1,11 @@
 const std = @import("std");
 
-/// boring_tls build — prebuilt-only.
+/// boring_tls build.
 ///
-/// We never source-build BoringSSL from this build.zig; it links prebuilt
-/// `libcrypto.a` + `libssl.a`, pinned by URL and sha256 in
-/// `prebuilt.sha256`. Each archive comes from one of two places:
+/// The CLI and the Lambda link prebuilt `libcrypto.a` + `libssl.a`, pinned by
+/// URL and sha256 in `prebuilt.sha256`; only libzpq's shared library compiles
+/// BoringSSL from source (`-Dsource-build`), and the `prebuilt` step below is
+/// how the macOS prebuilts are made. Each archive comes from one of two places:
 ///
 ///   - `prebuilt/<arch>-<os>/`, if both files are there: a local override
 ///     for offline builds or a locally built BoringSSL, used as is.
@@ -46,6 +47,18 @@ pub fn build(b: *std.Build) !void {
         .{ @tagName(target_info.cpu.arch), @tagName(target_info.os.tag) },
     );
     const libs = [_][]const u8{ "libcrypto.a", "libssl.a" };
+
+    // How the macOS archives prebuilt.sha256 pins are made: `zig build prebuilt -Dtarget=<arch>-macos.11.0
+    // -Doptimize=ReleaseFast` (the release's minimum macOS, tools/package_release.py), run in this directory, compiles
+    // them into zig-out/<arch>-macos/, to be uploaded under new keys and pinned. Only when this is the root build, so a
+    // build depending on boring_tls doesn't set it up.
+    if (b.dep_prefix.len == 0 and target_info.os.tag.isDarwin()) {
+        const prebuilt_step = b.step("prebuilt", "Compile libcrypto.a and libssl.a as the pinned macOS prebuilts are");
+        for (try sourceLibraries(b, boringssl_dep, target, optimize, .prebuilt), libs) |lib, name| {
+            const install = b.addInstallFileWithDir(lib.getEmittedBin(), .{ .custom = triple }, name);
+            prebuilt_step.dependOn(&install.step);
+        }
+    }
 
     const have_locally = !source_build and probeLocalPrebuilts(b, triple, &libs);
     var lib_paths: [libs.len]std.Build.LazyPath = undefined;
@@ -129,27 +142,12 @@ pub fn build(b: *std.Build) !void {
     }
 
     if (source_build) {
-        for (try sourceLibraries(b, boringssl_dep, target, optimize)) |lib| boring_tls_mod.linkLibrary(lib);
+        for (try sourceLibraries(b, boringssl_dep, target, optimize, .shared)) |lib| boring_tls_mod.linkLibrary(lib);
     } else {
-        // A Mach-O executable exports every global symbol it links, and these archives were compiled with default
-        // visibility: the binary would export BoringSSL's API, weak inline definitions among it, and dyld binds weak
-        // definitions afresh on every launch. Nothing links against an executable, so hide them all, making the weak
-        // functions local (hide_symbols.zig), and libc++'s operator delete with them (src/macos_delete.cpp).
+        // libc++ defines operator delete weak and default-visibility, so a macOS executable linking it would export a
+        // weak definition, which dyld binds afresh on every launch; src/macos_delete.cpp defines it again, hidden.
+        // The macOS archives are compiled with hidden visibility (sourceLibraries, `.prebuilt`) for the same reason.
         if (target.result.os.tag.isDarwin()) {
-            const hider = b.addExecutable(.{
-                .name = "hide_symbols",
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path("hide_symbols.zig"),
-                    .target = b.graph.host,
-                    .optimize = .Debug,
-                }),
-            });
-            const hide = b.addRunArtifact(hider);
-            hide.setName(b.fmt("hide symbols in {s}", .{triple}));
-            for (libs, &lib_paths) |lib, *path| {
-                hide.addFileArg(path.*);
-                path.* = hide.addOutputFileArg(lib);
-            }
             boring_tls_mod.addCSourceFile(.{ .file = b.path("src/macos_delete.cpp"), .flags = &.{
                 "-std=c++17",
                 "-fvisibility-global-new-delete=force-hidden",
@@ -160,14 +158,20 @@ pub fn build(b: *std.Build) !void {
     boring_tls_mod.linkSystemLibrary("c++", .{});
 }
 
+/// How sourceLibraries compiles. `.shared`, for libzpq's shared library: position-independent, with BoringSSL's own
+/// C++ flags (no exceptions or RTTI). `.prebuilt`, for the macOS archives prebuilt.sha256 pins: the flags they were
+/// first built with (exceptions and RTTI on), plus hidden visibility, so an executable linking them exports nothing.
+const Recipe = enum { shared, prebuilt };
+
 /// libcrypto and libssl compiled from `dep`'s sources as BoringSSL's own CMake build lists them (gen/sources.json),
-/// position-independent. Every generated assembly file is compiled: each guards itself by architecture and object
+/// with hidden visibility. Every generated assembly file is compiled: each guards itself by architecture and object
 /// format, so those for other targets assemble to nothing.
 fn sourceLibraries(
     b: *std.Build,
     dep: *std.Build.Dependency,
     target: std.Build.ResolvedTarget,
     optimize: std.lang.OptimizeMode,
+    recipe: Recipe,
 ) ![2]*std.Build.Step.Compile {
     const json_path = try dep.builder.root.joinString(b.allocator, "gen/sources.json");
     const json_text = try std.Io.Dir.cwd().readFileAlloc(b.graph.io, json_path, b.allocator, .limited(4 << 20));
@@ -183,23 +187,38 @@ fn sourceLibraries(
     };
     // _XOPEN_SOURCE alone hides the BSD types (u_int) Darwin's own headers use; _DARWIN_C_SOURCE brings them back.
     const os_flags: []const []const u8 = if (target.result.os.tag.isDarwin()) &.{"-D_DARWIN_C_SOURCE"} else &.{};
-    // The source build is for a shared library, which should export its own API alone: OPENSSL_EXPORT is empty
-    // without BORINGSSL_SHARED_LIBRARY, so this hides all of BoringSSL's.
-    const flags_c = try std.mem.concat(b.allocator, []const u8, &.{
-        &.{ "-std=c11", "-DBORINGSSL_IMPLEMENTATION", "-D_XOPEN_SOURCE=700", "-fvisibility=hidden" },
-        os_flags,
-    });
-    const flags_cc = try std.mem.concat(b.allocator, []const u8, &.{
-        &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DBORINGSSL_IMPLEMENTATION", "-D_XOPEN_SOURCE=700" },
-        &.{"-fvisibility=hidden"},
-        os_flags,
-    });
+    // The prebuilts are published, so they carry no path of the machine that built them: error records name source
+    // files from the package root (__FILE__), and they have no debug info, which a stripped release drops anyway.
+    const file_prefix_map = b.fmt("-ffile-prefix-map={s}=boringssl", .{try dep.builder.root.toString(b.allocator)});
+    // Both recipes hide BoringSSL's symbols, as each goes into a binary that should export its own API alone:
+    // OPENSSL_EXPORT is empty without BORINGSSL_SHARED_LIBRARY, so this hides all of them.
+    const flags_c: []const []const u8 = switch (recipe) {
+        .shared => try std.mem.concat(b.allocator, []const u8, &.{
+            &.{ "-std=c11", "-DBORINGSSL_IMPLEMENTATION", "-D_XOPEN_SOURCE=700", "-fvisibility=hidden" },
+            os_flags,
+        }),
+        .prebuilt => &.{ "-DBORINGSSL_IMPLEMENTATION", "-fvisibility=hidden", file_prefix_map },
+    };
+    const flags_cc: []const []const u8 = switch (recipe) {
+        .shared => try std.mem.concat(b.allocator, []const u8, &.{
+            &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-DBORINGSSL_IMPLEMENTATION", "-D_XOPEN_SOURCE=700" },
+            &.{"-fvisibility=hidden"},
+            os_flags,
+        }),
+        .prebuilt => &.{
+            "-DBORINGSSL_IMPLEMENTATION",
+            "-fvisibility=hidden",
+            "-fvisibility-inlines-hidden",
+            file_prefix_map,
+        },
+    };
     var out: [2]*std.Build.Step.Compile = undefined;
     for ([_][]const u8{ "crypto", "ssl" }, &out) |name, *lib| {
         const mod = b.createModule(.{
             .target = target,
             .optimize = optimize,
-            .pic = true,
+            .pic = if (recipe == .shared) true else null,
+            .strip = if (recipe == .prebuilt) true else null,
             .link_libc = true,
             .link_libcpp = true,
         });

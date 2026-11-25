@@ -42,6 +42,12 @@ sources.
 - `build.zig`: a `source-build` option compiles BoringSSL from its source package instead, position-independent and
   with its symbols hidden, for libzpq's shared library; on Darwin also with `_DARWIN_C_SOURCE`, without which
   `_XOPEN_SOURCE` hides the BSD types the system headers use.
+- `build.zig`: a `prebuilt` step (`zig build prebuilt -Dtarget=<arch>-macos.11.0 -Doptimize=ReleaseFast`, run in
+  `vendor/boring_tls` with the pinned Zig) compiles the macOS archives `prebuilt.sha256` pins, from the same source
+  package and source lists. They keep the flags the first macOS prebuilts had (C++ exceptions and RTTI on) and add
+  hidden visibility, so a macOS executable exports none of BoringSSL's symbols; `__FILE__` names files from the
+  package root and there is no debug info, so the archives carry no build path and rebuild byte for byte.
+  `src/macos_delete.cpp` hides libc++'s weak `operator delete`, which the executable would otherwise export.
 
 ## zstd (`vendor/zstd`, facebook/zstd 1.5.7)
 

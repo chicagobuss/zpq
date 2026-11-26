@@ -445,7 +445,7 @@ fn dropTableQualifier(root: *c.LpNode, qualifier: []const u8) bool {
 /// The grammar reads an unquoted `true` / `false` as a column name, which the unparser then quotes (`"true"`), and
 /// no column of that name exists: make each such reference the boolean literal SQL means. A quoted `"true"` stays a
 /// column.
-fn boolLiterals(root: *c.LpNode) void {
+pub fn boolLiterals(root: *c.LpNode) void {
     const Visit = struct {
         fn enter(_: [*c]c.LpVisitor, node: [*c]c.LpNode) callconv(.c) c_int {
             if (node.*.kind != c.LP_EXPR_COLUMN_REF) return 0;

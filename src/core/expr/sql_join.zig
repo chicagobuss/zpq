@@ -143,6 +143,8 @@ fn parse(sql: [:0]const u8) Error!Parsed {
     if (root.*.kind != c.LP_STMT_SELECT) return error.SqlParseError;
     // The plan's pieces are unparsed and read back (`toSql`): with NOT only above leaves they mean what was written,
     // as the single-table parser's do, however the planner regroups the conditions (`hoistOrs`).
+    // `TRUE` / `FALSE` read as column names until made literals; left so, `d.flag = TRUE` reads a column no table has.
+    @import("sql_parser.zig").boolLiterals(root);
     @import("sql_parser.zig").pushNotsDown(root, arena) catch return error.OutOfMemory;
     try unquoteAliases(root, arena);
     return .{ .arena = arena, .root = root };
@@ -1528,4 +1530,22 @@ test "an alias is its text: a quoted table alias qualifies, and an ORDER BY alia
     const spaced = try plan(a, "SELECT f.amt AS \"my n\", d.w AS \"Select\" FROM 'f.parquet' f JOIN 'd.parquet' d ON f.fk = d.pk ORDER BY \"my n\"", t);
     try std.testing.expect(std.mem.startsWith(u8, spaced.probe_sql, "SELECT amt AS \"my n\", w AS \"Select\" FROM "));
     try std.testing.expect(std.mem.endsWith(u8, spaced.probe_sql, " ORDER BY \"my n\""));
+}
+
+test "a boolean literal in a build column's condition keeps it the build's" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const Cols = struct {
+        const of = [_][]const []const u8{ &.{ "fk", "amt" }, &.{ "pk", "flag" } };
+        fn has(_: *const anyopaque, table: usize, name: []const u8) bool {
+            for (of[table]) |col| if (std.mem.eql(u8, col, name)) return true;
+            return false;
+        }
+    };
+    const t: Tables = .{ .paths = &.{ "f.parquet", "d.parquet" }, .has = Cols.has, .rows = &.{ 1000, 100 }, .ctx = undefined };
+    // `TRUE` parses as a column until made a literal: it must not read as a column of the probe.
+    const p = try plan(a, "SELECT count(*) AS n FROM 'f.parquet' f JOIN 'd.parquet' d ON f.fk = d.pk WHERE d.flag = TRUE", t);
+    try std.testing.expectEqualStrings("flag = TRUE", p.build_where.?);
+    try std.testing.expect(std.mem.indexOf(u8, p.probe_sql, "WHERE") == null);
 }

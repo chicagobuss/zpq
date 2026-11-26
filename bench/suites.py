@@ -14,7 +14,7 @@ FAIR = HOME / "bench/zpq-fair"
 GENERAL = HOME / "bench/zpq-general"
 DATA = HOME / "bench/data"
 CLICKBENCH = FAIR / "repos/ClickBench"
-SUITES = ("clickbench", "study", "pdsh", "reads-sf1", "writes", "votes-local")
+SUITES = ("clickbench", "study", "pdsh", "reads-sf1", "writes", "votes-local", "joins")
 STUDY = ("card10 card100k card10m card1k carduniq clust100k clustzipf comp100k compzipf files50_100k heavy i32_100k "
          "lstr100k lstr1m nulls100k nullszipf plain100k plainsstr100k rg64k_100k rg64k_10m sorted100k sorted10m "
          "sstr100k sstr10m zipf11 zipf15").split()
@@ -323,8 +323,18 @@ def votes():
                  {"form": "sql", "sql": sql.replace("{T}", "t")})]
 
 
+def joins():
+    """A join's top 20 by a probe's integer key, over a composite string key: 3M facts in 25 row groups sorted by `id`,
+    6,668 products, 1,000,200 of the facts matching. The inputs come from `joins_data.py`."""
+    fact, products = DATA / "joins/fact.parquet", DATA / "joins/products.parquet"
+    sql = (f"SELECT f.id AS id, d.name AS product FROM {quote(fact)} f JOIN {quote(products)} d "
+           "ON f.sku = d.sku AND f.region = d.region ORDER BY f.id LIMIT 20 OFFSET 5")
+    return [case("joins", "composite", "topk", [fact, products], ["query", "--query", sql], sql,
+                 {"form": "composite-topk"}, mode="ordered")]
+
+
 BUILDERS = {"clickbench": clickbench, "study": study, "pdsh": pdsh, "reads-sf1": reads, "writes": writes,
-            "votes-local": votes, "csv": csv}
+            "votes-local": votes, "csv": csv, "joins": joins}
 
 
 def cases(suites=SUITES, only=None):

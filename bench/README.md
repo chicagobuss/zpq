@@ -153,8 +153,8 @@ temporary directories explicitly.
 
 ## Full scorecard
 
-The scorecard: zpq against DuckDB 2.0 and Polars 2.0 on ClickBench, the study matrix, PDS-H, read shapes, writes and
-votes (`suites.py`, 464 cases), with the previous zpq build as a same-host control. Every answer is judged by
+The scorecard: zpq against DuckDB 2.0 and Polars 2.0 on ClickBench, the study matrix, PDS-H, read shapes, writes, votes
+and a join's top 20 (`suites.py`, 465 cases; the join's inputs come from `joins_data.py`), with the previous zpq build as a same-host control. Every answer is judged by
 `zpq-check compare`, the comparer the correctness gates use, against DuckDB 2.0; only judged answers are timed.
 
 ```sh

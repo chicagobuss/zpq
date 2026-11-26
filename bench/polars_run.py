@@ -47,6 +47,10 @@ def plan(pl, req):
         return pdsh(pl, req["inputs"][0], req["query_id"])
     if req["form"] == "csv":
         return pl.scan_csv(req["inputs"][0])  # its defaults, as a user's first try takes them
+    if req["form"] == "composite-topk":
+        fact, products = (pl.scan_parquet(path) for path in req["inputs"])
+        return (fact.join(products, on=["sku", "region"]).select("id", pl.col("name").alias("product"))
+                .sort("id").slice(5, 20))
     return pl.SQLContext(t=pl.scan_parquet(req["inputs"])).execute(req["sql"])
 
 

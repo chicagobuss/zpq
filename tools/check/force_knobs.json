@@ -126,6 +126,15 @@
     "evidence": "unavailable"
   },
   {
+    "name": "ZPQ_JOIN_TOPK",
+    "off": "0",
+    "cases": [
+      "join:topk:pin:3offset1"
+    ],
+    "evidence": "unavailable",
+    "note": "the cut a join's top-K finds first must keep the rows, ties and duplicates the unbounded scan returns"
+  },
+  {
     "name": "ZPQ_EXPR_BATCH_ROWS",
     "cases": [
       "parity:float-batches"

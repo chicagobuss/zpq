@@ -10,6 +10,11 @@ By default, `min / max / sum` decode their values instead of taking the answer f
 prune data using corroborated statistics. The metadata shortcuts have separate trust boundaries:
 
 - **`count(*)`** is answered from the row group's `num_rows` (structural, not a statistic).
+- **A join's row-group skips** use corroborated footer statistics, on by default, on the same trust boundary as the
+  row-group pruning below. An inner or semi join on one integer or DATE key skips the probe row groups wholly outside the
+  keys the filtered dimension kept. The top-K cut (`... JOIN ... ORDER BY f.id LIMIT n`) reads only the probe row groups
+  whose bounds can still reach the n-th key. Internally consistent but false bounds can change the result, as for row-group pruning. `--scan-all`
+  turns both off, and `ZPQ_JOIN_TOPK=0` turns off the top-K cut.
 - **Row-group pruning** uses footer/page statistics that pass type/order and consistency checks. Internally
   consistent but false bounds can still skip matching rows and change the result; `--scan-all` ignores statistics.
   See the [validation contract](output-format.md#validation-and-skipped-data).

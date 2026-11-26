@@ -51,7 +51,7 @@ reinterpreted:
 | type | its values |
 |---|---|
 | BIGINT | `-?(0\|[1-9][0-9]*)` in range: no `+`, no leading zeros (`02134` is text), no padding, no `-0` |
-| DECIMAL(p,s) | canonical decimals up to 38 digits, and integers too wide for BIGINT; precision is the data's |
+| DECIMAL(p,s) | canonical decimals up to 38 digits, and integers too wide for BIGINT; precision is the data's. A column holding a negative zero (`-0.000`) is DOUBLE instead, which keeps the sign |
 | DOUBLE | exponent, `inf` or `nan` text whose double has the same digits: at most 15 significant digits, no overflow or underflow (`1e-400` is text) |
 | DATE | `YYYY-MM-DD`, a valid date |
 | TIMESTAMP | `YYYY-MM-DD[ T]HH:MM:SS[.f]`, microseconds; nanoseconds (TIMESTAMP_NS) when a fraction needs them and every value is within 1677-2262 |

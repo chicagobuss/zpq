@@ -12,7 +12,7 @@ text when UTF-8, else `{"base64":...}`; UUIDs and INTERVALs in their own forms
 Encrypted Parquet is refused: zpq does not decrypt.
 
 **Filter** with `= != <> < <= > >=`, `IN` / `NOT IN`, `[NOT] BETWEEN x AND y`, `[NOT] LIKE`, `[NOT] ILIKE`, `IS [NOT] NULL`, `AND` /
-`OR` / `NOT` and grouping parentheses (nested at most 32 deep), plus row-group stat pruning and Hive-partition pruning
+`OR` / `NOT` and grouping parentheses (`--filter`: at most 32 deep), plus row-group stat pruning and Hive-partition pruning
 before any bytes are fetched. Keywords and parentheses inside a quoted literal are the literal's; a quote inside one is
 doubled (`'O''Reilly'`), and an unterminated quote is an error. NOT is three-valued: a row whose operand is NULL
 passes neither `p` nor `NOT p`. `ILIKE` takes a literal ASCII pattern and folds ASCII letters (and the two characters whose lower case is
@@ -22,7 +22,8 @@ passes neither `p` nor `NOT p`. `ILIKE` takes a literal ASCII pattern and folds 
 not rounded to it. In SQL a literal may be typed and a constant folded: `DATE '1998-09-02'`, `TIMESTAMP '1998-09-02
 10:00:00'`, `CAST('1998-09-02' AS date)`, `'1998-09-02'::DATE`, `CAST('0.055' AS DECIMAL(15,2))` (0.06: ties round away
 from zero, as in DuckDB), `DATE '1998-12-01' - INTERVAL '90' DAY` (DuckDB adds an interval to a DATE as a TIMESTAMP,
-the months first with the day clamped to the month's length), `.06 - 0.01`, `24 + 1`. A typed literal compares with a
+the months first with the day clamped to the month's length), `.06 - 0.01`, `24 + 1` (a WHERE folds them; a SELECT item takes `0.06 - 0.01`, but not a leading-dot literal such as `.06` or
+an exponent such as `1e2`). A typed literal compares with a
 column of its own kind: DATE and TIMESTAMP with DATE and TIMESTAMP columns (a TIMESTAMP against a DATE keeps its time of
 day, as DuckDB compares them as TIMESTAMPs), DECIMAL with a numeric column. Against any other column it is refused
 (`TypedLiteralColumn`), as is an INTERVAL anywhere but added to or subtracted from a DATE or TIMESTAMP literal, a
@@ -32,7 +33,7 @@ narrowest of INTEGER, BIGINT and HUGEINT that holds it after its sign (`-2147483
 component fits its field (32-bit months and days, 64-bit microseconds) before any other can cancel it, a TIMESTAMP stays
 within year 294247 (a DATE plus an INTERVAL included), a decimal stays within 38 digits, and a DATE or TIMESTAMP
 literal that does not convert to a column's timestamp type (`TemporalOutOfRange`: TIMESTAMP_NS stops at year 2262)
-compares with nothing, and a constant nested more deeply than the thread's stack allows folding (the budget is read from
+is refused, and a constant nested more deeply than the thread's stack allows folding (the budget is read from
 the thread, not fixed) is refused (`ConstantTooDeep`). In a SELECT, an aggregate argument, a GROUP BY key or a WHERE
 expression, a DATE or TIMESTAMP literal (and `CAST` or `TRY_CAST` of a constant text to one) is a value of its type,
 as a column of it is: `date_diff('day', DATE '2024-01-01', d)`, `SELECT DATE '2024-01-01' AS x` (written as a DATE);
@@ -167,7 +168,8 @@ Results are DuckDB's: ranks and counts BIGINT, `percent_rank` / `cume_dist` DOUB
 `min` / `max` the argument's type, integer sums BIGINT, added exactly frame by frame (DuckDB's is a HUGEINT, which its own Parquet writer
 turns into a DOUBLE; a frame past 64 bits is `WindowSumOverflow`, as zpq's plain `sum` is `AggIntTooWide`), DECIMAL sums DECIMAL(38, s)
 (`WindowSumOverflow` past 38 digits; DuckDB errors on some frames that fit), averages
-of integers and DECIMALs DOUBLE, finalized as DuckDB does. Compared with DuckDB 2.0.0 on fuzzed data (ties, NULL keys and values,
+of integers and DECIMALs DOUBLE, finalized as DuckDB does. A window call's argument that is a bare `avg()` of a DECIMAL reads the printed DECIMAL mean, as an outer query over a CTE
+does; DuckDB's is a DOUBLE. Compared with DuckDB 2.0.0 on fuzzed data (ties, NULL keys and values,
 DESC / NULLS FIRST, frames past the partition's ends, one-row partitions, and RANGE offsets over TINYINT, INTEGER, BIGINT, UBIGINT,
 DECIMAL, DOUBLE, DATE and TIMESTAMP keys, at the edges of a DECIMAL(38, s), a fractional offset on an integer key and a DATE's
 day range: 2,150 queries with no difference) and in `sql_windows.json`.
@@ -197,7 +199,8 @@ frame in a segment tree's order and averages with compensated sums, so the last 
 
 **Project** by column name, nested-aware: `events` resolves to every `events.list.element.*` leaf.
 
-**Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`), string concat (`||`),
+**Compute** new columns via `--select`: arithmetic on numerics with promotion (`i32 + f64 → f64`; FLOAT arithmetic in a SELECT, an aggregate argument or a GROUP BY
+key is computed and answered in DOUBLE, where DuckDB's is FLOAT, rounded at each step), string concat (`||`),
 `coalesce(a, b, ...)` over any expressions, `nullif(col, literal)` (NULL where the column equals the literal; a CASE, so
 a column and a literal) and `abs(x)` of an integer, DOUBLE or DECIMAL expression (the magnitude in the argument's type:
 the minimum of an integer column's SQL type, `abs(-2147483648)` of an INTEGER, is an overflow error, as DuckDB's),
@@ -210,7 +213,8 @@ here (NULL where `CAST` would stop the query, so the result can be NULL), a text
 decimal point and an exponent in an integer, rounded half away from zero; `inf`, `infinity` and `nan` in any case; text
 that is no such number is `ConversionInvalid`, NULL for `TRY_CAST`; a text column to DECIMAL, DATE or TIMESTAMP is refused
 by name, a constant text to DATE or TIMESTAMP is the value it spells),
-`CAST(x AS VARCHAR)` (also `TEXT`, `STRING`, `VARCHAR(n)` and `x::VARCHAR`) of an integer, BOOLEAN, DECIMAL (at its scale),
+`CAST(x AS VARCHAR)` (also `TEXT`, `STRING`, `VARCHAR(n)` and `x::VARCHAR`; not over a UBIGINT column, where any function or
+cast is refused) of an integer, BOOLEAN, DECIMAL (at its scale),
 DOUBLE, FLOAT column, DATE or TIMESTAMP as DuckDB 2.0 prints it (a DOUBLE by its shortest round-trip digits, fixed from
 `0.0001` to `1000000000000000.0` and `1e+16` beyond, `nan`, `inf`, `-0.0`; a FLOAT the way DuckDB's formatter settles on
 its digits, which is not always the shortest; a year before 1 as `0001-12-31 (BC)`; a TIMESTAMP with its fraction cut of
@@ -265,6 +269,11 @@ format, such as `%e`, and a TIMESTAMP_NS or INT96 argument are refused), and
 whole match, groups 0 to 9, DuckDB's option letters; the form with a list of group names is refused), the pattern, group
 and separator being constants. `trim`, `ltrim` and `rtrim` strip Unicode's space
 separators (U+0020, U+00A0, U+1680, U+2000 to U+200A, U+202F, U+205F, U+3000), not tabs or line breaks, as DuckDB's do.
+`date_trunc` takes the parts microsecond, millisecond, second, minute, hour, day, week, month, quarter and year;
+`decade`, `century` and `millennium` are refused ("unsupported part") though `date_diff` takes them. Where zpq is exact and
+DuckDB 2.0.1 is not: `year(t)` of a TIMESTAMP_NS within 500 ns below a year's start is the year before (DuckDB's
+`year()` rounds up, its `date_part('year', t)` agrees with zpq), and `epoch_ms` of a TIMESTAMP_NS answers where DuckDB
+raises an error.
 A computed date or time (`make_date`, the casts, `date_trunc`, `epoch_ms`, `coalesce` of timestamps) is the DATE or
 TIMESTAMP a column of it would be, in its unit and time zone, wherever it leaves: a Parquet type, CSV text, a group key,
 a `min` or `max`; JSON and JSONL print the stored integer, as for a column. Each distinct text is computed once, a dictionary-coded
@@ -392,7 +401,8 @@ scale, every integer digit either side has, at most 38 digits; a value that does
 is there), `a * b` adds scales and precisions (capped at 38 digits), an integer operand counts as DECIMAL(10,0) or
 DECIMAL(19,0), and a DOUBLE operand gives DOUBLE. Two places follow DuckDB instead: `/` gives DOUBLE, and an `avg`'s
 sum may pass 38 digits. DuckDB agrees on every scale but keeps some results at 18 digits where Trino and zpq widen
-(the product of two DECIMAL(15,2) is DECIMAL(18,4) in DuckDB, DECIMAL(30,4) here); values are the same.
+(the product of two DECIMAL(15,2) is DECIMAL(18,4) in DuckDB, DECIMAL(30,4) here); values are the same where DuckDB's fit. Past 18 digits DuckDB raises an overflow and zpq answers
+(`d9 * d15` per row).
 `sum` is DECIMAL(38, s); `min` / `max` keep the column's type. `avg` over DECIMAL(p, s) is DECIMAL(q, s + q - p) with
 q = min(38, p + 4): up to four more fractional digits and never fewer integer digits, so DataFusion's (p + 4, s + 4)
 for p <= 34, the input's own type at p = 38 as in Trino, and DECIMAL(38, 37) for DECIMAL(36, 35). The mean is exact,
@@ -483,7 +493,7 @@ and the page indexes and filters are written after the row groups.) The footer k
 (key-value metadata among them), and the bytes it shares with the source's are copied from it. In place, the result is staged beside the file, synced and renamed over it,
 keeping its mode, and refused if the file changed while it ran; `-o` writes it elsewhere and leaves the file as it was.
 
-- The literal is cast as a WHERE comparison casts it, and must be a value the column's type holds exactly.
+- The literal is cast as a WHERE comparison casts it, and must be a value the column's type holds exactly; a FLOAT or DOUBLE column takes the nearest value (`SET x = 0.1`).
 - `WHERE` is required; to rewrite a whole column, write a `SELECT` with `-o`.
 - Any number of rows may match; the cost grows with the pages they touch. A statement that changes no value writes
   nothing.

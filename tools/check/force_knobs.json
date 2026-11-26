@@ -129,7 +129,7 @@
     "name": "ZPQ_JOIN_TOPK",
     "off": "0",
     "cases": [
-      "join:topk:pin:3offset1"
+      "join:topk:path-parity"
     ],
     "evidence": "unavailable",
     "note": "the cut a join's top-K finds first must keep the rows, ties and duplicates the unbounded scan returns"

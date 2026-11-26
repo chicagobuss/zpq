@@ -1,11 +1,13 @@
 # zpq
 
-zpq is a small Unix tool for Parquet. It queries, filters, aggregates and rewrites Parquet files, on your disk or
-straight from S3, and prints NDJSON, CSV or Parquet for the next tool in the pipe. It does the least work a query
-needs for an exact answer: footers and statistics first, and only the pages that matter. DECIMAL stays in exact
-integers, and the same rows come back in the same order at any thread count.
+zpq is a small Unix tool for Parquet. It queries, filters, aggregates and rewrites Parquet files on your disk or
+straight from S3. Output is NDJSON, CSV or Parquet, ready for the next tool in the pipe.
 
-The project site, with every benchmark and example: **[zpq.chicagobuss.dev](https://zpq.chicagobuss.dev)**.
+zpq does the least work a query needs for an exact answer. It checks footers and statistics first, then reads only the
+pages that matter. DECIMAL values stay in exact integers. Queries return the same rows in the same order at any thread
+count.
+
+Visit the project site at **[zpq.chicagobuss.dev](https://zpq.chicagobuss.dev)** for every benchmark and example.
 
 ## Install
 
@@ -15,8 +17,8 @@ The project site, with every benchmark and example: **[zpq.chicagobuss.dev](http
 brew install chicagobuss/zpq/zpq
 ```
 
-**A static binary** from the [latest release](https://github.com/chicagobuss/zpq/releases/latest). Each archive holds
-`bin/`, `share/` and `MANIFEST.json` with no top folder, so give it one:
+**Static binaries** are on the [latest release](https://github.com/chicagobuss/zpq/releases/latest) page. Each archive
+contains `bin/`, `share/` and `MANIFEST.json` directly, without a top-level folder, so extract it into a new directory:
 
 ```bash
 curl -sSL https://github.com/chicagobuss/zpq/releases/latest/download/zpq-x86_64-linux-musl.tar.gz \
@@ -33,17 +35,17 @@ export PATH="$PWD/zpq/bin:$PATH"
 | macOS, Intel | `zpq-x86_64-macos.tar.gz` |
 | Windows x86_64 | `zpq-x86_64-windows-gnu.zip` |
 
-**Debian, Ubuntu, Fedora, RHEL:** the release also carries `zpq_0.6.1_amd64.deb`, `zpq_0.6.1_arm64.deb`,
+**Debian, Ubuntu, Fedora and RHEL:** The release also includes `zpq_0.6.1_amd64.deb`, `zpq_0.6.1_arm64.deb`,
 `zpq-0.6.1-1.x86_64.rpm` and `zpq-0.6.1-1.aarch64.rpm`.
 
 ```bash
 sudo apt install ./zpq_0.6.1_amd64.deb      # or: sudo dnf install ./zpq-0.6.1-1.x86_64.rpm
 ```
 
-The default Linux x86_64 build needs AVX2; on older CPUs use the `-compat` build.
+The default Linux x86_64 build needs AVX2. On older CPUs, use the `-compat` build.
 
-**Build it yourself.** All you need is a Zig 0.17.x release: Zig's bundled clang builds the C codecs, and the first build
-fetches checksum-pinned BoringSSL prebuilts. Cross-compiling is one flag.
+**Build it yourself.** All you need is a Zig 0.17.x release. Zig's bundled clang builds the C codecs, and the first
+build fetches checksum-pinned BoringSSL prebuilts. Cross-compiling takes one flag.
 
 ```bash
 git clone https://github.com/chicagobuss/zpq && cd zpq
@@ -53,10 +55,10 @@ zig build cli -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl      # a static
 
 ## First commands
 
-These run on ClickBench's public
+These examples use ClickBench's public
 [`hits_0.parquet`](https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_0.parquet) (122 MB, one
-million rows of web analytics). The output shown is the real output; more examples, each with its output, are on the
-site's [Examples](https://zpq.chicagobuss.dev/examples.html) page.
+million rows of web analytics). Each snippet shows real output. You can find more examples with their output on the
+[Examples](https://zpq.chicagobuss.dev/examples.html) page.
 
 <!-- examples:begin -->
 Look inside a file without reading its data pages:
@@ -115,46 +117,51 @@ $ S3_NO_SIGN_REQUEST=1 AWS_REGION=eu-central-1 zpq query \
 ```
 <!-- examples:end -->
 
-Files zpq writes use Parquet's version 2 encodings by default (`--parquet-version v2`: DELTA where it fits and
-RLE_DICTIONARY, with a version 2 footer). For readers that only understand version 1 files, add
-`--parquet-version v1` (PLAIN / PLAIN_DICTIONARY and a version 1 footer).
+By default, zpq writes Parquet files with version 2 encodings (`--parquet-version v2`). That uses DELTA where it fits,
+RLE_DICTIONARY, and a version 2 footer. For readers that only understand version 1 files, pass `--parquet-version v1`
+to write PLAIN / PLAIN_DICTIONARY encodings with a version 1 footer.
 
 ## Three ways in
 
-- **The `zpq` CLI**, shown above. `zpq --help` and `man zpq` list every option;
-  [docs/getting-started.md](docs/getting-started.md) walks through more, and
-  [docs/output-format.md](docs/output-format.md) is the output contract.
-- **`zpq-lambda`**, a static AWS Lambda bootstrap for `provided.al2023` that starts cold in tens of milliseconds and
-  reads and writes S3 natively, with no AWS SDK. `tools/serverless/fanout.py` fans one query out across many workers
-  by row group ([docs/lambda-and-s3.md](docs/lambda-and-s3.md)).
-- **libzpq**, a C library ([docs/libzpq.md](docs/libzpq.md)), with a Python binding, `python/zpq.py`, that needs no
+- **The `zpq` CLI** is shown above. `zpq --help` and `man zpq` list every option. See
+  [docs/getting-started.md](docs/getting-started.md) for a walkthrough and
+  [docs/output-format.md](docs/output-format.md) for the output contract.
+- **`zpq-lambda`** is a static AWS Lambda bootstrap for `provided.al2023`. It starts cold in tens of milliseconds and
+  reads and writes S3 natively, with no AWS SDK. `tools/serverless/fanout.py` fans one query out across many workers by
+  row group ([docs/lambda-and-s3.md](docs/lambda-and-s3.md)).
+- **libzpq** is a C library ([docs/libzpq.md](docs/libzpq.md)) with a Python binding, `python/zpq.py`, that needs no
   compiled extension. SQL through libzpq is experimental. libzpq can also return answers as Arrow C Data streams
-  (experimental): `python/zpq_arrow.py` reads them into PyArrow, and a Spark DataSource V2,
+  (experimental). `python/zpq_arrow.py` reads those streams into PyArrow. A Spark DataSource V2,
   [`spark.read.format("zpq")`](integrations/spark/README.md), runs Parquet scans and partial aggregates in zpq and
   takes the rows back as Arrow batches.
 
 ## What zpq isn't
 
-zpq isn't a general SQL database or a dataframe library. Its joins cover N:1 star and snowflake queries over local or
-S3 Parquet, where each build table has unique keys and fits in `--max-memory`; other shapes are refused by name. For
-the rest, pair zpq with DuckDB, Polars or Spark, and let zpq do the Parquet part.
+zpq isn't a general SQL database or a dataframe library. Its joins cover star and snowflake queries over local or S3
+Parquet. A star query joins one large table of facts, such as sales or page views, to smaller lookup tables, such as
+products, customers or dates, and each fact row matches at most one row in each lookup table (an N:1 join). A snowflake
+query is the same shape with lookup tables that join further lookup tables, such as a product to its category. Each
+lookup (build) table must have unique keys and fit in `--max-memory`. zpq refuses other join shapes by name.
+For everything else, pair zpq with DuckDB, Polars or Spark, and let zpq do the Parquet part.
 
 ## How fast
 
-On 464 benchmark queries (ClickBench, PDS-H and 390 synthetic aggregation cases), run hot with a fresh process for
-every query on a Ryzen 9 9950X, zpq 0.6.0 is faster than DuckDB 2.0.0 on 457 of 464 and faster than Polars 2.1.0 on
-459 of the 461 where Polars' answer validated. Every query, the cold runs, the method and where zpq is still behind are
-on the site's [Benchmarks](https://zpq.chicagobuss.dev/numbers.html) page.
+Across 464 benchmark queries, zpq 0.6.0 is faster than DuckDB 2.0.0 on 457 of 464 and faster than Polars 2.1.0 on 459
+of the 461 where Polars' answer validated. The suite covers ClickBench, PDS-H and 390 synthetic aggregation cases. Each
+query ran hot in a fresh process on a Ryzen 9 9950X.
+
+See the [Benchmarks](https://zpq.chicagobuss.dev/numbers.html) page for every query, the cold runs, the method and
+where zpq is still behind.
 
 ## Limits
 
-- `--max-memory` is a working budget, not a hard cap: it counts aggregation, DISTINCT and string memory, but not the
-  binary, thread stacks or mapped input pages, so a query can go somewhat past it (a 256 MiB budget peaked at about
-  284 MiB in testing). The answer stays exact, or the query refuses cleanly. For a hard ceiling, run zpq under a
-  cgroup `memory.max` or `ulimit -v`.
-- Window functions run (see docs/capabilities.md); some other SQL is refused with exit 2 and a message.
+- `--max-memory` is a working budget, not a hard cap. It counts aggregation, DISTINCT and string memory, but not the
+  binary, thread stacks or mapped input pages. Because of that, a query can go somewhat past the budget (a 256 MiB
+  budget peaked at about 284 MiB in testing). The answer stays exact, or the query refuses cleanly. For a hard ceiling,
+  run zpq under a cgroup `memory.max` or `ulimit -v`.
+- Window functions work (see docs/capabilities.md). zpq refuses some other SQL with exit 2 and a message.
 - JSON prints DATE and TIMESTAMP as their stored integers; CSV prints ISO text.
-- On Windows, only the x86_64 CLI is built; libzpq is not built for Windows (see docs/libzpq.md).
+- On Windows, only the x86_64 CLI is built. libzpq is not built for Windows (see docs/libzpq.md).
 
 The full list is under "Known limits" in [CHANGELOG.md](CHANGELOG.md).
 
@@ -188,9 +195,9 @@ just full              # the full gate (tools/check/README.md)
 just test-integration  # Lambda integration tests
 ```
 
-The check tiers are described in [tools/check/README.md](tools/check/README.md), test coverage in
-[docs/test-coverage.md](docs/test-coverage.md), and toolchain, release archives and packaging in
-[docs/building.md](docs/building.md). Contributors and coding agents start with [AGENTS.md](AGENTS.md).
+Contributors and coding agents should start with [AGENTS.md](AGENTS.md). For more detail, see
+[tools/check/README.md](tools/check/README.md) for the check tiers, [docs/test-coverage.md](docs/test-coverage.md) for
+test coverage, and [docs/building.md](docs/building.md) for the toolchain, release archives and packaging.
 
 ## License
 

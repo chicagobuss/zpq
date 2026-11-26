@@ -204,9 +204,62 @@ pub fn decimalMean(sum: i192, spec: Dec, count: i64, rewritten: bool) f64 {
     const wide = std.math.cast(i128, sum) orelse return decimalMeanWide(sum, spec.scale, count);
     const scale = hugeintAs(f64, pow10(spec.scale));
     if (spec.precision <= 4) return @as(f64, @floatFromInt(wide)) / (@as(f64, @floatFromInt(n)) * scale);
-    const divident: f80 = @as(f80, @floatFromInt(n)) * @as(f80, scale);
-    return @floatCast(hugeintAs(f80, wide) / divident);
+    return longDoubleMean(wide, n, scale);
 }
+
+/// `(long double)sum / ((long double)count * scale)` rounded to a double, as x87 computes it: the sum (the add of its two
+/// words in `Hugeint::Cast`), the product and the quotient each round to a 64-bit significand, ties to even, and the
+/// quotient rounds again to the double's 53 bits. In integers, so every target gives x86_64's bits: Zig's software f80
+/// divide, used off x86, misrounds a quotient's last bit when the numerator's significand is odd and at least the
+/// divisor's, and one bit flips a double that x87 leaves on a tie. `scale` is a positive double and `count` positive,
+/// so every value is normal and no step under- or overflows.
+pub fn longDoubleMean(sum: i128, count: u64, scale: f64) f64 {
+    std.debug.assert(count > 0 and scale >= 1);
+    if (sum == 0) return 0;
+    const bits: u64 = @bitCast(scale);
+    const e_scale: i32 = @as(i32, @intCast(bits >> 52)) - 1075;
+    const num = Extended.nearest(@abs(sum), 0);
+    const div = Extended.nearest(@as(u128, count) * ((bits & ((1 << 52) - 1)) | (1 << 52)), e_scale);
+    // The two 64-bit significands divide to 64 bits and a remainder: the numerator shifted 63 places when it is at
+    // least the divisor (a quotient in [1, 2)), else 64, puts the quotient's top bit at 63.
+    const shift: u7 = if (num.m >= div.m) 63 else 64;
+    const wide_num = @as(u128, num.m) << shift;
+    var q: Extended = .{ .m = @intCast(wide_num / div.m), .e = num.e - div.e - @as(i32, shift) };
+    q.roundUp(2 * (wide_num % div.m), div.m);
+    // To 53 bits, ties to even, as an x87 store of the 64-bit quotient to a double.
+    var m53 = q.m >> 11;
+    const low = q.m & 0x7ff;
+    if (low > 0x400 or (low == 0x400 and m53 & 1 == 1)) m53 += 1;
+    const magnitude = std.math.ldexp(@as(f64, @floatFromInt(m53)), q.e + 11);
+    return if (sum < 0) -magnitude else magnitude;
+}
+
+/// A positive x87 extended value `m * 2^e` whose 64-bit significand `m` has its top bit set.
+const Extended = struct {
+    m: u64,
+    e: i32,
+
+    /// `x * 2^e` rounded to 64 significant bits, ties to even.
+    fn nearest(x: u128, e: i32) Extended {
+        const top: u7 = @intCast(127 - @clz(x));
+        if (top < 64) return .{ .m = @intCast(x << (63 - top)), .e = e - (63 - top) };
+        const drop: u7 = top - 63;
+        var r: Extended = .{ .m = @intCast(x >> drop), .e = e + drop };
+        const rest = x & ((@as(u128, 1) << drop) - 1);
+        r.roundUp(2 * rest, @as(u128, 1) << drop);
+        return r;
+    }
+
+    /// Round up, ties to even, when the discarded part is past half a unit: `twice_rest / unit` is twice that part.
+    fn roundUp(self: *Extended, twice_rest: u128, unit: u128) void {
+        if (twice_rest < unit or (twice_rest == unit and self.m & 1 == 0)) return;
+        self.m, const carry = @addWithOverflow(self.m, 1);
+        if (carry == 1) {
+            self.m = 1 << 63;
+            self.e += 1;
+        }
+    }
+};
 
 /// `Hugeint::Cast<T>` of DuckDB: the low and the high word converted apart and added, so the only rounding is the add's
 /// (and the multiplication's, for a `double` high word; a power of ten below 2^53 words is exact in both).
@@ -1322,6 +1375,37 @@ test "round of a DOUBLE rounds its exact value half away from zero, even where t
     try std.testing.expect(std.math.isNan(roundDouble(std.math.nan(f64), 2)));
     try std.testing.expectEqual(std.math.inf(f64), roundDouble(std.math.inf(f64), 2));
     try std.testing.expectEqual(@as(f64, 1e308), roundDouble(1e308, 5)); // the scaling overflows: x stays
+}
+
+test "a wide DECIMAL AVG is x87's long double mean to the last bit, on every target" {
+    // The mean of 2.505 three times at DECIMAL(38,37): x87's 64-bit quotient lies exactly on a double halfway and the
+    // store rounds it to even, below 2.505, so it rounds to 2.5 at a cent.
+    const tie = decimalMean(7515 * pow10(34), .{ .precision = 38, .scale = 37 }, 3, false);
+    try testing.expectEqual(@as(u64, 0x40040a3d70a3d70a), @as(u64, @bitCast(tie)));
+    try testing.expectEqual(@as(f64, 2.5), roundDouble(tie, 2));
+    // Means whose double a misrounded 64-bit quotient changes; the bits are the exact x87 computation's.
+    const cases = [_]struct { sum: i128, count: u64, scale: u64, want: u64 }{
+        .{ .sum = -4135720900000000000000000000000000000, .count = 452, .scale = 0x46293e5939a08cea, .want = 0xc0c1dee99999999a },
+        .{ .sum = -470945917556135593956, .count = 1691819345, .scale = 0x3ff0000000000000, .want = 0xc25033fc1fde808c },
+        .{ .sum = -1790843375850922718686272, .count = 331502503473, .scale = 0x4381e1820ebc1c9c, .want = 0xbf0195f6160e1585 },
+        .{ .sum = 20020318752662125289977942033194781824, .count = 32, .scale = 0x40f86a0000000000, .want = 0x4653bdd6c6963090 },
+        .{ .sum = -69928881533742810057038, .count = 169, .scale = 0x4415af1d78b58c40, .want = 0xc0108d1c65ce50d0 },
+        .{ .sum = 557140701256562903896536, .count = 238563516, .scale = 0x46386f01cb698034, .want = 0x3cd5bb90a83fa889 },
+        .{ .sum = 3809227572213404865282520679472, .count = 156427, .scale = 0x46fed09bead87c03, .want = 0x3e24eaf1f3f9e0b8 },
+    };
+    for (cases) |c| try testing.expectEqual(c.want, @as(u64, @bitCast(longDoubleMean(c.sum, c.count, @bitCast(c.scale)))));
+    try testing.expectEqual(@as(f64, 0), longDoubleMean(0, 7, 1e30));
+    // Where x87 is the hardware, the integers agree with it on any sum, count and scale.
+    if (@import("builtin").cpu.arch != .x86_64) return;
+    var prng = std.Random.DefaultPrng.init(0x62);
+    const r = prng.random();
+    for (0..20000) |_| {
+        const sum = r.int(i128) >> r.uintLessThan(u7, 127);
+        const count = (r.int(u64) >> 1 >> r.uintLessThan(u6, 63)) | 1;
+        const scale = hugeintAs(f64, pow10(r.uintLessThan(u8, 38)));
+        const x87: f64 = @floatCast(@as(f80, @floatFromInt(sum)) / (@as(f80, @floatFromInt(count)) * @as(f80, scale)));
+        try testing.expectEqual(@as(u64, @bitCast(x87)), @as(u64, @bitCast(longDoubleMean(sum, count, scale))));
+    }
 }
 
 test "IntType: DuckDB's operation types, ranges and literal types" {

@@ -802,8 +802,7 @@ fn averageOf(total: i128, k: u32, width: u8, dec: ?expr_ast.Dec) f64 {
     const scale: f64 = if (dec) |d| @floatFromInt(expr_ast.pow10(d.scale)) else 1;
     const small = if (dec) |d| d.precision <= 4 else width <= 16;
     if (small) return @as(f64, @floatFromInt(total)) / (@as(f64, @floatFromInt(k)) * scale);
-    const divisor: f80 = @as(f80, @floatFromInt(k)) * @as(f80, scale);
-    return @floatCast(@as(f80, @floatFromInt(total)) / divisor);
+    return expr_ast.longDoubleMean(total, k, scale);
 }
 
 /// Row `i` of an integer or DECIMAL column as a 256-bit integer, 0 for NULL.

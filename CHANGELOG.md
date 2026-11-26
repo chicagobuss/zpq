@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **`%` and `//` in a SQL WHERE run and match DuckDB.** Earlier notes and docs said a WHERE predicate refuses them; only the `--filter` flag does, and over aggregates they are still refused by name.
+
 - **A DOUBLE or FLOAT `%` with no answer is `-nan` on every host.** `inf % 1.0`, `x % 0.0` and `x % -0.0` are the negative NaN DuckDB prints on x86_64 Linux; before, ARM builds printed `nan` there while x86 builds printed `-nan`. A NaN operand still keeps its sign, and nothing else about float formatting changes.
 
 - **A join's top rows by an integer, DATE or TIMESTAMP column of its probe table read only the row groups that can hold them.** `SELECT f.id, d.name FROM f JOIN d ON ... ORDER BY f.id LIMIT 20` first ranks the joined rows by `f.id` alone, which shows the key the 20th row has, then reads and groups only the rows no later than it, skipping every row group whose statistics put it after. On a 3-million-row probe in 25 row groups that joins by a composite string key, that is one row group read instead of all of them. The rows and their order are unchanged, ties and duplicates included. `ZPQ_JOIN_TOPK=0` turns it off.
@@ -247,7 +249,7 @@ Bug fixes for zpq 0.6. For what 0.6 introduced, see 0.6.0 below.
   `-`, `*`, `%` and `//` now take the SQL type DuckDB resolves for the pair and raise its overflow error where the
   result leaves it (`SMALLINT 32767 + TINYINT 127` was answered as 32894). **Changed answer:** `/` between integers is a
   DOUBLE division, as in DuckDB (`7 / 2` is 3.5, where it was truncated to 3); write `//` for the integer division.
-  `%` or `//` over aggregates, and of a date or text, are still refused by name; a SQL WHERE predicate takes them (only `--filter` refuses them).
+  `%` or `//` in a WHERE predicate or over aggregates, and of a date or text, are still refused by name.
 
 - **Date and timestamp casts, and typed computed times.** `CAST(t AS DATE)` and `CAST(x AS TIMESTAMP)` (also `::` and
   `DATETIME`) convert between a DATE and a TIMESTAMP in any unit, in a SELECT, an aggregate argument or a GROUP BY key,

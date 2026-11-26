@@ -247,7 +247,7 @@ Bug fixes for zpq 0.6. For what 0.6 introduced, see 0.6.0 below.
   `-`, `*`, `%` and `//` now take the SQL type DuckDB resolves for the pair and raise its overflow error where the
   result leaves it (`SMALLINT 32767 + TINYINT 127` was answered as 32894). **Changed answer:** `/` between integers is a
   DOUBLE division, as in DuckDB (`7 / 2` is 3.5, where it was truncated to 3); write `//` for the integer division.
-  `%` or `//` in a WHERE predicate or over aggregates, and of a date or text, are still refused by name.
+  `%` or `//` over aggregates, and of a date or text, are still refused by name; a SQL WHERE predicate takes them (only `--filter` refuses them).
 
 - **Date and timestamp casts, and typed computed times.** `CAST(t AS DATE)` and `CAST(x AS TIMESTAMP)` (also `::` and
   `DATETIME`) convert between a DATE and a TIMESTAMP in any unit, in a SELECT, an aggregate argument or a GROUP BY key,

@@ -245,8 +245,8 @@ and not NULL. `%` takes the sign of the dividend; `//` truncates toward zero; `/
 (`7 / 2` is 3.5: an earlier release truncated it, which `//` now spells). A zero divisor of `%` or `//` of integers or
 DECIMALs is an error, and so is the minimum of a signed type over -1; a DOUBLE `%` is C's `fmod` (`x % 0` and `inf % x` are `-nan` on every host, as DuckDB prints them on x86_64 Linux), and
 `//` of anything but two integers is `/` with a zero-divisor error. `%` of DECIMALs is exact: a DECIMAL of the larger
-integer part and the larger scale, or a DOUBLE where that passes 38 digits. `%` and `//` over aggregates, and in a
-WHERE predicate, are refused by name. The string functions count and cut text in characters (UTF-8 code points, as DuckDB does: a combining mark is a
+integer part and the larger scale, or a DOUBLE where that passes 38 digits. `%` and `//` over aggregates are refused by name
+(`PostAggNotSupported`). A SQL WHERE predicate takes them and matches DuckDB; only the `--filter` flag refuses them. The string functions count and cut text in characters (UTF-8 code points, as DuckDB does: a combining mark is a
 character); `upper` and `lower` map one code point to one with DuckDB's own table, so `ß` upper-cases to `ẞ` and
 there is no final-sigma form. Their other arguments are constants (a column there is refused; an empty `lpad`/`rpad`
 pad is an error only where padding is needed, as in DuckDB). `split_part(s, sep, n)` takes the `n`th field (1-based, a

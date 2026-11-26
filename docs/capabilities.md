@@ -338,7 +338,9 @@ Parquet (a DOUBLE or exact DECIMAL(38, s) sum, a non-null INT64 count), so per-f
 `sum(<name>__sum) / sum(<name>__count)`; you cannot average means. A double avg is the avg_state sum over its count,
 bit for bit.
 `-o out.parquet` writes the result as parquet: one row, or one row per group with the same columns and values as the
-JSON (avg_state as `<name>__sum` / `<name>__count`).
+JSON (avg_state as `<name>__sum` / `<name>__count`), with one difference: the Parquet column of an integer `sum` is an
+INT64, so a sum past the INT64 range (`sum` of BIGINT or UBIGINT values that add past 9223372036854775807) prints in
+JSON and CSV but fails under `-o`, and inside a CTE, with `AggIntTooWide` (exit 1).
 `count(*)` is answered straight from row-group metadata; `min / max / sum` are computed by decoding the data unless you
 opt into trusting file statistics — see [Statistics: trust is opt-in](statistics-trust.md). `--max-memory`
 is a ceiling on what an aggregate or a write holds at once: one budget (`src/core/memory.zig`) that the GROUP BY tables,

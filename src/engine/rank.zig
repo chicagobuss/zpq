@@ -1313,6 +1313,107 @@ pub fn topnLimit(ctx: Context, args: QueryArgs, inputs: []const scan.Input) usiz
     return args.max_memory;
 }
 
+/// One ranking pass (`RankShared`): workers take `items`, each keeping its best `h` rows by their keys alone, and the
+/// heaps merge into `entries`, best first. Address-pinned once `go` has started the workers.
+const RankRun = struct {
+    shared: RankShared,
+    workers: []RankWorker = &.{},
+    live: usize = 0,
+    /// Every worker's heap, sorted: the first `h` are the pass's best rows. Their blocks go with the workers.
+    entries: []RankEntry = &.{},
+
+    /// `seed`: the best first key a full heap elsewhere already reached, from which rows are passed over at once.
+    fn init(
+        ctx: Context,
+        arena: std.mem.Allocator,
+        args: QueryArgs,
+        inputs: []const scan.Input,
+        metas: []const schema.FileMetaData,
+        filter: ?filter_ast.Filter,
+        fetch: []const bool,
+        keys: []const RowSortKey,
+        h: usize,
+        items: []RankedRG,
+        res: *Reservation,
+        seed: ?SortCell,
+    ) !RankRun {
+        const key_specs = try arena.alloc(consumer.OutputCol, keys.len);
+        for (keys, key_specs) |k, *spec| spec.* = k.spec;
+        return .{ .shared = .{
+            .gpa = ctx.gpa,
+            .io = ctx.io,
+            .inputs = inputs,
+            .metas = metas,
+            .filter = filter,
+            .fetch = fetch,
+            .keys = keys,
+            .key_specs = key_specs,
+            .h = h,
+            .prune = !args.scan_all,
+            .dict_key = dictionaryKey(&metas[0], keys[0], filter),
+            .options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
+            .profiler = args.profiler,
+            .cursor = .{ .items = items },
+            .res = res,
+            .cut = seed,
+            .cut_version = .init(@intFromBool(seed != null)),
+        } };
+    }
+
+    fn deinit(r: *RankRun) void {
+        r.release();
+        r.shared.deinit();
+    }
+
+    /// The workers and their heaps go back: positions already read out of `entries` stay, its keys do not.
+    fn release(r: *RankRun) void {
+        for (r.workers[0..r.live]) |*w| w.deinit();
+        r.live = 0;
+    }
+
+    fn go(r: *RankRun, mem: *ReservedMem, args: QueryArgs, threads: usize, t: *Timings) !void {
+        const s = &r.shared;
+        const prof = profile.threadOf(args.profiler, .main);
+        // Every worker holds a heap of h: fewer workers rather than heaps taking more than an eighth of the budget.
+        var n_workers = std.math.clamp(threads, 1, s.cursor.items.len);
+        while (n_workers > 1 and n_workers *| s.h *| @sizeOf(RankEntry) > s.res.ledger.limit / 8) n_workers -= 1;
+
+        const t_rank = nowMonoNs();
+        r.workers = try mem.alloc(RankWorker, n_workers);
+        for (r.workers) |*w| {
+            w.* = try .init(s, r.live);
+            r.live += 1;
+        }
+        runAll(RankWorker, r.workers, RankWorker.run);
+        const t_merge = nowMonoNs();
+        profile.record(prof, .scan, t_rank, t_merge, profile.args(.{n_workers}));
+
+        var failed: ?*const RankWorker = null;
+        for (r.workers) |*w| {
+            t.core.decode_ns += w.timings.decode_ns;
+            t.core.eval_ns += w.timings.eval_ns;
+            t.core.rows_scanned += w.timings.rows_scanned;
+            t.core.rows_matched += w.timings.rows_matched;
+            if (w.err != null and (failed == null or w.err_at < failed.?.err_at)) failed = w;
+        }
+        if (failed) |w| {
+            consumer.setDecodeFailure(w.failure);
+            return w.err.?;
+        }
+
+        var n_entries: usize = 0;
+        for (r.workers) |w| n_entries += w.heap.count();
+        r.entries = try mem.alloc(RankEntry, n_entries);
+        var at: usize = 0;
+        for (r.workers) |w| {
+            @memcpy(r.entries[at..][0..w.heap.count()], w.heap.items);
+            at += w.heap.count();
+        }
+        std.mem.sortUnstable(RankEntry, r.entries, s.keys, RankEntry.lessThan);
+        profile.record(prof, .merge, t_merge, nowMonoNs(), profile.args(.{ n_entries, @min(s.h, n_entries) }));
+    }
+};
+
 /// The plain-row Top-N ranked in parallel and gathered (see `RankShared`). Null when its memory would pass the
 /// budget, refused before it is allocated and with everything given back; the caller then runs `TopRows`.
 pub fn rankAndGather(
@@ -1362,67 +1463,12 @@ fn gatherInto(
     const res = g.mem.res;
     const prof = profile.threadOf(args.profiler, .main);
     if (items.len == 0) return;
-    const key_specs = try arena.alloc(consumer.OutputCol, keys.len);
-    for (keys, key_specs) |k, *spec| spec.* = k.spec;
     const threads = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
-    // Every worker holds a heap of h: fewer workers rather than heaps taking more than an eighth of the budget.
-    var n_workers = std.math.clamp(threads, 1, items.len);
-    while (n_workers > 1 and n_workers *| h *| @sizeOf(RankEntry) > res.ledger.limit / 8) n_workers -= 1;
-
-    const t_rank = nowMonoNs();
-    var shared: RankShared = .{
-        .gpa = gpa,
-        .io = ctx.io,
-        .inputs = inputs,
-        .metas = metas,
-        .filter = filter,
-        .fetch = fetch,
-        .keys = keys,
-        .key_specs = key_specs,
-        .h = h,
-        .prune = !args.scan_all,
-        .dict_key = dictionaryKey(&metas[0], keys[0], filter),
-        .options = .{ .fast_levels = args.fast_levels, .expand_limit = args.max_memory },
-        .profiler = args.profiler,
-        .cursor = .{ .items = items },
-        .res = res,
-    };
-    defer shared.deinit();
-    const workers = try g.mem.alloc(RankWorker, n_workers);
-    var live: usize = 0;
-    defer for (workers[0..live]) |*w| w.deinit();
-    for (workers) |*w| {
-        w.* = try .init(&shared, live);
-        live += 1;
-    }
-    runAll(RankWorker, workers, RankWorker.run);
-    const t_merge = nowMonoNs();
-    profile.record(prof, .scan, t_rank, t_merge, profile.args(.{n_workers}));
-
-    var failed: ?*const RankWorker = null;
-    for (workers) |*w| {
-        t.core.decode_ns += w.timings.decode_ns;
-        t.core.eval_ns += w.timings.eval_ns;
-        t.core.rows_scanned += w.timings.rows_scanned;
-        t.core.rows_matched += w.timings.rows_matched;
-        if (w.err != null and (failed == null or w.err_at < failed.?.err_at)) failed = w;
-    }
-    if (failed) |w| {
-        consumer.setDecodeFailure(w.failure);
-        return w.err.?;
-    }
-
-    var n_entries: usize = 0;
-    for (workers) |w| n_entries += w.heap.count();
-    const entries = try g.mem.alloc(RankEntry, n_entries);
-    var at: usize = 0;
-    for (workers) |w| {
-        @memcpy(entries[at..][0..w.heap.count()], w.heap.items);
-        at += w.heap.count();
-    }
-    std.mem.sortUnstable(RankEntry, entries, keys, RankEntry.lessThan);
+    var run = try RankRun.init(ctx, arena, args, inputs, metas, filter, fetch, keys, h, items, res, null);
+    defer run.deinit();
+    try run.go(&g.mem, args, threads, t);
+    const entries = run.entries;
     const winners = entries[0..@min(h, entries.len)];
-    profile.record(prof, .merge, t_merge, nowMonoNs(), profile.args(.{ n_entries, winners.len }));
     if (winners.len == 0) return;
 
     // Winners by place in the input, grouped by row group; `slots[k]` is winner k's group and row within it.
@@ -1458,8 +1504,7 @@ fn gatherInto(
         }
     }
     // Only positions are needed from here: the heaps go before the winners' columns are read.
-    for (workers[0..live]) |*w| w.deinit();
-    live = 0;
+    run.release();
 
     const tasks = try g.mem.alloc(GatherTask, groups.len * specs.len);
     for (groups, 0..) |*grp, k| for (specs, g.out.cols, 0..) |spec, col, ci| {

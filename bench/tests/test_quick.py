@@ -392,13 +392,35 @@ class Quick(unittest.TestCase):
         self.assertIn("duckdb rejected", report["reason"])
 
     def test_command_timing_is_not_rounded_to_wait_backoff(self):
-        # Popen.wait(timeout) polls at 0.5, 1, 2 ... 32 ms, so an 18 ms child used to read 31.5 ms.
+        # Popen.wait(timeout) polls at 0.5, 1, 2 ... 32 ms, so an 18 ms child used to read 31.5 ms. Timed on the host's
+        # clock, the margin is the host's load (a shared 3-core runner read 57 ms over), so here the clock is the
+        # test's: a sleep moves it by what was asked, and the child exits once 18 ms have passed. A backoff, or a wait
+        # that doesn't poll, then reads exactly as it would on an idle host.
+        now = [0]
+        naps = []
+
+        class Child:
+            pid = 0
+
+            def poll(self):
+                return 0 if now[0] >= 18_000_000 else None
+
+            def wait(self, timeout=None):
+                return 0
+
+        def nap(seconds):
+            naps.append(seconds)
+            now[0] += round(seconds * 1e9)
+
         run = quick.Run(self.out, time.monotonic() + 5)
-        best = min(run.command([sys.executable, "-c", "import time; time.sleep(0.018)"],
-                               self.out / "o", self.out / "e")[1] for _ in range(3))
-        startup = min(run.command([sys.executable, "-c", "pass"], self.out / "o", self.out / "e")[1]
-                      for _ in range(3))
-        self.assertLess(best - startup, 27_000_000)
+        with patch.object(quick.subprocess, "Popen", lambda *a, **k: Child()), \
+                patch.object(quick.time, "sleep", nap), patch.object(quick.time, "monotonic_ns", lambda: now[0]), \
+                patch.object(quick.os, "killpg", lambda pid, sig: None):
+            rc, elapsed = run.command([sys.executable, "-c", "pass"], self.out / "o", self.out / "e")
+        self.assertEqual(rc, 0)
+        self.assertLessEqual(max(naps), 0.0005)
+        self.assertGreaterEqual(elapsed, 18_000_000)
+        self.assertLessEqual(elapsed, 18_500_000)
 
     # How long the next test waits for an event that has to happen (a child's pid, a child's exit) before it reports
     # that it never did. A hang guard, not a budget: nothing in the test is timed against it.

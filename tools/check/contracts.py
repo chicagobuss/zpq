@@ -40,6 +40,7 @@ NEEDS = {
     "libzpq": "library recovery needs libzpq.so (zig build libzpq)",
     "cow_dir": "the clone path needs ZPQ_TEST_COW_DIR naming a directory on a filesystem that shares blocks "
                "(btrfs, or XFS with reflink)",
+    "dev_full": "a device that is always full (ENOSPC on every write) needs /dev/full, which only Linux has",
 }
 EARLIER = b"earlier result must remain"
 CONTRACTS = []
@@ -388,12 +389,19 @@ def an_s3_write_puts_one_object(root, clean, corrupt, distinct, small):
 
 
 @contract
-def a_full_device_fails_and_a_closed_pipe_exits_quietly(root, clean, corrupt, distinct, small):
+def a_full_device_fails(root, clean, corrupt, distinct, small):
+    if not os.path.exists("/dev/full"):
+        raise Skip("dev_full")
     for args in ([small, "--aggregate", "count(*)"], [clean, "-o", "-", "--format", "parquet"],
                  [clean, "--select", "k, v * 2 AS w", "-o", "-", "--format", "parquet"]):
         with open("/dev/full", "wb", buffering=0) as full:
             p = run(*args, code=1, stdout=full)
         assert b"storage is full" in p.stderr if args[0] == small else p.stderr, (args, p.stderr)
+
+
+# A pipe whose reader has gone works on every POSIX host, so this half doesn't wait on /dev/full.
+@contract
+def a_closed_pipe_exits_quietly(root, clean, corrupt, distinct, small):
     for cmd, args in (("query", [small, "--aggregate", "count(*)"]), ("query", [clean, "--select", "k, v"]),
                       ("schema", [small]), ("inspect", [small]), ("conform", [small]), ("--help", [])):
         read_fd, write_fd = os.pipe()

@@ -1,16 +1,20 @@
 name: Platform gate
 
 # Every landing, natively on every shipped platform: the full tier, shard by shard, on Linux x86 and ARM and on Apple
-# silicon and Intel Macs, what runs natively on Windows today, and the release packaging path (release.yml) with
-# publishing off. It runs on every push to main or an integ/* branch and every pull request to them, whatever paths
-# the change touches: packaging and docs changes ship too.
+# silicon and Intel Macs, and the release packaging path (release.yml) with publishing off. It runs on every push to
+# main or an integ/* branch and every pull request to them, whatever paths the change touches: packaging and docs
+# changes ship too.
+#
+# A landing runs the runner:shard pairs in GATE, those proven green here, and the packaging. The rest are piloted:
+# a dispatch with pilot runs every pair not yet in GATE, and the Windows jobs; a pair joins GATE once a pilot run
+# shows it green. A dispatch with stale_man_pin runs only the packaging, on a commit with a stale manual pin, and
+# must fail.
 #
 # Each job builds cold (no build cache), passes the runner's physical memory as --maxrss and its core count as -j,
 # and records what it took (.github/ci/resources.py) next to its receipts.
 #
 # Not here, by name: the clickbench shard, whose ~14 GB of partitions don't fit a hosted runner's disk; it runs on
 # the fleet's build hosts (tools/check/fleet.sh). The canonical shard is also inside corpus, so it isn't run twice.
-# Windows runs what it runs today, the core and CLI tests and the shipped CLI (the windows jobs).
 
 on:
   push:
@@ -19,10 +23,21 @@ on:
     branches: [main, "integ/**"]
   workflow_dispatch:
     inputs:
+      pilot:
+        description: "Run the pairs not yet in GATE, and the Windows jobs, instead of the landing gate"
+        type: boolean
+        default: false
       stale_man_pin:
         description: "Rehearsal: package with the manual's pin from before its 0.6.1 re-pin, which must fail"
         type: boolean
         default: false
+
+env:
+  GATE: >-
+    ubuntu-24.04:units-core ubuntu-24.04:units ubuntu-24.04:cases ubuntu-24.04:corpus ubuntu-24.04:os
+    ubuntu-24.04:cpu ubuntu-24.04:libzpq
+    ubuntu-24.04-arm:units-core ubuntu-24.04-arm:units ubuntu-24.04-arm:corpus ubuntu-24.04-arm:os
+    ubuntu-24.04-arm:cpu ubuntu-24.04-arm:libzpq
 
 permissions:
   contents: read
@@ -32,16 +47,37 @@ defaults:
     shell: bash
 
 jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          MODE: ${{ inputs.stale_man_pin && 'rehearsal' || inputs.pilot && 'pilot' || 'gate' }}
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_OUTPUT"
+          import json, os
+          runners = ["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "macos-15-intel"]
+          shards = ["units-core", "units", "cases", "corpus", "os", "cpu", "libzpq"]
+          every = [f"{r}:{s}" for r in runners for s in shards]
+          gate = os.environ["GATE"].split()
+          assert set(gate) <= set(every), sorted(set(gate) - set(every))
+          pick = {"gate": [p for p in every if p in gate], "pilot": [p for p in every if p not in gate],
+                  "rehearsal": []}[os.environ["MODE"]]
+          print("matrix=" + json.dumps({"include": [dict(zip(("runner", "shard"), p.split(":"))) for p in pick]}))
+          PY
+
   full-tier:
     name: Full tier (${{ matrix.runner }}, ${{ matrix.shard }})
-    if: ${{ !inputs.stale_man_pin }}
+    needs: plan
+    if: ${{ fromJSON(needs.plan.outputs.matrix).include[0] }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
-        shard: [units-core, units, cases, corpus, os, cpu, libzpq]
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -55,6 +91,11 @@ jobs:
         with:
           version: 0.17.1
           use-cache: false
+
+      # A runner's network fails now and then (a DNS miss stopped one cold build), so the packages come first, retried.
+      - name: Fetch the build's packages
+        continue-on-error: true
+        run: for i in 1 2 3; do zig build --fetch=all && exit 0; sleep 30; done; exit 1
 
       # CLI cases use GNU timeout, which is not in the macOS default PATH.
       - name: Install GNU timeout on macOS
@@ -114,7 +155,7 @@ jobs:
   # CLI at .\zpq.exe for the fake-S3 test. The full tier's shards need zpq-check and don't run on Windows.
   windows-build:
     name: Windows cross-build
-    if: ${{ !inputs.stale_man_pin }}
+    if: ${{ inputs.pilot && !inputs.stale_man_pin }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -125,6 +166,11 @@ jobs:
         with:
           version: 0.17.1
           use-cache: false
+
+      # A runner's network fails now and then (a DNS miss stopped one cold build), so the packages come first, retried.
+      - name: Fetch the build's packages
+        continue-on-error: true
+        run: for i in 1 2 3; do zig build --fetch=all && exit 0; sleep 30; done; exit 1
 
       - name: Runner facts
         run: python3 .github/ci/resources.py facts >> "$GITHUB_ENV"
@@ -203,6 +249,7 @@ jobs:
 
   version:
     name: Release version
+    if: ${{ !inputs.pilot || inputs.stale_man_pin }}
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.v.outputs.tag }}

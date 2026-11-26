@@ -1096,6 +1096,14 @@ fn matchSimpleGlob(pat: []const u8, name: []const u8) bool {
     return true;
 }
 
+test "the default test scratch root is separator-free components, joined once" {
+    // A component spelled `a/b` meets the platform's separator in the path built under it, and a Windows verbatim
+    // path that mixes the two cannot be opened. Checked on every host: the mix is in the spelling, not in Windows.
+    for (@import("test_scratch.zig").default_root) |component| {
+        try std.testing.expect(std.mem.indexOfAny(u8, component, "/\\") == null);
+    }
+}
+
 test "review_windows: local glob handles backslashes" {
     if (comptime @import("builtin").os.tag != .windows) return;
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);

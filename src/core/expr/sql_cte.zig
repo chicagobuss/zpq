@@ -511,13 +511,22 @@ fn aliasFollows(text: []const u8, from: usize) bool {
 
 const testing = std.testing;
 
+/// A stage's file is the scratch dir joined to its name with the platform's separator (`d\cte0.parquet` on Windows),
+/// so the expectations spell it with `/` and compare after the plan's separators are read the same way.
+fn expectSql(arena: std.mem.Allocator, want: []const u8, got: []const u8) !void {
+    const slashed = try arena.dupe(u8, got);
+    std.mem.replaceScalar(u8, slashed, std.fs.path.sep, '/');
+    try testing.expectEqualStrings(want, slashed);
+}
+
 fn expectPlan(sql: []const u8, stages: []const []const u8, final: []const u8) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
-    const p = (try plan(arena_state.allocator(), sql, "d")).?;
+    const a = arena_state.allocator();
+    const p = (try plan(a, sql, "d")).?;
     try testing.expectEqual(stages.len, p.stages.len);
-    for (stages, p.stages) |want, got| try testing.expectEqualStrings(want, got.sql);
-    try testing.expectEqualStrings(final, p.sql);
+    for (stages, p.stages) |want, got| try expectSql(a, want, got.sql);
+    try expectSql(a, final, p.sql);
 }
 
 test "a CTE is staged once, where it is first read, and every read names its file" {
@@ -547,10 +556,10 @@ test "a derived table is a stage, nested ones first, and its column list names t
     const p = (try plan(a, "SELECT t.a FROM (SELECT x, y FROM (SELECT x, y FROM 'f' WHERE x > 1) AS i) AS t(a, b) JOIN 'g' ON t.a = k", "d")).?;
     try testing.expectEqual(@as(usize, 2), p.stages.len);
     try testing.expectEqualStrings("SELECT x, y FROM 'f' WHERE x > 1", p.stages[0].sql);
-    try testing.expectEqualStrings("SELECT x, y FROM 'd/cte0.parquet' AS i", p.stages[1].sql);
+    try expectSql(a, "SELECT x, y FROM 'd/cte0.parquet' AS i", p.stages[1].sql);
     try testing.expectEqual(@as(usize, 2), p.stages[1].columns.len);
     try testing.expectEqualStrings("b", p.stages[1].columns[1]);
-    try testing.expectEqualStrings("SELECT t.a FROM 'd/cte1.parquet' AS t JOIN 'g' ON t.a = k", p.sql);
+    try expectSql(a, "SELECT t.a FROM 'd/cte1.parquet' AS t JOIN 'g' ON t.a = k", p.sql);
     // No alias, a comma join, and a set operation inside.
     try expectPlan(
         "SELECT * FROM 'f', ((SELECT 1 AS x FROM 'g') UNION ALL (SELECT 2 FROM 'g')) WHERE 1 = 1",

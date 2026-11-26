@@ -17,6 +17,14 @@ pub const TmpDir = struct {
     }
 };
 
+/// The scratch root's default, one component at a time: a `/` spelled into one would meet the platform's separator in
+/// the path built under it, and Windows cannot open a verbatim (`\\?\`) path that mixes the two.
+pub const default_root = [_][]const u8{ ".zig-cache", "tmp" };
+
+fn scratchRoot(a: std.mem.Allocator, base: ?[]const u8) ![]u8 {
+    return std.fs.path.join(a, if (base) |p| &.{ p, "tmp" } else &default_root);
+}
+
 pub fn tmpDir(opts: std.Io.Dir.OpenOptions) TmpDir {
     const base = t.environ.getAlloc(t.allocator, "ZPQ_TEST_PARQUET_DIR") catch |err| switch (err) {
         error.EnvironmentVariableMissing => null,
@@ -27,7 +35,7 @@ pub fn tmpDir(opts: std.Io.Dir.OpenOptions) TmpDir {
     t.io.random(&random);
     var name: [16]u8 = undefined;
     _ = std.base64.url_safe.Encoder.encode(&name, &random);
-    const root = if (base) |p| std.fs.path.join(t.allocator, &.{ p, "tmp" }) catch @panic("OOM") else t.allocator.dupe(u8, ".zig-cache/tmp") catch @panic("OOM");
+    const root = scratchRoot(t.allocator, base) catch @panic("OOM");
     defer t.allocator.free(root);
     const parent = std.Io.Dir.cwd().createDirPathOpen(t.io, root, .{}) catch @panic("cannot open test scratch");
     const dir = parent.createDirPathOpen(t.io, &name, .{ .open_options = opts }) catch @panic("cannot create test scratch");

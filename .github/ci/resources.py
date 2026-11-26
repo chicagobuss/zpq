@@ -92,12 +92,13 @@ def run(label, command):
     sampler.start()
     start = time.monotonic()
     exe = shutil.which(command[0]) or command[0]
-    proc = subprocess.Popen([exe] + command[1:], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            errors="replace", bufsize=1)
+    proc = subprocess.Popen([exe] + command[1:], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     steps = []
-    for line in proc.stdout:
-        sys.stdout.write(line)
-        sys.stdout.flush()
+    # Bytes through, as the command wrote them: a Windows console encoding can't encode every test's output.
+    for raw in proc.stdout:
+        sys.stdout.buffer.write(raw)
+        sys.stdout.buffer.flush()
+        line = raw.decode("utf-8", "replace")
         if "MaxRSS:" in line:
             steps.append(line.strip(" \t\r\n│├└─"))
     code = proc.wait()

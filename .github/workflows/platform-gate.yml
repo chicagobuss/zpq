@@ -190,6 +190,7 @@ jobs:
         run: .venv/Scripts/python.exe .github/ci/resources.py run windows-core -- win/zpq-core-test.exe
 
       - name: CLI tests
+        if: ${{ !cancelled() }}
         run: .venv/Scripts/python.exe .github/ci/resources.py run windows-cli -- win/zpq-cli-test.exe
 
       - name: Keep the measurements

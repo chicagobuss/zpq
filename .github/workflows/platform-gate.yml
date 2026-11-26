@@ -1,0 +1,231 @@
+name: Platform gate
+
+# Every landing, natively on every shipped platform: the full tier, shard by shard, on Linux x86 and ARM and on Apple
+# silicon and Intel Macs, what runs natively on Windows today, and the release packaging path (release.yml) with
+# publishing off. It runs on every push to main or an integ/* branch and every pull request to them, whatever paths
+# the change touches: packaging and docs changes ship too.
+#
+# Each job builds cold (no build cache), passes the runner's physical memory as --maxrss and its core count as -j,
+# and records what it took (.github/ci/resources.py) next to its receipts.
+#
+# Not here, by name: the clickbench shard, whose ~14 GB of partitions don't fit a hosted runner's disk; it runs on
+# the fleet's build hosts (tools/check/fleet.sh). The canonical shard is also inside corpus, so it isn't run twice.
+# Windows: the full-tier shards run as a measurement that doesn't fail the gate; the windows job is the gate there.
+
+on:
+  push:
+    branches: [main, "integ/**"]
+  pull_request:
+    branches: [main, "integ/**"]
+  workflow_dispatch:
+    inputs:
+      stale_man_pin:
+        description: "Rehearsal: package with the manual's pin from before its 0.6.1 re-pin, which must fail"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  full-tier:
+    name: Full tier (${{ matrix.runner }}, ${{ matrix.shard }})
+    if: ${{ !inputs.stale_man_pin }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.runner == 'windows-latest' }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-latest]
+        shard: [units-core, units, cases, corpus, os, cpu, libzpq]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        if: runner.os != 'Linux'
+        with:
+          python-version: '3.14'
+
+      - name: Install Zig 0.17.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+          use-cache: false
+
+      # CLI cases use GNU timeout, which is not in the macOS default PATH.
+      - name: Install GNU timeout on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew list coreutils >/dev/null 2>&1 || brew install coreutils
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Runner facts and paths
+        run: |
+          python3 .github/ci/resources.py facts >> "$GITHUB_ENV" 2>/dev/null || python .github/ci/resources.py facts >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = Windows ]; then
+            root=$(pwd -W) tmp=$(cygpath -m "$RUNNER_TEMP")
+            echo "PY=$root/.venv/Scripts/python.exe" >> "$GITHUB_ENV"
+            echo "ORACLE=$tmp/oracle/duckdb.exe" >> "$GITHUB_ENV"
+          else
+            echo "PY=$PWD/.venv/bin/python" >> "$GITHUB_ENV"
+            echo "ORACLE=$RUNNER_TEMP/oracle/duckdb" >> "$GITHUB_ENV"
+          fi
+          cat "$GITHUB_ENV"
+
+      - name: Create Python test environment
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then python -m venv .venv; else python3 -m venv .venv; fi
+          "$PY" -m pip install --quiet --no-input -r tools/check/requirements.txt
+
+      # The oracle: DuckDB 2.0.1's CLI for this runner, pinned to the digest GitHub lists for the release asset.
+      - name: Install DuckDB 2.0.1
+        run: |
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64) asset=linux-amd64 sum=b676268be4d39e4e41a904442c9796c9914e645cc085c7505f048f2c992b5eca ;;
+            Linux-ARM64) asset=linux-arm64 sum=84e37891fcc45c887e30220f51a4914995cd8174139e87f8efd311ac83c956a7 ;;
+            macOS-ARM64) asset=osx-arm64 sum=7809dc1ea9215db53f76bdd539e38186c2310b6a3b5800581bf65876048556aa ;;
+            macOS-X64) asset=osx-amd64 sum=f63131b6e1e69ded1a55e0b96f2f1d77658e4cf5b666346487c927820a4d53c5 ;;
+            Windows-X64) asset=windows-amd64 sum=8e40d1e9c53dfd70dd671c1f886506211bd054272e7eed35e8aa979ad7bcc9b7 ;;
+            *) echo "no DuckDB pin for $RUNNER_OS-$RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/oracle" && cd "$RUNNER_TEMP/oracle"
+          curl -fsSLo cli.tar.gz "https://github.com/duckdb/duckdb/releases/download/v2.0.1/duckdb-cli-$asset.tar.gz"
+          if command -v sha256sum >/dev/null; then echo "$sum  cli.tar.gz" | sha256sum -c -; else echo "$sum  cli.tar.gz" | shasum -a 256 -c -; fi
+          tar -xzf cli.tar.gz
+          "$ORACLE" --version
+
+      - name: Full tier shard
+        run: >-
+          "$PY" .github/ci/resources.py run "${{ matrix.runner }}-${{ matrix.shard }}" --
+          zig build check -Dtier=full -Dshard=${{ matrix.shard }} -Dduckdb="$ORACLE" -Dpython="$PY"
+          -j"$cores" --maxrss "$mem" --summary all
+
+      - name: Keep the receipts and measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-${{ matrix.runner }}-${{ matrix.shard }}
+          path: |
+            zig-out/receipts
+            ci-metrics
+          if-no-files-found: warn
+
+  # What runs natively on Windows today: the fixtures, the core and CLI test executables (ReleaseSafe, run from the
+  # repository root, where their fixtures are), and the shipped CLI built and run. The release cases through
+  # zpq-check are a measurement, not yet the gate.
+  windows:
+    name: Windows native (core, CLI, smoke)
+    if: ${{ !inputs.stale_man_pin }}
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install Zig 0.17.1
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+          use-cache: false
+
+      - name: Runner facts and paths
+        run: |
+          python .github/ci/resources.py facts >> "$GITHUB_ENV"
+          root=$(pwd -W) tmp=$(cygpath -m "$RUNNER_TEMP")
+          echo "PY=$root/.venv/Scripts/python.exe" >> "$GITHUB_ENV"
+          echo "ORACLE=$tmp/oracle/duckdb.exe" >> "$GITHUB_ENV"
+          cat "$GITHUB_ENV"
+
+      - name: Create Python test environment
+        run: |
+          python -m venv .venv
+          "$PY" -m pip install --quiet --no-input -r tools/check/requirements.txt
+
+      - name: Install DuckDB 2.0.1
+        run: |
+          mkdir -p "$RUNNER_TEMP/oracle" && cd "$RUNNER_TEMP/oracle"
+          curl -fsSLo cli.tar.gz https://github.com/duckdb/duckdb/releases/download/v2.0.1/duckdb-cli-windows-amd64.tar.gz
+          echo "8e40d1e9c53dfd70dd671c1f886506211bd054272e7eed35e8aa979ad7bcc9b7  cli.tar.gz" | sha256sum -c -
+          tar -xzf cli.tar.gz
+          "$ORACLE" --version
+
+      # Git's bash by full path (the PATH may find WSL's first), and the venv's python as that bash names it.
+      - name: Fixtures
+        run: |
+          PYTHON=$(cygpath -u "$PY") "$PY" .github/ci/resources.py run windows-fixtures -- "$(cygpath -m "$BASH")" tools/check/fixtures.sh
+
+      - name: Build the test executables (ReleaseSafe)
+        run: >-
+          "$PY" .github/ci/resources.py run windows-test-bin --
+          zig build test-bin -Doptimize=ReleaseSafe -Dduckdb="$ORACLE" -j"$cores" --maxrss "$mem" --summary all
+
+      - name: Core tests
+        run: |
+          cp zig-out/bin/zpq-core-test zig-out/bin/zpq-core-test.exe 2>/dev/null || true
+          "$PY" .github/ci/resources.py run windows-core -- zig-out/bin/zpq-core-test.exe
+
+      - name: CLI tests
+        run: |
+          cp zig-out/bin/zpq-cli-test zig-out/bin/zpq-cli-test.exe 2>/dev/null || true
+          "$PY" .github/ci/resources.py run windows-cli -- zig-out/bin/zpq-cli-test.exe
+
+      - name: Build and run the shipped CLI
+        run: |
+          "$PY" .github/ci/resources.py run windows-cli-release -- zig build cli -Doptimize=ReleaseFast -Dstrip=true \
+            -Drevision=$GITHUB_SHA --prefix zig-out/release -j"$cores" --maxrss "$mem" --summary all
+          zig-out/release/bin/zpq.exe --version | grep -q "$GITHUB_SHA"
+
+      - name: Release cases (measurement)
+        continue-on-error: true
+        run: |
+          zig build check-runner -Doptimize=ReleaseSafe -Dduckdb="$ORACLE" -j"$cores" --maxrss "$mem"
+          "$PY" .github/ci/resources.py run windows-release-cases -- zig-out/bin/zpq-check.exe \
+            --cases tools/check/cases/release.json --zpq zig-out/release/bin/zpq.exe --duckdb "$ORACLE" --python "$PY" --no-cache
+
+      - name: Keep the measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-windows-native
+          path: ci-metrics
+          if-no-files-found: warn
+
+  version:
+    name: Release version
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: echo "tag=v$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' build.zig.zon)" >> "$GITHUB_OUTPUT"
+
+  # The release path itself (release.yml): every target built and packaged, the archives smoked natively, the
+  # checksums and release.json assembled; dry_run keeps it from publishing. release.yml's publishing job asks for
+  # contents: write, which a called workflow may only have if its caller grants it; with dry_run it publishes nothing,
+  # and the call passes no secrets.
+  # The stale_man_pin rehearsal packages a throwaway commit that restores the manual's pin from before 0.6.1's re-pin:
+  # the packaging must refuse it.
+  packaging:
+    name: Packaging
+    needs: version
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.version.outputs.tag }}
+      ref: ${{ github.sha }}
+      dry_run: true
+      prepare: >-
+        ${{ inputs.stale_man_pin && 'printf "%s  zpq.1\n%s  zpq.1.gz\n"
+        6c2e8ed6cd101651c82a6f5e6d7316818bccf6a2408a58eb010f8b2bedd12cfe
+        e046d47168e8b7962cfd6aeab53b144619c2229d414e5d27c2db343c2fbbb990 > packaging/man/zpq.1.gz.sha256 &&
+        git -c user.name=rehearsal -c user.email=rehearsal@example.com commit -qam "rehearsal: stale man pin"' || '' }}

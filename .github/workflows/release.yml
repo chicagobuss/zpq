@@ -11,6 +11,10 @@ name: Release
 # On Forgejo the build and release jobs take the pre-flight's own Linux label; Forgejo evaluates runs-on without
 # the github context, so there the test is false.
 #
+# The platform gate (platform-gate.yml) calls this file at every landing with dry_run set, so each landing is built,
+# packaged, smoked and assembled exactly as a release would be; only a tag push or a dispatch without dry_run
+# publishes.
+#
 # Lambda binaries are NOT shipped here. They're author-deployed via
 # `just lambda-deploy`; `tools/serverless/aws.sh build` is what
 # produces the artifact that hits AWS.
@@ -31,6 +35,27 @@ on:
         default: false
       ref:
         description: "Commit to build in place of the tag (a pre-flight dry run, before tagging)"
+        required: false
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      tag:
+        description: "Version to package as (v plus build.zig.zon's version)"
+        required: true
+        type: string
+      dry_run:
+        description: "Build, smoke and stage without publishing"
+        required: false
+        type: boolean
+        default: true
+      ref:
+        description: "Commit to build"
+        required: false
+        type: string
+        default: ""
+      prepare:
+        description: "Shell commands run in the build jobs' checkout before packaging (the gate's rehearsals)"
         required: false
         type: string
         default: ""
@@ -57,6 +82,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || inputs.tag || github.ref }}
+
+      - name: Prepare the checkout
+        if: inputs.prepare
+        env:
+          PREPARE: ${{ inputs.prepare }}
+        run: bash -c "$PREPARE"
 
       - name: Install Zig (anyzig pins to build.zig.zon)
         run: |
@@ -334,8 +365,9 @@ jobs:
           open("RELEASE_NOTES.md", "w").write(m.group(1).strip() + "\n")
           PY_NOTES
 
+      # A tag push has no inputs, so it publishes; a dispatch or a call (the platform gate) publishes only without dry_run.
       - name: Create GitHub Release
-        if: ${{ github.server_url == 'https://github.com' && (github.event_name != 'workflow_dispatch' || inputs.dry_run != true) }}
+        if: ${{ github.server_url == 'https://github.com' && inputs.dry_run != true }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
@@ -345,7 +377,7 @@ jobs:
 
       # R2 mirrors the GitHub Release; a failed upload (say, rotated credentials) must not block the release.
       - name: Upload to R2 (public mirror)
-        if: ${{ github.server_url == 'https://github.com' && (github.event_name != 'workflow_dispatch' || inputs.dry_run != true) }}
+        if: ${{ github.server_url == 'https://github.com' && inputs.dry_run != true }}
         continue-on-error: true
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}

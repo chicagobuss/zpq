@@ -19,6 +19,19 @@
 
 #include "zpq.h"
 
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+
+/* GCC says it builds under ASan with __SANITIZE_ADDRESS__; clang (macOS's cc and gcc) with __has_feature. */
+#if defined(__SANITIZE_ADDRESS__)
+#define UNDER_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define UNDER_ASAN 1
+#endif
+#endif
+
 static int failures = 0;
 #define CHECK(cond, ...)                                                   \
     do {                                                                   \
@@ -69,13 +82,23 @@ static char *agg_of(const char *resp) {
     return s;
 }
 
+/* This process's resident set in KB: /proc on Linux, the Mach task's on macOS. A reading that can't be taken stops
+ * the test, so an RSS check never passes by comparing two failures. */
 static long rss_kb(void) {
+#ifdef __APPLE__
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
+        return (long)(info.resident_size / 1024);
+#else
     FILE *f = fopen("/proc/self/statm", "r");
     long pages = 0, resident = 0;
-    if (!f) return -1;
-    if (fscanf(f, "%ld %ld", &pages, &resident) != 2) resident = -1;
-    fclose(f);
-    return resident * (sysconf(_SC_PAGESIZE) / 1024);
+    int read = f ? fscanf(f, "%ld %ld", &pages, &resident) : 0;
+    if (f) fclose(f);
+    if (read == 2) return resident * (sysconf(_SC_PAGESIZE) / 1024);
+#endif
+    fprintf(stderr, "test_abi: cannot read this process's resident set\n");
+    exit(1);
 }
 
 /* zpq_open with `options`, NULL on failure (any message freed). */
@@ -316,9 +339,10 @@ static void test_rss_flat(zpq_ctx *c, int calls) {
     long end = rss_kb();
     printf("rss: start %ld KB, after %d calls %ld KB, after %d calls %ld KB\n", start, calls / 2, at_half, calls,
            end);
-#ifndef __SANITIZE_ADDRESS__
+#ifndef UNDER_ASAN
     /* The second half may not grow resident memory by more than 2 MB (allocator noise). Not under ASan, whose
-       quarantine holds freed memory back and grows resident memory by design; there, LeakSanitizer checks. */
+       quarantine holds freed memory back and grows resident memory by design; there, LeakSanitizer checks (on
+       Linux; macOS's ASan has none, and the plain run's RSS checks stand). */
     CHECK(end - at_half < 2048, "RSS grew %ld KB over the second %d calls", end - at_half, calls - calls / 2);
 #endif
 }
@@ -513,7 +537,7 @@ static void test_sql(zpq_ctx *c) {
     }
     long end = rss_kb();
     printf("SQL RSS: at 500 %ld KB, at 1000 %ld KB\n", half, end);
-#ifndef __SANITIZE_ADDRESS__
+#ifndef UNDER_ASAN
     CHECK(end - half < 2048, "SQL RSS grew %ld KB", end - half);
 #endif
     const char *bad[] = {

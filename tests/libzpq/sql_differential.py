@@ -62,7 +62,12 @@ def cli(sql, j):
 
 
 def rss():
-    return int(Path('/proc/self/statm').read_text().split()[1]) * os.sysconf('SC_PAGESIZE') // 1024
+    """This process's resident set in KiB: /proc on Linux, ps where there is no /proc (macOS)."""
+    statm = Path('/proc/self/statm')
+    if statm.exists():
+        return int(statm.read_text().split()[1]) * os.sysconf('SC_PAGESIZE') // 1024
+    return int(subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())], capture_output=True, text=True,
+                              check=True).stdout)
 
 
 def main():

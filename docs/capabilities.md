@@ -487,8 +487,10 @@ keeping its mode, and refused if the file changed while it ran; `-o` writes it e
   nothing.
 - Refused, exit 2, naming the reason: repeated (LIST/MAP) columns, INT96 and FLOAT16 columns, encrypted files, S3
   targets, a page zpq cannot rewrite exactly, STRUCT fields (a leaf under a group), a value outside an 8- or 16-bit
-  integer type's range, a glob, a second UPDATE of the same file while one runs, and every option but `-o`, `--fsync`/`--no-fsync`, `--max-memory` and
-  `--summary=json`. A file replaced, removed or rewritten while an UPDATE runs is refused (`InputChanged`), and
+  integer type's range, a glob, a second UPDATE of the same file while one runs, and the options that shape a result: `--format`, `--limit`,
+  `--explain`, `--codec`, `--bloom-filter` and the profile options (`--select`, `--filter` and `--aggregate` cannot
+  join `--query` at all). The options an UPDATE uses are `-o`, `--fsync`/`--no-fsync`, `--max-memory` and
+  `--summary=json`; others, such as `-j`, are accepted. A file replaced, removed or rewritten while an UPDATE runs is refused (`InputChanged`), and
   `--max-memory` bounds what it holds as it bounds a SELECT.
 - On ext4 and other filesystems that share no blocks, the copy is written in full: time and transient disk grow with
   the file. On btrfs or XFS with reflink they grow with the pages touched.

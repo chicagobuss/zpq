@@ -38,6 +38,8 @@ env:
     ubuntu-24.04:cpu ubuntu-24.04:libzpq
     ubuntu-24.04-arm:units-core ubuntu-24.04-arm:units ubuntu-24.04-arm:corpus ubuntu-24.04-arm:os
     ubuntu-24.04-arm:cpu ubuntu-24.04-arm:libzpq
+    macos-15:units macos-15:corpus macos-15:cpu
+    macos-15-intel:units-core macos-15-intel:units macos-15-intel:corpus macos-15-intel:cpu
 
 permissions:
   contents: read

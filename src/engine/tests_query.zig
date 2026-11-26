@@ -507,6 +507,76 @@ test "kthKey is the h-th best key of the rows the filter keeps, either way up, a
     };
 }
 
+test "kthKey with the guard on declines before a read when no row group can be passed over, and after a short pilot" {
+    std.Io.Dir.cwd().access(std.testing.io, topn_gather_inputs[1], .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var setup = std.heap.ArenaAllocator.init(gpa);
+    defer setup.deinit();
+    const sa = setup.allocator();
+    var inputs: [topn_gather_inputs.len]scan.Input = undefined;
+    var metas: [topn_gather_inputs.len]schema.FileMetaData = undefined;
+    for (topn_gather_inputs, &inputs, &metas) |path, *in, *m| {
+        const bytes = try metadata.readFileSlice(path, sa);
+        in.* = .{ .name = path, .bytes = bytes };
+        m.* = try metadata.open(sa, bytes);
+    }
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    // Six row groups of 1,000 rows: `id` climbs through them (0..2999, 10000..12999), `k` spans 0..49 in each.
+    const Run = struct {
+        got: ?engine_rank.SortCell,
+        scanned: u64,
+    };
+    const run = struct {
+        fn at(
+            c: Context,
+            a: std.mem.Allocator,
+            ins: []const scan.Input,
+            ms: []const schema.FileMetaData,
+            order_by: []const u8,
+            h: usize,
+            economical: bool,
+        ) !Run {
+            const args: QueryArgs = .{
+                .inputs = &topn_gather_inputs,
+                .select = "id",
+                .result_order = .{ .rows = &.{.{ .expr = order_by, .descending = false }}, .limit = h },
+                .parallelism = 2,
+            };
+            const proj = try planProjection(a, args, &ms[0]);
+            const key = proj.row_keys[0];
+            const items = try rankRowGroups(a, ins, ms, key, true);
+            var t: Timings = .{};
+            const kth = engine_rank.kthKey;
+            const got = try kth(c, a, args, ins, ms, proj.filter, proj.fetch, key, h, items, 1 << 28, economical, &t);
+            return .{ .got = got, .scanned = t.core.rows_scanned };
+        }
+    }.at;
+    const ins: []const scan.Input = &inputs;
+    const ms: []const schema.FileMetaData = &metas;
+
+    // The key climbs: the pilot is the first row group, five others sort wholly after it, one in six stays to be read.
+    // The guard lets it through, and the cut is the fifth id with only that row group read.
+    const climbs = try run(ctx, sa, ins, ms, "id", 5, true);
+    try std.testing.expectEqual(@as(i128, 4), climbs.got.?.int);
+    try std.testing.expectEqual(@as(u64, 1000), climbs.scanned);
+    const unguarded = try run(ctx, sa, ins, ms, "id", 5, false);
+    try std.testing.expectEqual(climbs.got.?.int, unguarded.got.?.int);
+
+    // `k` spans the same values in every row group: the pilot's worst key is no better than any other row group's best,
+    // so the cut cannot pass over any, and nothing is read. Without the guard the same call reads and answers.
+    const spans = try run(ctx, sa, ins, ms, "k", 5, true);
+    try std.testing.expect(spans.got == null);
+    try std.testing.expectEqual(@as(u64, 0), spans.scanned);
+    try std.testing.expect((try run(ctx, sa, ins, ms, "k", 5, false)).got != null);
+
+    // The statistics promise a cut, but the pilot holds fewer than 1,500 rows: it reads its row group, finds no cutoff,
+    // and the others all stay, which is too many. The guard declines; unguarded, it ranks them all and answers.
+    const short = try run(ctx, sa, ins, ms, "id", 1500, true);
+    try std.testing.expect(short.got == null);
+    try std.testing.expectEqual(@as(u64, 1000), short.scanned);
+    try std.testing.expectEqual(@as(i128, 1499), (try run(ctx, sa, ins, ms, "id", 1500, false)).got.?.int);
+}
+
 /// Passes allocations through and refuses to grow or move one in place.
 const NoResizeAllocator = struct {
     child: std.mem.Allocator,

@@ -159,7 +159,7 @@ where zpq is still behind.
   binary, thread stacks or mapped input pages. Because of that, a query can go somewhat past the budget (a 256 MiB
   budget peaked at about 284 MiB in testing). The answer stays exact, or the query refuses cleanly. For a hard ceiling,
   run zpq under a cgroup `memory.max` or `ulimit -v`.
-- Window functions work (see docs/capabilities.md). zpq refuses some other SQL with exit 2 and a message.
+- Window functions work (see docs/capabilities.md). zpq refuses some other SQL with a message and exit 2, or exit 1 when the query had already started to run (`zpq --help`, exit codes).
 - JSON prints DATE and TIMESTAMP as their stored integers; CSV prints ISO text.
 - On Windows, only the x86_64 CLI is built. libzpq is not built for Windows (see docs/libzpq.md).
 

@@ -71,8 +71,12 @@ usage:
                  rows_matched (kept by the filter), rows (answer).
                  Times: wall_ms phases, worker_ms summed over workers
                  (docs/output-format.md).
-  exit codes     0 success; 1 read/decode/write failure; 2 invalid or
-                 unsupported query/options; 141 closed stdout pipe.
+  exit codes     0 success; 1 read/decode/write failure, and a query
+                 refused once it started running (set-operation types,
+                 a join's shape, a window's float sum, frame or lag
+                 default, CSV ORDER BY, a sum past 64 bits under -o);
+                 2 invalid or unsupported query/options refused before
+                 any data is read; 141 closed stdout pipe.
                  Local files publish atomically; failed stdout can
                  contain a partial result. Check pipeline status.
 

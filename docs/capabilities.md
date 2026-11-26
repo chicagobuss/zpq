@@ -105,7 +105,7 @@ under its rules. A join's plain rows (or a projection's with an `IN (SELECT ...)
 as it occurs, and are held in memory: rows past `--max-memory` are `JoinRowsExceedBudget`, a FLOAT or DOUBLE column among
 them `JoinRowsFloat` (a group's float key is not a row's value), and `SELECT *` or an expression without `AS`
 `JoinRowsShape`. `--explain` is not available, the in-process SQL requests do not carry them
-yet, a refusal of the query after its CTEs ran exits 1, and `--summary=json` describes the last query.
+yet, a refusal of the query after its CTEs ran exits 1 (as does any refusal after the query started: see [exit status](cli-output-contract.md)), and `--summary=json` describes the last query.
 
 **More scalar functions.** A column of the query's one table may be written `t.g` (its alias, else the file's own name).
 `epoch(t)` (also `date_part('epoch', t)` and `EXTRACT(epoch FROM t)`) is a DATE's or TIMESTAMP's seconds since the epoch as a

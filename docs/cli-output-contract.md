@@ -54,7 +54,12 @@ summaries a typed `profile` line; text profile summaries are rejected. The libzp
 the same row counters and time objects.
 
 Exit status is 0 for success, 1 for read/decode/write failure, 2 for invalid or unsupported options/queries, and 141
-when a consumer closes stdout. Disk-full errors remain failures. Named local outputs use an exclusive sibling
+when a consumer closes stdout. The 2 is for a refusal before the query starts to run. A query refused after it started
+exits 1 even where zpq does not support it: a set operation whose sides differ in type or column count, a join's
+shape, a window's `sum` or `avg` of a float, a `lag`/`lead` default of the wrong type, a RANGE offset the key does not
+take, ORDER BY, LIMIT and some aggregates over a CSV, a join over a CSV, a LEFT JOIN condition outside its ON, and a
+`sum` past 64 bits under `-o` (`AggIntTooWide`). A query that runs its CTEs or windows first is in this class too.
+Disk-full errors remain failures. Named local outputs use an exclusive sibling
 temporary file and atomic rename: failures remove the temporary and preserve the old target. Input/output aliases,
 including hard links, are rejected. This guarantees atomic visibility, not crash durability. S3 success follows PUT
 or multipart completion; network errors can leave completion ambiguous and do not promise POSIX rename semantics.

@@ -455,6 +455,58 @@ test "the parallel plain-row Top-N fails an allocation cleanly wherever it happe
     }.run, .{ args, @as([]const scan.Input, &inputs), @as([]const schema.FileMetaData, &metas), proj, items });
 }
 
+test "kthKey is the h-th best key of the rows the filter keeps, either way up, at any thread count" {
+    std.Io.Dir.cwd().access(std.testing.io, topn_gather_inputs[1], .{}) catch return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var setup = std.heap.ArenaAllocator.init(gpa);
+    defer setup.deinit();
+    const sa = setup.allocator();
+    var inputs: [topn_gather_inputs.len]scan.Input = undefined;
+    var metas: [topn_gather_inputs.len]schema.FileMetaData = undefined;
+    for (topn_gather_inputs, &inputs, &metas) |path, *in, *m| {
+        const bytes = try metadata.readFileSlice(path, sa);
+        in.* = .{ .name = path, .bytes = bytes };
+        m.* = try metadata.open(sa, bytes);
+    }
+    const ctx: Context = .{ .gpa = gpa, .env = .empty, .io = std.testing.io };
+    const kth = engine_rank.kthKey;
+    for ([_]bool{ false, true }) |descending| for ([_]usize{ 1, 3, 4 }) |j| for ([_]usize{ 1, 5, 40, 100000 }) |h| {
+        const args: QueryArgs = .{
+            .inputs = &topn_gather_inputs,
+            .select = "id",
+            .filter = "k > 40",
+            .result_order = .{ .rows = &.{.{ .expr = "id", .descending = descending }}, .limit = h },
+            .parallelism = j,
+        };
+        const proj = try planProjection(sa, args, &metas[0]);
+        var t: Timings = .{};
+        // The plain-row Top-N ranks the same rows: its h-th is the answer, and a heap that does not fill has none.
+        const key = proj.row_keys[0];
+        const ranked = try rankRowGroups(sa, &inputs, &metas, key, true);
+        var g = (try rankAndGather(
+            ctx,
+            sa,
+            args,
+            &inputs,
+            &metas,
+            proj.filter,
+            proj.fetch,
+            proj.output_specs,
+            proj.row_keys,
+            h,
+            ranked,
+            &t,
+        )).?;
+        defer g.deinit();
+        const ids = g.out.cols[0].i64.values.items;
+        const items = try rankRowGroups(sa, &inputs, &metas, key, true);
+        const got = try kth(ctx, sa, args, &inputs, &metas, proj.filter, proj.fetch, key, h, items, 1 << 28, false, &t);
+        if (ids.len < h) {
+            try std.testing.expect(got == null);
+        } else try std.testing.expectEqual(@as(i128, ids[h - 1]), got.?.int);
+    };
+}
+
 /// Passes allocations through and refuses to grow or move one in place.
 const NoResizeAllocator = struct {
     child: std.mem.Allocator,

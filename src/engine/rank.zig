@@ -456,6 +456,15 @@ fn rowGroupBest(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, ke
     }
 }
 
+/// The worst first key any row of a row group can have: the value end of its bounds, the best key of the opposite
+/// order, whatever its NULLs (`rowGroupBest` of the key turned around, NULLs last). A group of NULLs only is NULL.
+fn rowGroupWorst(rg: *const schema.RowGroup, meta: *const schema.FileMetaData, key: RowSortKey) ?SortCell {
+    var opposite = key;
+    opposite.descending = !key.descending;
+    opposite.nulls_first = false;
+    return rowGroupBest(rg, meta, opposite);
+}
+
 /// Whether every output column and sort key is a bare input column, which no row can fail to produce.
 pub fn allPassthrough(specs: []const consumer.OutputCol, keys: []const RowSortKey) bool {
     // A named leaf is renamed and flattened by the general path; the gather copies leaves as they are.
@@ -600,6 +609,14 @@ test "rowGroupBest reads the first key a row group can reach, and only what its 
     try testing.expect(rowGroupBest(&c.rg, &c.fm, asc).? == .null);
     c = try fixtures.StatsColumn.init(a, fixtures.statsLeaf(.INT64), .{ .null_count = 3 });
     try testing.expect(rowGroupBest(&c.rg, &c.fm, asc) == null);
+
+    // The worst key is the other end of the bounds, whatever the NULLs; a double's max proves nothing (NaN is last).
+    const nulls: schema.Statistics = .{ .min_value = &lo, .max_value = &hi, .null_count = 5 };
+    c = try fixtures.StatsColumn.init(a, fixtures.statsLeaf(.INT64), nulls);
+    try testing.expectEqual(@as(i128, 40), rowGroupWorst(&c.rg, &c.fm, asc).?.int);
+    try testing.expectEqual(@as(i128, -7), rowGroupWorst(&c.rg, &c.fm, desc).?.int);
+    c = try fixtures.StatsColumn.init(a, fixtures.statsLeaf(.DOUBLE), .{ .min_value = &dlo, .max_value = &dlo });
+    try testing.expect(rowGroupWorst(&c.rg, &c.fm, asc) == null);
 }
 
 test "TopRows.cutsOff passes over a row group only when its best first key sorts strictly after the last row kept" {
@@ -1413,6 +1430,105 @@ const RankRun = struct {
         profile.record(prof, .merge, t_merge, nowMonoNs(), profile.args(.{ n_entries, @min(s.h, n_entries) }));
     }
 };
+
+/// Whether the cut pays when `left` of `total` row groups stay to be read: it reads them a second time, under its
+/// bound, to save grouping the rows that match. Measured against the scan, that second read costs about three times
+/// what the scan spends on a row when almost nothing matches, so it pays only while a third or fewer stay.
+fn pays(left: usize, total: usize) bool {
+    return 3 *| left <= total;
+}
+
+test "the cut pays only while a third of the row groups or fewer stay to be read" {
+    try std.testing.expect(pays(1, 25));
+    try std.testing.expect(pays(8, 25));
+    try std.testing.expect(!pays(9, 25));
+    try std.testing.expect(!pays(25, 25));
+}
+
+/// The `h`-th best first key of the rows `filter` keeps, or null when fewer than `h` survive: what a LIMIT's cut
+/// is made of. The first row group alone goes first, on this thread, so a cutoff exists before the rest are read (a
+/// parallel start would read as many row groups as workers, whatever the first one proves); the row groups its
+/// cutoff and the filter's statistics do not rule out then run in parallel under it. When `economical`, null too
+/// where the cut cannot pay (`pays`): before anything is read, when the footers' bounds show that the pilot's cutoff
+/// could not pass over enough row groups, and after the pilot, when it did not. Only a bare integer key, whose cells
+/// own nothing. `items` are `rankRowGroups`' (bounded, so the likeliest first); `budget` caps the heaps and decode
+/// together. Whatever fails, the caller still has the whole scan to run.
+pub fn kthKey(
+    ctx: Context,
+    arena: std.mem.Allocator,
+    args: QueryArgs,
+    inputs: []const scan.Input,
+    metas: []const schema.FileMetaData,
+    filter: ?filter_ast.Filter,
+    fetch: []const bool,
+    key: RowSortKey,
+    h: usize,
+    items: []RankedRG,
+    budget: usize,
+    economical: bool,
+    t: *Timings,
+) !?SortCell {
+    if (h == 0) return null;
+    // A row group the filter's statistics rule out is read by no one.
+    var live: usize = 0;
+    for (items) |item| {
+        const meta = &metas[item.file];
+        const rg = &meta.row_groups.items[item.rg];
+        if (filter) |f| if (!args.scan_all and filter_prune.pruneRowGroup(rg, f, meta) == .skip) continue;
+        items[live] = item;
+        live += 1;
+    }
+    var rest = items[0..live];
+    if (rest.len == 0) return null;
+    const total = rest.len;
+    if (economical) {
+        // Once the pilot holds `h` rows its cutoff is no worse than the worst key its row group can have, so every
+        // row group whose best key sorts strictly after that is passed over. With no statistics on the pilot, or
+        // more than a third left to read, the cut cannot pay.
+        const pilot = &metas[rest[0].file];
+        const worst = rowGroupWorst(&pilot.row_groups.items[rest[0].rg], pilot, key) orelse return null;
+        var beyond: usize = 0;
+        for (rest[1..]) |item| if (item.best) |b| if (sortsAfter(key, b, worst)) {
+            beyond += 1;
+        };
+        if (!pays(total - beyond, total)) return null;
+    }
+    const res = try arena.create(Reservation);
+    res.* = .{ .ledger = .{ .limit = budget } };
+    var mem: ReservedMem = .{ .gpa = ctx.gpa, .res = res };
+    defer mem.deinit();
+    const keys = &[_]RowSortKey{key};
+    var best: std.ArrayList(SortCell) = .empty;
+    var seed: ?SortCell = null;
+    var threads: usize = 1;
+    // Pass one reads the pilot row group; pass two, the others the cutoff leaves.
+    for (0..2) |pass| {
+        const pass_items = rest[0..if (pass == 0) 1 else rest.len];
+        var run = try RankRun.init(ctx, arena, args, inputs, metas, filter, fetch, keys, h, pass_items, res, seed);
+        defer run.deinit();
+        try run.go(&mem, args, threads, t);
+        for (run.entries[0..@min(h, run.entries.len)]) |e| try best.append(arena, e.cells[0]);
+        std.mem.sort(SortCell, best.items, key, struct {
+            fn lt(k: RowSortKey, a: SortCell, b: SortCell) bool {
+                return cellOrder(k, a, b) == .lt;
+            }
+        }.lt);
+        if (best.items.len > h) best.shrinkRetainingCapacity(h);
+        if (pass == 1) break;
+        if (best.items.len == h) seed = best.items[h - 1];
+        var tail: usize = 0;
+        for (rest[1..]) |item| {
+            if (item.best) |b| if (seed) |c| if (sortsAfter(key, b, c)) continue;
+            rest[1 + tail] = item;
+            tail += 1;
+        }
+        if (tail == 0) break;
+        if (economical and !pays(tail + 1, total)) return null;
+        rest = rest[1..][0..tail];
+        threads = if (args.parallelism > 0) args.parallelism else system.discoverAvailableParallelism(ctx.env);
+    }
+    return if (best.items.len == h) best.items[h - 1] else null;
+}
 
 /// The plain-row Top-N ranked in parallel and gathered (see `RankShared`). Null when its memory would pass the
 /// budget, refused before it is allocated and with everything given back; the caller then runs `TopRows`.

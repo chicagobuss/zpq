@@ -91,6 +91,31 @@ pub const Cache = struct {
         return query;
     }
 
+    /// Every bound aggregate with `extra` as its first AND conjunct: a condition the engine learned from the data that
+    /// no row the answer comes from fails (`join_topk.zig`). First, so the rows it passes over are not looked up; a
+    /// join's lookups keep their order, the main one last.
+    pub fn narrow(self: *Cache, arena: std.mem.Allocator, extra: filter_ast.Filter) !void {
+        if (self.query) |*q| try narrowQuery(arena, q, extra);
+        var entry = self.extra;
+        while (entry) |e| : (entry = e.next) try narrowQuery(arena, &e.query, extra);
+    }
+
+    fn narrowQuery(arena: std.mem.Allocator, query: *Query, extra: filter_ast.Filter) !void {
+        const a = switch (query.*) {
+            .aggregate => |*a| a,
+            .projection => return,
+        };
+        const base = a.filter orelse {
+            a.filter = extra;
+            return;
+        };
+        const chain = base == .and_filter and base.and_filter.in_set == null and !base.and_filter.null_member;
+        const kids = try arena.alloc(filter_ast.Filter, (if (chain) base.and_filter.children.len else 1) + 1);
+        kids[0] = extra;
+        if (chain) @memcpy(kids[1..], base.and_filter.children) else kids[1] = base;
+        a.filter = .{ .and_filter = .{ .children = kids } };
+    }
+
     pub fn get(
         self: *Cache,
         source: Source,

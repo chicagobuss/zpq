@@ -37,6 +37,7 @@ pub const write = @import("engine/write.zig");
 pub const csv_write = @import("engine/csv_write.zig");
 pub const csv_agg = @import("engine/csv_agg.zig");
 pub const rank = @import("engine/rank.zig");
+pub const join_topk = @import("engine/join_topk.zig");
 pub const print = @import("engine/print.zig");
 pub const print_window = @import("engine/print_window.zig");
 pub const aggregate = @import("engine/aggregate.zig");

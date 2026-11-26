@@ -8,6 +8,7 @@ const engine_write_window = @import("write_window.zig");
 const engine_projection = @import("projection.zig");
 const engine_input = @import("input.zig");
 const engine_join = @import("join.zig");
+const engine_join_topk = @import("join_topk.zig");
 const engine_write = @import("write.zig");
 const engine_env = @import("env.zig");
 const engine_print = @import("print.zig");
@@ -402,6 +403,14 @@ fn executeAggregateOver(
                 .none => {},
             }
         };
+    // A join's rows cut by an integer probe column: the plan gains the cut the ranking finds, so the scan below reads
+    // and groups only rows that can reach the answer (`join_topk.zig`). The footers parsed for it serve the scan too.
+    const join_rows = args.join != null and args.result_order.repeat != null;
+    if (join_rows and !explain and !empty_result and allLocal(opened)) narrow: {
+        const m = steer_metas orelse (joinedMetas(arena, opened, args, null, prof) catch break :narrow);
+        engine_join_topk.narrow(ctx, arena, args, opened.inputs, m, &ledger);
+        steer_metas = m;
+    }
     // Off Linux everything below is comptime-dead, so the reader (io_uring, futexes) is never compiled in there.
     const on_linux = @import("builtin").os.tag == .linux;
     const plan_io = localIoNeeds(opened, io_policy).plan;

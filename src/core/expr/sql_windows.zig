@@ -113,8 +113,8 @@ const Builder = struct {
         return self.input(try self.unparse(node));
     }
 
-    /// `column` for a key the window partitions or orders by, which compares its value: a bare AVG is staged as the
-    /// DOUBLE an AVG in an expression reads (`avg(x) + 0`), not as the rounded DECIMAL mean it prints for a DECIMAL.
+    /// `column` for what a window reads the value of (a key it partitions or orders by, its argument): a bare AVG is
+    /// staged as the DOUBLE an AVG in an expression reads (`avg(x) + 0`), not as the rounded DECIMAL mean it prints.
     fn key(self: *Builder, node: *c.LpNode, what: []const u8) Error![]const u8 {
         if (!bareAvg(node)) return self.column(node, what);
         return self.input(try std.fmt.allocPrint(self.arena, "{s} + 0", .{try self.unparse(node)}));
@@ -411,14 +411,14 @@ const Builder = struct {
             .ranking => if (nargs != 0) return self.why.set("{s} takes no arguments", .{raw}),
             .offset => {
                 if (nargs < 1 or nargs > 3) return self.why.set("{s} takes a value, an offset and a default", .{raw});
-                call.arg = try self.column(f.args.items[0] orelse return error.SqlParseError, "argument");
+                call.arg = try self.key(f.args.items[0] orelse return error.SqlParseError, "argument");
                 if (nargs >= 2) call.offset = try self.literalInt(f.args.items[1], "the offset of lag / lead");
                 if (nargs == 3) call.default = try self.default(f.args.items[2] orelse return error.SqlParseError);
             },
             .value => {
                 const want: usize = if (call.func == .nth_value) 2 else 1;
                 if (nargs != want) return self.why.set("{s} takes {d} argument(s)", .{ raw, want });
-                call.arg = try self.column(f.args.items[0] orelse return error.SqlParseError, "argument");
+                call.arg = try self.key(f.args.items[0] orelse return error.SqlParseError, "argument");
                 if (call.func == .nth_value) {
                     call.offset = try self.literalInt(f.args.items[1], "the n of nth_value");
                     if (call.offset < 1) return self.why.set("the n of nth_value must be at least 1", .{});
@@ -436,7 +436,7 @@ const Builder = struct {
                     if (call.func != .count) return self.why.set("{s}(*) is not supported", .{raw});
                     call.func = .count_star;
                 } else if (nargs != 1) return self.why.set("{s} takes one argument", .{raw}) else {
-                    call.arg = try self.column(f.args.items[0] orelse return error.SqlParseError, "argument");
+                    call.arg = try self.key(f.args.items[0] orelse return error.SqlParseError, "argument");
                 }
             },
         }
@@ -817,7 +817,7 @@ test "QUALIFY is the final query's WHERE over the window columns, and a column o
     try std.testing.expectError(error.WindowNotSupported, build(a, text, &why, null));
 }
 
-test "a window partitions and orders by a bare AVG as the DOUBLE, and its argument reads the column as printed" {
+test "a window partitions, orders by and reads its argument of a bare AVG as the DOUBLE" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -826,6 +826,10 @@ test "a window partitions and orders by a bare AVG as the DOUBLE, and its argume
     try std.testing.expect(std.mem.indexOf(u8, plan.input_sql, "avg(d) AS \"c1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan.input_sql, "avg(e) + 0 AS") != null);
     try std.testing.expect(std.mem.indexOf(u8, plan.input_sql, "avg(d) + 0 AS") != null);
+    // The argument alone reads it too: `max(avg(d))` is the largest DOUBLE mean, not the largest rounded one.
+    const arg = try build(a, "SELECT g, max(avg(d)) OVER () AS w FROM t GROUP BY g", &why, &.{ "g", "d" });
+    try std.testing.expect(std.mem.indexOf(u8, arg.input_sql, "avg(d) + 0 AS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, arg.input_sql, "avg(d) AS") == null);
     // The query's own ORDER BY sorts a bare AVG, written, by position or by alias, by that DOUBLE too.
     for ([_][:0]const u8{
         "SELECT g, avg(d) AS m, count(*) OVER () AS n FROM t GROUP BY g ORDER BY avg(d), g DESC",

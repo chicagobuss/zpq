@@ -87,7 +87,7 @@ pub const JoinSchemas = struct {
             const m = zpq.engine.join.LocalSchemas.footer(&self.local, file) catch |err| {
                 if (self.diag) |d| d.input = file;
                 // A CSV is no table of a join: name that, not the Parquet reader's complaint about its bytes.
-                if ((err == error.NotParquet or err == error.BadMagic) and
+                if ((err == error.NotParquet or err == error.BadMagic or err == error.TooSmall) and
                     (zpq.engine.csv_write.inputFormat(file, .auto) catch .parquet) == .csv) return error.CsvJoinNotSupported;
                 return err;
             };

@@ -16,6 +16,8 @@
 
 - **The documentation says that an alias on a `COLUMNS(...)` item that expands to several columns is refused.** The alias names each of the columns, which makes duplicate output names, and zpq's output columns have distinct names.
 
+- **The UPDATE refusal message says what UPDATE refuses.** It listed the options UPDATE accepts as if no others were allowed; it now names the ones it refuses: `--format`, `--limit`, `--explain`, `--codec`, `--bloom-filter`, `--profile` and `--profile-summary`.
+
 - **`IGNORE NULLS` on a window function, QUALIFY beside ROLLUP, CUBE or GROUPING SETS, and a join over a CSV input are refused with a message that names them.** Each was documented as refused by name but printed "invalid SQL; check the syntax shown above" with nothing shown, or that the CSV was not a valid Parquet file.
 
 ## 0.6.1 — 2026-11-26

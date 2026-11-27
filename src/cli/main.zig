@@ -936,7 +936,7 @@ fn runParsedOnce(
             defer zpq.core.expr.sql_parser.diagnostic_fn = null;
             if (try zpq.core.expr.sql_parser.parseSqlUpdate(arena, q_str)) |up| {
                 if (format != null or limit != null or explain or codec != null or bloom_filters.items.len > 0 or profile_out.wanted()) {
-                    diagnosticPrint("zpq query: UPDATE takes -o, --fsync/--no-fsync, --max-memory and --summary=json only\n", .{});
+                    diagnosticPrint("zpq query: UPDATE refuses --format, --limit, --explain, --codec, --bloom-filter, --profile and --profile-summary: its output is the edited file (-o, --fsync/--no-fsync, --max-memory and --summary=json apply)\n", .{});
                     return error.BadArgs;
                 }
                 return runUpdate(io, gpa, arena, up, output, fsync, summary, max_memory orelse zpq.core.system.discoverAvailableMemory(env));

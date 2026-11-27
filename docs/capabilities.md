@@ -143,7 +143,7 @@ is read against the top-level columns of the table's first file), with the colum
 one local file or glob; a pattern that matches nothing is `ColumnsNoMatch`, an EXCLUDE of a column the table lacks
 `ColumnsExcludeMissing` (a trailing comma and quoted names are allowed), and a list of names, a lambda, `REPLACE` or `RENAME`,
 two in one item, one in WHERE or HAVING, or a join or S3 table is `ColumnsNotSupported`; an RE2 pattern zpq does not have
-(`\pL`) is `UnsupportedRegex`. An alias on the item, quoted or not, is the name of every column it expands to. A `COLUMNS(` in
+(`\pL`) is `UnsupportedRegex`. An alias on the item, quoted or not, is the name of every column it expands to, so on an item that expands to more than one column it makes output names that share one, which is refused (`DuplicateOutputColumn`: zpq's output columns have distinct names, in every query; DuckDB prints them all). A `COLUMNS(` in
 a comment is no call. A set operation or a grouping-set query expands each of its
 queries on its own.
 

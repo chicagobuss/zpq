@@ -14,6 +14,8 @@
 
 - **A `lag` or `lead` default outside an 8- or 16-bit column's range is refused by name.** `lag(i8, 1, 200)` over a TINYINT column failed as a decode error on zpq's own scratch file; it is now the `WindowDefaultType` refusal, where DuckDB raises a conversion error too.
 
+- **The documentation says that an alias on a `COLUMNS(...)` item that expands to several columns is refused.** The alias names each of the columns, which makes duplicate output names, and zpq's output columns have distinct names.
+
 ## 0.6.1 — 2026-11-26
 
 Bug fixes for zpq 0.6. For what 0.6 introduced, see 0.6.0 below.

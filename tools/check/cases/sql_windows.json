@@ -1748,8 +1748,8 @@
     "--summary=json"
    ],
    "refuse": {
-    "error": "SqlParseError",
-    "diag": "invalid SQL",
+    "error": "GroupingSetsQualify",
+    "diag": "QUALIFY with ROLLUP, CUBE or GROUPING SETS",
     "exit": 2
    }
   },
@@ -2768,6 +2768,38 @@
    "oracle": {
     "compare": "written_sql",
     "sql": "SELECT id, lag(i8, 1, 127) OVER (ORDER BY id) AS a, lead(i16, 1, -300) OVER (ORDER BY id) AS b, lag(u8, 1, 255) OVER (ORDER BY id) AS c FROM '{fixture:wnarrow}'"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:ignore-nulls",
+   "fixture": "wnarrow",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, lag(i8 IGNORE NULLS) OVER (ORDER BY id) AS w FROM '{fixture:wnarrow}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "IGNORE NULLS and RESPECT NULLS",
+    "exit": 2,
+    "no_output": true
+   }
+  },
+  {
+   "id": "sql_windows:refuse:respect-nulls",
+   "fixture": "wnarrow",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, first_value(i16 RESPECT NULLS) OVER (ORDER BY id) AS w FROM '{fixture:wnarrow}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowNotSupported",
+    "diag": "IGNORE NULLS and RESPECT NULLS",
+    "exit": 2,
+    "no_output": true
    }
   }
  ]

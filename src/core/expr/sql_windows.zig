@@ -51,6 +51,27 @@ pub fn mentions(sql: []const u8) bool {
     return false;
 }
 
+/// Whether `sql` writes `IGNORE NULLS` or `RESPECT NULLS` (a window call's treatment of NULLs) outside quoted text.
+fn writesNullTreatment(sql: []const u8) bool {
+    var i: usize = 0;
+    while (i < sql.len) {
+        if (sql[i] == '\'' or sql[i] == '"') {
+            i = sql_setops.quotedEnd(sql, i);
+            continue;
+        }
+        if (sql_setops.startsWord(sql, i)) {
+            const word = sql_setops.wordAt(sql, i);
+            if (sql_setops.eql(word, "ignore") or sql_setops.eql(word, "respect")) {
+                if (sql_setops.eql(sql_setops.nextWord(sql, i + word.len).word, "nulls")) return true;
+            }
+            i += word.len;
+            continue;
+        }
+        i += 1;
+    }
+    return false;
+}
+
 const Win = struct { name: []const u8, pass: usize, call: wp.Call };
 
 const PassB = struct {
@@ -616,7 +637,11 @@ pub fn build(arena: std.mem.Allocator, full_text: [:0]const u8, why: *Refusal, c
         text = try std.fmt.allocPrintSentinel(arena, "{s} {s}", .{ full_text[0..at], full_text[end..] }, 0);
     }
     const stmts = c.lp_parse_all(text.ptr, lp, &error_msg);
-    if (stmts == null or stmts.*.count != 1) return error.SqlParseError;
+    if (stmts == null or stmts.*.count != 1) {
+        // The grammar has no null treatment on a window call, so it says nothing of why it stopped there.
+        if (writesNullTreatment(text)) return why.set("IGNORE NULLS and RESPECT NULLS on a window function are not supported", .{});
+        return error.SqlParseError;
+    }
     const root: *c.LpNode = stmts.*.items[0] orelse return error.SqlParseError;
     if (root.*.kind != c.LP_STMT_SELECT) return why.set("window functions are supported in a SELECT", .{});
     const sel = root.*.u.select;
@@ -844,6 +869,23 @@ test "QUALIFY comes before ORDER BY and LIMIT, and a window function must be som
     try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT id, rank() OVER (ORDER BY id) AS r FROM t LIMIT 3 QUALIFY r > 2", &why, columns));
     try std.testing.expectError(error.WindowNotSupported, build(a, "SELECT id, v + 1 AS x FROM t QUALIFY x > 20", &why, columns));
     _ = try build(a, "SELECT id, rank() OVER (ORDER BY id) AS r FROM t QUALIFY id > 2", &why, columns);
+}
+
+test "IGNORE NULLS and RESPECT NULLS are refused by name, and only outside quoted text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const columns: []const []const u8 = &.{ "id", "v" };
+    for ([_][:0]const u8{
+        "SELECT id, lag(v IGNORE NULLS) OVER (ORDER BY id) AS w FROM t",
+        "SELECT first_value(v ignore  nulls) OVER (ORDER BY id) AS w FROM t",
+        "SELECT id, lead(v RESPECT NULLS) OVER (ORDER BY id) AS w FROM t",
+    }) |sql| {
+        var why: Refusal = .{};
+        try std.testing.expectError(error.WindowNotSupported, build(a, sql, &why, columns));
+        try std.testing.expect(std.mem.indexOf(u8, why.text(), "IGNORE NULLS and RESPECT NULLS") != null);
+    }
+    try std.testing.expect(!writesNullTreatment("SELECT 'ignore nulls' AS \"respect nulls\" FROM t"));
 }
 
 test "windows: a RANGE frame's offset is a reach from the ORDER BY key, in the width DuckDB gives the literal" {

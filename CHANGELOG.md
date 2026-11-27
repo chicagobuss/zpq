@@ -16,6 +16,8 @@
 
 - **The documentation says that an alias on a `COLUMNS(...)` item that expands to several columns is refused.** The alias names each of the columns, which makes duplicate output names, and zpq's output columns have distinct names.
 
+- **`IGNORE NULLS` on a window function, QUALIFY beside ROLLUP, CUBE or GROUPING SETS, and a join over a CSV input are refused with a message that names them.** Each was documented as refused by name but printed "invalid SQL; check the syntax shown above" with nothing shown, or that the CSV was not a valid Parquet file.
+
 ## 0.6.1 — 2026-11-26
 
 Bug fixes for zpq 0.6. For what 0.6 introduced, see 0.6.0 below.

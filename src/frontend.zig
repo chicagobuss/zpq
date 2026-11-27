@@ -86,6 +86,9 @@ pub const JoinSchemas = struct {
         for (files) |file| {
             const m = zpq.engine.join.LocalSchemas.footer(&self.local, file) catch |err| {
                 if (self.diag) |d| d.input = file;
+                // A CSV is no table of a join: name that, not the Parquet reader's complaint about its bytes.
+                if ((err == error.NotParquet or err == error.BadMagic) and
+                    (zpq.engine.csv_write.inputFormat(file, .auto) catch .parquet) == .csv) return error.CsvJoinNotSupported;
                 return err;
             };
             if (first == null) first = m;
@@ -817,6 +820,14 @@ fn csvError(err: anyerror, diag: *const Diag) bool {
                     "  SELECT a, b + 1 AS c FROM 'data.csv' WHERE ...), or aggregated, with or without\n" ++
                     "  GROUP BY and HAVING; ORDER BY, LIMIT and joins read the Parquet it writes\n",
                 .{},
+            );
+            return true;
+        },
+        error.CsvJoinNotSupported => {
+            diagnosticPrint(
+                "zpq query: a join over a CSV input is not supported ({s}); write it to Parquet first\n" ++
+                    "  (zpq query data.csv -o data.parquet) and join that\n",
+                .{path},
             );
             return true;
         },

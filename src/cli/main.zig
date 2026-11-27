@@ -862,6 +862,7 @@ fn runParsedOnce(
                 error.GroupingSetsNesting => diagnosticPrint("sql: ROLLUP or CUBE inside GROUPING SETS is not supported yet\n", .{}),
                 error.GroupingSetsGrouping => diagnosticPrint("sql: GROUPING is supported as a select item of its own, of grouping keys written as they are in the GROUP BY\n", .{}),
                 error.GroupingSetsTooMany => diagnosticPrint("sql: ROLLUP, CUBE and GROUPING SETS make at most {d} grouping sets\n", .{zpq.core.expr.sql_grouping.max_sets}),
+                error.GroupingSetsQualify => diagnosticPrint("sql: QUALIFY with ROLLUP, CUBE or GROUPING SETS is not supported\n", .{}),
                 else => {},
             }
             return err;
@@ -1383,7 +1384,7 @@ fn queryExitCode(err: anyerror, execution_started: bool) u8 {
         "SetOperationAll",             "SetOperationByName",    "SetOperationOrder",            "SetOperationNesting",         "SetOperationColumns",        "SetOperationTypes",
         "SetOperationNullability",     "GroupingSetsKey",       "GroupingSetsDistinct",         "GroupingSetsNesting",         "GroupingSetsGrouping",       "GroupingSetsTooMany",
         "CteRecursive",                "CteDuplicate",          "CteCircular",                  "LateralNotSupported",         "JoinRowsNotSupported",       "JoinRowsShape",
-        "StarWithItemsNotSupported",
+        "StarWithItemsNotSupported",   "GroupingSetsQualify",
     };
     for (usage) |name| if (std.mem.eql(u8, name, @errorName(err))) return 2;
     return 1;

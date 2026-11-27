@@ -26,6 +26,8 @@ pub const Error = error{
     GroupingSetsGrouping,
     /// More sets than a query is allowed (each one is a scan).
     GroupingSetsTooMany,
+    /// A QUALIFY clause beside the grouping sets.
+    GroupingSetsQualify,
 };
 
 pub const max_sets = 64;
@@ -71,7 +73,7 @@ pub fn expand(arena: std.mem.Allocator, sql: []const u8) Error!?setops.Compound 
         sets = next;
     }
     if (!grouped) return null;
-    if (c.trailing) return error.SqlParseError;
+    if (c.trailing) return if (c.trailing_qualify) error.GroupingSetsQualify else error.SqlParseError;
 
     const select_text = std.mem.trim(u8, text[c.select_start..c.from_start], " \t\r\n");
     if (setops.eql(setops.wordAt(select_text, 0), "distinct")) return error.GroupingSetsDistinct;
@@ -167,6 +169,8 @@ const Clauses = struct {
     tail: []const u8,
     /// A QUALIFY or WINDOW clause follows the GROUP BY: the grouping sets cannot be rewritten around it.
     trailing: bool = false,
+    /// The trailing clause is a QUALIFY (else a WINDOW clause).
+    trailing_qualify: bool = false,
 };
 
 /// The query's top-level clauses, or null when it is not a plain SELECT with a GROUP BY.
@@ -181,6 +185,7 @@ fn clauses(arena: std.mem.Allocator, text: []const u8) Error!?Clauses {
     var having_at: ?usize = null;
     var tail_at: ?usize = null;
     var trailing_at: ?usize = null;
+    var trailing_qualify = false;
     while (i < text.len) {
         const ch = text[i];
         if (ch == '\'' or ch == '"') {
@@ -204,7 +209,10 @@ fn clauses(arena: std.mem.Allocator, text: []const u8) Error!?Clauses {
             if (group_at != null and having_at == null and tail_at == null and setops.eql(w, "having")) having_at = i;
             if (group_at != null and tail_at == null and (setops.eql(w, "limit") or setops.eql(w, "offset") or
                 (setops.eql(w, "order") and setops.eql(setops.nextWord(text, i + w.len).word, "by")))) tail_at = i;
-            if (group_at != null and trailing_at == null and (setops.eql(w, "window") or setops.eql(w, "qualify"))) trailing_at = i;
+            if (group_at != null and trailing_at == null and (setops.eql(w, "window") or setops.eql(w, "qualify"))) {
+                trailing_at = i;
+                trailing_qualify = setops.eql(w, "qualify");
+            }
             i += w.len;
             continue;
         }
@@ -223,6 +231,7 @@ fn clauses(arena: std.mem.Allocator, text: []const u8) Error!?Clauses {
         .having = if (having_at) |h| std.mem.trim(u8, text[h..tail_start], " \t\r\n") else "",
         .tail = std.mem.trim(u8, text[tail_start..], " \t\r\n"),
         .trailing = trailing_at != null,
+        .trailing_qualify = trailing_qualify,
     };
 }
 
@@ -659,6 +668,10 @@ test "what cannot be rewritten is refused by name" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     try testing.expectError(error.GroupingSetsDistinct, expand(a, "SELECT DISTINCT a, count(*) FROM t GROUP BY ROLLUP (a)"));
+    for ([_][]const u8{ "CUBE (a, b)", "GROUPING SETS ((a), ())" }) |grouping| {
+        const sql = try std.fmt.allocPrint(a, "SELECT a, count(*) AS n, rank() OVER (ORDER BY a) AS r FROM t GROUP BY {s} QUALIFY r = 1", .{grouping});
+        try testing.expectError(error.GroupingSetsQualify, expand(a, sql));
+    }
     try testing.expectError(error.GroupingSetsNesting, expand(a, "SELECT a, count(*) FROM t GROUP BY GROUPING SETS (ROLLUP (a), (b))"));
     try testing.expectError(error.GroupingSetsGrouping, expand(a, "SELECT a, GROUPING(z) FROM t GROUP BY ROLLUP (a)"));
     try testing.expectError(error.GroupingSetsGrouping, expand(a, "SELECT a, GROUPING(a) + 1 AS x FROM t GROUP BY ROLLUP (a)"));
@@ -728,5 +741,7 @@ test "a QUALIFY after GROUP BY is no grouping-set query, and with ROLLUP it is r
     defer arena_state.deinit();
     const a = arena_state.allocator();
     try std.testing.expect((try expand(a, "SELECT g, sum(v) FROM t GROUP BY g QUALIFY rank() OVER (ORDER BY sum(v)) <= 3 ORDER BY g")) == null);
-    try std.testing.expectError(error.SqlParseError, expand(a, "SELECT g, sum(v) FROM t GROUP BY ROLLUP (g) QUALIFY rank() OVER (ORDER BY sum(v)) <= 3"));
+    try std.testing.expectError(error.GroupingSetsQualify, expand(a, "SELECT g, sum(v) FROM t GROUP BY ROLLUP (g) QUALIFY rank() OVER (ORDER BY sum(v)) <= 3"));
+    // A WINDOW clause there is still a bare parse error.
+    try std.testing.expectError(error.SqlParseError, expand(a, "SELECT g, sum(v) FROM t GROUP BY ROLLUP (g) WINDOW w AS (ORDER BY g)"));
 }

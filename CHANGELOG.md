@@ -26,6 +26,8 @@
 
 - **`--format csv` prints an infinite DATE or TIMESTAMP as `infinity` or `-infinity`, as DuckDB does.** Before, it printed the stored value as a calendar date, such as `294247-01-10 04:00:54.775807`. JSON output is unchanged: it prints the stored integer.
 
+- **A very long chain of operators in a query (`a OR b OR …`, `1 + 1 + …`, `s COLLATE c COLLATE c …`) no longer crashes zpq where it used to.** The parser builds such a chain at any length, but two steps after it walked the chain one stack frame per operator. Debug builds crashed from about 775 operators on Apple Silicon and 2,400 on x86_64, and optimized builds from about 60,000 (a 120 KB query). Debug builds now read chains of about 30,000 operators, and optimized builds several times longer than before; on Linux that is past the longest query a command line can hold. Other steps still take a little stack per operator, so on macOS, whose command line holds about 1 MB, a SELECT-list `+` chain of roughly 170,000 terms or more can still crash an optimized build. Results are unchanged, and no query that ran before is refused.
+
 ## 0.6.1 — 2026-11-26
 
 Bug fixes for zpq 0.6. For what 0.6 introduced, see 0.6.0 below.

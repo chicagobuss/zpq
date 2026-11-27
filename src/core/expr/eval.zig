@@ -559,6 +559,16 @@ fn evalGroupKeyConcatBinOp(
     } };
 }
 
+/// `x % y` on a DOUBLE or FLOAT: C's `fmod`, with one answer on every host. Where fmod has none (an infinite dividend or a
+/// zero divisor, neither operand NaN) it is the negative quiet NaN, `-nan`, as DuckDB prints it on x86_64 Linux, where glibc
+/// returns x86's default NaN. Zig's fmod returns the hardware's default NaN, positive on ARM, and Apple's libm a positive
+/// one even on Intel, so the sign is set here. A NaN operand comes back with its own sign.
+pub fn floatRem(comptime T: type, x: T, y: T) T {
+    const r = @rem(x, y);
+    if (std.math.isNan(r) and !std.math.isNan(x) and !std.math.isNan(y)) return -std.math.nan(T);
+    return r;
+}
+
 pub fn applyScalarKernel(comptime T: type, op: ast.Op, a: T, b: T) Error!T {
     // A DOUBLE divides by zero to infinity or NaN, as `/` does; `//` and the integers and DECIMALs raise it.
     if (@typeInfo(T) != .int) return switch (op) {
@@ -566,7 +576,7 @@ pub fn applyScalarKernel(comptime T: type, op: ast.Op, a: T, b: T) Error!T {
         .sub => a - b,
         .mul => a * b,
         .div => a / b,
-        .mod => @rem(a, b),
+        .mod => floatRem(T, a, b),
         .intdiv => if (b == 0) error.DivisionByZero else a / b,
         .neg => -b,
         .concat => error.TypeMismatch,
@@ -2702,6 +2712,34 @@ test "epoch counts and seconds are DuckDB 2.0.0's, an infinite time is NULL" {
     try T.expectEqual(@as(?f64, 9223372036854.775), try epochSeconds(.ts_us, true, 9223372036854775806));
 }
 
+test "an invalid DOUBLE or FLOAT remainder is the same negative NaN on every host, and a NaN operand keeps its sign" {
+    const inf = std.math.inf(f64);
+    const pos_nan = std.math.nan(f64);
+    const neg_nan = -std.math.nan(f64);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // Runtime operands: LLVM folds a constant `frem` to its own positive NaN, not the hardware's or the libm's.
+    var xs = [_]f64{ inf, -inf, 5, -5, inf, -inf, 0, pos_nan, neg_nan, 5, 5, -7.5 };
+    var ys = [_]f64{ 1, 1, 0, -0.0, 0, inf, 0, 1, 1, pos_nan, neg_nan, 2 };
+    const want = [_]u64{
+        0xfff8000000000000, 0xfff8000000000000, 0xfff8000000000000, 0xfff8000000000000,
+        0xfff8000000000000, 0xfff8000000000000, 0xfff8000000000000, 0x7ff8000000000000,
+        0xfff8000000000000, 0x7ff8000000000000, 0xfff8000000000000, @bitCast(@as(f64, -1.5)),
+    };
+    std.mem.doNotOptimizeAway(&xs);
+    std.mem.doNotOptimizeAway(&ys);
+    const out = try applyKernel(f64, arena_state.allocator(), .mod, &xs, &ys, .{});
+    for (out, xs, ys, want) |got, x, y, w| {
+        try std.testing.expectEqual(w, @as(u64, @bitCast(got)));
+        try std.testing.expectEqual(w, @as(u64, @bitCast(try applyScalarKernel(f64, .mod, x, y))));
+    }
+    var xs32 = [_]f32{ std.math.inf(f32), 1, -std.math.nan(f32) };
+    var ys32 = [_]f32{ 1, 0, 1 };
+    std.mem.doNotOptimizeAway(&xs32);
+    std.mem.doNotOptimizeAway(&ys32);
+    for (xs32, ys32) |x, y| try std.testing.expectEqual(@as(u32, 0xffc00000), @as(u32, @bitCast(floatRem(f32, x, y))));
+}
+
 test "negating a DOUBLE flips its sign bit, a zero's and a NaN's included" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -3407,7 +3445,7 @@ fn applyKernel(
             }
             if (faulted) try firstConsumedFault(T, op, a, b, consumed);
         } else if (op == .mod) {
-            for (a, b, 0..) |x, y, i| out[i] = @rem(x, y);
+            for (a, b, 0..) |x, y, i| out[i] = floatRem(T, x, y);
         } else {
             var zero = false;
             for (a, b, 0..) |x, y, i| {

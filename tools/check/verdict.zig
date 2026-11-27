@@ -1368,9 +1368,10 @@ fn modeCorpusArrow(in: Inputs, _: Spec) !Reason {
     return corpusRows(in, got, want, widths);
 }
 
-/// Where a pinned case's `sql` is the oracle too: DuckDB finalizes a wide AVG in C `long double`, which is x87's 80
-/// bits only on x86_64, so its answer is the reference there and a platform's own elsewhere (64 bits on macOS arm64).
-pub const pinned_by_oracle = builtin.cpu.arch == .x86_64;
+/// Where a pinned case's `sql` is the oracle too: x86_64 Linux, the reference platform. Elsewhere DuckDB's answer
+/// carries its platform: it finalizes a wide AVG in C `long double` (x87's 80 bits on x86_64, 64 bits on macOS arm64),
+/// and takes a DOUBLE `%` from the C library's fmod, whose NaN for `inf % x` is positive in Apple's libm, Intel included.
+pub const pinned_by_oracle = builtin.cpu.arch == .x86_64 and builtin.os.tag == .linux;
 
 /// Rows pinned in the case, where the rival readers are known to be wrong (`why` says how). A case with `sql` as well
 /// is also checked as `ordered` against the oracle where that is the reference (`pinned_by_oracle`), so a pin that

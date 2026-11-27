@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A DOUBLE or FLOAT `%` with no answer is `-nan` on every host.** `inf % 1.0`, `x % 0.0` and `x % -0.0` are the negative NaN DuckDB prints on x86_64 Linux; before, ARM builds printed `nan` there while x86 builds printed `-nan`. A NaN operand still keeps its sign, and nothing else about float formatting changes.
+
 - **A join's top rows by an integer, DATE or TIMESTAMP column of its probe table read only the row groups that can hold them.** `SELECT f.id, d.name FROM f JOIN d ON ... ORDER BY f.id LIMIT 20` first ranks the joined rows by `f.id` alone, which shows the key the 20th row has, then reads and groups only the rows no later than it, skipping every row group whose statistics put it after. On a 3-million-row probe in 25 row groups that joins by a composite string key, that is one row group read instead of all of them. The rows and their order are unchanged, ties and duplicates included. `ZPQ_JOIN_TOPK=0` turns it off.
 
 - **On arm64 (Linux and Apple Silicon), an AVG of a DECIMAL wider than 4 digits gives the same DOUBLE as on x86_64.** The grouped, filtered and window AVG follows DuckDB's x87 `long double` division, which zpq now computes exactly in integers on every target. Before, the software 80-bit divide used outside x86 could miss its last bit. In a few cases that changed the double, so the mean of three 2.505s at DECIMAL(38,37) rounded to 2.51 where x86_64 and DuckDB give 2.5.

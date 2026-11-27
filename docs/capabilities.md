@@ -243,7 +243,7 @@ DuckDB resolves for the pair (`SMALLINT + TINYINT` is a SMALLINT; a literal take
 fits, so `tinyint_col + 0` is a TINYINT), and a result outside that type is an overflow error, in rows that are read
 and not NULL. `%` takes the sign of the dividend; `//` truncates toward zero; `/` of two integers is a DOUBLE division
 (`7 / 2` is 3.5: an earlier release truncated it, which `//` now spells). A zero divisor of `%` or `//` of integers or
-DECIMALs is an error, and so is the minimum of a signed type over -1; a DOUBLE `%` is C's `fmod` (`x % 0` is NaN), and
+DECIMALs is an error, and so is the minimum of a signed type over -1; a DOUBLE `%` is C's `fmod` (`x % 0` and `inf % x` are `-nan` on every host, as DuckDB prints them on x86_64 Linux), and
 `//` of anything but two integers is `/` with a zero-divisor error. `%` of DECIMALs is exact: a DECIMAL of the larger
 integer part and the larger scale, or a DOUBLE where that passes 38 digits. `%` and `//` over aggregates, and in a
 WHERE predicate, are refused by name. The string functions count and cut text in characters (UTF-8 code points, as DuckDB does: a combining mark is a

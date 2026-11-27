@@ -2055,22 +2055,43 @@ int lp_node_equal(const LpNode *a, const LpNode *b) {
 /*  lp_fix_parents                                                     */
 /* ================================================================== */
 
-static void fix_node(LpNode *node);
+/*
+** The walk keeps its own stack of pending nodes, on the heap. A tree is as deep
+** as the query writes it: a left-deep chain (`1 + 1 + ...`, `a OR b OR ...`)
+** reduces without growing the parser's stack, so a recursion once per level
+** would take the thread's stack with it.
+*/
+typedef struct {
+    LpNode **items;
+    int count;
+    int capacity;
+    int failed;
+} FixStack;
 
-static void fix_list(LpNode *parent, LpNodeList *list) {
+static void fix_push(FixStack *s, LpNode *parent, LpNode *child) {
+    child->parent = parent;
+    if (s->count == s->capacity) {
+        int cap = s->capacity < 64 ? 64 : s->capacity * 2;
+        LpNode **items = (LpNode **)realloc(s->items, sizeof(LpNode *) * (size_t)cap);
+        if (!items) { s->failed = 1; return; }
+        s->items = items;
+        s->capacity = cap;
+    }
+    s->items[s->count++] = child;
+}
+
+static void fix_list(FixStack *s, LpNode *parent, LpNodeList *list) {
     if (!list || !list->items) return;
     for (int i = 0; i < list->count; i++) {
-        if (list->items[i]) {
-            list->items[i]->parent = parent;
-            fix_node(list->items[i]);
-        }
+        if (list->items[i]) fix_push(s, parent, list->items[i]);
     }
 }
 
-#define FIX_NODE(p, n) do { if (n) { (n)->parent = (p); fix_node(n); } } while(0)
-#define FIX_LIST(p, l) fix_list((p), &(l))
+#define FIX_NODE(p, n) do { if (n) fix_push(s, (p), (n)); } while(0)
+#define FIX_LIST(p, l) fix_list(s, (p), &(l))
 
-static void fix_node(LpNode *node) {
+/* Sets the parent of each child of `node` and queues it. */
+static void fix_node(FixStack *s, LpNode *node) {
     switch (node->kind) {
         case LP_STMT_SELECT:
             FIX_LIST(node, node->u.select.result_columns);
@@ -2351,10 +2372,13 @@ static void fix_node(LpNode *node) {
 #undef FIX_NODE
 #undef FIX_LIST
 
-void lp_fix_parents(LpNode *root) {
-    if (!root) return;
-    root->parent = NULL;
-    fix_node(root);
+int lp_fix_parents(LpNode *root) {
+    if (!root) return 0;
+    FixStack s = { NULL, 0, 0, 0 };
+    fix_push(&s, NULL, root);
+    while (s.count > 0 && !s.failed) fix_node(&s, s.items[--s.count]);
+    free(s.items);
+    return s.failed ? -1 : 0;
 }
 
 /* ================================================================== */
@@ -2848,7 +2872,7 @@ LpNode *lp_node_clone(arena_t *arena, const LpNode *node) {
     #undef CN
     #undef CL
 
-    lp_fix_parents(n);
+    if (lp_fix_parents(n) != 0) return NULL;
     return n;
 }
 

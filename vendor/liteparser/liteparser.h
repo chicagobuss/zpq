@@ -857,8 +857,11 @@ int lp_node_equal(const LpNode *a, const LpNode *b);
 ** Called automatically after lp_parse/lp_parse_all/lp_parse_tolerant
 ** and lp_node_clone. After using the mutation API (lp_list_push, etc.),
 ** call this to refresh parent pointers.
+**
+** Returns 0, or -1 when out of memory, in which case some parent pointers are
+** not set; the parse and clone calls above then return NULL.
 */
-void lp_fix_parents(LpNode *root);
+int lp_fix_parents(LpNode *root);
 
 /* ------------------------------------------------------------------ */
 /*  AST Mutation API                                                   */

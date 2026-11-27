@@ -894,7 +894,10 @@ LpNode *lp_parse(const char *sql, arena_t *arena, const char **error_msg) {
     if (error_msg) *error_msg = NULL;
     /* Return first statement for backwards compatibility */
     LpNode *node = ctx.stmts.count > 0 ? ctx.stmts.items[0] : NULL;
-    if (node) lp_fix_parents(node);
+    if (node && lp_fix_parents(node) != 0) {
+        if (error_msg) *error_msg = "out of memory";
+        return NULL;
+    }
     return node;
 }
 
@@ -910,7 +913,10 @@ LpNodeList *lp_parse_all(const char *sql, arena_t *arena, const char **error_msg
     if (!result) return NULL;
     *result = ctx.stmts;
     for (int i = 0; i < result->count; i++) {
-        lp_fix_parents(result->items[i]);
+        if (lp_fix_parents(result->items[i]) != 0) {
+            if (error_msg) *error_msg = "out of memory";
+            return NULL;
+        }
     }
     return result;
 }
@@ -924,7 +930,7 @@ LpParseResult *lp_parse_tolerant(const char *sql, arena_t *arena) {
     r->stmts = ctx.stmts;
     r->errors = ctx.all_errors;
     for (int i = 0; i < r->stmts.count; i++) {
-        lp_fix_parents(r->stmts.items[i]);
+        if (lp_fix_parents(r->stmts.items[i]) != 0) return NULL;
     }
     return r;
 }

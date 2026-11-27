@@ -104,9 +104,13 @@ const ExprInfo = struct {
     }
 };
 
-fn analyzeExpr(node: *const c.LpNode) ExprInfo {
+fn analyzeExpr(root: *const c.LpNode) ExprInfo {
     var info: ExprInfo = .{};
-    switch (node.kind) {
+    // A chain is as long as the query writes it (`a OR b OR ...`, `1 + 1 + ...`, `x COLLATE c COLLATE c ...`), and the
+    // parser builds it without growing its own stack: follow the operand a chain continues through in this loop, so the
+    // recursion goes only as deep as the other operands nest, which the parser's stack does bound.
+    var node = root;
+    while (true) switch (node.kind) {
         c.LP_EXPR_FUNCTION => {
             var is_agg = false;
             var is_count = false;
@@ -132,35 +136,36 @@ fn analyzeExpr(node: *const c.LpNode) ExprInfo {
             // so `sum(a)` is pure-agg, while `sum(a) + b` keeps b's bare flag.
             if (is_agg) child.has_bare_col = false;
             info.merge(child);
+            return info;
         },
         c.LP_EXPR_BINARY_OP => {
-            if (node.u.binary.left) |l| info.merge(analyzeExpr(l));
             if (node.u.binary.right) |r| info.merge(analyzeExpr(r));
+            node = node.u.binary.left orelse return info;
         },
-        c.LP_EXPR_UNARY_OP => {
-            if (node.u.unary.operand) |o| info.merge(analyzeExpr(o));
-        },
-        c.LP_EXPR_CAST => {
-            if (node.u.cast.expr) |e| info.merge(analyzeExpr(e));
-        },
-        c.LP_EXPR_COLLATE => {
-            if (node.u.collate.expr) |e| info.merge(analyzeExpr(e));
-        },
+        c.LP_EXPR_UNARY_OP => node = node.u.unary.operand orelse return info,
+        c.LP_EXPR_CAST => node = node.u.cast.expr orelse return info,
+        c.LP_EXPR_COLLATE => node = node.u.collate.expr orelse return info,
         c.LP_EXPR_BETWEEN => {
-            if (node.u.between.expr) |e| info.merge(analyzeExpr(e));
             if (node.u.between.low) |lo| info.merge(analyzeExpr(lo));
             if (node.u.between.high) |hi| info.merge(analyzeExpr(hi));
+            node = node.u.between.expr orelse return info;
         },
         c.LP_EXPR_IN => {
-            if (node.u.in.expr) |e| info.merge(analyzeExpr(e));
             if (node.u.in.select != null) info.has_subquery = true; // IN (SELECT ...)
             var i: usize = 0;
             while (i < @as(usize, @intCast(node.u.in.values.count))) : (i += 1) {
                 if (node.u.in.values.items[i]) |v| info.merge(analyzeExpr(v));
             }
+            node = node.u.in.expr orelse return info;
         },
-        c.LP_EXPR_COLUMN_REF => info.has_bare_col = true,
-        c.LP_EXPR_EXISTS, c.LP_EXPR_SUBQUERY => info.has_subquery = true,
+        c.LP_EXPR_COLUMN_REF => {
+            info.has_bare_col = true;
+            return info;
+        },
+        c.LP_EXPR_EXISTS, c.LP_EXPR_SUBQUERY => {
+            info.has_subquery = true;
+            return info;
+        },
         c.LP_EXPR_CASE => {
             if (node.u.case_.operand) |op| info.merge(analyzeExpr(op));
             var i: usize = 0;
@@ -168,13 +173,11 @@ fn analyzeExpr(node: *const c.LpNode) ExprInfo {
                 if (node.u.case_.when_exprs.items[i]) |w| info.merge(analyzeExpr(w));
             }
             if (node.u.case_.else_expr) |e| info.merge(analyzeExpr(e));
+            return info;
         },
-        c.LP_RESULT_COLUMN => {
-            if (node.u.result_column.expr) |e| info.merge(analyzeExpr(e));
-        },
-        else => {},
-    }
-    return info;
+        c.LP_RESULT_COLUMN => node = node.u.result_column.expr orelse return info,
+        else => return info,
+    };
 }
 
 /// `SELECT DISTINCT a, b` is `SELECT a, b ... GROUP BY a, b` with no aggregate: the groups are the distinct rows, and
@@ -3692,4 +3695,101 @@ test "an ORDER BY name that is a select alias is that item, quoted or not, whate
     try std.testing.expect(!aliasIs("\"dup\"", "\"dup\""));
     try std.testing.expect(!aliasIs("\"dup\"", "du"));
     try std.testing.expect(!aliasIs("\"du\"", "dup"));
+}
+
+/// The text of a query whose expression is a chain `depth` links long, in a shape the parser builds without growing its
+/// own stack: a constant sum (folded), an OR chain (read as written), a sum over a column (refused by
+/// `MAX_EXPR_DEPTH`), a constant sum in the select list, and a COLLATE chain (a postfix chain, refused once read).
+fn deepChain(a: std.mem.Allocator, shape: usize, depth: usize) ![]u8 {
+    const head = [_][]const u8{ "SELECT count(*) AS n FROM 't' WHERE i < 1", "SELECT count(*) AS n FROM 't' WHERE i = 1", "SELECT count(*) AS n FROM 't' WHERE i < 1", "SELECT 1", "SELECT count(*) AS n FROM 't' WHERE s" };
+    const link = [_][]const u8{ " + 1", " OR i = 1", " + i", " + 1", " COLLATE nocase" };
+    const tail = [_][]const u8{ "", "", "", " AS x FROM 't'", " = 'a'" };
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(a);
+    try text.appendSlice(a, head[shape]);
+    for (0..depth) |_| try text.appendSlice(a, link[shape]);
+    try text.appendSlice(a, tail[shape]);
+    return text.toOwnedSlice(a);
+}
+
+const DeepRead = struct {
+    shape: usize,
+    depth: usize,
+    failure: ?anyerror = null,
+
+    fn run(self: *DeepRead) void {
+        var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer arena.deinit();
+        const text = deepChain(arena.allocator(), self.shape, self.depth) catch |err| {
+            self.failure = err;
+            return;
+        };
+        _ = parseSqlPlan(arena.allocator(), text) catch |err| switch (err) {
+            // The refusals the walks make, by name, of a tree that deep: the fold's stack guard and `MAX_EXPR_DEPTH`.
+            error.ConstantTooDeep, error.ExpressionTooDeep => {},
+            error.UnexpectedChar => if (self.shape != 4) {
+                self.failure = err;
+            },
+            else => self.failure = err,
+        };
+    }
+};
+
+test "regression: a chain deeper than the recursive walks used to overflow at is read on a small thread" {
+    if (comptime @import("../../test_skip.zig").lacks(.posix)) return @import("../../test_skip.zig").skipNeeding(.posix, "thread stack-size hints do not set distinct Windows reservation sizes");
+    const builtin = @import("builtin");
+    if (!builtin.link_libc or builtin.os.tag != .linux and !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    // The parser builds these chains without growing its own stack, and the walks over them used to recurse once per
+    // level: liteparser's `fix_node` at 6,864 (x86_64) to 21,408 (arm64) bytes a level in Debug, and `analyzeExpr` at
+    // 240 to 276 optimized, so an 8 MiB thread overflowed by 1,222 levels in Debug and 34,953 optimized. Each shape is
+    // read here past that, on such a thread; the walks now take at most 528 bytes a level in Debug and 96 optimized
+    // (the fold, which guards its own stack, refuses by name). A crash fails the test run.
+    const depth: usize = if (builtin.mode == .debug) 3_000 else 40_000;
+    for (0..5) |shape| {
+        var read: DeepRead = .{ .shape = shape, .depth = depth };
+        const thread = try std.Thread.spawn(.{ .stack_size = 8 << 20 }, DeepRead.run, .{&read});
+        thread.join();
+        if (read.failure) |err| return err;
+    }
+}
+
+const RightDeep = struct {
+    depth: usize,
+    result: ?anyerror = null,
+
+    fn run(self: *RightDeep) void {
+        var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var text: std.ArrayList(u8) = .empty;
+        text.appendSlice(a, "SELECT count(*) AS n FROM 't' WHERE ") catch |err| return self.fail(err);
+        for (0..self.depth) |_| text.appendSlice(a, "i = 1 OR (") catch |err| return self.fail(err);
+        text.appendSlice(a, "i = 1") catch |err| return self.fail(err);
+        for (0..self.depth) |_| text.append(a, ')') catch |err| return self.fail(err);
+        _ = parseSqlPlan(a, text.items) catch |err| return self.fail(err);
+    }
+    fn fail(self: *RightDeep, err: anyerror) void {
+        self.result = err;
+    }
+};
+
+test "regression: nesting through right operands is bounded by the parser's own stack, and is read on a small thread" {
+    if (comptime @import("../../test_skip.zig").lacks(.posix)) return @import("../../test_skip.zig").skipNeeding(.posix, "thread stack-size hints do not set distinct Windows reservation sizes");
+    // The walks recurse into a right operand (only a chain's own operand is followed in a loop), so a right-deep tree
+    // recurses once per level. The parser refuses one deeper than its 1000-entry stack holds; the deepest it accepts
+    // is read on a 1 MiB thread in every build.
+    var accepted: usize = 0;
+    var depth: usize = 50;
+    while (depth <= 1000) : (depth += 50) {
+        var run: RightDeep = .{ .depth = depth };
+        const thread = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, RightDeep.run, .{&run});
+        thread.join();
+        if (run.result) |err| {
+            try std.testing.expectEqual(error.SqlParseError, err);
+            break;
+        }
+        accepted = depth;
+    }
+    try std.testing.expect(accepted >= 100);
+    try std.testing.expect(accepted < 1000);
 }

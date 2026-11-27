@@ -10,6 +10,8 @@
 
 - **On arm64 (Linux and Apple Silicon), an AVG of a DECIMAL wider than 4 digits gives the same DOUBLE as on x86_64.** The grouped, filtered and window AVG follows DuckDB's x87 `long double` division, which zpq now computes exactly in integers on every target. Before, the software 80-bit divide used outside x86 could miss its last bit. In a few cases that changed the double, so the mean of three 2.505s at DECIMAL(38,37) rounded to 2.51 where x86_64 and DuckDB give 2.5.
 
+- **An integer column compares exactly with a number that has a fraction or lies past its type.** `WHERE i8 > 5.5`, `WHERE i8 > CAST('5.5' AS DECIMAL(5,1))`, `WHERE i64 < 9223372036854775808` and `WHERE i32 < 3000000000` were refused as an invalid value in the filter; they answer as DuckDB does (`i8 > 5.5` is `i8 > 5`, and `i32 < 3000000000` holds for every row), in WHERE, HAVING and `--filter`, for signed and unsigned columns. A literal written as an exponent is a DOUBLE and is still refused.
+
 ## 0.6.1 — 2026-11-26
 
 Bug fixes for zpq 0.6. For what 0.6 introduced, see 0.6.0 below.

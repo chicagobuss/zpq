@@ -1073,16 +1073,39 @@ fn markStored(f: ast.Filter) ast.Filter {
 /// for every non-null row (`u > -1` holds, `u = -1` never does); fold it into a leaf that is always true (`>= 0`) or
 /// always false (`< 0`) so evaluation and pruning need no out-of-range case.
 fn buildUnsignedLeaf(col_idx: usize, op: ast.Operator, val_str: []const u8) Error!ast.Filter {
-    const v = std.fmt.parseInt(i128, val_str, 10) catch return error.BadValue;
-    if (std.math.cast(u64, v)) |in_range| return .{ .uint64 = .{ .col_idx = col_idx, .op = op, .value = in_range } };
+    const lit = try integerLiteral(val_str);
+    // A fraction lies between two integers, so no value equals it, and `>` / `<=` the integer below it say the rest.
+    if (lit.inexact and (op == .Eq or op == .NotEq))
+        return .{ .uint64 = .{ .col_idx = col_idx, .op = if (op == .NotEq) .GtEq else .Lt, .value = 0 } };
+    const o: ast.Operator = if (!lit.inexact) op else switch (op) {
+        .Gt, .GtEq => .Gt,
+        else => .LtEq,
+    };
+    const v = lit.floor;
+    if (std.math.cast(u64, v)) |in_range| return .{ .uint64 = .{ .col_idx = col_idx, .op = o, .value = in_range } };
     const below = v < 0;
-    const holds = switch (op) {
+    const holds = switch (o) {
         .Eq => false,
         .NotEq => true,
         .Lt, .LtEq => !below,
         .Gt, .GtEq => below,
     };
     return .{ .uint64 = .{ .col_idx = col_idx, .op = if (holds) .GtEq else .Lt, .value = 0 } };
+}
+
+/// An integer column's literal: whole digits or a decimal fraction, read exactly (`scaledLiteral`). An exponent is a
+/// DOUBLE and a `_` is no SQL, so neither is read as a number here.
+fn integerLiteral(text: []const u8) Error!ScaledLiteral {
+    for (text) |ch| if (ch == 'e' or ch == 'E' or ch == '_') return error.BadValue;
+    return scaledLiteral(text, 0);
+}
+
+/// A comparison of an integer column of type `T` with a literal that is exact or has a fraction, or lies past `T`'s
+/// range: the integer comparison with the same answer for every stored value (`ast.exactLeaf`), as DuckDB compares the
+/// column with the DECIMAL the literal is.
+fn integerLeaf(comptime T: type, col_idx: usize, op: ast.Operator, val_str: []const u8) Error!ast.Leaf(T) {
+    const lit = try integerLiteral(val_str);
+    return ast.exactLeaf(T, col_idx, op, lit.floor, lit.inexact);
 }
 
 /// A column whose INT32/INT64(/INT96) storage carries a temporal logical type. `ns_per_tick` is the stored unit
@@ -1166,9 +1189,11 @@ fn bindExact(col_idx: usize, op: ast.Operator, lane: Lane, floor: i128, inexact:
     };
 }
 
+const ScaledLiteral = struct { floor: i256, inexact: bool };
+
 /// A decimal literal (`-12.50`, `7`, `1.5e3`) times 10^`scale`: its floor and whether that dropped a fraction. A
 /// magnitude no DECIMAL holds (past 10^40) stands as ±10^40, which compares with every stored value as it would.
-fn scaledLiteral(text: []const u8, scale: i32) Error!struct { floor: i256, inexact: bool } {
+fn scaledLiteral(text: []const u8, scale: i32) Error!ScaledLiteral {
     var s = text;
     const neg = s.len > 0 and s[0] == '-';
     if (s.len > 0 and (s[0] == '-' or s[0] == '+')) s = s[1..];
@@ -1296,16 +1321,8 @@ fn parseTimeOfDayNs(s: []const u8) Error!ExactNs {
 
 fn buildLeafFilter(col_idx: usize, op: ast.Operator, val_str: []const u8, parquet_type: schema.Type) Error!ast.Filter {
     return switch (parquet_type) {
-        .INT32 => .{ .int32 = .{
-            .col_idx = col_idx,
-            .op = op,
-            .value = std.fmt.parseInt(i32, val_str, 10) catch return error.BadValue,
-        } },
-        .INT64 => .{ .int64 = .{
-            .col_idx = col_idx,
-            .op = op,
-            .value = std.fmt.parseInt(i64, val_str, 10) catch return error.BadValue,
-        } },
+        .INT32 => .{ .int32 = try integerLeaf(i32, col_idx, op, val_str) },
+        .INT64 => .{ .int64 = try integerLeaf(i64, col_idx, op, val_str) },
         .FLOAT => .{ .float = try floatLeaf(col_idx, op, val_str) },
         .DOUBLE => .{ .double = .{
             .col_idx = col_idx,

@@ -468,6 +468,37 @@ test "parse simple int equality" {
     try testing.expectEqual(@as(i32, 42), f.int32.value);
 }
 
+test "parse compares an integer column with a fraction or an out-of-range integer exactly" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var meta = try synthFileMeta(a);
+    defer meta.deinit(a);
+
+    const max32 = std.math.maxInt(i32);
+    const cases = [_]struct { text: []const u8, op: ast.Operator, value: i32 }{
+        // `id` is INT32. A fraction: no value equals it, a bound moves to the integer below it.
+        .{ .text = "id > 5.5", .op = .Gt, .value = 5 },
+        .{ .text = "id >= 5.5", .op = .Gt, .value = 5 },
+        .{ .text = "id < 5.5", .op = .LtEq, .value = 5 },
+        .{ .text = "id <= -5.5", .op = .LtEq, .value = -6 },
+        .{ .text = "id > -5.5", .op = .Gt, .value = -6 },
+        .{ .text = "id = 5.5", .op = .Gt, .value = max32 },
+        .{ .text = "id <> 5.5", .op = .LtEq, .value = max32 },
+        .{ .text = "id = 5.0", .op = .Eq, .value = 5 },
+        // Past the type: `id < 3000000000` holds for every value, `id > 3000000000` for none.
+        .{ .text = "id < 3000000000", .op = .LtEq, .value = max32 },
+        .{ .text = "id > 3000000000", .op = .Gt, .value = max32 },
+        .{ .text = "id > -3000000000", .op = .LtEq, .value = max32 },
+    };
+    for (cases) |c| {
+        const f = try parse(a, c.text, &meta, null);
+        try expectLeaf(i32, f, c.op, c.value);
+    }
+    for ([_][]const u8{ "id > 1e0", "id > 1_0", "id > 5.5.5", "id > 5x" }) |text|
+        try testing.expectError(error.BadValue, parse(a, text, &meta, null));
+}
+
 test "parse string less-than" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1462,7 +1493,23 @@ test "parse unsigned literals: in-range compares as u64, out-of-range folds to a
         try testing.expectEqual(@as(u64, 0), f.uint64.value);
         try testing.expectEqual(if (c.holds) ast.Operator.GtEq else ast.Operator.Lt, f.uint64.op);
     }
-    try testing.expectError(error.BadValue, parse(a, "u = 1.5", &fm, null));
+    // A fraction lies between two integers: `=` never holds, `<>` always, and a bound moves to the integer below it.
+    const fractions = [_]struct { expr: []const u8, op: ast.Operator, value: u64 }{
+        .{ .expr = "u = 1.5", .op = .Lt, .value = 0 },
+        .{ .expr = "u <> 1.5", .op = .GtEq, .value = 0 },
+        .{ .expr = "u > 1.5", .op = .Gt, .value = 1 },
+        .{ .expr = "u >= 1.5", .op = .Gt, .value = 1 },
+        .{ .expr = "u < 1.5", .op = .LtEq, .value = 1 },
+        .{ .expr = "u <= 1.5", .op = .LtEq, .value = 1 },
+        .{ .expr = "u > -0.5", .op = .GtEq, .value = 0 },
+        .{ .expr = "u < -0.5", .op = .Lt, .value = 0 },
+    };
+    for (fractions) |c| {
+        const f = try parse(a, c.expr, &fm, null);
+        try testing.expectEqual(c.op, f.uint64.op);
+        try testing.expectEqual(c.value, f.uint64.value);
+    }
+    try testing.expectError(error.BadValue, parse(a, "u = 1e0", &fm, null));
 }
 
 test "parse binds a bare name to the top-level column, not a nested leaf sharing it" {
@@ -1648,7 +1695,7 @@ test "regression: a SQL predicate handed on as text selects the rows it was writ
         .{ .where = "x > -5 AND z IN (-1, 2)", .want = "x > -5 AND z IN (-1, 2)" },
         .{ .where = "x BETWEEN -1 AND 1e0 OR s = ''", .err = error.BadValue }, // an INT32 takes no exponent literal
         .{ .where = "d >= '2020-06-01' AND s IS NOT NULL", .want = "d >= '2020-06-01' AND s IS NOT NULL" },
-        // A fraction or an exponent against an INT32 column is refused.
+        // An exponent against an INT32 column is refused, a fraction is not.
         .{ .where = "x > -5 AND y < +2.5e3 AND z IN (-1, 2)", .err = error.BadValue },
         .{ .where = "x BETWEEN -1.5 AND 1e2 OR s = ''", .err = error.BadValue },
         // Groups that are not an OR of ANDs.

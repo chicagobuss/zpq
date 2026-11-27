@@ -1093,10 +1093,10 @@ fn buildUnsignedLeaf(col_idx: usize, op: ast.Operator, val_str: []const u8) Erro
     return .{ .uint64 = .{ .col_idx = col_idx, .op = if (holds) .GtEq else .Lt, .value = 0 } };
 }
 
-/// An integer column's literal: whole digits or a decimal fraction, read exactly (`scaledLiteral`). An exponent is a
-/// DOUBLE and a `_` is no SQL, so neither is read as a number here.
+/// An integer column's literal: whole digits or a decimal fraction, read exactly (`scaledLiteral`, which reads `1_000`
+/// as `parseInt` did). An exponent is a DOUBLE and is not read as a number here.
 fn integerLiteral(text: []const u8) Error!ScaledLiteral {
-    for (text) |ch| if (ch == 'e' or ch == 'E' or ch == '_') return error.BadValue;
+    for (text) |ch| if (ch == 'e' or ch == 'E') return error.BadValue;
     return scaledLiteral(text, 0);
 }
 

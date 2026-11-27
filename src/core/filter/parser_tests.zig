@@ -490,12 +490,15 @@ test "parse compares an integer column with a fraction or an out-of-range intege
         .{ .text = "id < 3000000000", .op = .LtEq, .value = max32 },
         .{ .text = "id > 3000000000", .op = .Gt, .value = max32 },
         .{ .text = "id > -3000000000", .op = .LtEq, .value = max32 },
+        // A digit separator between digits, as `parseInt` read it.
+        .{ .text = "id > 1_000", .op = .Gt, .value = 1000 },
+        .{ .text = "id < 1_000.5", .op = .LtEq, .value = 1000 },
     };
     for (cases) |c| {
         const f = try parse(a, c.text, &meta, null);
         try expectLeaf(i32, f, c.op, c.value);
     }
-    for ([_][]const u8{ "id > 1e0", "id > 1_0", "id > 5.5.5", "id > 5x" }) |text|
+    for ([_][]const u8{ "id > 1e0", "id > 1__0", "id > _10", "id > 10_", "id > 5.5.5", "id > 5x" }) |text|
         try testing.expectError(error.BadValue, parse(a, text, &meta, null));
 }
 

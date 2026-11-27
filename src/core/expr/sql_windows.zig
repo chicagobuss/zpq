@@ -169,11 +169,15 @@ const Builder = struct {
         }
     }
 
-    /// An operand of an operation: a literal stays in place, anything else is lowered.
+    /// An operand of an operation: a literal stays in place, anything else is lowered. A bare AVG here is a value an
+    /// operation or a QUALIFY comparison reads, so it is staged as its DOUBLE (`key`), not the rounded DECIMAL mean.
     fn operand(self: *Builder, node: *c.LpNode) Error![]const u8 {
         switch (node.kind) {
             c.LP_EXPR_LITERAL_INT, c.LP_EXPR_LITERAL_FLOAT, c.LP_EXPR_LITERAL_STRING, c.LP_EXPR_LITERAL_NULL => return self.unparse(node),
-            else => return self.lower(node),
+            else => {
+                if (bareAvg(node)) return std.fmt.allocPrint(self.arena, "\"{s}\"", .{try self.key(node, "operand")});
+                return self.lower(node);
+            },
         }
     }
 
@@ -832,6 +836,19 @@ test "a window partitions and orders by a bare AVG as the DOUBLE, and its argume
         try std.testing.expect(std.mem.indexOf(u8, sorted.input_sql, "avg(d) AS \"c1\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, sorted.input_sql, "avg(d) + 0 AS \"c2\"") != null);
         try std.testing.expect(std.mem.startsWith(u8, sorted.final_tail, "ORDER BY \"c2\", "));
+    }
+    // QUALIFY compares a bare AVG, written or by alias, and an operation reads one, by that DOUBLE.
+    for ([_][2][:0]const u8{
+        .{ "SELECT g, row_number() OVER (ORDER BY g) AS rn FROM t GROUP BY g QUALIFY avg(d) = 0.5", "(\"@\" = 0.5)" },
+        .{ "SELECT g, avg(d) AS m, row_number() OVER (ORDER BY g) AS rn FROM t GROUP BY g QUALIFY m BETWEEN 0.4 AND 0.6", "(\"@\" BETWEEN 0.4 AND 0.6)" },
+        .{ "SELECT g, avg(d) AS m, row_number() OVER (ORDER BY g) AS rn FROM t GROUP BY g QUALIFY avg(d) + rn > 1", "((\"@\" + \"" },
+    }) |case| {
+        const q = try build(a, case[0], &why, &.{ "g", "d" });
+        const staged = "avg(d) + 0 AS \"";
+        const at = (std.mem.indexOf(u8, q.input_sql, staged) orelse return error.TestUnexpectedResult) + staged.len;
+        const name = q.input_sql[at..][0..std.mem.indexOfScalar(u8, q.input_sql[at..], '"').?];
+        const want = try std.mem.replaceOwned(u8, a, case[1], "@", name);
+        try std.testing.expect(std.mem.startsWith(u8, q.final_where, want));
     }
 }
 

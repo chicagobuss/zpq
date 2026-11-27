@@ -20,6 +20,12 @@
 
 - **`IGNORE NULLS` on a window function, QUALIFY beside ROLLUP, CUBE or GROUPING SETS, and a join over a CSV input are refused with a message that names them.** Each was documented as refused by name but printed "invalid SQL; check the syntax shown above" with nothing shown, or that the CSV was not a valid Parquet file.
 
+- **A bare `avg()` of a DECIMAL column compares its exact average in QUALIFY too, and a window function reads it as a DOUBLE.** `QUALIFY avg(x) = 0.333333` no longer keeps a group whose average is 1/3, whether the average is written out or named by its alias; before, QUALIFY compared the mean rounded to the printed scale. The same DOUBLE is read where a bare `avg()` sits beside a window function, as in `avg(x) + row_number() OVER (...)`, and where it is a window function's argument, as in `min(avg(x)) OVER ()` or `lag(avg(x)) OVER (ORDER BY g)`, as in DuckDB. `sum(avg(x))` and `avg(avg(x))` over a window are refused by name, as a window SUM or AVG of any DOUBLE is; before, they added the rounded means. What a bare `avg()` prints is unchanged.
+
+- **Date parts of an infinite DATE or TIMESTAMP are NULL, and `date_trunc` of one keeps the infinity.** `year(t)` of an infinite TIMESTAMP was 294247 (or -290308), so `max(year(t))`, `count(year(t))`, `GROUP BY year(t)` and `WHERE year(t) > 2000` counted the infinite rows as years; they are now NULL, as in DuckDB. This covers every part (`year` through `microsecond`, `dayofweek`, `isodow`, `dayofyear`, `date_part` and `EXTRACT`) and every TIMESTAMP unit, with or without a time zone. A date part of an infinite DATE and `date_trunc` of an infinite DATE or TIMESTAMP answer instead of failing.
+
+- **`--format csv` prints an infinite DATE or TIMESTAMP as `infinity` or `-infinity`, as DuckDB does.** Before, it printed the stored value as a calendar date, such as `294247-01-10 04:00:54.775807`. JSON output is unchanged: it prints the stored integer.
+
 ## 0.6.1 — 2026-11-26
 
 Bug fixes for zpq 0.6. For what 0.6 introduced, see 0.6.0 below.

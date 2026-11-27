@@ -31,6 +31,10 @@
   {
    "name": "ws",
    "path": "ci/fixtures/parquet/sql_windows_range_scale.parquet"
+  },
+  {
+   "name": "wnarrow",
+   "copy": "COPY (SELECT i::TINYINT AS i8, (i*100)::SMALLINT AS i16, abs(i)::UTINYINT AS u8, i::INTEGER AS id FROM (VALUES (1),(2),(-1)) t(i)) TO '{path}' (FORMAT PARQUET)"
   }
  ],
  "cases": [
@@ -2690,6 +2694,80 @@
     "diag": "needs one ORDER BY key whose type it reaches",
     "exit": 1,
     "binder_sql": "SELECT id, count(*) OVER (ORDER BY dt RANGE BETWEEN 3000000000 PRECEDING AND CURRENT ROW) AS c FROM '{fixture:wx}'"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:lag-default-past-tinyint",
+   "fixture": "wnarrow",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, lag(i8, 1, 200) OVER (ORDER BY id) AS w FROM '{fixture:wnarrow}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowDefaultType",
+    "diag": "default of lag / lead",
+    "exit": 1,
+    "binder_sql": "SELECT id, lag(i8, 1, 200) OVER (ORDER BY id) AS w FROM '{fixture:wnarrow}'",
+    "duck_error": "Conversion Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:lead-default-past-smallint",
+   "fixture": "wnarrow",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, lead(i16, 1, 40000) OVER (ORDER BY id) AS w FROM '{fixture:wnarrow}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowDefaultType",
+    "diag": "default of lag / lead",
+    "exit": 1,
+    "binder_sql": "SELECT id, lead(i16, 1, 40000) OVER (ORDER BY id) AS w FROM '{fixture:wnarrow}'",
+    "duck_error": "Conversion Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:lag-default-below-utinyint",
+   "fixture": "wnarrow",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, lag(u8, 1, -1) OVER (ORDER BY id) AS w FROM '{fixture:wnarrow}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowDefaultType",
+    "diag": "default of lag / lead",
+    "exit": 1,
+    "binder_sql": "SELECT id, lag(u8, 1, -1) OVER (ORDER BY id) AS w FROM '{fixture:wnarrow}'",
+    "duck_error": "Conversion Error:"
+   }
+  },
+  {
+   "id": "sql_windows:lag-default-in-narrow-range",
+   "fixture": "wnarrow",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, lag(i8, 1, 127) OVER (ORDER BY id) AS a, lead(i16, 1, -300) OVER (ORDER BY id) AS b, lag(u8, 1, 255) OVER (ORDER BY id) AS c FROM '{fixture:wnarrow}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, lag(i8, 1, 127) OVER (ORDER BY id) AS a, lead(i16, 1, -300) OVER (ORDER BY id) AS b, lag(u8, 1, 255) OVER (ORDER BY id) AS c FROM '{fixture:wnarrow}'"
    }
   }
  ]

@@ -12,6 +12,8 @@
 
 - **An integer column compares exactly with a number that has a fraction or lies past its type.** `WHERE i8 > 5.5`, `WHERE i8 > CAST('5.5' AS DECIMAL(5,1))`, `WHERE i64 < 9223372036854775808` and `WHERE i32 < 3000000000` were refused as an invalid value in the filter; they answer as DuckDB does (`i8 > 5.5` is `i8 > 5`, and `i32 < 3000000000` holds for every row), in WHERE, HAVING and `--filter`, for signed and unsigned columns. A literal written as an exponent is a DOUBLE and is still refused.
 
+- **A `lag` or `lead` default outside an 8- or 16-bit column's range is refused by name.** `lag(i8, 1, 200)` over a TINYINT column failed as a decode error on zpq's own scratch file; it is now the `WindowDefaultType` refusal, where DuckDB raises a conversion error too.
+
 ## 0.6.1 — 2026-11-26
 
 Bug fixes for zpq 0.6. For what 0.6 introduced, see 0.6.0 below.

@@ -673,6 +673,11 @@ fn compute(a: std.mem.Allocator, t: Table, r: Runs, spec: Spec, call: Call) !Out
         },
         .lag, .lead => {
             const ci = try argOf(call);
+            // The default is held in the column's INT32 lane, which an 8- or 16-bit annotation does not fill: a default past
+            // its range would be written to the pass's file and fail to read back.
+            if (call.default == .int) if (column_mod.IntRange.of(t.elems[ci])) |range| {
+                if (call.default.int < range.min or call.default.int > range.max) return error.WindowDefaultType;
+            };
             const pick = try a.alloc(i64, n);
             for (pick, 0..) |*p, i| {
                 const row: i64 = @intCast(i);

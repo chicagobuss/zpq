@@ -34,7 +34,7 @@
   },
   {
    "name": "wnarrow",
-   "copy": "COPY (SELECT i::TINYINT AS i8, (i*100)::SMALLINT AS i16, abs(i)::UTINYINT AS u8, i::INTEGER AS id FROM (VALUES (1),(2),(-1)) t(i)) TO '{path}' (FORMAT PARQUET)"
+   "copy": "COPY (SELECT i::TINYINT AS i8, (i*100)::SMALLINT AS i16, abs(i)::UTINYINT AS u8, abs(i)::UINTEGER AS u32, abs(i)::UBIGINT AS u64, i::INTEGER AS id FROM (VALUES (1),(2),(-1)) t(i)) TO '{path}' (FORMAT PARQUET)"
   }
  ],
  "cases": [
@@ -2800,6 +2800,63 @@
     "diag": "IGNORE NULLS and RESPECT NULLS",
     "exit": 2,
     "no_output": true
+   }
+  },
+  {
+   "id": "sql_windows:refuse:lag-default-below-uinteger",
+   "fixture": "wnarrow",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, lag(u32, 1, -1) OVER (ORDER BY id) AS w FROM '{fixture:wnarrow}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowDefaultType",
+    "diag": "default of lag / lead",
+    "exit": 1,
+    "binder_sql": "SELECT id, lag(u32, 1, -1) OVER (ORDER BY id) AS w FROM '{fixture:wnarrow}'",
+    "duck_error": "Conversion Error:"
+   }
+  },
+  {
+   "id": "sql_windows:refuse:lead-default-below-ubigint",
+   "fixture": "wnarrow",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, lead(u64, 1, -1) OVER (ORDER BY id) AS w FROM '{fixture:wnarrow}'",
+    "--summary=json"
+   ],
+   "refuse": {
+    "error": "WindowDefaultType",
+    "diag": "default of lag / lead",
+    "exit": 1,
+    "binder_sql": "SELECT id, lead(u64, 1, -1) OVER (ORDER BY id) AS w FROM '{fixture:wnarrow}'",
+    "duck_error": "Conversion Error:"
+   }
+  },
+  {
+   "id": "sql_windows:lag-default-in-wide-unsigned-range",
+   "fixture": "wnarrow",
+   "cli": [
+    "query",
+    "--query",
+    "SELECT id, lag(u32, 1, 0) OVER (ORDER BY id) AS a, lead(u64, 1, 5) OVER (ORDER BY id) AS b FROM '{fixture:wnarrow}'",
+    "-o",
+    "{out}"
+   ],
+   "axes": [
+    {
+     "jobs": 1
+    },
+    {
+     "jobs": 3
+    }
+   ],
+   "oracle": {
+    "compare": "written_sql",
+    "sql": "SELECT id, lag(u32, 1, 0) OVER (ORDER BY id) AS a, lead(u64, 1, 5) OVER (ORDER BY id) AS b FROM '{fixture:wnarrow}'"
    }
   }
  ]

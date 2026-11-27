@@ -29,7 +29,7 @@ SHARED_FILES = {"LICENSE": ROOT / "LICENSE",
                 **{"share/doc/zpq/" + n: ROOT / "docs" / n
                    for n in ("getting-started.md", "capabilities.md", "statistics-trust.md", "local_io.md", "output-format.md", "binary-output.md",
                              "writer-statistics.md", "decode-errors.md", "hardware-execution.md",
-                             "execution_knobs.md", "byte_topk.md", "capabilities.md",
+                             "execution_knobs.md", "byte_topk.md", "capabilities.md", "cli-output-contract.md",
                              "statistics-trust.md", "local_io.md")}}
 # Each target's archives as (name suffix, -Dcpu). Linux x86_64 ships x86-64-v3 (AVX2), which the binary checks at
 # startup, and a baseline "-compat" archive for older CPUs; .deb and .rpm come from the unsuffixed archive.

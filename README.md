@@ -35,11 +35,11 @@ export PATH="$PWD/zpq/bin:$PATH"
 | macOS, Intel | `zpq-x86_64-macos.tar.gz` |
 | Windows x86_64 | `zpq-x86_64-windows-gnu.zip` |
 
-**Debian, Ubuntu, Fedora and RHEL:** The release also includes `zpq_0.6.1_amd64.deb`, `zpq_0.6.1_arm64.deb`,
-`zpq-0.6.1-1.x86_64.rpm` and `zpq-0.6.1-1.aarch64.rpm`.
+**Debian, Ubuntu, Fedora and RHEL:** The release also includes `zpq_0.6.2_amd64.deb`, `zpq_0.6.2_arm64.deb`,
+`zpq-0.6.2-1.x86_64.rpm` and `zpq-0.6.2-1.aarch64.rpm`.
 
 ```bash
-sudo apt install ./zpq_0.6.1_amd64.deb      # or: sudo dnf install ./zpq-0.6.1-1.x86_64.rpm
+sudo apt install ./zpq_0.6.2_amd64.deb      # or: sudo dnf install ./zpq-0.6.2-1.x86_64.rpm
 ```
 
 The default Linux x86_64 build needs AVX2. On older CPUs, use the `-compat` build.

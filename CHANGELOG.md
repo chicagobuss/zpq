@@ -1,24 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.6.2 — 2026-11-27
 
-- **`%` and `//` in a SQL WHERE run and match DuckDB.** Earlier notes and docs said a WHERE predicate refuses them; only the `--filter` flag does, and over aggregates they are still refused by name.
+Bug fixes and one performance improvement for zpq 0.6. For what 0.6 introduced, see 0.6.0 below.
 
-- **A DOUBLE or FLOAT `%` with no answer is `-nan` on every host.** `inf % 1.0`, `x % 0.0` and `x % -0.0` are the negative NaN DuckDB prints on x86_64 Linux; before, ARM builds printed `nan` there while x86 builds printed `-nan`. A NaN operand still keeps its sign, and nothing else about float formatting changes.
-
-- **A join's top rows by an integer, DATE or TIMESTAMP column of its probe table read only the row groups that can hold them.** `SELECT f.id, d.name FROM f JOIN d ON ... ORDER BY f.id LIMIT 20` first ranks the joined rows by `f.id` alone, which shows the key the 20th row has, then reads and groups only the rows no later than it, skipping every row group whose statistics put it after. On a 3-million-row probe in 25 row groups that joins by a composite string key, that is one row group read instead of all of them. The rows and their order are unchanged, ties and duplicates included. `ZPQ_JOIN_TOPK=0` turns it off.
-
-- **On arm64 (Linux and Apple Silicon), an AVG of a DECIMAL wider than 4 digits gives the same DOUBLE as on x86_64.** The grouped, filtered and window AVG follows DuckDB's x87 `long double` division, which zpq now computes exactly in integers on every target. Before, the software 80-bit divide used outside x86 could miss its last bit. In a few cases that changed the double, so the mean of three 2.505s at DECIMAL(38,37) rounded to 2.51 where x86_64 and DuckDB give 2.5.
-
-- **An integer column compares exactly with a number that has a fraction or lies past its type.** `WHERE i8 > 5.5`, `WHERE i8 > CAST('5.5' AS DECIMAL(5,1))`, `WHERE i64 < 9223372036854775808` and `WHERE i32 < 3000000000` were refused as an invalid value in the filter; they answer as DuckDB does (`i8 > 5.5` is `i8 > 5`, and `i32 < 3000000000` holds for every row), in WHERE, HAVING and `--filter`, for signed and unsigned columns. A literal written as an exponent is a DOUBLE and is still refused.
-
-- **A `lag` or `lead` default outside an 8- or 16-bit column's range, or a negative one for an unsigned column, is refused by name.** `lag(i8, 1, 200)` over a TINYINT column failed as a decode error on zpq's own scratch file, and `lag(u32, 1, -1)` over an unsigned 32- or 64-bit column answered the type's maximum; both are now the `WindowDefaultType` refusal, where DuckDB raises a conversion error too.
-
-- **The documentation says that an alias on a `COLUMNS(...)` item that expands to several columns is refused.** The alias names each of the columns, which makes duplicate output names, and zpq's output columns have distinct names.
-
-- **The UPDATE refusal message says what UPDATE refuses.** It listed the options UPDATE accepts as if no others were allowed; it now names the ones it refuses: `--format`, `--limit`, `--explain`, `--codec`, `--bloom-filter`, `--profile` and `--profile-summary`.
-
-- **`IGNORE NULLS` on a window function, QUALIFY beside ROLLUP, CUBE or GROUPING SETS, and a join over a CSV input are refused with a message that names them.** Each was documented as refused by name but printed "invalid SQL; check the syntax shown above" with nothing shown, or that the CSV was not a valid Parquet file.
+**Wrong answers fixed:**
 
 - **A bare `avg()` of a DECIMAL column compares its exact average in QUALIFY too, and a window function reads it as a DOUBLE.** `QUALIFY avg(x) = 0.333333` no longer keeps a group whose average is 1/3, whether the average is written out or named by its alias; before, QUALIFY compared the mean rounded to the printed scale. The same DOUBLE is read where a bare `avg()` sits beside a window function, as in `avg(x) + row_number() OVER (...)`, and where it is a window function's argument, as in `min(avg(x)) OVER ()` or `lag(avg(x)) OVER (ORDER BY g)`, as in DuckDB. `sum(avg(x))` and `avg(avg(x))` over a window are refused by name, as a window SUM or AVG of any DOUBLE is; before, they added the rounded means. What a bare `avg()` prints is unchanged.
 
@@ -26,7 +12,37 @@
 
 - **`--format csv` prints an infinite DATE or TIMESTAMP as `infinity` or `-infinity`, as DuckDB does.** Before, it printed the stored value as a calendar date, such as `294247-01-10 04:00:54.775807`. JSON output is unchanged: it prints the stored integer.
 
+- **On arm64 (Linux and Apple Silicon), an AVG of a DECIMAL wider than 4 digits gives the same DOUBLE as on x86_64.** The grouped, filtered and window AVG follows DuckDB's x87 `long double` division, which zpq now computes exactly in integers on every target. Before, the software 80-bit divide used outside x86 could miss its last bit. In a few cases that changed the double, so the mean of three 2.505s at DECIMAL(38,37) rounded to 2.51 where x86_64 and DuckDB give 2.5.
+
+- **A DOUBLE or FLOAT `%` with no answer is `-nan` on every host.** `inf % 1.0`, `x % 0.0` and `x % -0.0` are the negative NaN DuckDB prints on x86_64 Linux; before, ARM builds printed `nan` there while x86 builds printed `-nan`. A NaN operand still keeps its sign, and nothing else about float formatting changes.
+
+**Queries that now answer:**
+
+- **An integer column compares exactly with a number that has a fraction or lies past its type.** `WHERE i8 > 5.5`, `WHERE i8 > CAST('5.5' AS DECIMAL(5,1))`, `WHERE i64 < 9223372036854775808` and `WHERE i32 < 3000000000` were refused as an invalid value in the filter; they answer as DuckDB does (`i8 > 5.5` is `i8 > 5`, and `i32 < 3000000000` holds for every row), in WHERE, HAVING and `--filter`, for signed and unsigned columns. A literal written as an exponent is a DOUBLE and is still refused.
+
+- **`%` and `//` in a SQL WHERE run and match DuckDB.** Earlier notes and docs said a WHERE predicate refuses them; only the `--filter` flag does, and over aggregates they are still refused by name.
+
+- **In a join, `WHERE d.flag = TRUE` (or `FALSE`) on a BOOLEAN column works.** The join planner read `TRUE` and `FALSE` as column names, so the query was refused as naming an unknown column; `WHERE d.flag` was unaffected.
+
+**Crashes:**
+
 - **A very long chain of operators in a query (`a OR b OR …`, `1 + 1 + …`, `s COLLATE c COLLATE c …`) no longer crashes zpq where it used to.** The parser builds such a chain at any length, but two steps after it walked the chain one stack frame per operator. Debug builds crashed from about 775 operators on Apple Silicon and 2,400 on x86_64, and optimized builds from about 60,000 (a 120 KB query). Debug builds now read chains of about 30,000 operators, and optimized builds several times longer than before; on Linux that is past the longest query a command line can hold. Other steps still take a little stack per operator, so on macOS, whose command line holds about 1 MB, a SELECT-list `+` chain of roughly 170,000 terms or more can still crash an optimized build. Results are unchanged, and no query that ran before is refused.
+
+**Faster:**
+
+- **A join's top rows by an integer, DATE or TIMESTAMP column of its probe table read only the row groups that can hold them.** `SELECT f.id, d.name FROM f JOIN d ON ... ORDER BY f.id LIMIT 20` first ranks the joined rows by `f.id` alone, which shows the key the 20th row has, then reads and groups only the rows no later than it, skipping every row group whose statistics put it after. On a 3-million-row probe in 25 row groups that joins by a composite string key, that is one row group read instead of all of them. The rows and their order are unchanged, ties and duplicates included. `ZPQ_JOIN_TOPK=0` turns it off.
+
+**Clearer refusals:**
+
+- **A `lag` or `lead` default outside an 8- or 16-bit column's range, or a negative one for an unsigned column, is refused by name.** `lag(i8, 1, 200)` over a TINYINT column failed as a decode error on zpq's own scratch file, and `lag(u32, 1, -1)` over an unsigned 32- or 64-bit column answered the type's maximum; both are now the `WindowDefaultType` refusal, where DuckDB raises a conversion error too.
+
+- **`IGNORE NULLS` on a window function, QUALIFY beside ROLLUP, CUBE or GROUPING SETS, and a join over a CSV input are refused with a message that names them.** Each was documented as refused by name but printed "invalid SQL; check the syntax shown above" with nothing shown, or that the CSV was not a valid Parquet file.
+
+- **The UPDATE refusal message says what UPDATE refuses.** It listed the options UPDATE accepts as if no others were allowed; it now names the ones it refuses: `--format`, `--limit`, `--explain`, `--codec`, `--bloom-filter`, `--profile` and `--profile-summary`.
+
+**Documentation:**
+
+- **The documentation says that an alias on a `COLUMNS(...)` item that expands to several columns is refused.** The alias names each of the columns, which makes duplicate output names, and zpq's output columns have distinct names.
 
 ## 0.6.1 — 2026-11-26
 

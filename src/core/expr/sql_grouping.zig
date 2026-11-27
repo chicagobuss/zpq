@@ -211,7 +211,8 @@ fn clauses(arena: std.mem.Allocator, text: []const u8) Error!?Clauses {
                 (setops.eql(w, "order") and setops.eql(setops.nextWord(text, i + w.len).word, "by")))) tail_at = i;
             if (group_at != null and trailing_at == null and (setops.eql(w, "window") or setops.eql(w, "qualify"))) {
                 trailing_at = i;
-                trailing_qualify = setops.eql(w, "qualify");
+                // A QUALIFY clause follows an expression's end, not an ORDER BY or HAVING that names a column `qualify`.
+                trailing_qualify = setops.eql(w, "qualify") and tail_at == null and followsExpression(text, i);
             }
             i += w.len;
             continue;
@@ -233,6 +234,23 @@ fn clauses(arena: std.mem.Allocator, text: []const u8) Error!?Clauses {
         .trailing = trailing_at != null,
         .trailing_qualify = trailing_qualify,
     };
+}
+
+/// Whether the word at `at` follows the end of an expression (a closing parenthesis or quote, a name or a number), not an
+/// operator, a comma or a keyword that wants one (`HAVING qualify > 0`): where a clause of its own can start.
+fn followsExpression(text: []const u8, at: usize) bool {
+    var end = at;
+    while (end > 0 and std.ascii.isWhitespace(text[end - 1])) end -= 1;
+    if (end == 0) return false;
+    const last = text[end - 1];
+    if (last == ')' or last == '\'' or last == '"') return true;
+    if (!std.ascii.isAlphanumeric(last) and last != '_') return false;
+    var start = end;
+    while (start > 0 and (std.ascii.isAlphanumeric(text[start - 1]) or text[start - 1] == '_')) start -= 1;
+    const word = text[start..end];
+    inline for (.{ "having", "by", "and", "or", "not", "is", "in", "like", "between", "as", "on", "where", "case", "when", "then", "else" }) |kw|
+        if (setops.eql(word, kw)) return false;
+    return true;
 }
 
 /// A comma-separated list as DuckDB reads one in a grouping clause: one trailing comma is ignored, and an empty entry
@@ -742,6 +760,10 @@ test "a QUALIFY after GROUP BY is no grouping-set query, and with ROLLUP it is r
     const a = arena_state.allocator();
     try std.testing.expect((try expand(a, "SELECT g, sum(v) FROM t GROUP BY g QUALIFY rank() OVER (ORDER BY sum(v)) <= 3 ORDER BY g")) == null);
     try std.testing.expectError(error.GroupingSetsQualify, expand(a, "SELECT g, sum(v) FROM t GROUP BY ROLLUP (g) QUALIFY rank() OVER (ORDER BY sum(v)) <= 3"));
+    // A column named `qualify` in ORDER BY or HAVING is no QUALIFY clause: it stays a bare parse error, as in DuckDB.
+    try std.testing.expectError(error.SqlParseError, expand(a, "SELECT g, sum(v) FROM t GROUP BY ROLLUP (g) ORDER BY qualify"));
+    try std.testing.expectError(error.SqlParseError, expand(a, "SELECT g, sum(v) FROM t GROUP BY ROLLUP (g) HAVING qualify > 0"));
+    try std.testing.expectError(error.GroupingSetsQualify, expand(a, "SELECT g, sum(v) FROM t GROUP BY ROLLUP (g) HAVING sum(v) > 0 QUALIFY rank() OVER (ORDER BY g) <= 3"));
     // A WINDOW clause there is still a bare parse error.
     try std.testing.expectError(error.SqlParseError, expand(a, "SELECT g, sum(v) FROM t GROUP BY ROLLUP (g) WINDOW w AS (ORDER BY g)"));
 }

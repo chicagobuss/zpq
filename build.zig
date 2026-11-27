@@ -727,6 +727,10 @@ const CoreDeps = struct {
             .optimize = optimize,
             .link_libc = true,
             .pic = archivePic(shared),
+            // Debug's C sanitizer keeps a stack slot per check, so the parser's tree walks (a recursion per level of
+            // the query) take 13-36 KiB a level on arm64 and 4-13 KiB on x86_64 instead of under 1 KiB, and a query
+            // nested a few hundred deep overflowed a Debug thread. The optimized modes keep their checks.
+            .sanitize_c = if (optimize == .debug) .off else null,
         });
         liteparser_mod.addCSourceFiles(.{
             .root = b.path("vendor/liteparser"),

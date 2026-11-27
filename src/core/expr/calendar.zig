@@ -11,7 +11,7 @@ pub const Error = error{
     DateOutOfRange,
     /// A time whose microseconds since the epoch do not fit 64 bits, which no DuckDB TIMESTAMP holds.
     TimestampOutOfRange,
-    /// A calendar field or truncation of DuckDB's infinite DATE, which has neither.
+    /// A calendar field or truncation of DuckDB's infinite DATE or TIMESTAMP, which has neither.
     InfiniteDate,
 };
 
@@ -81,15 +81,13 @@ pub fn roundDivAway(v: i64, per: i64) i64 {
 /// a TIMESTAMP_NS its microsecond to the nearest, as DuckDB casts it. A week is not a Monday's boundary: it is the day
 /// count over 7, truncated toward zero (1473 days are 210 weeks). Null where either time is infinite.
 pub fn diff(unit: ast.DiffPart, ta_in: ast.Temporal, a_in: i64, tb_in: ast.Temporal, b_in: i64) Error!?i64 {
-    const ts_infinity = std.math.maxInt(i64);
-    if ((ta_in != .date and (a_in == ts_infinity or a_in == -ts_infinity)) or
-        (tb_in != .date and (b_in == ts_infinity or b_in == -ts_infinity))) return null;
+    if (infinity(ta_in, a_in) != null or infinity(tb_in, b_in) != null) return null;
     const ta: ast.Temporal = if (ta_in == .ts_ns) .ts_us else ta_in;
     const tb: ast.Temporal = if (tb_in == .ts_ns) .ts_us else tb_in;
     const a = if (ta_in == .ts_ns) roundDivAway(a_in, std.time.ns_per_us) else a_in;
     const b = if (tb_in == .ts_ns) roundDivAway(b_in, std.time.ns_per_us) else b_in;
-    const sa = split(ta, a) catch |e| return if (e == error.InfiniteDate) null else e;
-    const sb = split(tb, b) catch |e| return if (e == error.InfiniteDate) null else e;
+    const sa = try split(ta, a);
+    const sb = try split(tb, b);
     const ca = civilFromDays(sa.days);
     const cb = civilFromDays(sb.days);
     const da: i128 = sa.days;
@@ -207,12 +205,7 @@ pub const Format = struct {
 
     /// Append the time `v` in unit `t` to `out`. DuckDB's infinite DATE and TIMESTAMP print as `infinity` and `-infinity`.
     pub fn render(f: Format, gpa: std.mem.Allocator, out: *std.ArrayList(u8), t: ast.Temporal, v: i64) (Error || std.mem.Allocator.Error)!void {
-        const ts_infinity = std.math.maxInt(i64);
-        const infinite: ?i8 = if (t == .date)
-            (if (v == std.math.maxInt(i32)) @as(?i8, 1) else if (v == -std.math.maxInt(i32)) @as(?i8, -1) else null)
-        else
-            (if (v == ts_infinity) @as(?i8, 1) else if (v == -ts_infinity) @as(?i8, -1) else null);
-        if (infinite) |sign| return out.appendSlice(gpa, if (sign > 0) "infinity" else "-infinity");
+        if (infinity(t, v)) |sign| return out.appendSlice(gpa, if (sign > 0) "infinity" else "-infinity");
         const x = try split(t, v);
         const c = civilFromDays(x.days);
         const wday: i64 = @mod(x.days + 4, 7); // 0 is Sunday; 1970-01-01 was a Thursday
@@ -268,16 +261,20 @@ pub const Format = struct {
     }
 };
 
-/// A time split into its day and the microseconds into it; a DATE has none. DuckDB's infinite DATEs (`make_date` of
-/// ±maxInt(i32)) have no calendar fields, so they are refused rather than answered as a finite day.
+/// The sign of DuckDB's infinite DATE (±maxInt(i32) days) or TIMESTAMP (±maxInt(i64) in its unit), else null.
+pub fn infinity(t: ast.Temporal, v: i64) ?i2 {
+    const inf: i64 = if (t == .date) std.math.maxInt(i32) else std.math.maxInt(i64);
+    return if (v == inf) 1 else if (v == -inf) -1 else null;
+}
+
+/// A time split into its day and the microseconds into it; a DATE has none. An infinite time has no calendar fields,
+/// so it is refused rather than answered as a finite day: the caller says what DuckDB answers for one.
 const Split = struct { days: i64, of_day: i64 };
 
 fn split(t: ast.Temporal, v: i64) Error!Split {
+    if (infinity(t, v) != null) return error.InfiniteDate;
     const us: i64 = switch (t) {
-        .date => {
-            if (v == std.math.maxInt(i32) or v == -std.math.maxInt(i32)) return error.InfiniteDate;
-            return .{ .days = v, .of_day = 0 };
-        },
+        .date => return .{ .days = v, .of_day = 0 },
         .ts_ms => std.math.mul(i64, v, std.time.us_per_ms) catch return error.TimestampOutOfRange,
         .ts_us => v,
         .ts_ns => roundDivAway(v, std.time.ns_per_us),
@@ -322,6 +319,7 @@ pub inline fn trunc(comptime p: ast.DatePart, t: ast.Temporal, v: i64) Error!i64
 /// `date_part(part, v)` of a time: as `part`, but a TIMESTAMP_NS reaches microseconds by flooring, so a time just
 /// before a boundary stays before it (23:59:59.999999999 is in the second and the day it began, not the next one).
 pub inline fn partOf(comptime p: ast.DatePart, t: ast.Temporal, v: i64) Error!i64 {
+    if (infinity(t, v) != null) return error.InfiniteDate;
     return if (t == .ts_ns) part(p, .ts_us, @divFloor(v, std.time.ns_per_us)) else part(p, t, v);
 }
 
@@ -392,6 +390,13 @@ test "trunc and part match DuckDB on 2013-07-31 19:59:59.123, before the epoch a
     try testing.expectError(error.TimestampOutOfRange, trunc(.month, .date, 2147483646));
     try testing.expectError(error.InfiniteDate, part(.year, .date, std.math.maxInt(i32)));
     try testing.expectError(error.TimestampOutOfRange, trunc(.day, .ts_ms, -9223372036854775));
+    // An infinite TIMESTAMP in any unit has no fields either: no sentinel's calendar date (year 294247).
+    for ([_]ast.Temporal{ .ts_ms, .ts_us, .ts_ns }) |t| for ([_]i64{ std.math.maxInt(i64), -std.math.maxInt(i64) }) |v| {
+        try testing.expectError(error.InfiniteDate, partOf(.year, t, v));
+        try testing.expectError(error.InfiniteDate, trunc(.month, t, v));
+    };
+    try testing.expectEqual(@as(?i2, -1), infinity(.date, -std.math.maxInt(i32)));
+    try testing.expectEqual(@as(?i2, null), infinity(.date, std.math.maxInt(i32) - 1));
 }
 
 test "make_date(y, m, d) and its edges match DuckDB 2.0.0" {

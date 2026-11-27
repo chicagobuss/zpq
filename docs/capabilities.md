@@ -234,7 +234,8 @@ TIMESTAMP_NS, which DuckDB keeps as a type of its own, casts to a DATE from its 
 precision DuckDB gives it; an integer or a DOUBLE floors and ceils to a DOUBLE; `sqrt` is a DOUBLE and NaN below zero;
 `n` is a constant, and an integer is not rounded to tens or up), `least` and `greatest` over numbers (NULLs skipped,
 NULL where all are, NaN above every number), `year`, `quarter`, `month`, `week`, `day`/`dayofmonth`, `hour`, `minute`,
-`second`, `dayofweek`, `isodow` and `dayofyear` of a date or timestamp (spellings of `date_part`), `ifnull(a, b)` (a
+`second`, `dayofweek`, `isodow` and `dayofyear` of a date or timestamp (spellings of `date_part`; every part of an
+infinite date or time is NULL, and its `date_trunc` is that infinity, as in DuckDB), `ifnull(a, b)` (a
 two-argument `coalesce`), `strlen(s)` (bytes; NULL for NULL), the string functions `length`,
 `substring`/`substr` (also `substring(x FROM a [FOR b])`), `left`, `right`, `upper`/`lower`, `trim`/`ltrim`/`rtrim`
 (spaces), `replace`, `lpad`/`rpad` and `concat(a, b, ...)` (a NULL is the empty text, unlike `||`; the arguments must be

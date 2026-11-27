@@ -1690,10 +1690,6 @@ fn evalStringTest(arena: std.mem.Allocator, batch: *const Batch, column_lookup: 
 const day_names = [_][]const u8{ "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
 const month_names = [_][]const u8{ "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December" };
 
-fn isInfiniteTime(unit: ast.Temporal, v: i64) bool {
-    return if (unit == .date) v == std.math.maxInt(i32) or v == -std.math.maxInt(i32) else v == std.math.maxInt(i64) or v == -std.math.maxInt(i64);
-}
-
 /// `dayname(t)`, `monthname(t)` and `last_day(t)`; an infinite time is NULL.
 fn evalDateName(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []const ?usize, c: ast.Call) Error!Batch.Column {
     const arg = c.args[0].*;
@@ -1710,7 +1706,7 @@ fn evalDateName(arena: std.mem.Allocator, batch: *const Batch, column_lookup: []
     for (0..n) |i| {
         def[i] = 0;
         if (c.func == .date_name) names[i] = "" else days[i] = 0;
-        if (rowIsNull(col, i) or isInfiniteTime(unit, in.values[i])) {
+        if (rowIsNull(col, i) or calendar.infinity(unit, in.values[i]) != null) {
             any_null = true;
             continue;
         }
@@ -3049,20 +3045,36 @@ fn evalTemporal(
         }.f, t),
         // Bound only over a TIMESTAMP literal's microseconds, which its parse kept in range.
         .make_timestamp => @memcpy(out, in.values),
+        // An infinite time truncates to the TIMESTAMP infinity of its sign, as DuckDB's does.
         .date_trunc => switch (c.part.?) {
             .dow, .isodow, .doy => unreachable,
             inline else => |p| try mapRows(col, batch.sel, out, struct {
                 fn f(tt: ?ast.Temporal, v: i64) calendar.Error!i64 {
+                    if (calendar.infinity(tt.?, v)) |sign| return @as(i64, sign) * std.math.maxInt(i64);
                     return calendar.trunc(p, tt.?, v);
                 }
             }.f, t),
         },
-        .date_part => switch (c.part.?) {
-            inline else => |p| try mapRows(col, batch.sel, out, struct {
-                fn f(tt: ?ast.Temporal, v: i64) calendar.Error!i64 {
-                    return calendar.partOf(p, tt.?, v);
-                }
-            }.f, t),
+        .date_part => {
+            switch (c.part.?) {
+                inline else => |p| try mapRows(col, batch.sel, out, struct {
+                    fn f(tt: ?ast.Temporal, v: i64) calendar.Error!i64 {
+                        return calendar.partOf(p, tt.?, v) catch |err| if (err == error.InfiniteDate) 0 else err;
+                    }
+                }.f, t),
+            }
+            // An infinite time has no calendar fields: DuckDB's part of one is NULL.
+            var def: ?[]u32 = null;
+            for (in.values, 0..) |v, i| if (calendar.infinity(t.?, v) != null and !rowIsNull(col, i)) {
+                const d = def orelse blk: {
+                    const fresh = try arena.alloc(u32, in.values.len);
+                    for (fresh, 0..) |*x, r| x.* = @intFromBool(!rowIsNull(col, r));
+                    break :blk fresh;
+                };
+                d[i] = 0;
+                def = d;
+            };
+            if (def) |d| return .{ .i64 = .{ .values = out, .def_levels = d, .max_def = 1, .has_nulls = true } };
         },
         .coalesce, .strlen, .regexp_replace, .cast_text, .abs, .length, .substring, .left, .right, .upper, .lower, .trim, .ltrim, .rtrim, .replace, .lpad, .rpad, .split_part, .regexp_extract, .date_diff, .strftime, .cast_i8, .cast_i16, .cast_i32, .cast_i64, .cast_double, .cast_dec, .cast_date, .cast_timestamp, .floor, .ceil, .sqrt, .round, .least, .greatest, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns, .math, .sign, .trunc, .str_test, .regexp_matches, .strpos, .concat_ws, .date_name, .last_day, .ascii, .chr, .repeat => unreachable,
     }

@@ -1018,9 +1018,9 @@ pub const Expr = union(enum) {
                     if (a.mayBeNull()) break true;
                 } else false),
                 .make_timestamp => c.lenient or c.args[0].mayBeNull(),
-                .date_trunc, .date_part => c.args[1].mayBeNull(),
+                .date_trunc => c.args[1].mayBeNull(),
                 // Infinite times give NULL whatever the columns say.
-                .date_diff, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => true,
+                .date_part, .date_diff, .epoch, .to_epoch_ms, .to_epoch_us, .to_epoch_ns => true,
                 .coalesce, .least, .greatest => for (c.args) |a| {
                     if (!a.mayBeNull()) break false;
                 } else true,

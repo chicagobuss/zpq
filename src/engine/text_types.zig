@@ -53,9 +53,11 @@ pub const Temporal = struct {
     kind: enum { date, time, timestamp },
     unit: enum { ms, us, ns } = .us,
     utc: bool = false,
+    /// An INT96 holds no infinity: its every value is an instant.
+    int96: bool = false,
 
     pub fn of(elem: schema.SchemaElement) ?Temporal {
-        if (elem.type == .INT96) return .{ .kind = .timestamp, .unit = .ns };
+        if (elem.type == .INT96) return .{ .kind = .timestamp, .unit = .ns, .int96 = true };
         if (elem.type != .INT32 and elem.type != .INT64) return null;
         const lt = elem.effectiveLogicalType() orelse return null;
         return switch (lt) {
@@ -93,6 +95,13 @@ pub const Temporal = struct {
     /// `v` (days, or units since midnight or the epoch) as `YYYY-MM-DD`, `HH:MM:SS.fff` or `YYYY-MM-DD HH:MM:SS.fff`,
     /// every fractional digit of the unit printed.
     pub fn write(self: Temporal, writer: anytype, v: i128) !void {
+        // DuckDB's infinite DATE (±maxInt(i32) days) and TIMESTAMP (±maxInt(i64) in any unit) print as it prints them.
+        const inf: ?i128 = switch (self.kind) {
+            .date => std.math.maxInt(i32),
+            .timestamp => if (self.int96) null else std.math.maxInt(i64),
+            .time => null,
+        };
+        if (inf) |m| if (v == m or v == -m) return writer.writeAll(if (v > 0) "infinity" else "-infinity");
         if (self.kind == .date) return writeCivilDate(writer, v);
         const per = self.perSecond();
         const day = per * 86_400;

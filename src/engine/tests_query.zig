@@ -1610,3 +1610,25 @@ test "cold mapped passes read ahead of their workers and answer as the faulting 
         }
     };
 }
+
+test "a CSV cell prints DuckDB's infinite DATE and TIMESTAMP as infinity, and an INT96 as its instant" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const date: Temporal = .{ .kind = .date };
+    try date.write(&out.writer, std.math.maxInt(i32));
+    try out.writer.writeByte(',');
+    try date.write(&out.writer, -std.math.maxInt(i32));
+    try out.writer.writeByte(',');
+    try date.write(&out.writer, std.math.maxInt(i32) - 1);
+    for ([_]@FieldType(Temporal, "unit"){ .ms, .us, .ns }) |unit| {
+        const ts: Temporal = .{ .kind = .timestamp, .unit = unit, .utc = unit == .us };
+        try out.writer.writeByte(',');
+        try ts.write(&out.writer, std.math.maxInt(i64));
+        try out.writer.writeByte(',');
+        try ts.write(&out.writer, -std.math.maxInt(i64));
+    }
+    try out.writer.writeByte(',');
+    try (Temporal{ .kind = .timestamp, .unit = .ns, .int96 = true }).write(&out.writer, std.math.maxInt(i64));
+    try std.testing.expectEqualStrings("infinity,-infinity,5881580-07-10,infinity,-infinity,infinity,-infinity," ++
+        "infinity,-infinity,2262-04-11 23:47:16.854775807", out.written());
+}

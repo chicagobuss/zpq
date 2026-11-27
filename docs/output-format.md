@@ -127,6 +127,8 @@ Notes:
 - **Dates and times.** In JSON, DATE, TIME and TIMESTAMP print as their stored integers, and do not say their unit.
   Read the unit from `zpq schema`. CSV prints them as ISO text with the column's own fractional digits, and adds `Z`
   when the column is adjusted to UTC: `2024-01-02`, `12:00:00.250`, `2024-01-02 03:04:05.600000Z`.
+  An infinite DATE or TIMESTAMP prints `infinity` or `-infinity` in CSV, as DuckDB prints it; in JSON it is its
+  stored integer (±2147483647 days, or ±9223372036854775807 in the column's unit).
 - **Strings.** JSON escapes `"`, `\`, `\n`, `\r`, `\t` and the other control characters (`\u0001`), and also
   U+2028 and U+2029. All other text passes through as UTF-8. A STRING value that is not valid UTF-8 is an error (exit
   1), not a replacement character.
